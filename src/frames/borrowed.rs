@@ -254,8 +254,8 @@ unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
         &self.layout
     }
     #[inline]
-    fn header(&self) -> &VideoHeader {
-        &self.header
+    fn header(&self) -> VideoHeader {
+        self.header
     }
     #[inline]
     fn pixels(&self) -> *const u8 {

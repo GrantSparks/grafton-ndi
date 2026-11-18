@@ -4,6 +4,7 @@
 //! reordered fields or lost context cannot silently preserve a generic message.
 
 use super::*;
+use crate::media::MAX_ALLOCATION_BYTES;
 use crate::{ColorInfo, FrameMetadataStatus, PixelFormat, TransferFunction};
 use std::time::Duration;
 
@@ -178,6 +179,7 @@ fn frame_defect_diagnostics_preserve_their_text() {
 
 #[test]
 fn input_defect_diagnostics_preserve_their_text() {
+    let allocator_limit = format!("max_allocation_bytes exceeds {MAX_ALLOCATION_BYTES} bytes");
     let cases = [
         ("Layout", InputDefect::Layout(LayoutDefect::VideoZeroStride), "Video line stride must be positive, got 0"),
         ("ListElement", InputDefect::ListElement { setting: "groups", index: 2 }, "groups element 2 must be nonempty and contain neither a comma nor a NUL"),
@@ -196,7 +198,7 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("SessionCounterExhausted", InputDefect::SessionCounterExhausted, "the session counter is exhausted"),
         ("RecorderGenerationExhausted", InputDefect::RecorderGenerationExhausted, "the recorder generation is exhausted"),
         ("AllocatorPositiveLimits", InputDefect::AllocatorPositiveLimits, "Allocator limits must be positive"),
-        ("AllocatorAllocationLimit", InputDefect::AllocatorAllocationLimit, "max_allocation_bytes exceeds 256 MiB"),
+        ("AllocatorAllocationLimit", InputDefect::AllocatorAllocationLimit, &allocator_limit),
         ("AllocatorConcurrentLimit", InputDefect::AllocatorConcurrentLimit, "max_concurrent_calls exceeds max_allocations, which counts every call in progress"),
         ("AllocatorByteLimit", InputDefect::AllocatorByteLimit, "max_bytes is less than max_concurrent_calls allocations of max_allocation_bytes"),
         ("CompressedAllocationStride", InputDefect::CompressedAllocationStride, "Compressed allocations have a byte size, not a configurable stride"),
@@ -227,10 +229,9 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("KvmWheel", InputDefect::KvmWheel { units: 2.5 }, "KVM wheel units 2.5 are not finite"),
         ("KvmTouchCount", InputDefect::KvmTouchCount { count: 3 }, "3 KVM touch points are more than the SDK can count"),
         ("QueueFrameTooLarge", InputDefect::QueueFrameTooLarge { bytes: 268435457, limit: 268435456 }, "frame retains 268435457 bytes of allocation capacity, exceeding the queue's 268435456 byte limit"),
-        ("ImageQuality", InputDefect::ImageQuality { codec: ImageCodecKind::Jpeg, quality: 101, minimum: 1, maximum: 100 }, "JPEG quality must be in 1..=100, got 101"),
-        ("WebpEffort", InputDefect::WebpEffort { effort: 7 }, "WebP effort must be in 0..=6, got 7"),
+        ("ImageSetting", InputDefect::ImageSetting { codec: ImageCodecKind::Jpeg, setting: ImageSettingKind::Quality, value: 101, minimum: 1, maximum: 100 }, "JPEG quality must be in 1..=100, got 101"),
         ("SixteenBitNeedsPng", InputDefect::SixteenBitNeedsPng { codec: ImageCodecKind::Jpeg }, "JPEG images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png"),
-        ("HdrNeedsPng", InputDefect::HdrNeedsPng { codec: ImageCodecKind::Jpeg, transfer: TransferFunction::Pq }, "JPEG cannot say that its values are PQ code values; HdrPolicy::CodeValues needs ImageFormat::Png"),
+        ("ColorTagNeedsPng", InputDefect::ColorTagNeedsPng { codec: ImageCodecKind::Jpeg, primaries: Some(crate::ColorPrimaries::Bt2020), transfer: Some(TransferFunction::Pq) }, "JPEG cannot carry the required color tag for BT.2020 primaries and PQ transfer. Use ImageFormat::Png"),
         ("RecordingPathTooLong", InputDefect::RecordingPathTooLong { maximum_bytes: 4094, longest_bytes: 4095, index_digits_reserved: 17 }, "recording file path may reach 4095 UTF-8 bytes, exceeding the 4094-byte event path limit (17 digits reserved for index growth)"),
         ("DiscoveryAddressRejected", InputDefect::DiscoveryAddressRejected(Box::new(DiscoveryAddressFailure { object: "advertiser", address: "server:5960".into() })), "the SDK created no advertiser: it does not accept \"server:5960\" as a Discovery Server address"),
         ("DiscoveryConfigurationRejected", InputDefect::DiscoveryConfigurationRejected { object: "advertiser" }, "the SDK created no advertiser: no Discovery Server was named, and the configuration names none it accepts"),
@@ -238,6 +239,17 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("SpeedHqCodec", InputDefect::SpeedHqCodec { codec: crate::advanced::VideoCodec::H264 }, "SpeedHQ quality guidance does not apply to H264"),
     ];
     check_cases("InputDefect", &cases);
+    assert_eq!(
+        InputDefect::ImageSetting {
+            codec: ImageCodecKind::Webp,
+            setting: ImageSettingKind::Effort,
+            value: 7,
+            minimum: 0,
+            maximum: 6,
+        }
+        .to_string(),
+        "WebP effort must be in 0..=6, got 7"
+    );
 }
 
 #[test]
@@ -390,6 +402,10 @@ fn diagnostic_sizes_keep_unsigned_evidence_and_word_alignment() {
 
 #[test]
 fn layout_defect_diagnostics_preserve_their_text() {
+    let video_limit = format!(
+        "Video frame exceeds maximum size: 7 bytes > {} bytes",
+        crate::frames::MAX_VIDEO_BYTES
+    );
     let cases = [
         ("FrameRate", LayoutDefect::FrameRate { detail: CompactDiagnostic::new(FrameRateDefect { numerator: 30, denominator: 0 }) }, "Invalid frame rate 30/0: both parts must be in 1..=2147483647"),
         ("CompressedVideoDimensions", LayoutDefect::CompressedVideoDimensions { detail: CompactDiagnostic::new(VideoDimensionsDefect { width: 8, height: 4 }) }, "Compressed video dimensions 8x4 must each be in 1..=2147483647"),
@@ -400,7 +416,7 @@ fn layout_defect_diagnostics_preserve_their_text() {
         ("VideoHeight", LayoutDefect::VideoHeight((-3).into()), "Video frame has invalid height: -3"),
         ("VideoSdkStride", LayoutDefect::VideoSdkStride(-3), "Uncompressed video frame has invalid line_stride_in_bytes: -3"),
         ("VideoShortStride", LayoutDefect::VideoShortStride { stride: 7, minimum: 12, format: PixelFormat::Bgra, width: 8 }, "Video line_stride_in_bytes 7 is smaller than minimum row size 12 for Bgra width 8"),
-        ("VideoBytes", LayoutDefect::VideoBytes(7u64.into()), "Video frame exceeds maximum size: 7 bytes > 268435456 bytes"),
+        ("VideoBytes", LayoutDefect::VideoBytes(7u64.into()), &video_limit),
         ("VideoPlanar420", LayoutDefect::VideoPlanar420 { height: 4, stride: 7 }, "Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height 4 and stride 7"),
         ("VideoSemiPlanar420", LayoutDefect::VideoSemiPlanar420(7), "Semi-planar 4:2:0 (NV12) video frames require even height, got 7"),
         ("VideoUyvaStride", LayoutDefect::VideoUyvaStride(7), "UYVA video frames require even line stride, got 7"),

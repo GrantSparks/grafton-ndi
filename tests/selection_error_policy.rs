@@ -4,16 +4,14 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, file);
-#[path = "support/fixture.rs"]
-mod fixture;
+common_helpers!(runtime, file, child, fixture);
+use common::TestChild;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use fixture::FixtureDir;
 use grafton_ndi::{Ndi, RuntimeOptions};
 use runtime_fixture::FakeRuntime;
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf};
 
 #[test]
 fn prerequisite_helpers_fail_when_native_code_loaded_but_was_refused() {
@@ -30,7 +28,7 @@ fn prerequisite_helpers_fail_when_native_code_loaded_but_was_refused() {
         }
         return;
     }
-    let directory = FixtureDir::create("selection-policy");
+    let directory = common::FixtureDir::create("selection-policy");
     let root = directory.path();
     for name in ["trusted", "executable", "refused", "absent", "loader"] {
         fs::create_dir(root.join(name)).unwrap();
@@ -60,36 +58,26 @@ fn prerequisite_helpers_fail_when_native_code_loaded_but_was_refused() {
         "file-refused",
         "file-absent",
     ] {
-        let output = Command::new(&executable)
-            .args([
-                "--exact",
-                "prerequisite_helpers_fail_when_native_code_loaded_but_was_refused",
-                "--nocapture",
-            ])
-            .env("GRAFTON_SELECTION_POLICY_CASE", scenario)
-            .env("GRAFTON_SELECTION_POLICY_ROOT", root)
-            .env(
-                "NDI_RUNTIME_DIR_V6",
-                root.join(if scenario.ends_with("refused") {
-                    "refused"
-                } else {
-                    "absent"
-                }),
-            )
-            .env("LD_LIBRARY_PATH", root.join("loader"))
-            .env_remove("LD_PRELOAD")
-            .env_remove("GRAFTON_NDI_REQUIRE_RUNTIME")
-            .env_remove("GRAFTON_NDI_EXPECTED_RUNTIME")
-            .env_remove("GRAFTON_NDI_EXPECTED_VERSION")
-            .env_remove("GRAFTON_NDI_EXPECTED_EDITION")
-            .output()
-            .unwrap();
-        assert_eq!(
-            output.status.success(),
-            scenario.ends_with("absent"),
-            "{scenario}: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        TestChild::at(
+            &executable,
+            "prerequisite_helpers_fail_when_native_code_loaded_but_was_refused",
+        )
+        .env("GRAFTON_SELECTION_POLICY_CASE", scenario)
+        .env("GRAFTON_SELECTION_POLICY_ROOT", root)
+        .env(
+            "NDI_RUNTIME_DIR_V6",
+            root.join(if scenario.ends_with("refused") {
+                "refused"
+            } else {
+                "absent"
+            }),
+        )
+        .env("LD_LIBRARY_PATH", root.join("loader"))
+        .env_remove("LD_PRELOAD")
+        .env_remove("GRAFTON_NDI_REQUIRE_RUNTIME")
+        .env_remove("GRAFTON_NDI_EXPECTED_RUNTIME")
+        .env_remove("GRAFTON_NDI_EXPECTED_VERSION")
+        .env_remove("GRAFTON_NDI_EXPECTED_EDITION")
+        .run_expecting(scenario.ends_with("absent"));
     }
 }

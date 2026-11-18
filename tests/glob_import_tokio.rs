@@ -4,8 +4,11 @@
 //! and `smol`. Its unqualified imports must resolve without explicit aliases
 //! that could hide an ambiguous root export.
 
-#[path = "support/fixture.rs"]
-mod fixture;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(fixture);
+
 #[path = "support/nested_cargo.rs"]
 mod nested_cargo;
 
@@ -27,7 +30,7 @@ fn glob_import_leaves_the_tokio_crate_nameable() {
 fn root_glob_import_keeps_external_crates_unambiguous() {
     use std::{fs, path::PathBuf};
 
-    let directory = fixture::FixtureDir::create("glob-import");
+    let directory = common::FixtureDir::create("glob-import");
     let root = directory.path();
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let dependency_path = manifest

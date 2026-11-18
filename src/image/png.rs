@@ -4,27 +4,29 @@
 use std::io::Write;
 
 use super::{
-    color::Sample, options::PngCompression, Channels, ImageShape, PixelDensity, Pixels, SampleDepth,
+    color::Sample, options::PngCompression, Channels, Cicp, ImageShape, PixelDensity, Pixels,
+    SampleDepth,
 };
 use crate::{Error, Result};
 
 /// Encode `pixels` as a PNG of `channels` channels into `out`, with a `cICP`
 /// chunk when `cicp` gives one.
 ///
-/// An RGBA frame whose rows are the image's rows is read in place; anything
-/// else converts into one row of scratch, reused for every row.
+/// Contiguous RGBA rows at full size are read in place. Otherwise one row
+/// of scratch holds the converted pixels.
 pub(super) fn encode<P: Sample>(
     pixels: &mut Pixels<'_, P>,
     shape: ImageShape,
     compression: PngCompression,
-    cicp: Option<[u8; 4]>,
+    cicp: Option<Cicp>,
     density: Option<PixelDensity>,
     out: &mut dyn Write,
     row: &mut Vec<u8>,
 ) -> Result<()> {
     // Complete wrapper storage preparation before the signature, IHDR or cICP.
     // Eligible RGBA rows borrow the source and need no conversion storage.
-    if pixels.rgba_rows().is_none() {
+    let direct = pixels.direct_rgba();
+    if direct.is_none() {
         super::resize_scratch(row, shape.row_bytes)?;
     }
     let mut encoder = ::png::Encoder::new(out, shape.width, shape.height);
@@ -53,13 +55,13 @@ pub(super) fn encode<P: Sample>(
         // `png` reads `cICP` but does not write it, so the chunk is written
         // here: after the header and before the image data, as PNG requires.
         writer
-            .write_chunk(::png::chunk::cICP, &cicp)
+            .write_chunk(::png::chunk::cICP, &cicp.bytes())
             .map_err(png_error)?;
     }
     {
         let mut stream = writer.stream_writer().map_err(png_error)?;
-        if let Some(plane) = pixels.rgba_rows() {
-            for row in plane.rows() {
+        if let Some(bytes) = direct {
+            for row in bytes.chunks_exact(shape.row_bytes) {
                 stream.write_all(row)?;
             }
         } else {

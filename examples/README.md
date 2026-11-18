@@ -60,7 +60,7 @@ demonstrations; use the output device's clock for playback. See the
 | [`send_audio.rs`](send_audio.rs) | `cargo run --example send_audio` | Send audio. |
 | [`send_video.rs`](send_video.rs) | `cargo run --example send_video` | Send video. |
 | [`submit_video.rs`](submit_video.rs) | `cargo run --example submit_video` | Reuse two owned frames for async sending and recover completed frames. |
-| [`submit_video_copy.rs`](submit_video_copy.rs) | `cargo run --example submit_video_copy` | Copy borrowed pixels into async sends, then into the frames they return. |
+| [`submit_video_copy.rs`](submit_video_copy.rs) | `cargo run --example submit_video_copy` | Copy borrowed pixels into async sends. The sender recycles released copies. |
 | [`zero_copy_send.rs`](zero_copy_send.rs) | `cargo run --example zero_copy_send` | Render into two reusable owned frames without per-send pixel copies. |
 | [`media_buffers.rs`](media_buffers.rs) | `cargo run --example media_buffers` | Recover and swap pooled buffers, borrow planar audio, inspect trait objects and convert borrowed P216. |
 

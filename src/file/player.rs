@@ -30,8 +30,8 @@ pub struct FilePlayer {
     playback: FileBound<sys::FilePlayback>,
     handle: NonNull<NDIlib_file_player_instance_type>,
     // Strings passed to the SDK are needed only for the call that receives
-    // them; see the note in `recorder.rs`. The name is kept for `Debug`.
-    name: String,
+    // them; see the note in `recorder/native.rs`. The name is kept for `Debug`.
+    name: types::FileText,
     // Neither the NDI File Format API documentation nor
     // Processing.NDI.Lib.File.Player.h says on which threads a player may be
     // created, used and destroyed, or whether calls on one player may
@@ -46,16 +46,11 @@ pub struct FilePlayer {
 pub(super) struct PreparedPlayer {
     playback: FileBound<sys::FilePlayback>,
     resolved: types::ResolvedPlayerOptions,
-    name: String,
 }
 
 impl PreparedPlayer {
     pub(super) fn create(self) -> Result<FilePlayer> {
-        let Self {
-            playback,
-            resolved,
-            name,
-        } = self;
+        let Self { playback, resolved } = self;
         let settings = NDIlib_file_player_create_t {
             p_ndi_send_name: resolved.name.as_ptr(),
             p_groups: resolved
@@ -68,7 +63,7 @@ impl PreparedPlayer {
         Ok(FilePlayer {
             playback,
             handle,
-            name,
+            name: resolved.name,
             _thread: PhantomData,
         })
     }
@@ -91,8 +86,8 @@ impl FilePlayer {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when the player's name is empty or a group
-    /// is empty or contains a comma or NUL. [`Error::InvalidCString`] when
+    /// [`Error::InvalidInput`] when the player's name or group list is empty,
+    /// or a group is empty or contains a comma or NUL. [`Error::InvalidCString`] when
     /// the player's name contains a NUL.
     /// [`Error::NativeOperationFailed`] when the SDK cannot create the player
     /// and [`Error::UnsupportedCapability`] when the library does not provide
@@ -105,11 +100,7 @@ impl FilePlayer {
     pub(super) fn prepare(api: FileApi, options: &FilePlayerOptions) -> Result<PreparedPlayer> {
         let playback = api.into_table::<sys::FilePlayback>()?;
         let resolved = options.resolve()?;
-        Ok(PreparedPlayer {
-            playback,
-            resolved,
-            name: options.name.clone(),
-        })
+        Ok(PreparedPlayer { playback, resolved })
     }
 
     /// Read a recording's duration and track layout.

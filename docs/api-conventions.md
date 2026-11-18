@@ -29,8 +29,10 @@ exactly as stored, including whether it is unset. `clear_<setter>()` restores
 an inherited default. These accessors describe requests, rather than the
 runtime's effective configuration. Lists accept
 `impl IntoIterator<Item = impl Into<String>>` and read back as
-`Option<&[String]>`. Object creation validates settings, including rejecting
-empty, comma-containing or NUL-containing list elements with `InvalidInput`.
+`Option<&[String]>`. An unset list passes NULL so the SDK inherits its
+configuration. An explicit list replaces the configuration and must be non-empty.
+Object creation refuses an empty list and empty, comma-containing or
+NUL-containing list elements with `InvalidInput`.
 
 Every options type implements `Debug + Clone + PartialEq`, and implements
 `Default` when it has no required setting.
@@ -65,7 +67,7 @@ FrameSync audio capture returns a frame because it can synthesize silence.
 
 `wait_for_<condition>(timeout)` returns `Result<bool>`, or `Result<Option<T>>`
 when it reports a value. `false` or `None` means the wait expired.
-For example, `wait_for_finish` returns `Option<FinishStatus>`: `None` on
+For example, `wait_for_finish` returns `Option<SessionEnd>`: `None` on
 timeout, or `Some` with a final recorder outcome. The separate bounded
 completion operation `finish` retains `FinishStatus::TimedOut(report)`;
 `report()` supplies a current snapshot after an expired wait.
@@ -144,7 +146,8 @@ at most one module path. Root names do not shadow `tokio`, `smol` or `image`.
 Public parameter names form part of the documentation. They have no leading
 underscore, and common inputs consistently use `frame`, `metadata`, `source`,
 `options` and `timeout`. Public wrappers carry a `doc(alias = "NDIlib_...")`
-for their SDK entry points. The documentation checker verifies parameter
-names in generated HTML and native table alias coverage, with explicit
-reasons for entry points used only internally. Example target names use
+for their SDK entry points. Synchronous and asynchronous twins carry the same
+aliases. The documentation checker verifies alias parity, native table alias
+coverage and parameter names in generated HTML. Internal SDK entry points
+have an explicit reason for their exemption. Example target names use
 snake_case; ports of SDK samples identify the original sample in their header.

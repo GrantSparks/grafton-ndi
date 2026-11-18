@@ -9,8 +9,7 @@
 //! Arguments: the recording to play, and optionally the name of the NDI
 //! source to advertise ("grafton-ndi File Player" by default).
 //!
-//! The File library ships with the NDI SDK, beside the runtime library. On
-//! Linux and macOS it needs the Advanced SDK runtime.
+//! See the [File library requirements](../docs/file-io.md#requirements).
 
 use std::{env, time::Duration};
 

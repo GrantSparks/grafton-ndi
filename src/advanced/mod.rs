@@ -1,8 +1,7 @@
 //! NDI Advanced SDK operations.
 //!
-//! * Per-instance JSON configuration of senders, receivers, finders, routers
-//!   and Discovery Server advertisers and listeners ([`AdvancedConfig`]),
-//!   given to each through the `config` setter of its options.
+//! * Per-instance JSON configuration through the `config` setter of
+//!   supported options. See [`AdvancedConfig`] for the configurable objects.
 //! * Compressed passthrough: receiving codec packets ([`PacketReceiver`]) and
 //!   sending them ([`CompressedSender`]), including scatter-gather submission.
 //! * Encoder guidance, keyframe demand and stream selection on the ordinary
@@ -56,6 +55,8 @@ mod controls;
 mod descriptors;
 mod finder;
 mod kvm;
+#[cfg(ndi_has_advanced_kvm)]
+pub(crate) use kvm::TouchPoints;
 mod kvm_receiver;
 mod packets;
 mod queued;
@@ -95,6 +96,7 @@ pub trait CompressedAudioSendMode: crate::sender::SenderMode {}
 pub use crate::framesync::capture::FrameSyncCapture;
 pub use allocators::*;
 pub use config::AdvancedConfig;
+pub(crate) use config::RetainedConfig;
 pub(crate) use configured::Configurable;
 pub use controls::*;
 pub use finder::ExtendedSource;

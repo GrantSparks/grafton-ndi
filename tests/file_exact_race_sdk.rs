@@ -10,14 +10,12 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, prerequisites);
-#[path = "support/fixture.rs"]
-mod fixture;
-use fixture::FixtureDir;
+common_helpers!(runtime, prerequisites, child, fixture);
+use common::TestChild;
 use grafton_ndi::{
     file::{
         FileApi, FileApiOptions, FileNaming, FileRecorderOptions, FinishStatus, RecorderEventKind,
-        RecorderState, RecordingTarget, RecordingTimecode, SourceSpec,
+        RecorderState, RecordingTarget, RecordingTimecode, SessionEnd, SourceSpec,
     },
     Error, SelectionConflict,
 };
@@ -93,7 +91,8 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
                 recorder.is_recording(),
                 recorder.state()
             );
-            let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(2)).unwrap()
+            let FinishStatus::Ended(SessionEnd::Closed(report)) =
+                recorder.finish(Duration::from_secs(2)).unwrap()
             else {
                 panic!("session not closed")
             };
@@ -103,7 +102,7 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
         }
         return;
     }
-    let directory = FixtureDir::create("file-exact-race");
+    let directory = common::FixtureDir::create("file-exact-race");
     let interposer = directory.path().join("race.so");
     let output = Command::new("cc")
         .args(["-std=c11", "-shared", "-fPIC"])
@@ -130,13 +129,9 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
             if kind == "symlink" {
                 fs::write(&victim, SENTINEL).unwrap();
             }
-            let mut command = Command::new(std::env::current_exe().unwrap());
+            let mut command =
+                TestChild::new("exact_name_races_preserve_files_and_report_native_failures");
             command
-                .args([
-                    "--exact",
-                    "exact_name_races_preserve_files_and_report_native_failures",
-                    "--nocapture",
-                ])
                 .env("LD_PRELOAD", &interposer)
                 .env("GRAFTON_FILE_RACE_OPERATION", operation)
                 .env("GRAFTON_FILE_RACE_TARGET", &target)
@@ -144,13 +139,7 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
             if kind != "regular" {
                 command.env("GRAFTON_FILE_RACE_SYMLINK", &victim);
             }
-            let output = command.output().unwrap();
-            assert!(
-                output.status.success(),
-                "{operation} {kind}: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            command.run();
             match kind {
                 "regular" => assert_eq!(fs::read(&target).unwrap(), SENTINEL),
                 "symlink" => {

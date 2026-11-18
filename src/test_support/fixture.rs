@@ -35,8 +35,15 @@ impl FixtureDir {
     }
 
     /// The directory.
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.0
+    }
+
+    /// Resolve a child path inside the directory.
+    #[allow(dead_code)]
+    pub fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.0.join(path)
     }
 }
 

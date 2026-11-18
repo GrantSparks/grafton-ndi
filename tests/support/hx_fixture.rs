@@ -1,14 +1,25 @@
-//! Generate encoded pictures only when a native test needs them.
+//! Load the CI test pictures or generate them on demand for local runs.
 
-#[path = "fixture.rs"]
-mod fixture;
+use crate::common::FixtureDir;
 
-use std::{process::Command, sync::OnceLock};
+use std::{path::Path, process::Command, sync::OnceLock};
+
+fn read_pictures(directory: &Path) -> (Vec<u8>, Vec<u8>) {
+    let read = |name| {
+        let path = directory.join(name);
+        std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("read NDI|HX test picture {}: {error}", path.display()))
+    };
+    (read("quadrants-420.h264"), read("chroma-444.hevc"))
+}
 
 fn pictures() -> &'static (Vec<u8>, Vec<u8>) {
     static PICTURES: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
     PICTURES.get_or_init(|| {
-        let directory = fixture::FixtureDir::create("hx-pictures");
+        if let Some(directory) = std::env::var_os("GRAFTON_NDI_HX_PICTURES") {
+            return read_pictures(Path::new(&directory));
+        }
+        let directory = FixtureDir::create("hx-pictures");
         let python = if cfg!(windows) { "python" } else { "python3" };
         let output = Command::new(python)
             .arg(concat!(
@@ -24,9 +35,7 @@ fn pictures() -> &'static (Vec<u8>, Vec<u8>) {
             "NDI|HX test picture generation failed; install FFmpeg with libx264/libx265: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let read =
-            |name| std::fs::read(directory.path().join(name)).expect("read generated picture");
-        (read("quadrants-420.h264"), read("chroma-444.hevc"))
+        read_pictures(directory.path())
     })
 }
 

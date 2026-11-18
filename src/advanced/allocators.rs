@@ -34,12 +34,12 @@ use crate::{
     sys::advanced::ReceiveAllocators,
     FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode, Rejected, Result,
 };
-#[cfg(ndi_has_advanced_receive_allocators)]
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
 use std::ffi::c_void;
 
 const MIB: usize = 1024 * 1024;
 
-const MAX_ALLOCATION: usize = super::packets::MAX_PACKET_BYTES;
+pub use crate::media::MAX_ALLOCATION_BYTES;
 
 /// Process-wide limits on custom receive allocation.
 ///
@@ -51,8 +51,8 @@ const MAX_ALLOCATION: usize = super::packets::MAX_PACKET_BYTES;
 /// [`AllocatorUsage::declined`] and [`AllocatorUsage::declined_allocations`].
 ///
 /// The defaults are 256 generations, 1024 allocations, 1 GiB in total, 16
-/// concurrent calls and 64 MiB per allocation, which holds an 8-bit 4:2:2
-/// frame of 8K video.
+/// concurrent calls and 64 MiB per allocation, which holds a packed
+/// 7680×4320 8-bit 4:2:2 frame.
 ///
 /// # How the limits combine
 ///
@@ -153,7 +153,7 @@ impl AllocatorLimits {
         self
     }
 
-    /// The largest single allocation, at most 256 MiB.
+    /// The largest single allocation, at most [`MAX_ALLOCATION_BYTES`].
     #[must_use]
     pub fn max_allocation_bytes(mut self, value: usize) -> Self {
         self.max_allocation_bytes = value;
@@ -169,7 +169,7 @@ impl AllocatorLimits {
         {
             return Err(limits_error(crate::InputDefect::AllocatorPositiveLimits));
         }
-        if self.max_allocation_bytes > MAX_ALLOCATION {
+        if self.max_allocation_bytes > MAX_ALLOCATION_BYTES {
             return Err(limits_error(crate::InputDefect::AllocatorAllocationLimit));
         }
         if self.max_concurrent_calls > self.max_allocations {
@@ -438,7 +438,7 @@ struct OwnedStorage {
 
 // Rounding a valid request up to its 64-byte alignment remains representable
 // in Layout's signed allocation-size bound on every supported target.
-const _: () = assert!(MAX_ALLOCATION <= isize::MAX as usize - 63);
+const_assert!(MAX_ALLOCATION_BYTES <= isize::MAX as usize - 63);
 
 impl OwnedStorage {
     /// Allocate this validated, non-zero request aligned to 64.
@@ -789,18 +789,20 @@ impl Reservation<'_> {
     /// End the call under a lock the caller already holds, so that the
     /// buffer it publishes is never charged beside its own grant.
     fn release(self, state: &mut State) {
+        self.uncharge(state);
+        std::mem::forget(self);
+    }
+
+    fn uncharge(&self, state: &mut State) {
         state.calls -= 1;
         state.reserved_bytes -= self.bytes;
-        std::mem::forget(self);
     }
 }
 
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        let mut state = lock(&self.registry.state);
-        state.calls -= 1;
-        state.reserved_bytes -= self.bytes;
+        self.uncharge(&mut lock(&self.registry.state));
     }
 }
 
@@ -975,7 +977,7 @@ impl Registry {
             self.decline(AllocationDecline::BufferRefused);
             return None;
         }
-        // At most the capacity, which is at most MAX_ALLOCATION.
+        // At most the capacity, which is at most MAX_ALLOCATION_BYTES.
         let stride = match actual.layout {
             RequestLayout::Audio(layout) => layout.sdk_channel_stride(),
             RequestLayout::Video(_) | RequestLayout::Compressed(_) => {
@@ -1370,7 +1372,7 @@ pub struct AllocatedReceiver<M: ReceiverMode = RawCapture> {
 impl<M: ReceiverMode> std::fmt::Debug for AllocatedReceiver<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AllocatedReceiver")
-            .field("mode", &std::any::type_name::<M>())
+            .field("receiver", &self.receiver)
             .finish_non_exhaustive()
     }
 }
@@ -1550,14 +1552,14 @@ impl Registration {
                     Stream::Video => table.NDIlib_recv_set_video_allocator(
                         instance,
                         opaque,
-                        token.map(|_| video_allocate as _),
-                        token.map(|_| video_free as _),
+                        token.map(|_| allocate::<NDIlib_video_frame_v2_t> as _),
+                        token.map(|_| free::<NDIlib_video_frame_v2_t> as _),
                     ),
                     Stream::Audio => table.NDIlib_recv_set_audio_allocator(
                         instance,
                         opaque,
-                        token.map(|_| audio_allocate as _),
-                        token.map(|_| audio_free as _),
+                        token.map(|_| allocate::<NDIlib_audio_frame_v3_t> as _),
+                        token.map(|_| free::<NDIlib_audio_frame_v3_t> as _),
                     ),
                 }
             }
@@ -1607,87 +1609,121 @@ fn compressed_dimension(value: i32) -> std::result::Result<u32, AllocationDeclin
     u32::try_from(value).map_err(|_| AllocationDecline::RequestNotRepresentable)
 }
 
-/// The request for the video frame the SDK is about to receive.
+/// The native frame types accepted by the allocation and release callbacks.
+/// Kept private so only this module determines how their unions are read and written.
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-fn video_request(
-    frame: &NDIlib_video_frame_v2_t,
-) -> std::result::Result<AllocationRequest, AllocationDecline> {
-    let fourcc = FourCc::from_raw(frame.FourCC);
-    if VideoCodec::from_outer(frame.FourCC).is_some() {
-        // SAFETY: for a compressed frame the union holds the data size.
-        let size = compressed_size(unsafe { frame.__bindgen_anon_1.data_size_in_bytes })?;
-        return Ok(AllocationRequest {
-            bytes: size.to_usize(),
-            stride: size.to_usize(),
-            layout: RequestLayout::Compressed(AllocationFormat::CompressedVideo(fourcc)),
-            width: compressed_dimension(frame.xres)?,
-            height: compressed_dimension(frame.yres)?,
-            capacity_limit: MAX_ALLOCATION,
-        });
-    }
-    let pixel =
-        PixelFormat::from_fourcc(fourcc).ok_or(AllocationDecline::RequestNotRepresentable)?;
-    let layout = ValidatedVideoLayout::from_sdk_checked(pixel, frame.xres, frame.yres, 0)
-        .map_err(|_| AllocationDecline::RequestNotRepresentable)?;
-    Ok(AllocationRequest {
-        bytes: layout.data_len_bytes(),
-        stride: layout.line_stride_bytes(),
-        layout: RequestLayout::Video(pixel),
-        width: layout.width(),
-        height: layout.height(),
-        capacity_limit: MAX_ALLOCATION,
-    })
+trait AllocatedDescriptor {
+    fn request(&self) -> std::result::Result<AllocationRequest, AllocationDecline>;
+    fn clear(&mut self);
+    fn fill(&mut self, pointer: NonNull<u8>, stride: i32);
+    fn data(&self) -> *mut u8;
 }
 
-/// The request for the audio frame the SDK is about to receive.
 #[cfg(any(test, ndi_has_advanced_receive_allocators))]
-fn audio_request(
-    frame: &NDIlib_audio_frame_v3_t,
-) -> std::result::Result<AllocationRequest, AllocationDecline> {
-    if frame.FourCC != crate::FourCc::from(crate::AudioFormat::Fltp).raw() {
-        if AudioCodec::from_outer(frame.FourCC).is_none() {
-            return Err(AllocationDecline::RequestNotRepresentable);
+impl AllocatedDescriptor for NDIlib_video_frame_v2_t {
+    fn request(&self) -> std::result::Result<AllocationRequest, AllocationDecline> {
+        let fourcc = FourCc::from_raw(self.FourCC);
+        if VideoCodec::from_outer(self.FourCC).is_some() {
+            // SAFETY: for a compressed frame the union holds the data size.
+            let size = compressed_size(unsafe { self.__bindgen_anon_1.data_size_in_bytes })?;
+            return Ok(AllocationRequest {
+                bytes: size.to_usize(),
+                stride: size.to_usize(),
+                layout: RequestLayout::Compressed(AllocationFormat::CompressedVideo(fourcc)),
+                width: compressed_dimension(self.xres)?,
+                height: compressed_dimension(self.yres)?,
+                capacity_limit: MAX_ALLOCATION_BYTES,
+            });
         }
-        // SAFETY: for compressed audio the union holds the exact packet size;
-        // tests/advanced_runtime.rs::compressed_audio_packets_use_exact_custom_allocator_grants
-        // pins the AAC/Opus request format, extent and delivered application memory.
-        let size = compressed_size(unsafe { frame.__bindgen_anon_1.data_size_in_bytes })?;
-        return Ok(AllocationRequest {
-            bytes: size.to_usize(),
-            stride: size.to_usize(),
-            layout: RequestLayout::Compressed(AllocationFormat::CompressedAudio(FourCc::from_raw(
-                frame.FourCC,
-            ))),
-            width: compressed_dimension(frame.no_samples)?,
-            height: compressed_dimension(frame.no_channels)?,
-            capacity_limit: MAX_ALLOCATION,
-        });
+        let pixel =
+            PixelFormat::from_fourcc(fourcc).ok_or(AllocationDecline::RequestNotRepresentable)?;
+        let layout = ValidatedVideoLayout::from_sdk_checked(pixel, self.xres, self.yres, 0)
+            .map_err(|_| AllocationDecline::RequestNotRepresentable)?;
+        Ok(AllocationRequest {
+            bytes: layout.data_len_bytes(),
+            stride: layout.line_stride_bytes(),
+            layout: RequestLayout::Video(pixel),
+            width: layout.width(),
+            height: layout.height(),
+            capacity_limit: MAX_ALLOCATION_BYTES,
+        })
     }
-    // The callback chooses a packed stride. The incoming data pointer and
-    // stride do not name allocated storage yet and must not be read as media.
-    let layout = ValidatedAudioLayout::from_sdk_checked(
-        AudioFormat::Fltp,
-        frame.sample_rate,
-        frame.no_channels,
-        frame.no_samples,
-        None,
-    )
-    .map_err(|_| AllocationDecline::RequestNotRepresentable)?;
-    Ok(AllocationRequest {
-        bytes: layout.sample_count() * size_of::<f32>(),
-        stride: layout.channel_stride_bytes(),
-        layout: RequestLayout::Audio(layout),
-        width: layout.num_samples(),
-        height: layout.num_channels(),
-        capacity_limit: MAX_ALLOCATION,
-    })
+
+    fn clear(&mut self) {
+        self.p_data = std::ptr::null_mut();
+        self.__bindgen_anon_1.line_stride_in_bytes = 0;
+    }
+
+    fn fill(&mut self, pointer: NonNull<u8>, stride: i32) {
+        self.p_data = pointer.as_ptr();
+        self.__bindgen_anon_1.line_stride_in_bytes = stride;
+    }
+
+    fn data(&self) -> *mut u8 {
+        self.p_data
+    }
 }
-/// The SDK's request for video memory. `opaque` is the generation token.
-#[cfg(ndi_has_advanced_receive_allocators)]
-unsafe extern "C" fn video_allocate(
-    opaque: *mut c_void,
-    frame: *mut NDIlib_video_frame_v2_t,
-) -> bool {
+
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
+impl AllocatedDescriptor for NDIlib_audio_frame_v3_t {
+    fn request(&self) -> std::result::Result<AllocationRequest, AllocationDecline> {
+        if self.FourCC != crate::FourCc::from(crate::AudioFormat::Fltp).raw() {
+            if AudioCodec::from_outer(self.FourCC).is_none() {
+                return Err(AllocationDecline::RequestNotRepresentable);
+            }
+            // SAFETY: for compressed audio the union holds the exact packet size;
+            // tests/advanced_runtime.rs::compressed_audio_packets_use_exact_custom_allocator_grants
+            // pins the AAC/Opus request format, extent and delivered application memory.
+            let size = compressed_size(unsafe { self.__bindgen_anon_1.data_size_in_bytes })?;
+            return Ok(AllocationRequest {
+                bytes: size.to_usize(),
+                stride: size.to_usize(),
+                layout: RequestLayout::Compressed(AllocationFormat::CompressedAudio(
+                    FourCc::from_raw(self.FourCC),
+                )),
+                width: compressed_dimension(self.no_samples)?,
+                height: compressed_dimension(self.no_channels)?,
+                capacity_limit: MAX_ALLOCATION_BYTES,
+            });
+        }
+        // The callback chooses a packed stride. The incoming data pointer and
+        // stride do not name allocated storage yet and must not be read as media.
+        let layout = ValidatedAudioLayout::from_sdk_checked(
+            AudioFormat::Fltp,
+            self.sample_rate,
+            self.no_channels,
+            self.no_samples,
+            None,
+        )
+        .map_err(|_| AllocationDecline::RequestNotRepresentable)?;
+        Ok(AllocationRequest {
+            bytes: layout.sample_count() * size_of::<f32>(),
+            stride: layout.channel_stride_bytes(),
+            layout: RequestLayout::Audio(layout),
+            width: layout.num_samples(),
+            height: layout.num_channels(),
+            capacity_limit: MAX_ALLOCATION_BYTES,
+        })
+    }
+
+    fn clear(&mut self) {
+        self.p_data = std::ptr::null_mut();
+        self.__bindgen_anon_1.channel_stride_in_bytes = 0;
+    }
+
+    fn fill(&mut self, pointer: NonNull<u8>, stride: i32) {
+        self.p_data = pointer.as_ptr();
+        self.__bindgen_anon_1.channel_stride_in_bytes = stride;
+    }
+
+    fn data(&self) -> *mut u8 {
+        self.p_data
+    }
+}
+
+/// The SDK's request for frame memory. `opaque` is the generation token.
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
+unsafe extern "C" fn allocate<D: AllocatedDescriptor>(opaque: *mut c_void, frame: *mut D) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(registry) = REGISTRY.get() else {
             return false;
@@ -1697,76 +1733,30 @@ unsafe extern "C" fn video_allocate(
             registry.decline(AllocationDecline::RequestNotRepresentable);
             return false;
         };
-        let request = video_request(frame);
-        frame.p_data = std::ptr::null_mut();
-        frame.__bindgen_anon_1.line_stride_in_bytes = 0;
+        let request = frame.request();
+        frame.clear();
         let Some((pointer, stride)) = registry.allocate_request(opaque as usize, request) else {
             return false;
         };
-        frame.p_data = pointer.as_ptr();
-        frame.__bindgen_anon_1.line_stride_in_bytes = stride;
+        frame.fill(pointer, stride);
         true
     }))
     .unwrap_or(false)
 }
 
-/// The SDK's request for audio memory. `opaque` is the generation token.
-#[cfg(ndi_has_advanced_receive_allocators)]
-unsafe extern "C" fn audio_allocate(
-    opaque: *mut c_void,
-    frame: *mut NDIlib_audio_frame_v3_t,
-) -> bool {
+/// The SDK's release of frame memory. `opaque` names the owning generation.
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
+unsafe extern "C" fn free<D: AllocatedDescriptor>(opaque: *mut c_void, frame: *const D) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
-        let Some(registry) = REGISTRY.get() else {
+        // SAFETY: the SDK passes null or a descriptor that is valid for this call.
+        let Some(frame) = (unsafe { frame.as_ref() }) else {
             return false;
         };
-        // SAFETY: the SDK passes null or a descriptor it owns for this call.
-        let Some(frame) = (unsafe { frame.as_mut() }) else {
-            registry.decline(AllocationDecline::RequestNotRepresentable);
-            return false;
-        };
-        let request = audio_request(frame);
-        frame.p_data = std::ptr::null_mut();
-        frame.__bindgen_anon_1.channel_stride_in_bytes = 0;
-        let Some((pointer, stride)) = registry.allocate_request(opaque as usize, request) else {
-            return false;
-        };
-        frame.p_data = pointer.as_ptr();
-        frame.__bindgen_anon_1.channel_stride_in_bytes = stride;
-        true
-    }))
-    .unwrap_or(false)
-}
-
-/// Release the allocation at `data` that generation `opaque` made.
-#[cfg(ndi_has_advanced_receive_allocators)]
-fn free(opaque: *mut c_void, data: *mut u8) -> bool {
-    catch_unwind(AssertUnwindSafe(|| {
         REGISTRY
             .get()
-            .is_some_and(|registry| registry.free(opaque as usize, data))
+            .is_some_and(|registry| registry.free(opaque as usize, frame.data()))
     }))
     .unwrap_or(false)
-}
-
-/// The SDK's release of video memory. `opaque` is the generation token.
-#[cfg(ndi_has_advanced_receive_allocators)]
-unsafe extern "C" fn video_free(
-    opaque: *mut c_void,
-    frame: *const NDIlib_video_frame_v2_t,
-) -> bool {
-    // SAFETY: the SDK passes null or a descriptor that is valid for this call.
-    unsafe { frame.as_ref() }.is_some_and(|frame| free(opaque, frame.p_data))
-}
-
-/// The SDK's release of audio memory. `opaque` is the generation token.
-#[cfg(ndi_has_advanced_receive_allocators)]
-unsafe extern "C" fn audio_free(
-    opaque: *mut c_void,
-    frame: *const NDIlib_audio_frame_v3_t,
-) -> bool {
-    // SAFETY: the SDK passes null or a descriptor that is valid for this call.
-    unsafe { frame.as_ref() }.is_some_and(|frame| free(opaque, frame.p_data))
 }
 
 #[cfg(test)]
@@ -1783,14 +1773,14 @@ mod tests {
                 Err(AllocationDecline::RequestNotRepresentable)
             );
         }
-        for size in [1, MAX_ALLOCATION] {
+        for size in [1, super::super::MAX_PACKET_BYTES] {
             let sdk_size = i32::try_from(size).unwrap();
             let checked = compressed_size(sdk_size).unwrap();
             assert_eq!(checked.to_usize(), size);
             assert_eq!(checked.to_sdk(), sdk_size);
         }
         assert_eq!(
-            compressed_size(i32::try_from(MAX_ALLOCATION + 1).unwrap()),
+            compressed_size(i32::try_from(super::super::MAX_PACKET_BYTES + 1).unwrap()),
             Err(AllocationDecline::RequestNotRepresentable)
         );
     }
@@ -1798,24 +1788,25 @@ mod tests {
     #[test]
     #[cfg_attr(
         miri,
-        ignore = "the full 256 MiB allocation is covered by the native test run"
+        ignore = "the maximum packet allocation is covered by the native test run"
     )]
     fn compressed_allocator_and_capture_accept_the_same_maximum_extent() {
-        let mut bytes = vec![0; MAX_ALLOCATION];
+        let mut bytes = vec![0; super::super::MAX_PACKET_BYTES];
         let size = compressed_size(i32::try_from(bytes.len()).unwrap()).unwrap();
         let mut raw = super::super::VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16)
             .unwrap()
             .raw();
         raw.p_data = bytes.as_mut_ptr();
         raw.__bindgen_anon_1.data_size_in_bytes = size.to_sdk();
-        let request = video_request(&raw).unwrap();
+        let request = raw.request().unwrap();
         assert_eq!(request.bytes, size.to_usize());
         assert_eq!(request.stride, size.to_usize());
         // SAFETY: bytes owns this initialized allocation through the borrowed
         // frame's lifetime; the synthetic guard releases no native storage.
         let guard =
             unsafe { crate::capture::Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
-        let frame = super::super::CompressedVideoRef::new(guard).unwrap();
+        let frame =
+            super::super::CompressedRef::<super::super::VideoPacketFormat>::new(guard).unwrap();
         assert_eq!(frame.data().len(), request.bytes);
     }
 
@@ -2084,7 +2075,7 @@ mod tests {
             ..Default::default()
         };
         video.__bindgen_anon_1.data_size_in_bytes = 64;
-        let request = video_request(&video).unwrap();
+        let request = video.request().unwrap();
         assert_eq!(
             request.format(),
             AllocationFormat::CompressedVideo(FourCc::from_raw(protected_video))
@@ -2095,14 +2086,14 @@ mod tests {
         );
         video.xres = -16;
         assert!(matches!(
-            video_request(&video),
+            video.request(),
             Err(AllocationDecline::RequestNotRepresentable)
         ));
         video.xres = 16;
         video.__bindgen_anon_1.data_size_in_bytes = 0;
-        assert!(video_request(&video).is_err());
+        assert!(video.request().is_err());
         video.FourCC = crate::FourCc::from(PixelFormat::Bgra).raw();
-        let request = video_request(&video).unwrap();
+        let request = video.request().unwrap();
         assert_eq!(request.format(), AllocationFormat::Video(PixelFormat::Bgra));
         assert_eq!(
             (request.width(), request.height(), request.stride_bytes()),
@@ -2110,7 +2101,7 @@ mod tests {
         );
         assert_eq!(request.minimum_bytes(), 16 * 64);
         video.FourCC = u32::MAX;
-        assert!(video_request(&video).is_err());
+        assert!(video.request().is_err());
         for codec in [AudioCodec::Aac, AudioCodec::Opus] {
             for protected in [false, true] {
                 let bits = codec.outer(protected);
@@ -2120,11 +2111,11 @@ mod tests {
                 };
                 audio.__bindgen_anon_1.data_size_in_bytes = 64;
                 assert_eq!(
-                    audio_request(&audio).unwrap().format(),
+                    audio.request().unwrap().format(),
                     AllocationFormat::CompressedAudio(FourCc::from_raw(bits))
                 );
                 audio.FourCC = bits ^ PROTECTED ^ 1;
-                assert!(audio_request(&audio).is_err());
+                assert!(audio.request().is_err());
             }
         }
     }
@@ -2156,7 +2147,7 @@ mod tests {
             layout: RequestLayout::Audio(layout),
             width: (bytes / 8) as u32,
             height: 2,
-            capacity_limit: MAX_ALLOCATION,
+            capacity_limit: MAX_ALLOCATION_BYTES,
         }
     }
 
@@ -2176,12 +2167,8 @@ mod tests {
             FourCC: u32::MAX,
             ..Default::default()
         };
-        assert!(registry
-            .allocate_request(token, video_request(&video))
-            .is_none());
-        assert!(registry
-            .allocate_request(token, audio_request(&audio))
-            .is_none());
+        assert!(registry.allocate_request(token, video.request()).is_none());
+        assert!(registry.allocate_request(token, audio.request()).is_none());
         let usage = registry.usage();
         assert_eq!(
             usage.declined(AllocationDecline::RequestNotRepresentable),
@@ -2285,14 +2272,10 @@ mod tests {
         ];
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
             for frame in &videos {
-                assert!(registry
-                    .allocate_request(token, video_request(frame))
-                    .is_none());
+                assert!(registry.allocate_request(token, frame.request()).is_none());
             }
             for frame in &audios {
-                assert!(registry
-                    .allocate_request(token, audio_request(frame))
-                    .is_none());
+                assert!(registry.allocate_request(token, frame.request()).is_none());
             }
         });
         assert_eq!(allocations, 0);
@@ -2320,7 +2303,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let (request, allocations) = crate::test_alloc::allocation_count(|| audio_request(&frame));
+        let (request, allocations) = crate::test_alloc::allocation_count(|| frame.request());
         let request = request.unwrap();
         assert_eq!(allocations, 0);
         let layout = ValidatedAudioLayout::from_sdk_checked(
@@ -2658,10 +2641,7 @@ mod tests {
             ..Default::default()
         };
         audio.__bindgen_anon_1.data_size_in_bytes = bytes;
-        [
-            video_request(&video).unwrap(),
-            audio_request(&audio).unwrap(),
-        ]
+        [video.request().unwrap(), audio.request().unwrap()]
     }
 
     fn cached_request_policy() -> impl ReceiveAllocator {
@@ -2693,12 +2673,13 @@ mod tests {
 
     #[test]
     fn exact_compressed_sizes_and_valid_uncompressed_padding_are_published() {
-        let video = video_request(&NDIlib_video_frame_v2_t {
+        let video = (NDIlib_video_frame_v2_t {
             FourCC: FourCc::from(PixelFormat::Bgra).raw(),
             xres: 4,
             yres: 2,
             ..Default::default()
         })
+        .request()
         .unwrap();
         for request in compressed_requests(32)
             .into_iter()
@@ -2717,7 +2698,6 @@ mod tests {
         }
     }
 
-    #[cfg(ndi_has_advanced_receive_allocators)]
     #[test]
     fn compressed_callback_declines_clear_the_data_and_size() {
         // Drive the process callback registry directly. Native setter fixtures
@@ -2735,10 +2715,10 @@ mod tests {
         // SAFETY: this live descriptor belongs to this call, and the token
         // names a registered policy. The fixture performs no native access.
         unsafe {
-            assert!(video_allocate(opaque, &mut video));
-            assert!(video_free(opaque, &video));
+            assert!(allocate(opaque, &mut video));
+            assert!(free(opaque, &video));
             video.__bindgen_anon_1.data_size_in_bytes = 32;
-            assert!(!video_allocate(opaque, &mut video));
+            assert!(!allocate(opaque, &mut video));
             assert!(video.p_data.is_null());
             assert_eq!(video.__bindgen_anon_1.data_size_in_bytes, 0);
         }
@@ -2756,10 +2736,10 @@ mod tests {
         audio.__bindgen_anon_1.data_size_in_bytes = 64;
         // SAFETY: as above, with the matching audio allocation and release.
         unsafe {
-            assert!(audio_allocate(opaque, &mut audio));
-            assert!(audio_free(opaque, &audio));
+            assert!(allocate(opaque, &mut audio));
+            assert!(free(opaque, &audio));
             audio.__bindgen_anon_1.data_size_in_bytes = 32;
-            assert!(!audio_allocate(opaque, &mut audio));
+            assert!(!allocate(opaque, &mut audio));
             assert!(audio.p_data.is_null());
             assert_eq!(audio.__bindgen_anon_1.data_size_in_bytes, 0);
         }
@@ -2845,7 +2825,7 @@ mod tests {
             ));
         }
         assert!(matches!(
-            reason(defaults.max_allocation_bytes(MAX_ALLOCATION + 1)),
+            reason(defaults.max_allocation_bytes(MAX_ALLOCATION_BYTES + 1)),
             crate::InputDefect::AllocatorAllocationLimit
         ));
         assert!(matches!(
@@ -2870,7 +2850,7 @@ mod tests {
             reason(
                 defaults
                     .max_concurrent_calls(32)
-                    .max_allocation_bytes(MAX_ALLOCATION)
+                    .max_allocation_bytes(MAX_ALLOCATION_BYTES)
             ),
             crate::InputDefect::AllocatorByteLimit
         ));
@@ -2886,13 +2866,13 @@ mod tests {
 
         // The largest single allocation, with the budget to match: accepted
         // whenever the budget for the calls can be named. On a 32-bit target
-        // sixteen largest allocations are 4 GiB, which no `usize` holds, so
+        // sixteen largest allocations exceed `usize::MAX`, so
         // the same limits are refused there as unreachable.
         for calls in [4, 16] {
             let limits = defaults
-                .max_allocation_bytes(MAX_ALLOCATION)
+                .max_allocation_bytes(MAX_ALLOCATION_BYTES)
                 .max_concurrent_calls(calls);
-            match calls.checked_mul(MAX_ALLOCATION) {
+            match calls.checked_mul(MAX_ALLOCATION_BYTES) {
                 Some(budget) => {
                     limits.max_bytes(budget).validate().unwrap();
                 }
@@ -2903,8 +2883,8 @@ mod tests {
             }
         }
         defaults
-            .max_allocation_bytes(MAX_ALLOCATION)
-            .max_concurrent_calls(4)
+            .max_allocation_bytes(MAX_ALLOCATION_BYTES)
+            .max_concurrent_calls(1)
             .validate()
             .unwrap();
     }
@@ -3027,7 +3007,7 @@ mod tests {
             .register(|request: AllocationRequest| {
                 // Twice what the call was granted.
                 let padded = AllocationRequest {
-                    capacity_limit: MAX_ALLOCATION,
+                    capacity_limit: MAX_ALLOCATION_BYTES,
                     ..request
                 };
                 AllocationBuffer::zeroed(padded.with_stride_bytes(request.stride_bytes() * 4)?)
@@ -3181,13 +3161,16 @@ mod tests {
             no_samples: 1,
             ..Default::default()
         };
-        assert!(video_request(&video).unwrap().minimum_bytes() > 0);
-        assert!(audio_request(&audio).unwrap().minimum_bytes() > 0);
-        assert!(video_request(&NDIlib_video_frame_v2_t { xres: 0, ..video }).is_err());
-        assert!(audio_request(&NDIlib_audio_frame_v3_t {
+        assert!(video.request().unwrap().minimum_bytes() > 0);
+        assert!(audio.request().unwrap().minimum_bytes() > 0);
+        assert!((NDIlib_video_frame_v2_t { xres: 0, ..video })
+            .request()
+            .is_err());
+        assert!((NDIlib_audio_frame_v3_t {
             no_samples: 0,
             ..audio
         })
+        .request()
         .is_err());
         for size in [0, 1] {
             let compressed_video = NDIlib_video_frame_v2_t {
@@ -3204,8 +3187,8 @@ mod tests {
                 },
                 ..Default::default()
             };
-            assert_eq!(video_request(&compressed_video).is_ok(), size != 0);
-            assert_eq!(audio_request(&compressed_audio).is_ok(), size != 0);
+            assert_eq!(compressed_video.request().is_ok(), size != 0);
+            assert_eq!(compressed_audio.request().is_ok(), size != 0);
         }
     }
 
@@ -3222,13 +3205,14 @@ mod tests {
         )
         .unwrap();
         let format = AudioFormat::Fltp;
-        let request = audio_request(&NDIlib_audio_frame_v3_t {
+        let request = (NDIlib_audio_frame_v3_t {
             FourCC: format.to_sdk(),
             sample_rate: 48_000,
             no_channels: 2,
             no_samples: 1024,
             ..Default::default()
         })
+        .request()
         .unwrap();
         assert!(matches!(
             request.with_stride_bytes(4098),
@@ -3260,12 +3244,13 @@ mod tests {
             Err(Error::InvalidInput(reason)) => reason,
             other => panic!("expected invalid input, got {other:?}"),
         };
-        let planar = video_request(&NDIlib_video_frame_v2_t {
+        let planar = (NDIlib_video_frame_v2_t {
             FourCC: FourCc::from(PixelFormat::I420).raw(),
             xres: 16,
             yres: 16,
             ..Default::default()
         })
+        .request()
         .unwrap();
         assert_eq!(planar.stride_bytes(), 16);
         let padded = planar.with_stride_bytes(32).unwrap();
@@ -3323,13 +3308,14 @@ mod tests {
             crate::InputDefect::AllocationTooLarge { .. }
         ));
 
-        let compressed = audio_request(&NDIlib_audio_frame_v3_t {
+        let compressed = (NDIlib_audio_frame_v3_t {
             FourCC: AudioCodec::Opus.outer(false),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 data_size_in_bytes: 32,
             },
             ..Default::default()
         })
+        .request()
         .unwrap();
         assert_eq!(compressed.with_stride_bytes(32).unwrap(), compressed);
         for stride in [0, 31, 36] {
@@ -3338,13 +3324,14 @@ mod tests {
                 crate::InputDefect::CompressedAllocationStride
             ));
         }
-        let audio = audio_request(&NDIlib_audio_frame_v3_t {
+        let audio = (NDIlib_audio_frame_v3_t {
             FourCC: AudioFormat::Fltp.to_sdk(),
             sample_rate: 48_000,
             no_channels: 2,
             no_samples: 4,
             ..Default::default()
         })
+        .request()
         .unwrap();
         let narrowed = audio
             .with_stride_bytes(32)

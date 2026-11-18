@@ -8,7 +8,7 @@ fn packet_payload_fields_are_private_to_their_storage_module() {
         (
             "ndi_test_packet_payload",
             "E0451",
-            &["PacketBytes", "PacketSlice"][..],
+            &["PacketBytes", "PacketSlice", "CompressedFrame"][..],
         ),
         (
             "ndi_test_packet_payload_mutation",

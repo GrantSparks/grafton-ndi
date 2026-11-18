@@ -89,14 +89,14 @@ impl<K: Eq + Hash, V> ReservedMap<K, V> {
     }
 
     fn rebuild(&mut self) {
-        debug_assert!(self.scratch.is_empty());
-        debug_assert!(self.scratch.capacity() >= self.entries.len());
+        debug_invariant!(self.scratch.is_empty());
+        debug_invariant!(self.scratch.capacity() >= self.entries.len());
         self.scratch.extend(self.entries.drain());
-        debug_assert!(self.entries.capacity() > self.scratch.len());
+        debug_invariant!(self.entries.capacity() > self.scratch.len());
         for (key, value) in self.scratch.drain(..) {
             self.entries.insert(key, value);
         }
-        debug_assert!(self.entries.capacity() > self.entries.len());
+        debug_invariant!(self.entries.capacity() > self.entries.len());
     }
 
     pub(super) fn len(&self) -> usize {

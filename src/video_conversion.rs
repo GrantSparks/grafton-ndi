@@ -22,7 +22,7 @@ use crate::{
 ///
 /// Width must be positive and divisible by six. Height must be positive. Rows
 /// contain at least `width / 6 * 16` bytes; their stride must be divisible by four.
-/// Both the V210 storage and equivalent P216 frame must fit the 256 MiB video cap.
+/// Both the V210 storage and equivalent P216 frame must fit [`MAX_VIDEO_BYTES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct V210Layout {
     width: u32,
@@ -59,7 +59,7 @@ impl V210Layout {
         // Validate the corresponding two full-height, 16-bit P216 planes
         // before arithmetic. Their extent bounds width to MAX_VIDEO_BYTES / 4.
         ValidatedVideoLayout::new_uncompressed(PixelFormat::P216, width, height, None)?;
-        const _: () = assert!(MAX_VIDEO_BYTES / 4 <= usize::MAX / 16);
+        const_assert!(MAX_VIDEO_BYTES / 4 <= usize::MAX / 16);
         let active_words = width as usize / 6 * 4;
         let stride_bytes = stride.unwrap_or(active_words * 4);
         if stride_bytes == 0 || !stride_bytes.is_multiple_of(4) || stride_bytes / 4 < active_words {
@@ -223,8 +223,8 @@ unsafe impl VideoParts for P216Output<'_> {
     fn layout(&self) -> &ValidatedVideoLayout {
         &self.layout
     }
-    fn header(&self) -> &VideoHeader {
-        &self.header
+    fn header(&self) -> VideoHeader {
+        self.header
     }
     fn pixels(&self) -> *const u8 {
         self.pointer.cast_const()

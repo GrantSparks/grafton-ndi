@@ -2,7 +2,7 @@
 //! and finalization waits remain private to this module's event-pump impls.
 
 use super::*;
-use crate::file::recorder::{FinishReply, FinishWaiters, Settlement};
+use crate::file::recorder::{FinishReply, FinishWaiters, Settlement, WaitOutcome};
 
 /// Playback's native owner is private to the event-pump module. Only
 /// commands that cannot consume native events are forwarded to the handles.
@@ -107,7 +107,7 @@ impl FinishRequest for RecorderFinish {
 /// async response without that admission proof.
 pub(super) enum FinishResponse {
     Finish(CommandReply<FinishStatus, RecordingReport>, Place),
-    Wait(CommandReply<Option<FinishStatus>, RecordingReport>, Place),
+    Wait(CommandReply<Option<SessionEnd>, RecordingReport>, Place),
 }
 
 impl FinishReply for FinishResponse {
@@ -117,14 +117,14 @@ impl FinishReply for FinishResponse {
             Self::Wait(reply, _) => reply.cancelled(),
         }
     }
-    fn complete(self, result: Result<FinishStatus>) {
+    fn complete(self, result: Result<WaitOutcome>) {
         match self {
             Self::Finish(reply, place) => {
-                reply.complete(result);
+                reply.complete(result.map(WaitOutcome::into_finish));
                 drop(place);
             }
             Self::Wait(reply, place) => {
-                reply.complete(result.map(FinishStatus::into_wait_outcome));
+                reply.complete(result.map(WaitOutcome::into_end));
                 drop(place);
             }
         }
@@ -392,7 +392,7 @@ mod tests {
         );
         assert!(matches!(
             block_on(FileOperation::live(future)).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
         drop(owner);
         assert_eq!(device.stops.load(Ordering::Acquire), 1);
@@ -467,7 +467,7 @@ mod tests {
                     .unwrap();
                 assert!(matches!(
                     recorder.finish(Duration::ZERO).unwrap(),
-                    FinishStatus::Closed(_)
+                    FinishStatus::Ended(SessionEnd::Closed(_))
                 ));
                 assert!(recorder.report().last_closed_path().is_some());
             }
@@ -494,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn recording_and_stopping_pumps_keep_sampling_live_session_evidence() {
+    fn empty_pumps_query_recording_only_after_the_last_file_closes() {
         for stopping in [false, true] {
             let device = mock::Recorder::new(Closing::WhenTold);
             device.install();
@@ -524,8 +524,18 @@ mod tests {
                 owner.after_events(&events, &control);
             }
             assert_eq!(device.captures.load(Ordering::Acquire) - before, 100);
-            assert_eq!(device.recording_queries.load(Ordering::Acquire), 100);
+            assert_eq!(device.recording_queries.load(Ordering::Acquire), 0);
             assert_eq!(device.dropped_queries.load(Ordering::Acquire), 100);
+
+            // The SDK keeps reporting recording while we simulate a final
+            // close arriving before its recording flag clears.
+            device.push(mock::FILE_CLOSED, mock::TAKE);
+            assert!(owner.poll_native().unwrap().is_some());
+            for _ in 0..100 {
+                assert!(owner.poll_native().unwrap().is_none());
+                owner.after_events(&events, &control);
+            }
+            assert_eq!(device.recording_queries.load(Ordering::Acquire), 100);
             owner.recorder.abandon();
         }
     }
@@ -807,7 +817,7 @@ mod tests {
         assert!(control.shutdown_requested());
         assert!(matches!(
             block_on(finishing).unwrap(),
-            FinishStatus::Indeterminate(_)
+            FinishStatus::Ended(SessionEnd::Indeterminate(_))
         ));
         owner.shutdown(Instant::now(), &events, &control, &mut []);
         let event = lock(&events.0).queue.pop_front().unwrap().unwrap();
@@ -870,7 +880,7 @@ mod tests {
         );
         assert!(matches!(
             block_on(finishing).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
     }
 
@@ -890,7 +900,7 @@ mod tests {
         );
         assert!(matches!(
             block_on(finishing).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
         owner.recorder.abandon();
     }
@@ -940,7 +950,10 @@ mod tests {
         // Simulate the first reply's callback taking the owner past the
         // later deadline. Its queued closure needs a new native drain.
         owner.settle_at(&events, &control, false, later_deadline.end());
-        assert!(matches!(block_on(later).unwrap(), FinishStatus::Closed(_)));
+        assert!(matches!(
+            block_on(later).unwrap(),
+            FinishStatus::Ended(SessionEnd::Closed(_))
+        ));
         owner.recorder.abandon();
     }
 }

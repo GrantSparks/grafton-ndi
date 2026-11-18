@@ -49,16 +49,13 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
         // Exercise two distinct capability invalidations using the SDK's
         // Send_VirtualPTZ / Send_Capabilities XML conventions. Capability flag
         // reset behavior on idle receivers is not part of notification retention.
-        // Retain the existing single-invalidation coverage on Windows.
         // Repeated publication/consumption is also covered by deterministic
         // receiver unit tests on every platform.
-        let updates = if cfg!(target_os = "windows") { 1 } else { 2 };
         for (update, capabilities) in [
             "<ndi_capabilities ntk_ptz=\"true\"/>",
             "<ndi_capabilities ntk_ptz=\"true\" web_control=\"http://127.0.0.1/status-control\"/>",
         ]
         .into_iter()
-        .take(updates)
         .enumerate()
         {
             eprintln!("capture case {kind}: capability update {update}");

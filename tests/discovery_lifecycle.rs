@@ -4,11 +4,11 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(policy, prerequisites);
-#[path = "support/fixture.rs"]
-mod fixture;
+common_helpers!(policy, prerequisites, child, fixture);
+use common::TestChild;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
+use runtime_fixture::read_fake_log;
 
 use grafton_ndi::{
     advanced::AdvancedConfig,
@@ -19,14 +19,13 @@ use grafton_ndi::{
     },
     Error, Ndi, Receiver, ReceiverOptions, RuntimeOptions, Sender, SenderOptions, Source,
 };
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf};
 
 #[test]
 fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
     if let Some(library) = std::env::var_os("GRAFTON_LIFECYCLE_LIBRARY") {
         let ndi =
             Ndi::with_options(&RuntimeOptions::new().library_path(PathBuf::from(library))).unwrap();
-        let log_path = PathBuf::from(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap());
         let configured = std::env::var_os("GRAFTON_LIFECYCLE_CONFIGURED").is_some();
         let refused = std::env::var_os("GRAFTON_LIFECYCLE_REFUSED").is_some();
         if configured {
@@ -65,7 +64,7 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
                 assert_eq!(detail.object, object);
                 assert_eq!(&*detail.address, SERVER);
             }
-            let log = fs::read_to_string(log_path).unwrap_or_default();
+            let log = read_fake_log();
             assert!(
                 !log.contains("-destroy"),
                 "null objects must never be destroyed: {log}"
@@ -105,14 +104,14 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
         drop(advertisers);
         drop(listeners);
         drop(ndi);
-        let log = fs::read_to_string(&log_path).unwrap();
+        let log = read_fake_log();
         assert!(
             !log.lines()
                 .any(|line| matches!(line, "sender-destroy" | "receiver-destroy" | "destroy")),
             "{log}"
         );
         drop(owners);
-        let log = fs::read_to_string(log_path).unwrap();
+        let log = read_fake_log();
         let position = |event: &str| {
             log.lines()
                 .position(|line| line == event)
@@ -179,7 +178,7 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
         }
         return;
     }
-    let directory = fixture::FixtureDir::create("discovery-lifecycle");
+    let directory = common::FixtureDir::create("discovery-lifecycle");
     for refused in [false, true] {
         let variant = directory
             .path()
@@ -207,20 +206,15 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
                 if refused && removal_refused {
                     continue;
                 }
-                let mut command = Command::new(std::env::current_exe().unwrap());
-                command
-                    .args([
-                        "--exact",
-                        "every_server_object_shares_plain_and_configured_creation_and_destruction",
-                        "--nocapture",
-                    ])
-                    .env("GRAFTON_LIFECYCLE_LIBRARY", &library)
-                    .env(
-                        "GRAFTON_FAKE_NDI_LOG",
-                        variant.join(format!(
-                            "configured-{configured}-removal-refused-{removal_refused}.log"
-                        )),
-                    );
+                let mut command = TestChild::new(
+                    "every_server_object_shares_plain_and_configured_creation_and_destruction",
+                );
+                command.env("GRAFTON_LIFECYCLE_LIBRARY", &library).env(
+                    "GRAFTON_FAKE_NDI_LOG",
+                    variant.join(format!(
+                        "configured-{configured}-removal-refused-{removal_refused}.log"
+                    )),
+                );
                 if configured {
                     command.env("GRAFTON_LIFECYCLE_CONFIGURED", "1");
                 }
@@ -232,13 +226,7 @@ fn every_server_object_shares_plain_and_configured_creation_and_destruction() {
                         .env("GRAFTON_LIFECYCLE_REMOVE_REFUSED", "1")
                         .env("GRAFTON_FAKE_ADVERTISER_REMOVE", "refuse");
                 }
-                let output = command.output().unwrap();
-                assert!(
-                    output.status.success(),
-                    "{}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                command.run();
             }
         }
     }

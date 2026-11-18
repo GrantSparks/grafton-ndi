@@ -15,10 +15,11 @@ use std::{
     borrow::{Borrow, Cow},
     cell::Cell,
     collections::{HashMap, HashSet},
-    ffi::{c_char, CString},
+    ffi::{c_char, CStr, CString},
     fmt::{self, Display, Formatter},
     hash::{Hash, Hasher},
     net::IpAddr,
+    num::NonZeroU16,
     ptr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -26,6 +27,7 @@ use std::{
 
 use crate::{
     change_feed::ChangeFeed,
+    list_setting::list_cstring,
     sdk_copy::LossyText,
     sys::{self, bindings::*},
     timeout::{Deadline, NeverStop, Stop, StopResult, POLL_INTERVAL},
@@ -35,7 +37,7 @@ use crate::{
 /// Configuration for NDI source discovery.
 ///
 /// The defaults find the sources of the groups the NDI configuration names,
-/// including those of this machine, with no extra addresses to query.
+/// including those of this machine, and query the configured `networks.ips`.
 ///
 /// # Examples
 ///
@@ -73,7 +75,7 @@ impl FinderOptions {
         self
     }
 
-    /// Remove the explicitly requested direct IP addresses.
+    /// Inherit direct IP addresses from the NDI configuration.
     #[must_use]
     pub fn clear_extra_ips(mut self) -> Self {
         self.extra_ips = None;
@@ -114,7 +116,7 @@ impl FinderOptions {
     }
 
     /// The default options: local sources included, the groups of the NDI
-    /// configuration, and no extra addresses.
+    /// configuration, and the direct addresses in its `networks.ips`.
     pub fn new() -> Self {
         Self {
             show_local_sources: true,
@@ -132,7 +134,8 @@ impl FinderOptions {
         self
     }
 
-    /// Set the groups to search instead of those of the NDI configuration.
+    /// Set a non-empty list of groups to search in place of the NDI configuration.
+    /// Use [`Self::clear_groups`] to inherit the configuration.
     /// Creation refuses empty elements and elements containing a comma or NUL.
     #[must_use]
     pub fn groups(mut self, groups: impl IntoIterator<Item = impl Into<String>>) -> Self {
@@ -140,8 +143,10 @@ impl FinderOptions {
         self
     }
 
-    /// Set IP addresses to query directly for sources discovery does not reach.
-    /// Creation refuses empty elements and elements containing a comma or NUL.
+    /// Set a non-empty list of individual IP addresses to query directly.
+    /// This replaces `networks.ips` from the NDI configuration. Use
+    /// [`Self::clear_extra_ips`] to inherit the configuration. Creation
+    /// refuses empty elements and elements containing a comma or NUL.
     #[must_use]
     pub fn extra_ips(mut self, ips: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.extra_ips = Some(ips.into_iter().map(Into::into).collect());
@@ -159,40 +164,6 @@ impl FinderOptions {
         self.config = Some(config);
         self
     }
-}
-
-/// Validate and join a configured list only at native-owner construction.
-/// Every element must be representable without changing list boundaries.
-pub(crate) fn list_cstring(
-    values: Option<&[String]>,
-    setting: &'static str,
-) -> Result<Option<CString>> {
-    values
-        .map(|values| {
-            let invalid =
-                |index| Error::InvalidInput(crate::InputDefect::ListElement { setting, index });
-            let boundary = values
-                .iter()
-                .position(|value| value.is_empty() || value.contains(','));
-            // Only earlier elements can take precedence over a boundary error.
-            // CString supplies the sole NUL check; every comma before that NUL
-            // is a separator, so its count is the original element index.
-            let prefix = &values[..boundary.unwrap_or(values.len())];
-            let joined = CString::new(prefix.join(",")).map_err(|error| {
-                let nul = error.nul_position();
-                invalid(
-                    error.into_vec()[..nul]
-                        .iter()
-                        .filter(|&&byte| byte == b',')
-                        .count(),
-                )
-            })?;
-            if let Some(index) = boundary {
-                return Err(invalid(index));
-            }
-            Ok(joined)
-        })
-        .transpose()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,7 +216,7 @@ pub struct Finder {
     _groups: Option<CString>,    // Hold ownership of CStrings
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
     #[cfg(feature = "advanced")]
-    _config: Option<crate::advanced::AdvancedConfig>,
+    _config: crate::advanced::RetainedConfig,
     sdk: crate::runtime::Bound<sys::Core>,
 }
 
@@ -530,6 +501,7 @@ impl SourceWatch<'_> {
     /// [`Error::UnexpectedSdkResult`] for a malformed top-level descriptor array,
     /// [`Error::AllocationFailed`] when result or text storage cannot be reserved,
     /// or [`Error::ResourceLimit`] when a snapshot exceeds its copy budgets.
+    #[doc(alias = "NDIlib_find_get_current_sources")]
     pub fn current_sources(&mut self) -> Result<Vec<Source>> {
         self.snapshot(Finder::current_sources, |_| true)
     }
@@ -602,12 +574,25 @@ impl BorrowedSource<'_> {
         Ok(inspect((&name, address.as_deref())))
     }
 
-    fn matches_query(&self, query: HostQuery<'_>) -> Result<bool> {
-        self.with_key(|(name, address)| source_matches_query(name, address, query))
+    fn selected_by(
+        &self,
+        query: Option<HostQuery<'_>>,
+        seen: Option<&HashSet<SeenSource>>,
+    ) -> Result<bool> {
+        self.with_key(|key @ (name, address)| {
+            query.is_none_or(|query| source_matches_query(name, address, query))
+                && seen.is_none_or(|seen| !seen.contains(&key as &dyn SourceIdentity))
+        })
     }
 
+    #[cfg(test)]
+    fn matches_query(&self, query: HostQuery<'_>) -> Result<bool> {
+        self.selected_by(Some(query), None)
+    }
+
+    #[cfg(test)]
     fn seen_in(&self, seen: &HashSet<SeenSource>) -> Result<bool> {
-        self.with_key(|key| seen.contains(&key as &dyn SourceIdentity))
+        Ok(!self.selected_by(None, Some(seen))?)
     }
 }
 
@@ -725,8 +710,8 @@ impl Finder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidInput`] when a group or extra address is empty
-    /// or contains a comma or NUL, [`Error::UnsupportedCapability`] when the options
+    /// Returns [`Error::InvalidInput`] when either list is empty or a group or
+    /// extra address is empty or contains a comma or NUL, [`Error::UnsupportedCapability`] when the options
     /// carry an Advanced configuration that the runtime or this build cannot
     /// take, and [`Error::NativeOperationFailed`] when the SDK creates no
     /// finder.
@@ -734,19 +719,22 @@ impl Finder {
     #[doc(alias = "NDIlib_find_create_v3")]
     pub fn new(ndi: &Ndi, options: &FinderOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
-        if let Some(config) = &options.config {
-            return Self::new_configured(ndi, options, config);
+        {
+            <Self as crate::advanced::Configurable>::create_from_options(ndi, options)
         }
+        #[cfg(not(feature = "advanced"))]
+        {
+            Self::create_plain(ndi, options)
+        }
+    }
+
+    pub(crate) fn create_plain(ndi: &Ndi, options: &FinderOptions) -> Result<Self> {
         // SAFETY: the SDK's finder creation returns null or a fresh finder
         // that nothing else owns, and the settings outlive the call.
         unsafe {
-            Self::create(
-                ndi,
-                options,
-                #[cfg(feature = "advanced")]
-                None,
-                |core, raw| core.named().NDIlib_find_create_v2(raw),
-            )
+            Self::create(ndi, options, |core, raw| {
+                crate::runtime::NativeCreation::plain(core.named().NDIlib_find_create_v2(raw))
+            })
         }
     }
 
@@ -761,25 +749,23 @@ impl Finder {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         settings: &FinderOptions,
-        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
             &sys::Core,
             &NDIlib_find_create_t,
-        ) -> sys::table::Called<NDIlib_find_instance_t>,
+        ) -> crate::runtime::NativeCreation<NDIlib_find_instance_t>,
     ) -> Result<Self> {
         let groups = list_cstring(settings.groups.as_deref(), "groups")?;
         let extra_ips = list_cstring(settings.extra_ips.as_deref(), "extra_ips")?;
         let sdk = ndi.bind_core();
-        let instance = create(
+        let created = create(
             &sdk,
             &NDIlib_find_create_t {
                 show_local_sources: settings.show_local_sources,
                 p_groups: groups.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
                 p_extra_ips: extra_ips.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
             },
-        )
-        .created()?
-        .as_ptr();
+        );
+        let instance = created.call.created()?.as_ptr();
         let finder = Self {
             instance: FindInstance(instance),
             sources_lock: parking_lot::Mutex::new(FindInstance(instance)),
@@ -787,7 +773,7 @@ impl Finder {
             _groups: groups,
             _extra_ips: extra_ips,
             #[cfg(feature = "advanced")]
-            _config: config,
+            _config: created.config,
             sdk,
         };
         // Some standard-library mutexes allocate their native backing on the
@@ -1047,6 +1033,8 @@ impl Finder {
     /// Returns [`Error::InvalidInput`] for a timeout above [`crate::MAX_TIMEOUT`],
     /// including immediate matches, and snapshot errors such as
     /// [`Error::ResourceLimit`]. A panic in `select` propagates outside SDK locks.
+    #[doc(alias = "NDIlib_find_get_current_sources")]
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub fn find_source(
         &self,
         timeout: Duration,
@@ -1084,6 +1072,8 @@ impl Finder {
     /// An empty name returns [`Error::InvalidInput`]; a name containing a NUL
     /// returns [`Error::InvalidCString`]. The name is checked before the timeout,
     /// including in async lookups. Other errors match [`Self::find_source`].
+    #[doc(alias = "NDIlib_find_get_current_sources")]
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub fn find_source_by_name(&self, name: &str, timeout: Duration) -> Result<Option<Source>> {
         let (name, deadline) = checked_name_lookup(name, timeout)?;
         let Ok(source) = self.find_source_by_name_until(name.as_str(), deadline, NeverStop)?;
@@ -1162,6 +1152,8 @@ impl Finder {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_find_get_current_sources")]
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub fn find_sources(&self, timeout: Duration) -> Result<Vec<Source>> {
         let Ok(sources) = self.find_sources_until(Deadline::after(timeout)?, NeverStop)?;
         Ok(sources)
@@ -1187,14 +1179,7 @@ impl Finder {
             deadline,
             stop,
             &mut state,
-            |(_, seen, _), source| {
-                if let Some(query) = query {
-                    if !source.matches_query(query)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(!source.seen_in(seen)?)
-            },
+            |(_, seen, _), source| source.selected_by(query, Some(seen)),
             |(discovered, seen, retained_bytes), sources| {
                 accumulate_sources(discovered, seen, retained_bytes, sources)?;
                 Ok(None::<()>)
@@ -1211,10 +1196,10 @@ impl Drop for Finder {
     }
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Finder>();
-};
+});
 
 /// An exact, nonempty NDI source name with no interior NUL. Ownership can
 /// change without checking the same text again.
@@ -1622,18 +1607,6 @@ impl SourceText {
         }))
     }
 
-    pub(crate) fn with_port(&self, port: u16) -> Self {
-        let address = self.as_str();
-        let endpoint = if address.parse::<std::net::Ipv6Addr>().is_ok() {
-            format!("[{address}]:{port}")
-        } else {
-            format!("{address}:{port}")
-        };
-        // SAFETY: SourceText contains no interior NUL, and formatting adds
-        // only brackets, a colon and decimal digits.
-        unsafe { Self::from_nul_free_string(endpoint) }
-    }
-
     pub(crate) fn new(text: String) -> Result<Self> {
         Ok(Self(Arc::new(CString::new(text)?)))
     }
@@ -1644,8 +1617,8 @@ impl SourceText {
         unsafe { std::str::from_utf8_unchecked(self.0.as_bytes()) }
     }
 
-    fn as_ptr(&self) -> *const c_char {
-        self.0.as_ptr()
+    fn as_c_str(&self) -> &CStr {
+        self.0.as_c_str()
     }
 
     fn storage_bytes(&self) -> usize {
@@ -1660,8 +1633,28 @@ impl fmt::Debug for SourceText {
 }
 
 impl SourceAddress {
-    pub(crate) fn from_text(text: SourceText) -> Self {
-        Self(text)
+    pub(crate) fn from_advertised_host(text: &str, port: NonZeroU16) -> Option<Self> {
+        let host = HostQuery::parse(text)?;
+        let endpoint = match host {
+            HostQuery::Ip(IpAddr::V6(_)) => {
+                let literal = text
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .unwrap_or(text);
+                format!("[{literal}]:{port}")
+            }
+            HostQuery::Ip(IpAddr::V4(ip)) => format!("{ip}:{port}"),
+            // Preserve a final DNS dot, which marks an absolute host name.
+            HostQuery::Host(_) => format!("{text}:{port}"),
+            HostQuery::Machine(_) => return None,
+        };
+        let authority = parse_authority(&endpoint)?;
+        if authority.port != Some(port.get()) || !host.matches(authority.host) {
+            return None;
+        }
+        // SAFETY: an IP literal or DNS host name contains no NUL, and
+        // formatting adds only brackets, a colon and decimal digits.
+        Some(Self(unsafe { SourceText::from_nul_free_string(endpoint) }))
     }
 
     /// Keep the opaque address text unchanged after checking its native form.
@@ -1676,6 +1669,10 @@ impl SourceAddress {
     /// The exact address text, whether it names a host, IP address or URL.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+
+    pub(crate) fn as_c_str(&self) -> &CStr {
+        self.0.as_c_str()
     }
 
     /// Whether the address contains a URL scheme separator (`://`).
@@ -1780,7 +1777,7 @@ pub struct Source {
 #[derive(Clone, PartialEq, Eq)]
 struct SeenSource(Source);
 
-const _: () = assert!(std::mem::size_of::<SeenSource>() == std::mem::size_of::<Source>());
+const_assert!(std::mem::size_of::<SeenSource>() == std::mem::size_of::<Source>());
 
 /// Owned and borrowed source keys use the same complete textual identity.
 /// Trait-object borrowing permits a HashSet lookup without allocating a Source.
@@ -1835,30 +1832,6 @@ impl<'a> Borrow<dyn SourceIdentity + 'a> for SeenSource {
     }
 }
 
-#[repr(C)]
-pub(crate) struct RawSource {
-    _source: Source,
-    raw: NDIlib_source_t,
-}
-
-// SAFETY: the descriptor's pointers lead only into the strings this value
-// owns, whose heap buffers do not move when the value does, and nothing
-// writes through them. Moving it to another thread moves those strings with
-// it, as moving a `CString` does.
-unsafe impl Send for RawSource {}
-
-// SAFETY: a shared descriptor exposes only immutable pointers into the C strings
-// this value owns. Their buffers stay allocated for the shared borrow and no SDK
-// operation writes through them, so concurrent readers cannot race with mutation.
-unsafe impl Sync for RawSource {}
-
-impl RawSource {
-    /// Lend the descriptor only while its backing C strings remain owned.
-    pub(crate) fn as_raw(&self) -> &NDIlib_source_t {
-        &self.raw
-    }
-}
-
 impl Source {
     pub(crate) fn from_text(name: SourceText, address: Option<SourceAddress>) -> Self {
         Self { name, address }
@@ -1889,6 +1862,10 @@ impl Source {
     /// described by its address alone has an empty name.
     pub fn name(&self) -> &str {
         self.name.as_str()
+    }
+
+    pub(crate) fn name_c_str(&self) -> &CStr {
+        self.name.as_c_str()
     }
 
     /// The network address for connecting to this source, when known.
@@ -2015,25 +1992,6 @@ impl Source {
             )
         }?
         .ok_or_else(failed)
-    }
-
-    /// Retain the source's validated storage and lend its native descriptor.
-    /// No strings are allocated or validated again.
-    pub(crate) fn to_raw(&self) -> RawSource {
-        let source = self.clone();
-        let raw = NDIlib_source_t {
-            p_ndi_name: source.name.as_ptr(),
-            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
-                p_url_address: source
-                    .address
-                    .as_ref()
-                    .map_or(ptr::null(), |address| address.0.as_ptr()),
-            },
-        };
-        RawSource {
-            _source: source,
-            raw,
-        }
     }
 }
 
@@ -2210,6 +2168,8 @@ impl SourceCache {
     /// discovery/resource errors propagate without filling an entry. A completed
     /// result the cache cannot store is returned uncached. IP hints must already
     /// be configured on the finder; this method does not change its scope.
+    #[doc(alias = "NDIlib_find_get_current_sources")]
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
         let (query, deadline) = checked_host_lookup(host, timeout)?;
         let Ok(sources) = self.find_sources_by_host_until(query, deadline, NeverStop)?;
@@ -2714,6 +2674,33 @@ mod tests {
     }
 
     #[test]
+    fn advertised_hosts_round_trip_through_authority() {
+        for host in [
+            "192.0.2.10",
+            "[192.0.2.10]",
+            "::1",
+            "2001:db8:0000::0010",
+            "[2001:db8:0000::0010]",
+            "::ffff:192.0.2.10",
+            "a",
+            "camera-1.local",
+            "CAMERA.Local.",
+        ] {
+            let query = HostQuery::parse(host).unwrap();
+            for port in [
+                NonZeroU16::MIN,
+                NonZeroU16::new(5960).unwrap(),
+                NonZeroU16::MAX,
+            ] {
+                let endpoint = SourceAddress::from_advertised_host(host, port).unwrap();
+                let authority = parse_authority(endpoint.as_str()).unwrap();
+                assert!(query.matches(authority.host), "{host}: {endpoint:?}");
+                assert_eq!(authority.port, Some(port.get()));
+            }
+        }
+    }
+
+    #[test]
     fn source_values_refuse_nul_before_any_native_use() {
         assert!(matches!(
             Source::new("Camera\0other"),
@@ -2725,39 +2712,6 @@ mod tests {
         ));
         assert_eq!(Source::new("").unwrap().name(), "");
         assert_eq!(SourceAddress::new("").unwrap().as_str(), "");
-    }
-
-    #[test]
-    fn native_source_descriptors_share_validated_storage_without_allocating() {
-        let source = Source::new("Studio (Camera)")
-            .unwrap()
-            .with_address(SourceAddress::new("192.0.2.1:5960").unwrap());
-        let (raw, allocations) = crate::test_alloc::allocation_count(|| {
-            let first = source.to_raw();
-            let second = source.to_raw();
-            assert_eq!(first.as_raw().p_ndi_name, second.as_raw().p_ndi_name);
-            // SAFETY: both descriptors initialized their address pointer.
-            unsafe {
-                assert_eq!(
-                    first.as_raw().__bindgen_anon_1.p_url_address,
-                    second.as_raw().__bindgen_anon_1.p_url_address
-                );
-            }
-            first
-        });
-        assert_eq!(allocations, 0);
-        drop(source);
-        // SAFETY: RawSource retains the immutable strings after Source is dropped.
-        unsafe {
-            assert_eq!(
-                std::ffi::CStr::from_ptr(raw.as_raw().p_ndi_name),
-                c"Studio (Camera)"
-            );
-            assert_eq!(
-                std::ffi::CStr::from_ptr(raw.as_raw().__bindgen_anon_1.p_url_address),
-                c"192.0.2.1:5960"
-            );
-        }
     }
 
     #[test]
@@ -2773,10 +2727,12 @@ mod tests {
             Some(c"Public,Studio")
         );
         assert_eq!(list_cstring(None, "groups").unwrap(), None);
-        assert_eq!(
-            list_cstring(Some(&[]), "groups").unwrap().as_deref(),
-            Some(c"")
-        );
+        assert!(matches!(
+            list_cstring(Some(&[]), "groups"),
+            Err(Error::InvalidInput(crate::InputDefect::Empty {
+                what: "groups"
+            }))
+        ));
         for invalid in ["", "Studio,Public", "Studio\0Public"] {
             let options = FinderOptions::new().groups(["valid", invalid]);
             assert_eq!(options.configured_groups().unwrap()[1], invalid);
@@ -3590,51 +3546,6 @@ mod tests {
     }
 
     #[test]
-    fn configured_and_discovered_sources_share_text_identity() {
-        use std::hash::{DefaultHasher, Hash, Hasher};
-
-        let hash = |source: &Source| {
-            let mut state = DefaultHasher::new();
-            source.hash(&mut state);
-            state.finish()
-        };
-        for text in [
-            "camera.local:8080",
-            "192.0.2.1:5960",
-            "[2001:db8::1]:5960",
-            "ndi://h:1",
-            "opaque text",
-        ] {
-            let configured = Source::new("Camera")
-                .unwrap()
-                .with_address(SourceAddress::new(text).unwrap());
-            let raw = configured.to_raw();
-            // SAFETY: RawSource lends its descriptor while retaining both C
-            // strings for this synchronous owned copy.
-            let discovered = unsafe { source_from_raw(raw.as_raw(), c"test") }.unwrap();
-            assert_eq!(configured, discovered);
-            assert_eq!(hash(&configured), hash(&discovered));
-            let address = discovered.address().unwrap();
-            assert_eq!(address.as_str(), text);
-            assert_eq!(address.is_url(), text.contains("://"));
-            // Both native union member names denote the same address pointer.
-            // SAFETY: RawSource initialized the pointer member of this union.
-            unsafe {
-                assert_eq!(
-                    raw.as_raw().__bindgen_anon_1.p_url_address,
-                    raw.as_raw().__bindgen_anon_1.p_ip_address
-                );
-                assert_eq!(
-                    std::ffi::CStr::from_ptr(raw.as_raw().__bindgen_anon_1.p_url_address)
-                        .to_str()
-                        .unwrap(),
-                    text
-                );
-            }
-        }
-    }
-
-    #[test]
     fn discovery_accumulates_distinct_name_and_address_text_in_order() {
         let first = Source::new("Camera")
             .unwrap()
@@ -4136,24 +4047,6 @@ mod tests {
             Err(Error::NativeOperationFailed {
                 operation}) if operation.name() == c"NDIlib_find_get_current_sources"
         ));
-    }
-
-    #[test]
-    fn test_try_from_raw_address_only_source() {
-        let url = CString::new("ndi://127.0.0.1:5960").unwrap();
-        let raw = NDIlib_source_t {
-            p_ndi_name: ptr::null(),
-            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
-                p_url_address: url.as_ptr(),
-            },
-        };
-        let source = unsafe { source_from_raw(&raw, c"test") }.unwrap();
-        assert!(source.name().is_empty());
-        assert!(
-            matches!(source.address(), Some(address) if address.is_url() && address.as_str() == "ndi://127.0.0.1:5960")
-        );
-        let roundtrip = source.to_raw();
-        assert!(!roundtrip.as_raw().p_ndi_name.is_null());
     }
 
     #[test]

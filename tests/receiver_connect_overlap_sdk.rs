@@ -9,19 +9,38 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-#[cfg(any(feature = "advanced", all(target_os = "linux", not(ndi_link_static))))]
-common_helpers!(runtime, prerequisites, name, loopback, discovery_server);
-#[cfg(not(any(feature = "advanced", all(target_os = "linux", not(ndi_link_static)))))]
-common_helpers!(runtime, name, loopback);
-
 #[cfg(all(target_os = "linux", not(ndi_link_static)))]
-#[path = "support/fixture.rs"]
-mod fixture;
+common_helpers!(
+    runtime,
+    prerequisites,
+    name,
+    loopback,
+    discovery_server,
+    child,
+    fixture,
+    stop
+);
+#[cfg(all(
+    feature = "advanced",
+    not(all(target_os = "linux", not(ndi_link_static)))
+))]
+common_helpers!(
+    runtime,
+    prerequisites,
+    name,
+    loopback,
+    discovery_server,
+    stop
+);
+#[cfg(not(any(feature = "advanced", all(target_os = "linux", not(ndi_link_static)))))]
+common_helpers!(runtime, name, loopback, stop);
+#[cfg(all(target_os = "linux", not(ndi_link_static)))]
+use common::TestChild;
 
 use grafton_ndi::{
     AudioFrame, AudioSource, Error, FrameRate, FrameSync, FrameSyncAudioRequest, MetadataFrame,
-    Ndi, PixelFormat, Receiver, ReceiverItemRef, ReceiverMode, ReceiverOptions, ScanType, Sender,
-    SenderOptions, Source, Timecode, VideoFrame, VideoSource,
+    Ndi, PixelFormat, ReceiveDelay, Receiver, ReceiverItemRef, ReceiverMode, ReceiverOptions,
+    ScanType, Sender, SenderOptions, Source, Timecode, VideoFrame, VideoSource,
 };
 use std::{
     sync::{
@@ -67,13 +86,6 @@ fn timed<T>(operation: &str, budget: Duration, call: impl FnOnce() -> T) -> T {
         began.elapsed()
     );
     result
-}
-
-struct Stop<'a>(&'a AtomicBool);
-impl Drop for Stop<'_> {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
 }
 
 struct Peers {
@@ -215,7 +227,7 @@ impl Peers {
                     }
                 });
             }
-            let _stop = Stop(&stopped);
+            let _stop = common::StopOnDrop(&stopped);
             work(&stopped, &traffic);
         });
         traffic
@@ -421,7 +433,7 @@ fn native_capture_and_connect_overlap_without_torn_frames() {
     assert!(workers >= 3);
     peers.run(|stopped| {
         thread::scope(|scope| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             for kind in 0..workers {
                 let (receiver, peers, loans) = (&receiver, &peers, &loans);
                 scope.spawn(move || {
@@ -513,9 +525,10 @@ fn shared_controls<M: ReceiverMode>(receiver: &Receiver<M>, kind: usize, round: 
             control_result(receiver.connection_stats());
             let _ = receiver.is_connected();
             // Older runtimes may lack the delay or keyframe families entirely.
+            let delay = ReceiveDelay::new(Duration::from_millis(round % 2)).unwrap();
             for result in [
-                receiver.set_video_delay(Duration::from_millis(round % 2)),
-                receiver.set_audio_delay(Duration::from_millis(round % 2)),
+                receiver.set_video_delay(delay),
+                receiver.set_audio_delay(delay),
             ] {
                 if !matches!(result, Err(Error::UnsupportedCapability { .. })) {
                     control_result(result);
@@ -577,102 +590,9 @@ fn shared_controls_capture_and_connect_complete_without_torn_frames() {
     control_load_then_settle(&[0, 1, 2]);
 }
 
-/// Manual throughput/liveness measurement, stronger than the SDK request contract.
-#[test]
-#[ignore = "manual liveness characterization: continuous metadata pressure does not guarantee fresh media after every asynchronous switch"]
-fn continuous_control_pressure_and_per_change_media_liveness() {
-    characterize_per_change_control_liveness();
-}
-
-fn characterize_per_change_control_liveness() {
-    let kinds = &[0, 1, 2];
-    let Some(ndi) = common::ndi() else {
-        return;
-    };
-    let _turn = sockets();
-    let peers = Peers::new(&ndi);
-    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(peers.sources[0].clone())).unwrap();
-    let loans = Loans::default();
-    let controls = ControlProgress::default();
-    eprintln!(
-        "control overlap runtime {:?}; peers {:?}",
-        ndi.info(),
-        peers.sources
-    );
-    let upstream = peers.run(|stopped| {
-        thread::scope(|scope| {
-            let _stop = Stop(stopped);
-            for &kind in kinds {
-                let (receiver, controls) = (&receiver, &controls.0[kind]);
-                scope.spawn(move || {
-                    let mut round = 0;
-                    while !stopped.load(Ordering::Acquire) {
-                        timed("shared controls", Duration::ZERO, || {
-                            shared_controls(receiver, kind, round)
-                        });
-                        controls.fetch_add(1, Ordering::Relaxed);
-                        round += 1;
-                        thread::sleep(Duration::from_millis(2));
-                    }
-                });
-            }
-            let workers = std::env::var("GRAFTON_NDI_OVERLAP_THREADS")
-                .map(|value| value.parse::<usize>().unwrap())
-                .unwrap_or(3);
-            for kind in 0..workers {
-                let (receiver, peers, loans) = (&receiver, &peers, &loans);
-                scope.spawn(move || {
-                    while !stopped.load(Ordering::Acquire) {
-                        match kind % 3 {
-                            0 => {
-                                if let Some(frame) =
-                                    captured(timed("control overlap video", SLICE, || {
-                                        receiver.capture_video_ref(SLICE)
-                                    }))
-                                {
-                                    loans.video(frame, peers);
-                                }
-                            }
-                            1 => {
-                                if let Some(frame) =
-                                    captured(timed("control overlap audio", SLICE, || {
-                                        receiver.capture_audio_ref(SLICE)
-                                    }))
-                                {
-                                    loans.audio(frame);
-                                }
-                            }
-                            _ => match captured(timed("control overlap mixed", SLICE, || {
-                                receiver.capture_any_ref(SLICE)
-                            })) {
-                                Some(ReceiverItemRef::Video(frame)) => loans.video(frame, peers),
-                                Some(ReceiverItemRef::Audio(frame)) => loans.audio(frame),
-                                _ => {}
-                            },
-                        }
-                    }
-                });
-            }
-            progress(&receiver);
-            loans.wait_for_media(&ndi);
-            storm(&receiver, &peers, stopped);
-        });
-    });
-    for &kind in kinds {
-        assert!(
-            controls.0[kind].load(Ordering::Relaxed) > 0,
-            "{} made no calls",
-            CONTROL_FAMILIES[kind]
-        );
-    }
-    assert!(upstream > 0, "source handled no upstream controls");
-    loans.balanced(&ndi);
-}
-
 // Connection methods submit asynchronous SDK requests. Concurrent controls do
 // not promise uninterrupted media after every request: require bounded calls,
-// valid delivered frames, and convergence after load stops instead. The manual
-// characterization above retains the stronger per-change measurement.
+// valid delivered frames, and convergence after load stops.
 fn control_load_then_settle(kinds: &[usize]) {
     let Some(ndi) = common::ndi() else {
         return;
@@ -703,7 +623,7 @@ fn control_load_then_settle(kinds: &[usize]) {
     };
     let upstream = peers.run_with_traffic(true, |stopped, traffic| {
         thread::scope(|captures| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             for kind in 0..workers {
                 let (receiver, peers, loans, latest_video, audio) = (
                     &receiver,
@@ -777,7 +697,7 @@ fn control_load_then_settle(kinds: &[usize]) {
             );
             let stop_controls = AtomicBool::new(false);
             thread::scope(|control_scope| {
-                let _stop_controls = Stop(&stop_controls);
+                let _stop_controls = common::StopOnDrop(&stop_controls);
                 for &kind in kinds {
                     let (receiver, count, stopped) = (&receiver, &controls.0[kind], &stop_controls);
                     control_scope.spawn(move || {
@@ -890,7 +810,7 @@ fn kvm_overlap(
         let mut session = receiver.kvm().unwrap();
         let view = session.receiver();
         thread::scope(|scope| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             scope.spawn(|| changes(stopped));
             scope.spawn(|| {
                 while !stopped.load(Ordering::Acquire) {
@@ -967,7 +887,7 @@ fn framesync_capture_and_connect_overlap_without_torn_frames() {
     let loans = Loans::default();
     peers.run(|stopped| {
         thread::scope(|scope| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             scope.spawn(|| {
                 while !stopped.load(Ordering::Acquire) {
                     if let Some(frame) = timed("FrameSync video", Duration::ZERO, || {
@@ -1048,9 +968,9 @@ fn avsync_capture_and_connect_overlap_without_invalid_audio() {
         }
         let finished = AtomicBool::new(false);
         thread::scope(|scope| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             scope.spawn(|| {
-                let _finished = Stop(&finished);
+                let _finished = common::StopOnDrop(&finished);
                 storm(receiver, &peers, stopped);
             });
             while !finished.load(Ordering::Acquire) {
@@ -1079,25 +999,17 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
     // connections. Its native internal finder needs a loopback discovery hint,
     // installed before the child initializes the SDK's process configuration.
     if std::env::var_os("GRAFTON_NDI_OVERLAP_REMOTE_CHILD").is_none() {
-        let fixture = fixture::FixtureDir::create("overlap-remote");
+        let fixture = common::FixtureDir::create("overlap-remote");
         std::fs::write(
             fixture.path().join("ndi-config.v1.json"),
             r#"{"ndi":{"networks":{"ips":"127.0.0.1"}}}"#,
         )
         .unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "discovery_server_connects_overlap_capture_and_report_the_remote_target",
-                "--nocapture",
-            ])
+        TestChild::new("discovery_server_connects_overlap_capture_and_report_the_remote_target")
             .env("GRAFTON_NDI_OVERLAP_REMOTE_CHILD", "1")
             .env("NDI_CONFIG_DIR", fixture.path())
-            .output()
-            .unwrap();
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        eprint!("{}", String::from_utf8_lossy(&output.stdout));
-        assert!(output.status.success(), "remote overlap subprocess failed");
+            .run();
+
         return;
     }
     let Some(ndi) = common::ndi() else {
@@ -1196,7 +1108,7 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
     let loans = Loans::default();
     peers.run(|stopped| {
         thread::scope(|scope| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             for kind in 0..3 {
                 let receiver = &receiver;
                 scope.spawn(move || {
@@ -1311,7 +1223,7 @@ fn advertiser_membership_changes_overlap_capture_connect_and_controls() {
     let memberships = AtomicU64::new(0);
     peers.run(|stopped| {
         thread::scope(|captures| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             let receiver = &receiver;
             captures.spawn(|| {
                 while !stopped.load(Ordering::Acquire) {
@@ -1444,10 +1356,7 @@ fn receiver_mutation_allows_membership_changes_from_active_allocator_policies() 
         discovery_server::{AdvertiserOptions, RecvAdvertisement, RecvAdvertiser},
         RuntimeFeature,
     };
-    use std::{
-        process::{Command, Stdio},
-        sync::{mpsc, Arc, OnceLock, Weak},
-    };
+    use std::sync::{mpsc, Arc, OnceLock, Weak};
     let Some(ndi) = common::ndi() else { return };
     for (feature, requirement) in [
         (
@@ -1473,39 +1382,13 @@ fn receiver_mutation_allows_membership_changes_from_active_allocator_policies() 
             ("reconnect", "add"),
             ("disconnect", "add"),
         ] {
-            let mut child = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "receiver_mutation_allows_membership_changes_from_active_allocator_policies",
-                    "--nocapture",
-                ])
-                .env("GRAFTON_NDI_ALLOCATOR_MEMBERSHIP_CHILD", "1")
-                .env("GRAFTON_NDI_MEMBERSHIP_ACTION", action)
-                .env("GRAFTON_NDI_NATIVE_OPERATION", operation)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(45);
-            while child.try_wait().unwrap().is_none() {
-                if Instant::now() >= deadline {
-                    child.kill().unwrap();
-                    let output = child.wait_with_output().unwrap();
-                    panic!(
-                        "{operation}/{action} did not complete:\n{}\n{}",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            let output = child.wait_with_output().unwrap();
-            assert!(
-                output.status.success(),
-                "{operation}/{action} subprocess failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            TestChild::new(
+                "receiver_mutation_allows_membership_changes_from_active_allocator_policies",
+            )
+            .env("GRAFTON_NDI_ALLOCATOR_MEMBERSHIP_CHILD", "1")
+            .env("GRAFTON_NDI_MEMBERSHIP_ACTION", action)
+            .env("GRAFTON_NDI_NATIVE_OPERATION", operation)
+            .run_with_timeout(Duration::from_secs(45));
         }
         return;
     }
@@ -1588,7 +1471,7 @@ fn receiver_mutation_allows_membership_changes_from_active_allocator_policies() 
         Owner::Shared(owner)
     };
     thread::scope(|scope| {
-        let _stop = Stop(&stopped);
+        let _stop = common::StopOnDrop(&stopped);
         scope.spawn(|| {
             let frame = VideoFrame::builder()
                 .resolution(64, 64)
@@ -1688,7 +1571,6 @@ fn allocator_code_uses_shared_controls_during_connection_changes() {
         RuntimeFeature, Tally,
     };
     use std::{
-        process::{Command, Stdio},
         ptr::NonNull,
         sync::{mpsc, Arc, OnceLock, Weak},
     };
@@ -1701,39 +1583,11 @@ fn allocator_code_uses_shared_controls_during_connection_changes() {
     if std::env::var_os("GRAFTON_NDI_ALLOCATOR_CONTROLS_CHILD").is_none() {
         for operation in ["connect_to", "disconnect", "reconnect"] {
             for callback in ["policy", "release"] {
-                let mut child = Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "allocator_code_uses_shared_controls_during_connection_changes",
-                        "--nocapture",
-                    ])
+                TestChild::new("allocator_code_uses_shared_controls_during_connection_changes")
                     .env("GRAFTON_NDI_ALLOCATOR_CONTROLS_CHILD", "1")
                     .env("GRAFTON_NDI_NATIVE_OPERATION", operation)
                     .env("GRAFTON_NDI_ALLOCATOR_CALLBACK", callback)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                let deadline = Instant::now() + Duration::from_secs(45);
-                while child.try_wait().unwrap().is_none() {
-                    if Instant::now() >= deadline {
-                        child.kill().unwrap();
-                        let output = child.wait_with_output().unwrap();
-                        panic!(
-                            "{operation}/{callback} did not complete:\n{}\n{}",
-                            String::from_utf8_lossy(&output.stdout),
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
-                let output = child.wait_with_output().unwrap();
-                assert!(
-                    output.status.success(),
-                    "{operation}/{callback} failed:\n{}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                    .run_with_timeout(Duration::from_secs(45));
                 eprintln!("{operation}/{callback} completed");
             }
         }
@@ -1852,7 +1706,7 @@ fn allocator_code_uses_shared_controls_during_connection_changes() {
     owner.set(Arc::downgrade(&allocated)).unwrap();
     let stopped = AtomicBool::new(false);
     thread::scope(|scope| {
-        let _stop = Stop(&stopped);
+        let _stop = common::StopOnDrop(&stopped);
         scope.spawn(|| {
             let frame = VideoFrame::builder()
                 .resolution(64, 64)

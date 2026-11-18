@@ -109,6 +109,11 @@ fn log(operation: &str) {
     }
 }
 
+#[cfg(fake_config_lending)]
+fn log_configuration(kind: &str, config: *const c_char) {
+    log(&format!("config:{kind}:{config:p}"));
+}
+
 #[cfg(fake_constructor)]
 extern "C" fn mark_load() {
     if let Some(path) = std::env::var_os("GRAFTON_REJECTED_CONSTRUCTOR_MARKER") {
@@ -258,16 +263,21 @@ export! {
         log(&format!("receiver-connect:{name}"));
         #[cfg(fake_blocking_connect)]
         if name == "Blocked" {
-            let gate = std::path::PathBuf::from(std::env::var_os("GRAFTON_FAKE_CONNECT_GATE").unwrap());
-            std::fs::write(gate.join("entered"), b"").unwrap();
-            while !gate.join("release").exists() {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+            wait_at_gate("GRAFTON_FAKE_CONNECT_GATE");
         }
         #[cfg(fake_objects)]
         unsafe { objects::connect_source(_p_instance, p_src) };
         #[cfg(fake_receiver_controls)]
         log(&format!("connect-instance:{_p_instance:p}"));
+    }
+}
+
+#[cfg(any(fake_blocking_connect, fake_capture))]
+fn wait_at_gate(variable: &str) {
+    let gate = std::path::PathBuf::from(std::env::var_os(variable).unwrap());
+    std::fs::write(gate.join("entered"), []).unwrap();
+    while !gate.join("release").exists() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -347,7 +357,7 @@ stub! {
 
 }
 
-#[cfg(not(fake_capability_descriptors))]
+#[cfg(not(any(fake_capability_descriptors, fake_objects)))]
 stub! {
     fn NDIlib_send_send_video_v2(p_instance: NDIlib_send_instance_t, p_video_data: *const NDIlib_video_frame_v2_t);
 }
@@ -498,7 +508,7 @@ mod objects {
         }
 
         /// Report every retained frame as complete, most recent first.
-        unsafe fn complete(&mut self) {
+        pub(super) unsafe fn complete(&mut self) {
             unsafe { self.release_copy() };
             if std::env::var_os("GRAFTON_FAKE_VALIDATE_COMPRESSED_LOANS").is_some() {
                 for frame in self.pending.drain(..) {
@@ -513,6 +523,15 @@ mod objects {
                 log("sender-completion");
                 unsafe { completion(self.opaque, &frame) };
             }
+        }
+    }
+
+    #[cfg(not(fake_capability_descriptors))]
+    export! {
+        fn NDIlib_send_send_video_v2(p_instance: NDIlib_send_instance_t, _p_video_data: *const NDIlib_video_frame_v2_t) {
+            let sender = unsafe { &mut *p_instance.cast::<Sender>() };
+            log("sender-send");
+            unsafe { sender.complete() };
         }
     }
 
@@ -1232,6 +1251,8 @@ pub unsafe extern "C" fn NDIlib_recv_create_v4(
     p_create_settings: *const NDIlib_recv_create_v3_t,
     _p_config_data: *const c_char,
 ) -> NDIlib_recv_instance_t {
+    #[cfg(fake_config_lending)]
+    log_configuration("receiver", _p_config_data);
     unsafe { NDIlib_recv_create_v3(p_create_settings) }
 }
 
@@ -1251,6 +1272,8 @@ pub unsafe extern "C" fn NDIlib_send_create_v2(
     p_create_settings: *const NDIlib_send_create_t,
     _p_config_data: *const c_char,
 ) -> NDIlib_send_instance_t {
+    #[cfg(fake_config_lending)]
+    log_configuration("sender", _p_config_data);
     unsafe { NDIlib_send_create(p_create_settings) }
 }
 
@@ -1294,10 +1317,14 @@ pub unsafe extern "C" fn NDIlib_send_send_video_scatter_async(
 #[cfg(all(fake_advanced, fake_objects, not(fake_omit_scatter)))]
 #[no_mangle]
 pub unsafe extern "C" fn NDIlib_send_send_video_scatter(
-    _instance: NDIlib_send_instance_t,
+    instance: NDIlib_send_instance_t,
     _frame: *const NDIlib_video_frame_v2_t,
     _scatter: *const FrameScatter,
-) {}
+) {
+    let sender = unsafe { &mut *instance.cast::<objects::Sender>() };
+    log("sender-scatter-send");
+    unsafe { sender.complete() };
+}
 
 #[cfg(all(fake_advanced, fake_objects, not(fake_omit_scatter)))]
 #[no_mangle]
@@ -1319,6 +1346,8 @@ macro_rules! configured_creation {
             _p_config_data: *const c_char,
         ) -> $Instance {
             log(stringify!($name));
+            #[cfg(fake_config_lending)]
+            log_configuration(stringify!($name), _p_config_data);
             #[cfg(fake_configured_success)]
             { unsafe { $plain(_p_create_settings) } }
             #[cfg(not(fake_configured_success))]

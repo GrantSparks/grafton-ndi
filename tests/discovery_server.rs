@@ -10,9 +10,18 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, prerequisites, name, discovery_server);
-#[path = "support/fixture.rs"]
-mod fixture;
+common_helpers!(
+    runtime,
+    prerequisites,
+    name,
+    discovery_server,
+    child,
+    fixture
+);
+use common::TestChild;
+
+#[path = "support/native_discovery_configuration.rs"]
+mod native_discovery_configuration;
 
 use grafton_ndi::{
     capabilities::RuntimeFeature,
@@ -26,7 +35,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::{Ipv4Addr, TcpListener},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -385,11 +394,17 @@ fn creation_does_not_wait_for_the_server() {
             index: 0,
         }))
     ));
-    // A listener's singular endpoint still reaches the native address parser.
+    assert!(matches!(
+        SendAdvertiser::new(&ndi, &AdvertiserOptions::default().servers([] as [&str; 0])),
+        Err(Error::InvalidInput(grafton_ndi::InputDefect::Empty {
+            what: "servers"
+        }))
+    ));
     assert!(matches!(
         SendListener::new(&ndi, &ListenerOptions::default().server("")),
-        Err(Error::InvalidInput(grafton_ndi::InputDefect::DiscoveryAddressRejected(detail)))
-            if detail.address.is_empty()
+        Err(Error::InvalidInput(grafton_ndi::InputDefect::Empty {
+            what: "server"
+        }))
     ));
 
     // An address the SDK cannot parse is refused at creation, and the error
@@ -454,7 +469,7 @@ fn configured_servers_without_a_usable_endpoint_report_configuration_rejection()
         }
         return;
     }
-    let fixture = fixture::FixtureDir::create("discovery-configuration");
+    let fixture = common::FixtureDir::create("discovery-configuration");
     let scenarios = [
         ("absent", r#"{"ndi":{}}"#),
         (
@@ -468,24 +483,12 @@ fn configured_servers_without_a_usable_endpoint_report_configuration_rejection()
         let directory = fixture.path().join(scenario);
         std::fs::create_dir(&directory).unwrap();
         std::fs::write(directory.join("ndi-config.v1.json"), configuration).unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "configured_servers_without_a_usable_endpoint_report_configuration_rejection",
-                "--nocapture",
-            ])
-            .env(SCENARIO, scenario)
-            .env("NDI_CONFIG_DIR", &directory)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{scenario}: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        TestChild::new(
+            "configured_servers_without_a_usable_endpoint_report_configuration_rejection",
+        )
+        .env(SCENARIO, scenario)
+        .env("NDI_CONFIG_DIR", &directory)
+        .run();
     }
 }
 
@@ -615,13 +618,9 @@ fn the_server_does_not_outlive_a_killed_test_process() {
     let Some((_ndi, binary)) = discovery_server() else {
         return;
     };
-    let mut holder = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "the_server_does_not_outlive_a_killed_test_process",
-            "--nocapture",
-        ])
+    let mut holder = TestChild::new("the_server_does_not_outlive_a_killed_test_process")
         .env(HOLDER, &binary)
+        .command()
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();

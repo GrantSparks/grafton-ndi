@@ -2,18 +2,20 @@
 //! opening a library and rejecting it after its initializer has already run.
 #![cfg(all(any(windows, target_os = "macos"), not(ndi_link_static)))]
 
-#[path = "support/fixture.rs"]
-mod fixture;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child, fixture);
+use common::TestChild;
+
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use fixture::FixtureDir;
-use grafton_ndi::{Error, LoadFailure, Runtime, RuntimeOptions};
+use grafton_ndi::{Error, LoadFailure, LoadOrigin, LoadRefusal, Runtime, RuntimeOptions};
 use runtime_fixture::FakeRuntime;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 fn canonical_fixture_path(path: &Path) -> PathBuf {
@@ -87,6 +89,17 @@ fn failed(error: Error, working: &Path) -> LoadFailure {
     failure
 }
 
+fn assert_absent_explicit(error: Error, working: &Path, absent: &Path) {
+    let failure = failed(error, working);
+    let [attempt] = failure.attempts() else {
+        panic!("expected only the explicit attempt, got {failure}");
+    };
+    assert_eq!(attempt.location(), absent);
+    assert_eq!(attempt.origin(), LoadOrigin::Explicit);
+    assert_eq!(attempt.refusal(), &LoadRefusal::Absent);
+    assert!(!attempt.loaded());
+}
+
 #[test]
 fn working_directory_libraries_never_run_constructors() {
     if let Ok(scenario) = std::env::var("GRAFTON_WORKING_DIRECTORY_SCENARIO") {
@@ -153,6 +166,27 @@ fn working_directory_libraries_never_run_constructors() {
                 let error = FileApi::new(&ndi, &FileApiOptions::new()).unwrap_err();
                 failed(error, &working);
             }
+            "absent-explicit-runtime" => {
+                let absent = root.join("missing").join(STANDARD);
+                let error =
+                    Runtime::select(&RuntimeOptions::new().library_path(&absent)).unwrap_err();
+                assert_absent_explicit(error, &working, &absent);
+            }
+            #[cfg(feature = "file-io")]
+            "absent-explicit-file" => {
+                use grafton_ndi::{
+                    file::{FileApi, FileApiOptions},
+                    Ndi,
+                };
+                let ndi = Ndi::with_options(
+                    &RuntimeOptions::new().library_path(root.join("trusted").join(ADVANCED)),
+                )
+                .unwrap();
+                let absent = root.join("missing").join(FILE);
+                let error =
+                    FileApi::new(&ndi, &FileApiOptions::new().library_path(&absent)).unwrap_err();
+                assert_absent_explicit(error, &working, &absent);
+            }
             "path" | "dyld-absolute" => {
                 let runtime = Runtime::select(&RuntimeOptions::new()).unwrap();
                 let reported = runtime.info().library_path().unwrap();
@@ -178,7 +212,7 @@ fn working_directory_libraries_never_run_constructors() {
         return;
     }
 
-    let directory = FixtureDir::create("working-directory-loader");
+    let directory = common::FixtureDir::create("working-directory-loader");
     let root = directory.path();
     for name in [
         "bin",
@@ -232,6 +266,8 @@ fn working_directory_libraries_never_run_constructors() {
         "file",
         "path",
         "detector",
+        "absent-explicit-runtime",
+        "absent-explicit-file",
         "dyld-relative-runtime",
         "dyld-empty-runtime",
         "dyld-mixed-runtime",
@@ -251,19 +287,15 @@ fn working_directory_libraries_never_run_constructors() {
         }
         let marker = root.join("marker");
         let _ = fs::remove_file(&marker);
-        let mut command = Command::new(
+        let mut command = TestChild::at(
             if scenario.starts_with("dyld-") && scenario != "dyld-absolute" {
                 &trusted_executable
             } else {
                 &executable
             },
+            "working_directory_libraries_never_run_constructors",
         );
         command
-            .args([
-                "--exact",
-                "working_directory_libraries_never_run_constructors",
-                "--nocapture",
-            ])
             .current_dir(&working)
             .env("GRAFTON_WORKING_DIRECTORY_SCENARIO", scenario)
             .env("GRAFTON_WORKING_DIRECTORY_ROOT", root)
@@ -279,6 +311,11 @@ fn working_directory_libraries_never_run_constructors() {
                     root.join("empty")
                 },
             );
+        if cfg!(target_os = "macos") && scenario.starts_with("absent-explicit-") {
+            // This directory contains libraries with the absent paths' leaf
+            // names. Their constructor would prove a native fallback ran.
+            command.env("DYLD_FALLBACK_LIBRARY_PATH", &working);
+        }
         if scenario.starts_with("dyld-") {
             let value = if scenario == "dyld-absolute" {
                 root.join("loader").into_os_string()
@@ -300,12 +337,6 @@ fn working_directory_libraries_never_run_constructors() {
                 value,
             );
         }
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{scenario}:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        command.run();
     }
 }

@@ -92,9 +92,9 @@ pub(crate) unsafe trait FrameFree: sealed::Sealed + 'static {
     /// generic `Debug` implementations.
     const REF_DEBUG_NAME: &'static str;
 
-    /// Additional unknown-timestamp marker for audio from this capture family.
-    /// Receiver capture uses the header marker; FrameSync also reports zero.
-    const AUDIO_TIMESTAMP_UNDEFINED: i64 = NDIlib_recv_timestamp_undefined;
+    /// The unknown-timestamp marker for descriptors from this capture family.
+    /// FrameSync and AV-sync audio also report zero for an unknown timestamp.
+    const TIMESTAMP_UNDEFINED: i64 = NDIlib_recv_timestamp_undefined;
 
     /// The descriptor's natural metadata rule, overridden by capture families
     /// with a stronger text guarantee (notably upstream sender metadata).
@@ -339,11 +339,9 @@ unsafe impl FrameFree for FrameSyncAudioFree {
     type Instance = NDIlib_framesync_instance_t;
     type RawFrame = NDIlib_audio_frame_v3_t;
     const REF_DEBUG_NAME: &'static str = "FrameSyncAudioRef";
-    const AUDIO_TIMESTAMP_UNDEFINED: i64 = 0;
+    const TIMESTAMP_UNDEFINED: i64 = 0;
 
     unsafe fn free(core: &sys::Core, instance: Self::Instance, frame: &mut Self::RawFrame) {
-        #[cfg(test)]
-        crate::framesync::audio_test_calls::free();
         core.NDIlib_framesync_free_audio_v2(instance, frame);
     }
 }
@@ -388,7 +386,7 @@ unsafe impl FrameFree for AvSyncAudioFree {
     // Advanced 6.3.2 and 6.4.0.2 return zero for the no-source audio
     // descriptor, and sender timestamps for matched samples. The native
     // avsync timestamp regression and synthetic normalization tests pin both.
-    const AUDIO_TIMESTAMP_UNDEFINED: i64 = 0;
+    const TIMESTAMP_UNDEFINED: i64 = 0;
 
     unsafe fn free(_core: &sys::Core, instance: Self::Instance, _frame: &mut Self::RawFrame) {
         match instance {
@@ -491,11 +489,11 @@ enum Release<'owner, #[cfg(test)] S: FrameFree> {
 // Outside unit tests the release state is the runtime reference alone, as
 // large as the `Option<&Ndi>` it replaced, so a guard is no larger.
 #[cfg(not(test))]
-const _: () = {
+const_assert!({
     use std::mem::{align_of, size_of};
     assert!(size_of::<Release<'static>>() == size_of::<Option<&'static Ndi>>());
     assert!(align_of::<Release<'static>>() == align_of::<Option<&'static Ndi>>());
-};
+});
 
 impl<'owner, S: FrameFree> Guard<'owner, S> {
     /// Create a new frame guard.
@@ -825,17 +823,9 @@ pub(crate) fn capture_any<'rx, S: SlotSet>(lock: &CaptureLock<'rx>) -> Result<De
     S::capture(lock)
 }
 
-// Convenience aliases for the receiver guard kinds that have a kind-specific
-// constructor (audio validates a concrete layout; metadata wraps its own ref).
-// Video and the FrameSync families name `Guard<'_, Strategy>` directly.
-/// RAII guard for a captured audio frame.
-///
-/// Automatically calls `NDIlib_recv_free_audio_v3` when dropped.
-pub type RecvAudioGuard<'rx> = Guard<'rx, AudioKind>;
-
-/// RAII guard for a captured metadata frame.
-///
-/// Automatically calls `NDIlib_recv_free_metadata` when dropped.
+/// Receiver metadata guard accepted by the kind-specific
+/// `MetadataFrameRef::new` constructor. It calls `NDIlib_recv_free_metadata`
+/// when dropped.
 pub type RecvMetadataGuard<'rx> = Guard<'rx, MetadataKind>;
 
 #[cfg(test)]

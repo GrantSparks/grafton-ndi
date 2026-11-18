@@ -241,8 +241,8 @@ fn retained_video_output_does_not_advance_received_counter() {
         },
         "video was not received",
     );
-    // Let in-flight input drain. Output may be retained or absent depending
-    // on the runtime; either way, capture availability is not input progress.
+    // Let in-flight input drain so retained output can be observed without
+    // any advance in reception.
     let mut previous = framesync
         .receiver()
         .connection_stats()
@@ -284,14 +284,8 @@ fn retained_video_output_does_not_advance_received_counter() {
         .video_frames_received();
     eprintln!("retained video output: first={first}, second={second}, received={before}");
     assert_eq!(before, after);
-    if ndi
-        .info()
-        .version()
-        .is_some_and(|version| version.to_string() == "6.4.0.2")
-    {
-        assert!(
-            first && second,
-            "6.4.0.2 retained output after input stopped"
-        );
-    }
+    assert!(
+        first && second,
+        "FrameSync did not retain video after input stopped"
+    );
 }

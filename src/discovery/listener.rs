@@ -14,7 +14,9 @@ use std::{
     borrow::Cow,
     collections::BTreeSet,
     ffi::{c_char, CStr, CString},
-    fmt, ptr,
+    fmt,
+    num::NonZeroU16,
+    ptr,
     time::Duration,
 };
 
@@ -168,11 +170,11 @@ impl ListenerOptions {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Connect to this endpoint: a host name or IP address, optionally followed
-    /// by a colon and a port (5959 when omitted).
+    /// Use one non-empty endpoint in place of the NDI configuration: a host name
+    /// or IP address, optionally followed by a colon and a port (5959 when
+    /// omitted). Use [`Self::clear_server`] to inherit the configuration.
     ///
-    /// One endpoint only: the listener constructors refuse a comma-separated
-    /// list, of which a listener would use only the first entry.
+    /// The listener constructors refuse a comma-separated list of endpoints.
     #[must_use]
     pub fn server(mut self, server: impl Into<String>) -> Self {
         self.server = Some(server.into());
@@ -365,7 +367,7 @@ pub struct AdvertisedSender {
     name: Option<SourceText>,
     metadata: Option<String>,
     address: Option<SourceText>,
-    port: Option<u16>,
+    port: Option<NonZeroU16>,
     groups: Vec<String>,
     subscribed: bool,
 }
@@ -386,9 +388,9 @@ impl AdvertisedSender {
     pub fn address(&self) -> Option<&str> {
         self.address.as_ref().map(SourceText::as_str)
     }
-    /// The sender's network port, or `None` when the advertised value is not a
-    /// port number.
-    pub fn port(&self) -> Option<u16> {
+    /// The sender's non-zero network port, or `None` when the advertised value
+    /// is outside the range 1–65535.
+    pub fn port(&self) -> Option<NonZeroU16> {
         self.port
     }
     /// The discovery groups the sender belongs to.
@@ -398,15 +400,16 @@ impl AdvertisedSender {
     /// Convert this advertised sender into a connection target.
     ///
     /// Returns `None` when the server supplied no source name. An address is
-    /// included only when both the address and a valid port were advertised.
-    /// IPv6 literals are enclosed in brackets before their port is appended.
+    /// included when the advertised host is an IP address or host name and the
+    /// advertised port is non-zero. IPv6 literals are enclosed in brackets.
+    /// Otherwise the receiver can look up the source by name.
     pub fn to_source(&self) -> Option<crate::Source> {
-        let mut source = crate::Source::from_text(self.name.as_ref()?.clone(), None);
-        if let (Some(address), Some(port)) = (&self.address, self.port) {
-            let endpoint = address.with_port(port);
-            source = source.with_address(crate::SourceAddress::from_text(endpoint));
-        }
-        Some(source)
+        let name = self.name.as_ref()?.clone();
+        let address = self
+            .address()
+            .zip(self.port)
+            .and_then(|(host, port)| crate::SourceAddress::from_advertised_host(host, port));
+        Some(crate::Source::from_text(name, address))
     }
 
     /// Whether this listener is subscribed to the sender's events.
@@ -563,11 +566,11 @@ struct Listener<A: ListenerApi>(ServerObject<A, BTreeSet<A::Id>>);
 // its own listener unsubscribes or is destroyed; no pre-destroy calls are needed.
 unsafe impl<A: ListenerApi> Retained<A> for BTreeSet<A::Id> {}
 
-const _: () = {
+const_assert!({
     const fn assert_send<T: Send>() {}
     assert_send::<Listener<sys::SenderDiscovery>>();
     assert_send::<Listener<sys::ReceiverDiscovery>>();
-};
+});
 
 impl<A: ListenerApi> Listener<A>
 where
@@ -724,11 +727,11 @@ pub struct RecvListener {
     inner: Listener<sys::ReceiverDiscovery>,
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send<T: Send>() {}
     assert_send::<SendListener>();
     assert_send::<RecvListener>();
-};
+});
 
 impl fmt::Debug for SendListener {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -841,8 +844,8 @@ impl SendListener {
     /// cannot provide [sender discovery], which needs NDI 6.4.0 or later, or the
     /// options carry an Advanced configuration that the runtime or this build
     /// cannot take; [`Error::InvalidCString`] when the endpoint contains a NUL
-    /// byte; and [`Error::InvalidInput`] when the options name more than one
-    /// endpoint, or the SDK creates no listener. Without an explicit server the
+    /// byte; and [`Error::InvalidInput`] when the endpoint is empty, the options
+    /// name multiple endpoints, or the SDK creates no listener. Without an explicit server the
     /// SDK uses its configuration; creation fails when it names no server or
     /// one the SDK cannot use. An explicit address the SDK cannot parse is also
     /// refused.
@@ -884,7 +887,7 @@ impl SendListener {
                     name: budget.source_text(sender.p_name)?,
                     metadata: budget.text(sender.p_metadata)?,
                     address: budget.source_text(sender.p_address)?,
-                    port: u16::try_from(sender.port).ok(),
+                    port: advertised_port(sender.port),
                     groups,
                     subscribed: sender.events_subscribed,
                 })
@@ -892,6 +895,10 @@ impl SendListener {
         })
     }
 }
+fn advertised_port(port: std::ffi::c_int) -> Option<NonZeroU16> {
+    u16::try_from(port).ok().and_then(NonZeroU16::new)
+}
+
 impl RecvListener {
     /// Create a listener for the Discovery Server `options` name.
     ///
@@ -904,8 +911,8 @@ impl RecvListener {
     /// cannot provide [receiver discovery], which needs NDI 6.4.0 or later, or the
     /// options carry an Advanced configuration that the runtime or this build
     /// cannot take; [`Error::InvalidCString`] when the endpoint contains a NUL
-    /// byte; and [`Error::InvalidInput`] when the options name more than one
-    /// endpoint, or the SDK creates no listener. Without an explicit server the
+    /// byte; and [`Error::InvalidInput`] when the endpoint is empty, the options
+    /// name multiple endpoints, or the SDK creates no listener. Without an explicit server the
     /// SDK uses its configuration; creation fails when it names no server or
     /// one the SDK cannot use. An explicit address the SDK cannot parse is also
     /// refused.
@@ -1039,7 +1046,7 @@ mod tests {
             name: Some(SourceText::new("Studio (Camera)".into()).unwrap()),
             metadata: None,
             address: Some(SourceText::new("192.0.2.10".into()).unwrap()),
-            port: Some(5960),
+            port: NonZeroU16::new(5960),
             groups: vec![],
             subscribed: false,
         };
@@ -1057,10 +1064,26 @@ mod tests {
             let actual = source.address().unwrap();
             assert_eq!(actual.as_str(), endpoint);
             assert_eq!(actual.port(), Some(5960));
+            assert!(source.host().is_some());
         }
-        sender.port = None;
-        assert!(sender.to_source().unwrap().address().is_none());
-        sender.port = Some(5960);
+        for port in [0, -1, 65_536] {
+            sender.port = advertised_port(port);
+            assert!(sender.port().is_none());
+            assert!(sender.to_source().unwrap().address().is_none());
+        }
+        sender.port = advertised_port(5960);
+        for address in [
+            "",
+            "fe80::1%eth0",
+            "bad\u{fffd}.local",
+            "192.0.2.10:1234",
+            "Camera Desk",
+        ] {
+            sender.address = Some(SourceText::new(address.into()).unwrap());
+            let source = sender.to_source().unwrap();
+            assert_eq!(source.name(), "Studio (Camera)");
+            assert!(source.address().is_none(), "{address}");
+        }
         sender.address = None;
         assert!(sender.to_source().unwrap().address().is_none());
         sender.name = None;

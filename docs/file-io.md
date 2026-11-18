@@ -10,34 +10,15 @@ grafton-ndi = { version = "3.0", features = ["file-io"] }
 
 ## Requirements
 
-The File API uses a separate native library. See [setup](setup.md#sdk-editions)
-for runtime selection and [platform support](setup.md#platforms) for supported
-targets. On Linux, macOS and Android the wrapper requires an Advanced runtime
-for File operations; the `advanced` Cargo feature is not required. The File ABI
-is included, so enabling `file-io` alone does not generate bindings.
+The File API uses a separate native library. See its
+[supported targets](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/index.html#supported-targets)
+and [select the runtime edition](setup.md#sdk-editions) for your platform. The
+File ABI is included, so enabling `file-io` alone does not generate bindings.
 
-Open it with `FileApi::new(&ndi, &FileApiOptions::default())`. On targets
-that load libraries dynamically, discovery tries the selected runtime's
-directory, the executable's directory and an absolute `NDI_RUNTIME_DIR_V6`.
-Windows then expands absolute `PATH` entries and tries a System32-only name
-lookup. macOS tries `@rpath/<name>` and absolute `DYLD_LIBRARY_PATH` entries.
-Linux and Android retain their native loader search (`rpath`,
-`LD_LIBRARY_PATH` and system locations). Windows and macOS never add the
-working directory to this search. Relative or empty environment directory
-entries on Windows/macOS, and a relative `NDI_RUNTIME_DIR_V6` on any platform,
-are recorded as refused and never opened. On macOS, any relative or empty
-entry in either `DYLD_LIBRARY_PATH` or `DYLD_FALLBACK_LIBRARY_PATH` refuses
-the entire default search before opening a library. The check reads the process
-environment at search time; dyld uses its launch-time values, so changing
-`DYLD_*` after launch is unsupported.
-Explicit paths retain dyld's own policy. In unrestricted macOS processes,
-dyld can substitute `DYLD_LIBRARY_PATH` even for an absolute path; the crate
-refuses a substitute with `LoadRefusal::ResolvedToAnotherFile`. Native
-dependencies still follow platform loader rules.
-`FileApiOptions::library_path` selects one absolute file without
-fallback. A successful selection lasts for the process; a later conflicting
-selection returns `RuntimeConflict`. Use trusted library locations, including
-their dependencies, as described in [runtime selection](setup.md#selecting-a-runtime).
+Open it with `FileApi::new(&ndi, &FileApiOptions::default())`. Use
+`FileApiOptions::library_path` to select an existing absolute file. See
+[where the File library is loaded from](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/index.html#where-the-file-library-is-loaded-from)
+for the companion search and its trust policy.
 
 ### What the selected library provides
 
@@ -120,59 +101,26 @@ request still needs events and the final report to establish its outcome.
 
 ### Finishing a recording
 
-Call `finish(timeout)` and inspect both its status and `RecordingReport`:
+Call `finish(timeout)` to request the stop. It returns
+`FinishStatus::Ended(end)` when the session ends, or `FinishStatus::TimedOut(report)`
+when the completion budget expires. Use `wait_for_finish(timeout)` to continue
+observing the session. It returns `Some(SessionEnd)` when the session ends or
+`None` when the deadline expires. After `None`, inspect `recorder.report()` for
+the current snapshot.
 
-| Status | Action |
+| Session outcome | Action |
 | --- | --- |
-| `Closed` | The SDK reported every opened file finalized. Check errors, write failures, empty files and `stopped_by_sdk` for an early end. |
-| `TimedOut` | Use `wait_for_finish` to continue waiting. |
-| `Indeterminate` | Closure could not be established from the events; waiting longer does not repair the report. `empty_files` is a lower bound counting files confirmed empty under complete tracking. Reset before restarting when file tracking is incomplete. |
+| `SessionEnd::Closed(report)` | The SDK reported every opened file finalized. Check errors, write failures, empty files and `stopped_by_sdk` for an early end. |
+| `SessionEnd::Indeterminate(report)` | Inspect the report for evidence about the session and check whether restart requires a reset. |
 
-`finish(timeout)` requests the stop and reports that bounded completion attempt,
-including `FinishStatus::TimedOut(report)`. A later
-`wait_for_finish(timeout) -> Result<Option<FinishStatus>>` only waits: `None`
-means its deadline expired, while `Some(Closed(report))` or
-`Some(Indeterminate(report))` carries a final outcome. It never returns
-`Some(TimedOut(...))`. After `None`, inspect `recorder.report()` for the current
-session snapshot and keep waiting or choose recovery.
+See [`RecordingReport::closure_confirmed`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.RecordingReport.html#method.closure_confirmed)
+for the closure rule, including sessions that report no file. Drop and async
+close follow [`FileRecorderOptions::drop_wait`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorderOptions.html#method.drop_wait).
+Recovery after event loss or a tracking limit follows
+[`StateConflict::IncompleteFileTracking`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/enum.StateConflict.html#variant.IncompleteFileTracking).
 
-The timeout of synchronous `FileRecorder::finish` bounds the event wait, not
-the native stop call. `AsyncFileRecorder::finish` measures its timeout from
-submission, so the budget includes time queued behind other commands and the
-native stop; events already queued when it expires are still taken. Native event
-loss, unreadable lifecycle evidence or exhaustion of file bookkeeping makes
-tracking incomplete. A final indeterminate report stays unchanged as later
-events arrive. Even if every known file closes and the SDK stops recording,
-unknown files can still need finalization. After the session ends, another
-`start` returns `IncompleteFileTracking` until `reset` succeeds. A failed reset
-keeps the original recorder and its cleanup obligation. `reset` replaces the native
-recorder and returns the old session's report; `abandon` destroys it without
-waiting. Async callers await `AsyncFileRecorder::abandon()` for the same
-immediate teardown and last session report. It bypasses a full command queue
-and ends an existing close's cleanup wait. Either recovery can leave an
-unfinished file.
-
-An indeterminate report alone does not imply incomplete tracking. See
-[`RecordingReport::closure_confirmed`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.RecordingReport.html#method.closure_confirmed)
-for the closure rule, including sessions that report no file. The reset
-requirement applies when file tracking became incomplete.
-
-Drop requests a stop and waits for closure events within one `drop_wait`
-budget (five seconds by default), including cleanup after an indeterminate
-outcome, but cannot report the outcome. The budget starts at
-drop, or an async close's submission, and includes the native stop. The stop
-can itself outlast the budget; after it returns, only the remaining time is
-available for closure events. Synchronous `FileRecorder::finish` instead
-measures its event wait from the stop's return, giving closure its full
-requested wait. Complete tracking allows cleanup to end early once all files
-close; while a file remains open, a new start returns `PreviousSessionOpen`.
-Incomplete tracking consumes the remaining original cleanup budget even after
-every known file closes. Once the session ends, a new start returns
-`IncompleteFileTracking` until `reset` succeeds. Use
-`abandon` for immediate teardown without the cleanup wait.
-Use explicit finishing when the result matters. See
-[`FileRecorder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorder.html)
-for state transitions, error conditions and recovery.
+Use `reset` to replace a recorder and continue recording, or `abandon` for
+immediate teardown. Either can leave unfinished files.
 
 File bookkeeping has private ceilings of 16,384 entries and 16 MiB, including
 entry-storage capacity and retained path capacity. Crossing either ceiling or
@@ -182,15 +130,11 @@ delivered and native dropped-event counters keep their SDK values. These limits
 apply independently of the async application-notification queue.
 
 If another async clone calls `close` while a submitted `finish` or
-`wait_for_finish` is queued or running,
-the wait uses the earlier of its own deadline and `drop_wait` measured from
-the close's submission, including the native stop. A settled session reports `Closed` or `Indeterminate`
-(wrapped in `Some` for `wait_for_finish`); an unsettled one returns
-`InvalidState(Closed)` if that budget ends first. Neither `TimedOut` from
-`finish` nor `None` from `wait_for_finish` would be appropriate for a handle
-that cannot be waited on again. Destruction
-uses only the remainder of the close's budget after an earlier finish deadline;
-the finish never shortens the time available to close.
+`wait_for_finish` is queued or running, the wait also uses the close's
+[cleanup deadline](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorderOptions.html#method.drop_wait).
+A settled session returns its `SessionEnd` through `FinishStatus::Ended` or
+`Some`, respectively. An unsettled session returns `InvalidState(Closed)` if
+the close's budget ends first.
 
 ## Limits of the NDI 6.4 File library
 
@@ -243,15 +187,15 @@ stop requests use their separate command budget; close and abandon bypass both
 budgets. Closed/failed owners and invalid timeouts retain their precedence over
 capacity errors; when both budgets are full, `FileCommands` takes precedence.
 
-Async `wait_for_finish` returns `FileOperation<Option<FinishStatus>>`, with the
+Async `wait_for_finish` returns `FileOperation<Option<SessionEnd>>`, with the
 same `None`/`Some` distinction. After an expired wait, await
 `recorder.report()` to inspect the current report. Async `finish` retains
 `FileOperation<FinishStatus>` and its `TimedOut(report)` outcome.
 
 Await `finish`, inspect its report, then await `close` to shut down all clones
 without blocking the executor. **Dropping the last clone blocks** until its
-worker exits. Its `drop_wait` budget includes the native stop, which can
-itself outlast that budget; native destruction can also take longer.
+worker exits. The recorder follows the [cleanup budget](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorderOptions.html#method.drop_wait)
+during shutdown.
 While a submitted close or abandon has a live future, dropping the last clone does not
 wait because that future reports completion. Dropping the close future restores
 the blocking last-drop guarantee.

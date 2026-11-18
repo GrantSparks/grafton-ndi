@@ -15,7 +15,7 @@ use super::{
     reserved_map::ReservedMap,
     send::PendingVideo,
     send_slots::{DescriptorLease, Released, SlotKey},
-    CompressedVideoFrame, QueueAttached, ScatterVideoFrame, SubmittedVideo,
+    CompressedFrame, QueueAttached, ScatterFrame, SubmittedVideo, VideoPacketFormat,
 };
 #[cfg(test)]
 use crate::sys::advanced::ScatterSend;
@@ -129,9 +129,9 @@ pub enum QueuedVideoFrame {
     /// An uncompressed frame.
     Pixels(VideoFrame),
     /// A compressed frame.
-    Compressed(CompressedVideoFrame),
+    Compressed(CompressedFrame<VideoPacketFormat>),
     /// A compressed frame held in separate owned blocks.
-    Scatter(ScatterVideoFrame),
+    Scatter(ScatterFrame<VideoPacketFormat>),
 }
 
 impl From<VideoFrame> for QueuedVideoFrame {
@@ -140,14 +140,14 @@ impl From<VideoFrame> for QueuedVideoFrame {
     }
 }
 
-impl From<CompressedVideoFrame> for QueuedVideoFrame {
-    fn from(v: CompressedVideoFrame) -> Self {
+impl From<CompressedFrame<VideoPacketFormat>> for QueuedVideoFrame {
+    fn from(v: CompressedFrame<VideoPacketFormat>) -> Self {
         Self::Compressed(v)
     }
 }
 
-impl From<ScatterVideoFrame> for QueuedVideoFrame {
-    fn from(frame: ScatterVideoFrame) -> Self {
+impl From<ScatterFrame<VideoPacketFormat>> for QueuedVideoFrame {
+    fn from(frame: ScatterFrame<VideoPacketFormat>) -> Self {
         Self::Scatter(frame)
     }
 }
@@ -167,7 +167,7 @@ impl QueuedVideoFrame {
         sender: &Sender<QueueAttached>,
     ) -> std::result::Result<QueuedStorage, Rejected<Self>> {
         self.authorize_with(
-            |frame| sender.require_video_layout(frame),
+            |frame| Sendable::new(frame, sender.runtime()),
             |frame| ScatterSendable::checked(frame, sender.runtime()),
         )
     }
@@ -178,10 +178,10 @@ impl QueuedVideoFrame {
             VideoFrame,
         ) -> std::result::Result<Sendable<VideoFrame>, Rejected<VideoFrame>>,
         scatter: impl FnOnce(
-            ScatterVideoFrame,
+            ScatterFrame<VideoPacketFormat>,
         ) -> std::result::Result<
-            ScatterSendable<ScatterVideoFrame>,
-            (Error, ScatterVideoFrame),
+            ScatterSendable<ScatterFrame<VideoPacketFormat>>,
+            (Error, ScatterFrame<VideoPacketFormat>),
         >,
     ) -> std::result::Result<QueuedStorage, Rejected<Self>> {
         match self {
@@ -316,17 +316,17 @@ pub(super) struct Completion {
     _private: (),
 }
 
-const _: () = assert!(std::mem::size_of::<Completion>() == 0);
+const_assert!(std::mem::size_of::<Completion>() == 0);
 
 struct ReadyEntry {
     entry: Entry,
     completion: Completion,
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Entry>();
-};
+});
 
 pub(crate) struct Admitted {
     pub(crate) id: SubmissionId,
@@ -389,7 +389,7 @@ impl State {
                 frame.into_frame(),
             ));
         };
-        debug_assert!(self.free.len() + self.retained() <= self.options.frames);
+        debug_invariant!(self.free.len() + self.retained() <= self.options.frames);
         let Some(slot_key) = self.free.pop() else {
             return Err(Rejected::new(
                 Error::QueueFull(QueueLimit::Frames),
@@ -725,14 +725,15 @@ impl Loans for AliasableBox<CallbackState> {
 // `NDIlib_send_destroy` call every outstanding completion before it returns;
 // it puts no thread requirement on the sender or on its completion
 // registration. The lent sender is the crate's ordinary `Send + Sync` native
-// sender, all state the callback shares is behind `CallbackState`'s mutex
-// and atomic, and every operation that changes the queue takes `&mut self`.
+// sender. CallbackState keeps an immutable byte limit and shares mutable
+// state through one mutex and its condition variable. Application operations
+// that change the queue take `&mut self`.
 // The runtime test `a_queued_sender_moves_between_threads` sends, completes,
 // reads and drops one on threads other than the one that created it.
-const _: () = {
+const_assert!({
     const fn send_and_sync<T: Send + Sync>() {}
     send_and_sync::<QueuedSender>();
-};
+});
 
 impl QueuedSender {
     /// Create a sender, with the options' Advanced SDK
@@ -817,7 +818,7 @@ impl QueuedSender {
         // keeps it until after the sender has been destroyed.
         unsafe {
             register(
-                sender.native_instance(),
+                sender.handle().instance(),
                 state.cast_mut().cast(),
                 Some(completion),
             )
@@ -1039,10 +1040,10 @@ mod tests {
             let format = VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap();
             [
                 QueuedVideoFrame::Compressed(
-                    CompressedVideoFrame::new(format, bytes.clone()).unwrap(),
+                    CompressedFrame::<VideoPacketFormat>::new(format, bytes.clone()).unwrap(),
                 ),
                 QueuedVideoFrame::Scatter(
-                    ScatterVideoFrame::new(
+                    ScatterFrame::<VideoPacketFormat>::new(
                         format,
                         vec![bytes[..44].to_vec(), bytes[44..].to_vec()],
                     )
@@ -1067,7 +1068,9 @@ mod tests {
         let format =
             super::super::VideoPacketFormat::new(super::super::VideoCodec::SpeedHq422, 16, 16)
                 .unwrap();
-        let frame = ScatterVideoFrame::new(format, vec![vec![1, 2, 3, 4], vec![5, 6]]).unwrap();
+        let frame =
+            ScatterFrame::<VideoPacketFormat>::new(format, vec![vec![1, 2, 3, 4], vec![5, 6]])
+                .unwrap();
         let blocks: Vec<_> = frame.blocks().map(|block| block.as_ptr()).collect();
         let rejected = QueuedVideoFrame::Scatter(frame)
             .authorize_with(
@@ -1273,10 +1276,14 @@ mod tests {
                     VideoFrame::builder().resolution(16, 16).build().unwrap(),
                 ),
                 1 => QueuedVideoFrame::Compressed(
-                    CompressedVideoFrame::new(packet, vec![1, 2, 3, 4]).unwrap(),
+                    CompressedFrame::<VideoPacketFormat>::new(packet, vec![1, 2, 3, 4]).unwrap(),
                 ),
                 _ => QueuedVideoFrame::Scatter(
-                    ScatterVideoFrame::new(packet, vec![vec![1, 2, 3, 4], vec![5, 6]]).unwrap(),
+                    ScatterFrame::<VideoPacketFormat>::new(
+                        packet,
+                        vec![vec![1, 2, 3, 4], vec![5, 6]],
+                    )
+                    .unwrap(),
                 ),
             };
             for limit in [QueueLimit::Frames, QueueLimit::Bytes] {
@@ -1440,10 +1447,11 @@ mod tests {
         for frame in [
             QueuedVideoFrame::Pixels(VideoFrame::builder().resolution(16, 16).build().unwrap()),
             QueuedVideoFrame::Compressed(
-                CompressedVideoFrame::new(format, vec![1, 2, 3, 4]).unwrap(),
+                CompressedFrame::<VideoPacketFormat>::new(format, vec![1, 2, 3, 4]).unwrap(),
             ),
             QueuedVideoFrame::Scatter(
-                ScatterVideoFrame::new(format, vec![vec![1, 2, 3, 4], vec![5, 6]]).unwrap(),
+                ScatterFrame::<VideoPacketFormat>::new(format, vec![vec![1, 2, 3, 4], vec![5, 6]])
+                    .unwrap(),
             ),
         ] {
             let expected = match &frame {

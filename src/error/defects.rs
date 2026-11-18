@@ -1,6 +1,7 @@
 //! Allocation-free causes and the rare diagnostic payloads errors retain.
 use crate::frames::{MAX_AUDIO_BYTES, MAX_METADATA_BYTES, MAX_VIDEO_BYTES};
-use crate::{ColorInfo, FrameMetadataStatus, PixelFormat, TransferFunction};
+use crate::media::MAX_ALLOCATION_BYTES;
+use crate::{ColorInfo, ColorPrimaries, FrameMetadataStatus, PixelFormat, TransferFunction};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -44,6 +45,18 @@ pub enum ImageCodecKind {
     /// WebP.
     #[error("WebP")]
     Webp,
+}
+
+/// A numerical codec setting checked by the image encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[non_exhaustive]
+pub enum ImageSettingKind {
+    /// JPEG or lossy WebP quality.
+    #[error("quality")]
+    Quality,
+    /// Lossy WebP encoding effort.
+    #[error("effort")]
+    Effort,
 }
 
 /// The rejected native Discovery Server address, retained only for diagnostics.
@@ -568,8 +581,8 @@ pub enum InputDefect {
     /// Allocator limits must be positive.
     #[error("Allocator limits must be positive")]
     AllocatorPositiveLimits,
-    /// max_allocation_bytes exceeds 256 MiB.
-    #[error("max_allocation_bytes exceeds 256 MiB")]
+    /// The allocation limit exceeds the maximum supported receive allocation.
+    #[error("max_allocation_bytes exceeds {MAX_ALLOCATION_BYTES} bytes")]
     AllocatorAllocationLimit,
     /// max_concurrent_calls exceeds max_allocations, which counts every call in progress.
     #[error("max_concurrent_calls exceeds max_allocations, which counts every call in progress")]
@@ -629,7 +642,7 @@ pub enum InputDefect {
         requested: DiagnosticDuration,
     },
     /// receive delay {requested:?} exceeds 2000 ms.
-    #[error("receive delay {requested:?} exceeds 2000 ms")]
+    #[error("receive delay {requested:?} exceeds {} ms", crate::ReceiveDelay::MAX.to_sdk())]
     ReceiveDelayTooLong {
         /// The requested.
         requested: DiagnosticDuration,
@@ -714,23 +727,19 @@ pub enum InputDefect {
         /// The limit.
         limit: usize,
     },
-    /// {codec} quality must be in {minimum}..={maximum}, got {quality}.
-    #[error("{codec} quality must be in {minimum}..={maximum}, got {quality}")]
-    ImageQuality {
+    /// A codec setting falls outside its supported range.
+    #[error("{codec} {setting} must be in {minimum}..={maximum}, got {value}")]
+    ImageSetting {
         /// The codec.
         codec: ImageCodecKind,
-        /// The quality.
-        quality: u8,
+        /// The setting.
+        setting: ImageSettingKind,
+        /// The requested value.
+        value: u8,
         /// The minimum.
         minimum: u8,
         /// The maximum.
         maximum: u8,
-    },
-    /// WebP effort must be in 0..=6, got {effort}.
-    #[error("WebP effort must be in 0..=6, got {effort}")]
-    WebpEffort {
-        /// The effort.
-        effort: u8,
     },
     /// {codec} images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png.
     #[error("{codec} images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png")]
@@ -738,13 +747,19 @@ pub enum InputDefect {
         /// The codec.
         codec: ImageCodecKind,
     },
-    /// {codec} cannot say that its values are {transfer} code values; HdrPolicy::CodeValues needs ImageFormat::Png.
-    #[error("{codec} cannot say that its values are {transfer} code values; HdrPolicy::CodeValues needs ImageFormat::Png")]
-    HdrNeedsPng {
+    /// The image needs a color tag and only PNG can write it.
+    #[error(
+        "{codec} cannot carry the required color tag for {} primaries and {} transfer. Use ImageFormat::Png",
+        primaries.map_or("unspecified", ColorPrimaries::name),
+        transfer.map_or("SDR", TransferFunction::name)
+    )]
+    ColorTagNeedsPng {
         /// The codec.
         codec: ImageCodecKind,
-        /// The transfer.
-        transfer: TransferFunction,
+        /// The frame's primaries, if known.
+        primaries: Option<ColorPrimaries>,
+        /// The frame's transfer, if given.
+        transfer: Option<TransferFunction>,
     },
     /// recording file path may reach {longest_bytes} UTF-8 bytes, exceeding the {maximum_bytes}-byte event path limit ({index_digits_reserved} digits reserved for index growth).
     #[error("recording file path may reach {longest_bytes} UTF-8 bytes, exceeding the {maximum_bytes}-byte event path limit ({index_digits_reserved} digits reserved for index growth)")]

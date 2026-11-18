@@ -4,6 +4,7 @@ use super::{
     mock::{self, Closing, FILE_CLOSED, ROLLOVER, TAKE},
     *,
 };
+use crate::test_support::FixtureDir;
 use crate::{sys, timeout::Deadline, MediaTypes};
 use std::{
     cell::Cell,
@@ -48,7 +49,7 @@ fn an_active_or_stopping_session_refuses_start_until_its_known_file_closes() {
     device.close();
     assert!(matches!(
         recorder.finish(Duration::ZERO).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -70,7 +71,7 @@ fn generated_session_timecodes_reach_the_native_start_unchanged() {
         assert_eq!(device.starts.load(Ordering::Acquire), 1);
         assert!(matches!(
             recorder.finish(Duration::ZERO).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
     }
 }
@@ -129,7 +130,7 @@ fn a_timeout_keeps_the_recorder_and_a_later_close_completes_without_a_second_sto
     device.push(FILE_CLOSED, TAKE);
     assert!(matches!(
         recorder.wait_for_finish(Duration::from_secs(1)).unwrap(),
-        Some(FinishStatus::Closed(_))
+        Some(SessionEnd::Closed(_))
     ));
     assert_eq!(recorder.request_stop(), StopRequest::AlreadyClosed);
     drop(recorder);
@@ -141,7 +142,9 @@ fn a_timeout_keeps_the_recorder_and_a_later_close_completes_without_a_second_sto
 fn finish_waits_for_a_close_that_follows_the_stop() {
     let device = mock::Recorder::new(Closing::After(Duration::from_millis(100)));
     let mut recorder = recording_on(&device);
-    let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(5)).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) =
+        recorder.finish(Duration::from_secs(5)).unwrap()
+    else {
         panic!("the close arrived within the wait");
     };
     assert!(report.closure_confirmed());
@@ -161,7 +164,7 @@ fn a_rollover_requested_just_before_the_stop_does_not_hold_the_session_open() {
     recorder.rollover(&target("second")).unwrap();
     let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
     assert!(
-        matches!(outcome, FinishStatus::Closed(_)),
+        matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
         "the session never reached a final state: {outcome:?}"
     );
 }
@@ -175,7 +178,7 @@ fn a_source_switch_just_before_the_stop_does_not_hold_the_session_open() {
         .unwrap();
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -195,7 +198,7 @@ fn a_completed_rollover_is_followed_in_the_order_the_sdk_reports_it() {
     );
     recorder.request_stop();
     device.push(FILE_CLOSED, "second.mkv");
-    let Some(FinishStatus::Closed(report)) =
+    let Some(SessionEnd::Closed(report)) =
         recorder.wait_for_finish(Duration::from_secs(1)).unwrap()
     else {
         panic!("both files were reported closed");
@@ -244,7 +247,7 @@ fn resetting_an_unconfirmed_session_preserves_its_report_and_isolates_late_event
     assert_eq!(recorder.report().closed_files(), 0);
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     drop(recorder);
     assert_eq!(replacement.destroys.load(Ordering::Acquire), 1);
@@ -270,7 +273,7 @@ fn a_failed_reset_keeps_the_old_recorder_and_its_finalization_pending() {
     old.push(FILE_CLOSED, TAKE);
     assert!(matches!(
         recorder.wait_for_finish(Duration::from_secs(1)).unwrap(),
-        Some(FinishStatus::Closed(_))
+        Some(SessionEnd::Closed(_))
     ));
 }
 
@@ -295,7 +298,9 @@ fn an_indeterminate_report_counts_only_files_confirmed_empty_before_loss() {
         }
         device.push(ROLLOVER, "hidden.mkv");
         device.push(FILE_CLOSED, "hidden.mkv");
-        let FinishStatus::Indeterminate(report) = recorder.finish(Duration::ZERO).unwrap() else {
+        let FinishStatus::Ended(SessionEnd::Indeterminate(report)) =
+            recorder.finish(Duration::ZERO).unwrap()
+        else {
             panic!("lost file evidence prevents confirmed closure");
         };
         assert_eq!(report.empty_files(), u64::from(empty_before_loss));
@@ -312,13 +317,12 @@ fn lost_sdk_events_end_the_session_as_indeterminate() {
     device.dropped_events.store(1, Ordering::Release);
     let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
     assert!(
-        matches!(outcome, FinishStatus::Indeterminate(_)),
+        matches!(outcome, FinishStatus::Ended(SessionEnd::Indeterminate(_))),
         "{outcome:?}"
     );
     assert!(!recorder.report().closure_confirmed());
     assert_eq!(recorder.report().dropped_events(), 1);
-    let Some(FinishStatus::Indeterminate(report)) =
-        recorder.wait_for_finish(Duration::ZERO).unwrap()
+    let Some(SessionEnd::Indeterminate(report)) = recorder.wait_for_finish(Duration::ZERO).unwrap()
     else {
         panic!("a settled session must remain an indeterminate outcome");
     };
@@ -348,7 +352,7 @@ fn lost_sdk_events_end_the_session_as_indeterminate() {
         .unwrap();
     assert!(matches!(
         recorder.finish(Duration::ZERO).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     drop(recorder);
     assert_eq!(replacement.stops.load(Ordering::Acquire), 1);
@@ -370,7 +374,9 @@ fn recording_with_a_lost_open(
     );
     device.dropped_events.store(1, Ordering::Release);
     device.push(FILE_CLOSED, TAKE);
-    let FinishStatus::Indeterminate(report) = recorder.finish(Duration::ZERO).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Indeterminate(report)) =
+        recorder.finish(Duration::ZERO).unwrap()
+    else {
         panic!("the lost open event prevents confirmation of closure");
     };
     assert_eq!(report.closed_files(), 1);
@@ -535,7 +541,7 @@ fn complete_tracking_needs_no_cleanup_after_every_file_is_confirmed_closed() {
     let mut recorder = recording_on(&device);
     assert!(matches!(
         recorder.finish(Duration::ZERO).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     device.push(mock::OPEN_FAILED, "outside-the-session.mkv");
     let captures = device.captures.load(Ordering::Acquire);
@@ -552,7 +558,7 @@ fn evidence_lost_during_the_stale_event_drain_refuses_the_next_native_start() {
         let mut recorder = recording_on(&device);
         assert!(matches!(
             recorder.finish(Duration::ZERO).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
         let report = recorder.report();
         match evidence {
@@ -575,7 +581,7 @@ fn evidence_lost_during_the_stale_event_drain_refuses_the_next_native_start() {
         assert_eq!(recorder.report(), report, "final reports stay immutable");
         assert_eq!(
             recorder.finish(Duration::ZERO).unwrap(),
-            FinishStatus::Closed(report.clone())
+            FinishStatus::Ended(SessionEnd::Closed(report.clone()))
         );
         assert!(matches!(
             recorder.start(&target("restart-after-finish"), RecordingTimecode::Preserve),
@@ -604,7 +610,7 @@ fn evidence_lost_during_the_stale_event_drain_refuses_the_next_native_start() {
         );
         assert!(matches!(
             recorder.finish(Duration::ZERO).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
         drop(recorder);
         assert_eq!(replacement.stops.load(Ordering::Acquire), 1);
@@ -637,7 +643,7 @@ fn a_malformed_close_event_still_closes_the_session() {
     );
     assert!(matches!(
         recorder.wait_for_finish(Duration::from_millis(50)).unwrap(),
-        Some(FinishStatus::Closed(_))
+        Some(SessionEnd::Closed(_))
     ));
 }
 
@@ -685,7 +691,7 @@ fn an_event_larger_than_this_crate_expects_is_rejected_and_taints_the_session() 
     );
     let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
     assert!(
-        matches!(outcome, FinishStatus::Indeterminate(_)),
+        matches!(outcome, FinishStatus::Ended(SessionEnd::Indeterminate(_))),
         "{outcome:?}"
     );
     recorder.abandon();
@@ -708,7 +714,7 @@ fn a_malformed_close_taken_by_finish_still_closes_the_session() {
     // Queued before the wait, so the wait itself takes it.
     device.push_event(malformed(FILE_CLOSED));
     let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the close was taken, malformed or not: {outcome:?}");
     };
     assert!(report.closure_confirmed());
@@ -723,7 +729,7 @@ fn a_malformed_event_during_finish_does_not_end_the_wait_for_the_close() {
     let mut recorder = recording_on(&device);
     device.push_event(malformed(mock::FIRST_FRAME));
     let outcome = recorder.finish(Duration::from_secs(5)).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the wait ended before the close: {outcome:?}");
     };
     // What the malformed event showed was kept: the file had a first frame.
@@ -739,7 +745,7 @@ fn an_unreadable_event_during_finish_makes_the_outcome_indeterminate() {
     device.oversize_next_event.store(true, Ordering::Release);
     let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
     assert!(
-        matches!(outcome, FinishStatus::Indeterminate(_)),
+        matches!(outcome, FinishStatus::Ended(SessionEnd::Indeterminate(_))),
         "{outcome:?}"
     );
     assert!(!recorder.report().closure_confirmed());
@@ -856,7 +862,7 @@ fn a_target_in_a_directory_that_does_not_exist_is_refused_before_the_sdk_sees_it
     assert_eq!(device.rollovers.load(Ordering::Acquire), 1);
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -872,7 +878,7 @@ fn a_file_closed_before_its_first_frame_is_reported_as_empty() {
     assert_eq!(recorder.report().empty_files(), 0);
     recorder.request_stop();
     device.push(FILE_CLOSED, "second.mkv");
-    let Some(FinishStatus::Closed(report)) =
+    let Some(SessionEnd::Closed(report)) =
         recorder.wait_for_finish(Duration::from_secs(1)).unwrap()
     else {
         panic!("both files were reported closed");
@@ -888,7 +894,9 @@ fn a_metadata_only_recording_reports_no_empty_files() {
     let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
         .tracks(MediaTypes::METADATA);
     let mut recorder = recording_with(&device, options);
-    let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(1)).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) =
+        recorder.finish(Duration::from_secs(1)).unwrap()
+    else {
         panic!("the file was reported closed");
     };
     assert_eq!(report.closed_files(), 1);
@@ -952,14 +960,16 @@ fn malformed_player_options_are_refused_before_the_sdk_creates_a_player() {
         Err(Error::InvalidCString(_))
     ));
     assert_eq!(PLAYER_CREATES.get(), 0);
-    drop(
+    assert!(matches!(
         crate::file::FilePlayer::new(
             &api,
             &FilePlayerOptions::new("mock player").groups([] as [&str; 0]),
-        )
-        .unwrap(),
-    );
-    assert_eq!(PLAYER_CREATES.get(), 1);
+        ),
+        Err(Error::InvalidInput(crate::InputDefect::Empty {
+            what: "player groups"
+        }))
+    ));
+    assert_eq!(PLAYER_CREATES.get(), 0);
 }
 
 #[test]
@@ -1065,7 +1075,7 @@ fn finishing_a_session_the_sdk_is_ending_itself_still_tells_it_to_stop() {
     assert_eq!(device.stops.load(Ordering::Acquire), 1);
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     recorder
         .start(&target("second"), RecordingTimecode::Preserve)
@@ -1094,7 +1104,7 @@ fn a_malformed_stale_event_is_consumed_before_the_native_start() {
     assert_eq!(recorder.report().error_events(), 0);
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -1153,7 +1163,7 @@ fn a_refused_start_is_not_counted_in_any_session() {
         .unwrap();
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     refuse_start(&mut recorder);
     let report = recorder.report();
@@ -1170,7 +1180,7 @@ fn the_source_can_be_changed_after_a_session_that_ended_unconfirmed() {
     device.dropped_events.store(1, Ordering::Release);
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Indeterminate(_)
+        FinishStatus::Ended(SessionEnd::Indeterminate(_))
     ));
     // Source selection is still allowed, although another start requires reset.
     recorder
@@ -1189,13 +1199,13 @@ fn waiting_on_a_final_report_preserves_queued_out_of_session_events() {
     let mut recorder = recording_on(&device);
     assert!(matches!(
         recorder.finish(Duration::ZERO).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     device.push(mock::OPEN_FAILED, "later.mkv");
     let before = device.captures.load(Ordering::Acquire);
     assert!(matches!(
         recorder.wait_for_finish(Duration::ZERO).unwrap(),
-        Some(FinishStatus::Closed(_))
+        Some(SessionEnd::Closed(_))
     ));
     assert_eq!(device.captures.load(Ordering::Acquire), before);
     assert_eq!(
@@ -1209,7 +1219,7 @@ fn finishing_without_a_wait_reports_a_close_the_stop_already_queued() {
     let device = mock::Recorder::new(Closing::AtStop);
     let mut recorder = recording_on(&device);
     let outcome = recorder.finish(Duration::ZERO).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the close was queued before the wait began: {outcome:?}");
     };
     assert!(report.closure_confirmed());
@@ -1226,7 +1236,10 @@ fn a_wait_that_ends_during_a_slow_stop_still_takes_the_queued_close() {
     recorder.request_stop();
     assert!(deadline.is_expired());
     let outcome = recorder.wait_until(deadline).unwrap();
-    assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+    assert!(
+        matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
+        "{outcome:?}"
+    );
 }
 
 #[test]
@@ -1239,7 +1252,10 @@ fn finish_starts_its_wait_once_the_stop_has_returned() {
     ));
     let mut recorder = recording_on(&device);
     let outcome = recorder.finish(Duration::from_millis(250)).unwrap();
-    assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+    assert!(
+        matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
+        "{outcome:?}"
+    );
 }
 
 #[test]
@@ -1277,7 +1293,7 @@ fn a_timeout_out_of_range_is_refused_before_the_stop() {
     assert_eq!(recorder.state(), RecorderState::Recording);
     assert!(matches!(
         recorder.finish(crate::MAX_TIMEOUT).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -1322,7 +1338,9 @@ fn a_session_the_sdk_ended_is_reported_as_stopped_by_it() {
     take_events(&mut recorder);
     assert!(!recorder.report().stopped_by_sdk(), "an open session");
     device.end_session_itself();
-    let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(1)).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) =
+        recorder.finish(Duration::from_secs(1)).unwrap()
+    else {
         panic!("the session was closed");
     };
     assert!(report.stopped_by_sdk());
@@ -1331,37 +1349,16 @@ fn a_session_the_sdk_ended_is_reported_as_stopped_by_it() {
     recorder
         .start(&target("third"), RecordingTimecode::Preserve)
         .unwrap();
-    let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(1)).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) =
+        recorder.finish(Duration::from_secs(1)).unwrap()
+    else {
         panic!("the session was closed");
     };
     assert!(!report.stopped_by_sdk());
 }
 
-/// A directory of its own for one test's targets, removed when it ends.
-struct Directory(std::path::PathBuf);
-
-impl Directory {
-    fn new(test: &str) -> Self {
-        let directory = std::env::temp_dir().join(format!(
-            "grafton-ndi-mock-{test}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        Self(directory)
-    }
-
-    fn target(&self, name: &str) -> RecordingTarget {
-        RecordingTarget::new(self.0.join(name)).unwrap()
-    }
-}
-
-impl Drop for Directory {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+fn fixture_target(directory: &std::path::Path, name: &str) -> RecordingTarget {
+    RecordingTarget::new(directory.join(name)).unwrap()
 }
 
 fn exact() -> FileRecorderOptions {
@@ -1377,11 +1374,11 @@ fn io_kind<T: std::fmt::Debug>(result: Result<T>) -> std::io::ErrorKind {
 
 #[test]
 fn unreportable_recording_paths_never_reach_native_start_or_rollover() {
-    let directory = Directory::new("path-limit");
+    let directory = FixtureDir::create("path-limit");
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
-    let base = directory.0.to_str().unwrap();
+    let base = directory.path().to_str().unwrap();
     let path_bytes = sys::bindings::NDIlib_file_recorder_event_path_max_size as usize - 1;
     let too_long = RecordingTarget::new(format!(
         "{base}/{}",
@@ -1394,7 +1391,10 @@ fn unreportable_recording_paths_never_reach_native_start_or_rollover() {
     ));
     assert_eq!(device.starts.load(Ordering::Acquire), 0);
     recorder
-        .start(&directory.target("take.mkv"), RecordingTimecode::Preserve)
+        .start(
+            &fixture_target(directory.path(), "take.mkv"),
+            RecordingTimecode::Preserve,
+        )
         .unwrap();
     assert!(matches!(
         recorder.rollover(&too_long),
@@ -1405,7 +1405,7 @@ fn unreportable_recording_paths_never_reach_native_start_or_rollover() {
     assert_eq!(recorder.state(), RecorderState::Recording);
     assert!(matches!(
         recorder.finish(Duration::ZERO).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -1511,13 +1511,13 @@ fn a_reset_to_conflicting_options_keeps_the_recorder() {
     assert_eq!(recorder.state(), RecorderState::Recording);
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
 #[test]
 fn an_exact_recorder_changes_source_only_between_sessions() {
-    let directory = Directory::new("exact-source");
+    let directory = FixtureDir::create("exact-source");
     let device = mock::Recorder::new(Closing::Never);
     device.install();
     let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
@@ -1527,7 +1527,10 @@ fn an_exact_recorder_changes_source_only_between_sessions() {
     assert_eq!(device.source_changes.load(Ordering::Acquire), 1);
 
     recorder
-        .start(&directory.target("take.mkv"), RecordingTimecode::Preserve)
+        .start(
+            &fixture_target(directory.path(), "take.mkv"),
+            RecordingTimecode::Preserve,
+        )
         .unwrap();
     assert!(matches!(
         recorder.set_source(&another()),
@@ -1566,39 +1569,44 @@ fn an_indexed_recorder_refuses_a_change_of_source_only_while_stopping() {
 
 #[test]
 fn an_exact_target_that_exists_is_refused_before_the_sdk_sees_it() {
-    let directory = Directory::new("exact-exists");
-    std::fs::write(directory.0.join("taken.mkv"), b"kept").unwrap();
+    let directory = FixtureDir::create("exact-exists");
+    std::fs::write(directory.join("taken.mkv"), b"kept").unwrap();
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
 
     assert_eq!(
-        io_kind(recorder.start(&directory.target("taken.mkv"), RecordingTimecode::Preserve)),
+        io_kind(recorder.start(
+            &fixture_target(directory.path(), "taken.mkv"),
+            RecordingTimecode::Preserve
+        )),
         std::io::ErrorKind::AlreadyExists
     );
     assert_eq!(device.starts.load(Ordering::Acquire), 0);
     assert_eq!(recorder.state(), RecorderState::Idle);
 
     recorder
-        .start(&directory.target("first.mkv"), RecordingTimecode::Preserve)
+        .start(
+            &fixture_target(directory.path(), "first.mkv"),
+            RecordingTimecode::Preserve,
+        )
         .unwrap();
     assert_eq!(
-        io_kind(recorder.rollover(&directory.target("taken.mkv"))),
+        io_kind(recorder.rollover(&fixture_target(directory.path(), "taken.mkv"))),
         std::io::ErrorKind::AlreadyExists
     );
     assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
     assert_eq!(recorder.state(), RecorderState::Recording);
-    recorder.rollover(&directory.target("second.mkv")).unwrap();
+    recorder
+        .rollover(&fixture_target(directory.path(), "second.mkv"))
+        .unwrap();
     assert_eq!(device.rollovers.load(Ordering::Acquire), 1);
-    assert_eq!(
-        std::fs::read(directory.0.join("taken.mkv")).unwrap(),
-        b"kept"
-    );
+    assert_eq!(std::fs::read(directory.join("taken.mkv")).unwrap(), b"kept");
 }
 
 #[test]
 fn the_directory_a_pattern_names_is_checked_before_the_sdk_sees_it() {
-    let directory = Directory::new("pattern-directory");
+    let directory = FixtureDir::create("pattern-directory");
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
@@ -1607,16 +1615,22 @@ fn the_directory_a_pattern_names_is_checked_before_the_sdk_sees_it() {
 
     // The target's own directory exists; the one the pattern names does not.
     assert_eq!(
-        io_kind(recorder.start(&directory.target("first"), RecordingTimecode::Preserve)),
+        io_kind(recorder.start(
+            &fixture_target(directory.path(), "first"),
+            RecordingTimecode::Preserve
+        )),
         std::io::ErrorKind::NotFound
     );
     assert_eq!(device.starts.load(Ordering::Acquire), 0);
-    std::fs::create_dir(directory.0.join("first")).unwrap();
+    std::fs::create_dir(directory.join("first")).unwrap();
     recorder
-        .start(&directory.target("first"), RecordingTimecode::Preserve)
+        .start(
+            &fixture_target(directory.path(), "first"),
+            RecordingTimecode::Preserve,
+        )
         .unwrap();
     assert_eq!(
-        io_kind(recorder.rollover(&directory.target("missing"))),
+        io_kind(recorder.rollover(&fixture_target(directory.path(), "missing"))),
         std::io::ErrorKind::NotFound
     );
     assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
@@ -1626,11 +1640,11 @@ fn the_directory_a_pattern_names_is_checked_before_the_sdk_sees_it() {
 /// Exercise the public start and rollover paths against a permission-restricted
 /// child directory, keeping the active session outside that directory.
 #[cfg(any(unix, windows))]
-fn unwritable_directory_is_refused_before_native_calls(directory: &Directory) {
+fn unwritable_directory_is_refused_before_native_calls(directory: &std::path::Path) {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let mut recorder = FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
-    let denied = directory.target("denied/take.mkv");
+    let denied = fixture_target(directory, "denied/take.mkv");
     let error = recorder
         .start(&denied, RecordingTimecode::Preserve)
         .unwrap_err();
@@ -1643,7 +1657,10 @@ fn unwritable_directory_is_refused_before_native_calls(directory: &Directory) {
     assert_eq!(recorder.state(), RecorderState::Idle);
 
     recorder
-        .start(&directory.target("live.mkv"), RecordingTimecode::Preserve)
+        .start(
+            &fixture_target(directory, "live.mkv"),
+            RecordingTimecode::Preserve,
+        )
         .unwrap();
     assert_eq!(
         io_kind(recorder.rollover(&denied)),
@@ -1652,9 +1669,7 @@ fn unwritable_directory_is_refused_before_native_calls(directory: &Directory) {
     assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
     assert_eq!(recorder.state(), RecorderState::Recording);
     assert_eq!(
-        std::fs::read_dir(directory.0.join("denied"))
-            .unwrap()
-            .count(),
+        std::fs::read_dir(directory.join("denied")).unwrap().count(),
         0
     );
 }
@@ -1669,8 +1684,8 @@ fn unwritable_unix_recording_directories_never_reach_the_sdk() {
             std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
-    let directory = Directory::new("unwritable-unix");
-    let denied = directory.0.join("denied");
+    let directory = FixtureDir::create("unwritable-unix");
+    let denied = directory.join("denied");
     std::fs::create_dir(&denied).unwrap();
     let _restore = Restore(denied.clone());
     std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -1693,7 +1708,7 @@ fn unwritable_unix_recording_directories_never_reach_the_sdk() {
         crate::test_support::unsupported("this process can override directory write permissions");
         return;
     }
-    unwritable_directory_is_refused_before_native_calls(&directory);
+    unwritable_directory_is_refused_before_native_calls(directory.path());
 }
 
 #[cfg(target_os = "linux")]
@@ -1701,11 +1716,10 @@ fn unwritable_unix_recording_directories_never_reach_the_sdk() {
 fn an_effective_identity_without_write_access_is_refused() {
     use std::os::unix::fs::PermissionsExt;
     const CHILD_DIRECTORY: &str = "GRAFTON_NDI_PERMISSION_CHILD_DIRECTORY";
-    const IDENTITY_UNAVAILABLE: i32 = 77;
     if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
         // This isolated subprocess alone changes identity. The parent retains
         // ownership of the fixture and removes it after this process exits.
-        let directory = std::mem::ManuallyDrop::new(Directory(directory.into()));
+        let directory = std::path::PathBuf::from(directory);
         // SAFETY: geteuid/getuid take no arguments and inspect this process.
         assert_eq!(unsafe { libc::getuid() }, 0);
         assert_eq!(unsafe { libc::geteuid() }, 0);
@@ -1715,8 +1729,11 @@ fn an_effective_identity_without_write_access_is_refused() {
             let error = std::io::Error::last_os_error();
             if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EINVAL)) {
                 // User namespaces may map root alone, or forbid changing
-                // identity. Let the parent report that limitation visibly.
-                std::process::exit(IDENTITY_UNAVAILABLE);
+                // identity. The child helper forwards this limitation visibly.
+                crate::test_support::unsupported(
+                    "this process cannot switch to an unprivileged effective identity",
+                );
+                return;
             }
             panic!("cannot set the subprocess's effective identity: {error}");
         }
@@ -1728,32 +1745,16 @@ fn an_effective_identity_without_write_access_is_refused() {
         crate::test_support::unsupported("this identity-switching regression requires root");
         return;
     }
-    let directory = Directory::new("effective-identity");
-    std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o777)).unwrap();
-    let denied = directory.0.join("denied");
+    let directory = FixtureDir::create("effective-identity");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let denied = directory.join("denied");
     std::fs::create_dir(&denied).unwrap();
     std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let result = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "file::lifecycle_tests::an_effective_identity_without_write_access_is_refused",
-            "--nocapture",
-        ])
-        .env(CHILD_DIRECTORY, &directory.0)
-        .output()
-        .unwrap();
-    if result.status.code() == Some(IDENTITY_UNAVAILABLE) {
-        crate::test_support::unsupported(
-            "this process cannot switch to an unprivileged effective identity",
-        );
-        return;
-    }
-    assert!(
-        result.status.success(),
-        "effective-identity child failed:\n{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr),
-    );
+    crate::test_support::TestChild::new(
+        "file::lifecycle_tests::an_effective_identity_without_write_access_is_refused",
+    )
+    .env(CHILD_DIRECTORY, directory.path())
+    .run();
 }
 
 #[cfg(windows)]
@@ -1774,8 +1775,8 @@ fn acl_denied_windows_recording_directories_never_reach_the_sdk() {
             );
         }
     }
-    let directory = Directory::new("unwritable-windows");
-    let denied = directory.0.join("denied");
+    let directory = FixtureDir::create("unwritable-windows");
+    let denied = directory.join("denied");
     std::fs::create_dir(&denied).unwrap();
     let _restore = Restore(denied.clone());
     // Deny Everyone's write-data/add-file right on this test-owned directory.
@@ -1790,7 +1791,7 @@ fn acl_denied_windows_recording_directories_never_reach_the_sdk() {
         "{}",
         String::from_utf8_lossy(&restricted.stderr)
     );
-    unwritable_directory_is_refused_before_native_calls(&directory);
+    unwritable_directory_is_refused_before_native_calls(directory.path());
 }
 
 #[cfg(windows)]
@@ -1834,9 +1835,9 @@ fn low_integrity_recording_honours_the_directory_label() {
         assert_ne!(value, 0, "{}", std::io::Error::last_os_error());
     }
 
-    let directory = Directory::new("integrity-windows");
+    let directory = FixtureDir::create("integrity-windows");
     for (name, label) in [("low", "(OI)(CI)L"), ("medium", "(OI)(CI)M")] {
-        let child = directory.0.join(name);
+        let child = directory.join(name);
         std::fs::create_dir(&child).unwrap();
         let output = std::process::Command::new("icacls")
             .arg(&child)
@@ -1853,8 +1854,8 @@ fn low_integrity_recording_honours_the_directory_label() {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let mut recorder = FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
-    let low = directory.target("low/take.mkv");
-    let medium = directory.target("medium/take.mkv");
+    let low = fixture_target(directory.path(), "low/take.mkv");
+    let medium = fixture_target(directory.path(), "medium/take.mkv");
 
     let mut process_token = ptr::null_mut();
     // SAFETY: the process pseudo-handle is live and the out handle is writable.
@@ -1927,28 +1928,28 @@ fn low_integrity_recording_honours_the_directory_label() {
 
 #[test]
 fn values_a_refused_call_was_given_stay_with_the_caller_to_pass_again() {
-    let directory = Directory::new("borrowed");
+    let directory = FixtureDir::create("borrowed");
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap());
     let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &options).unwrap();
 
     // The indexed pattern puts each file in the directory the target names.
-    let first = directory.target("first/take");
+    let first = fixture_target(directory.path(), "first/take");
     assert_eq!(
         io_kind(recorder.start(&first, RecordingTimecode::Preserve)),
         std::io::ErrorKind::NotFound
     );
-    std::fs::create_dir(directory.0.join("first")).unwrap();
+    std::fs::create_dir(directory.join("first")).unwrap();
     recorder.start(&first, RecordingTimecode::Preserve).unwrap();
 
-    let second = directory.target("second/take");
+    let second = fixture_target(directory.path(), "second/take");
     assert_eq!(
         io_kind(recorder.rollover(&second)),
         std::io::ErrorKind::NotFound
     );
     assert_eq!(recorder.state(), RecorderState::Recording);
-    std::fs::create_dir(directory.0.join("second")).unwrap();
+    std::fs::create_dir(directory.join("second")).unwrap();
     recorder.rollover(&second).unwrap();
     assert_eq!(device.rollovers.load(Ordering::Acquire), 1);
 
@@ -1957,7 +1958,7 @@ fn values_a_refused_call_was_given_stay_with_the_caller_to_pass_again() {
     assert_eq!(recorder.last_accepted_source(), Some(&source));
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 
     // A reset the SDK refuses leaves the options to try again with.
@@ -1975,6 +1976,16 @@ fn values_a_refused_call_was_given_stay_with_the_caller_to_pass_again() {
     assert_eq!(replacement.creates.load(Ordering::Acquire), 1);
     assert_eq!(recorder.last_accepted_source(), Some(&options.source));
     assert_eq!(options.source, SourceSpec::new("mock source").unwrap());
+}
+
+#[test]
+fn preparing_a_player_allocates_only_its_checked_name() {
+    let options = FilePlayerOptions::new("mock player");
+    let api = mock::recorder_api();
+    let (_, allocations) = crate::test_alloc::allocation_count(|| {
+        crate::file::FilePlayer::prepare(api, &options).unwrap()
+    });
+    assert_eq!(allocations, 1);
 }
 
 #[test]

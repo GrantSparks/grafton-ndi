@@ -58,10 +58,13 @@
 //! # }
 //! ```
 //!
-//! An explicit path tries only that file and never falls back to executable,
-//! environment or platform search paths. A later explicit selection cannot
-//! undo code already run by an earlier load. Native dependencies still use
-//! platform loader rules and must also come from trusted locations. With the
+//! An explicit path must be absolute and name an existing file. A relative
+//! path returns [`Error::InvalidInput`]. An absent file returns an absent-path
+//! refusal before calling the platform loader. The crate makes no
+//! executable, environment or platform search for an explicit path. A later
+//! explicit selection cannot undo code already run by an earlier load. Native
+//! dependencies still use platform loader rules and must also come from
+//! trusted locations. With the
 //! File API, explicitly select `FileApiOptions::library_path`
 //! too, or establish that its companion and other search directories are
 //! trusted; inspect the selection through `FileApi::library_path`.
@@ -76,6 +79,8 @@
 //!    followed by a System32-only name lookup; on macOS, `@rpath/<name>` and
 //!    absolute `DYLD_LIBRARY_PATH` directories; on Linux and Android, the
 //!    native loader search (`rpath`, `LD_LIBRARY_PATH` and system locations).
+//!    Explicitly configured relative or empty `LD_LIBRARY_PATH` entries can
+//!    still name the working directory on Linux and Android.
 //!
 //! Windows and macOS never add the working directory to this search. Relative
 //! or empty `PATH`/`DYLD_LIBRARY_PATH` entries are recorded as refused locations.
@@ -83,11 +88,11 @@
 //! `DYLD_FALLBACK_LIBRARY_PATH` refuses the entire default search before opening
 //! a library. The check reads the process environment at search time; dyld uses
 //! its launch-time values, so changing `DYLD_*` after launch is unsupported.
-//! Explicit paths retain dyld's own policy.
-//! On unrestricted macOS processes dyld can substitute `DYLD_LIBRARY_PATH`
-//! even for an absolute path; such substitutions are refused with
-//! [`crate::LoadRefusal::ResolvedToAnotherFile`]. Native dependencies still
-//! follow platform loader rules.
+//! On unrestricted macOS processes dyld can use `DYLD_LIBRARY_PATH` to
+//! substitute an existing explicit file. Such substitutions are refused with
+//! [`crate::LoadRefusal::ResolvedToAnotherFile`] after loading the candidate,
+//! when its initializers have already run. Configure trusted absolute
+//! `DYLD_*` entries before launching.
 //!
 //! Each location is tried for the file names of both SDK editions, for
 //! example `libndi.so.6` and `libndi_advanced.so.6` on Linux, unless
@@ -202,8 +207,8 @@ impl RuntimeOptions {
 
     /// Load exactly this absolute shared-library path.
     ///
-    /// No other location is tried, so a failure to load it is reported rather
-    /// than hidden by a fallback. A statically linked target has no library to
+    /// A path that does not name an existing file is refused before native
+    /// loading. A failure to load the file is reported without a fallback. A statically linked target has no library to
     /// load and rejects an absolute path with [`Error::RuntimeConflict`].
     /// A relative path returns [`Error::InvalidInput`] on every target,
     /// before an implementation is selected.
@@ -621,7 +626,7 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
                 self.cv.notify_all();
             }
             other => {
-                debug_assert!(false, "release() called while runtime was {other:?}");
+                debug_invariant!(false, "release() called while runtime was {other:?}");
             }
         }
     }
@@ -748,6 +753,23 @@ macro_rules! file_bound_tables {
 #[cfg(feature = "file-io")]
 file_bound_tables!(sys::FileRuntime, sys::FilePlayback, sys::FileRecording);
 
+/// A native constructor's result and any configuration it may have retained.
+pub(crate) struct NativeCreation<I> {
+    pub(crate) call: sys::table::Called<I>,
+    #[cfg(feature = "advanced")]
+    pub(crate) config: crate::advanced::RetainedConfig,
+}
+
+impl<I> NativeCreation<I> {
+    pub(crate) fn plain(call: sys::table::Called<I>) -> Self {
+        Self {
+            call,
+            #[cfg(feature = "advanced")]
+            config: crate::advanced::RetainedConfig::default(),
+        }
+    }
+}
+
 /// Native entry points paired with the initialized runtime they require.
 /// Only runtime binding paths can construct this capability. Dereferencing it
 /// borrows the table for no longer than the retained owner.
@@ -851,11 +873,8 @@ impl Ndi {
     /// This is [`Runtime::select`] with the default [`RuntimeOptions`]
     /// followed by [`Runtime::initialize`]. It is thread-safe: the first
     /// handle starts NDI and later calls add handles to the running runtime.
-    /// The default search trusts every searched directory: native constructors
-    /// run before validation, including for rejected candidates. Services and
-    /// elevated processes should make their first selection through
-    /// [`Self::with_options`] with an absolute [`RuntimeOptions::library_path`]
-    /// under application-owner control.
+    /// See the [search and trust policy](crate::runtime#where-the-runtime-is-loaded-from)
+    /// before selecting a runtime in a service or elevated process.
     ///
     /// # Errors
     ///
@@ -863,7 +882,8 @@ impl Ndi {
     /// found in the [search order](crate::runtime#where-the-runtime-is-loaded-from).
     /// Its [`crate::LoadFailure`] distinguishes code that loaded and was refused
     /// from locations that could not be opened. Returns
-    /// [`Error::UnsupportedCpu`] if the runtime does not start because this
+    /// [`Error::RuntimeConflict`] if native loading re-enters runtime selection
+    /// on the same thread. Returns [`Error::UnsupportedCpu`] if the runtime does not start because this
     /// CPU cannot run it, and [`Error::InitializationFailed`] if it does not
     /// start for another reason or the count of handles is exhausted.
     ///
@@ -1196,16 +1216,13 @@ mod tests {
             // SAFETY: no native instance is returned; an exhausted bind must
             // panic before this closure can observe the settings at all.
             let _ = unsafe {
-                crate::Finder::create(
-                    &ndi,
-                    &crate::FinderOptions::new(),
-                    #[cfg(feature = "advanced")]
-                    None,
-                    |_, _| {
-                        creates.fetch_add(1, Ordering::Relaxed);
-                        sys::table::for_test(std::ptr::null_mut(), c"NDIlib_find_create_v2")
-                    },
-                )
+                crate::Finder::create(&ndi, &crate::FinderOptions::new(), |_, _| {
+                    creates.fetch_add(1, Ordering::Relaxed);
+                    NativeCreation::plain(sys::table::for_test(
+                        std::ptr::null_mut(),
+                        c"NDIlib_find_create_v2",
+                    ))
+                })
             };
         }));
         // An unavailable capability is still refused before the exhausted clone.

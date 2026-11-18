@@ -21,8 +21,7 @@
 //! avoids waiting for an optional proxy stream at startup and produces the
 //! single-video-track input supported by the `file_thumbnails` example.
 //!
-//! The File library ships with the NDI SDK, beside the runtime library. On
-//! Linux and macOS it needs the Advanced SDK runtime.
+//! See the [File library requirements](../docs/file-io.md#requirements).
 
 use std::{
     env,
@@ -32,7 +31,7 @@ use std::{
 use grafton_ndi::{
     file::{
         FileApi, FileApiOptions, FileRecorder, FileRecorderOptions, FinishStatus,
-        RecorderEventKind, RecordingTarget, RecordingTimecode, SourceSpec,
+        RecorderEventKind, RecordingTarget, RecordingTimecode, SessionEnd, SourceSpec,
     },
     Finder, FinderOptions, Ndi,
 };
@@ -121,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Closure alone does not prove a usable recording. Check the session's
     // separate error, write-failure and empty-file counters as well.
     match recorder.finish(Duration::from_secs(10))? {
-        FinishStatus::Closed(report) => {
+        FinishStatus::Ended(SessionEnd::Closed(report)) => {
             println!("Finalized {} file(s).", report.closed_files());
             if report.error_events() > 0
                 || report.write_failures() > 0

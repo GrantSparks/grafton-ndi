@@ -78,8 +78,11 @@ instead of repacking a captured frame solely for encoding.
 | `WebpLossless` | Lossless 8-bit RGB/RGBA | `alpha` |
 | `WebpLossy(quality)` | Lossy 8-bit color with exact alpha unless discarded | Quality 0–100, `webp_effort` 0–6, `webp_sharp_yuv` |
 
-JPEG drops alpha. PNG and WebP keep it by default; `AlphaMode::Discard`
-removes it. Lossy WebP quality 100 is still lossy for color. Its default effort
+JPEG drops alpha. PNG and lossless WebP use RGB for sources without alpha and
+keep existing alpha by default. `AlphaMode::Discard` removes it. Lossy WebP
+preserves existing alpha by default, and its encoder takes opaque alpha when
+the source has none or alpha is discarded. Lossy WebP quality 100 is still
+lossy for color. Its default effort
 is 4 and SharpYUV is enabled. Effort and conversion settings affect only lossy
 WebP; they impose no time or memory limit. Measure their effect on your content.
 
@@ -106,7 +109,7 @@ The SDK's own YUV-to-RGB conversion always uses BT.709 limited range, whatever
 `ndi_color_info` says. RGB-received frames, including those from
 `ReceiverOptions::snapshot_preset` and `ReceiverOptions::high_quality_preset`,
 already carry that conversion. Encoding keeps those RGB pixels; it cannot
-apply the tag's matrix afterward. The tag still controls HDR refusal and a
+apply the tag's matrix afterward. The tag still governs color admission and a
 PNG's `cICP` chunk.
 
 `ReceiverColorFormat::UyvyBgra` and `ReceiverColorFormat::UyvyRgba` keep
@@ -126,7 +129,7 @@ so encoding on a blocking thread has the same behavior as encoding a capture.
 The default encoding policy refuses these frames before writing output; an
 explicit `ColorPolicy::Override` ignores unreadable color metadata and treats
 it as SDR with unknown primaries. Readable metadata still
-controls the HDR check and PNG tagging. See
+governs color admission and PNG tagging. See
 [`ColorInfo`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/struct.ColorInfo.html)
 for accepted metadata values.
 
@@ -147,7 +150,8 @@ HDR refusal and the PNG `cICP` chunk for RGB as well as YUV.
 ### Tagging a PNG
 
 The encoder writes a `cICP` color tag for BT.2020 primaries or PQ/HLG transfer
-metadata. It leaves BT.601/BT.709 SDR and untagged inputs without that chunk.
+metadata. Encode those frames as PNG. JPEG and WebP cannot carry the tag.
+BT.601/BT.709 SDR and untagged inputs do not require it.
 See [`HdrPolicy`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/image_encoding/enum.HdrPolicy.html)
 for the code-value contract.
 
@@ -175,8 +179,11 @@ for application planning.
 
 ## Errors
 
-Inspect the method's `Result`: invalid quality, effort or depth settings, and
-`HdrPolicy::CodeValues` with JPEG or WebP for an HDR frame, return `InvalidInput`.
+Invalid quality and effort settings return `InvalidInput` with
+`InputDefect::ImageSetting`. Incompatible sample depth also returns
+`InvalidInput`. JPEG and
+WebP also return `InvalidInput` with `InputDefect::ColorTagNeedsPng` for frames
+with BT.2020 primaries or with PQ or HLG under `HdrPolicy::CodeValues`.
 Malformed color descriptions, HDR refusal, excessive dimensions
 or codec failures return `InvalidFrame`. Conversion scratch allocation failures
 return `AllocationFailed`. The lossy WebP encoder's own allocation failures are

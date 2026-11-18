@@ -147,7 +147,7 @@ impl<M: SenderMode> Sender<M> {
             let tally = tally.to_sdk();
             // The SDK gives this control flag no failure meaning.
             // SAFETY: the sender instance is live for this borrow.
-            unsafe { table.NDIlib_send_set_tally(self.native_instance(), &tally) };
+            unsafe { table.NDIlib_send_set_tally(self.handle().instance(), &tally) };
             Ok(())
         })
     }
@@ -166,7 +166,7 @@ impl<M: SenderMode> Sender<M> {
             let format = format.raw();
             // SAFETY: the sender instance is live for this borrow.
             let value = unsafe {
-                table.named().NDIlib_send_get_target_frame_size(self.native_instance(), &format)
+                table.named().NDIlib_send_get_target_frame_size(self.handle().instance(), &format)
             };
             guidance(value)
         })
@@ -186,7 +186,7 @@ impl<M: SenderMode> Sender<M> {
             let format = format.raw();
             // SAFETY: the sender instance is live for this borrow.
             let value = unsafe {
-                table.named().NDIlib_send_get_target_bit_rate(self.native_instance(), &format)
+                table.named().NDIlib_send_get_target_bit_rate(self.handle().instance(), &format)
             };
             guidance(value)
         })
@@ -209,7 +209,7 @@ impl<M: SenderMode> Sender<M> {
             require_speedhq(format)?;
             let format = format.raw();
             // SAFETY: the sender instance is live for this borrow.
-            let value = unsafe { table.named().NDIlib_send_get_q_factor(self.native_instance(), &format) };
+            let value = unsafe { table.named().NDIlib_send_get_q_factor(self.handle().instance(), &format) };
             guidance(value)
         })
     }
@@ -236,7 +236,7 @@ impl<M: SenderMode> Sender<M> {
             // is writable storage for the flag.
             let value = unsafe {
                 table.named().NDIlib_send_get_q_factor_v2(
-                    self.native_instance(),
+                    self.handle().instance(),
                     &format,
                     supports_new_format,
                     &mut short_dc,
@@ -267,7 +267,7 @@ impl<M: SenderMode> Sender<M> {
             let format = format.map(VideoPacketFormat::raw);
             // SAFETY: the sender instance is live for this borrow.
             Ok(unsafe {
-                table.NDIlib_send_is_keyframe_required(self.native_instance(), stream(format.as_ref()))
+                table.NDIlib_send_is_keyframe_required(self.handle().instance(), stream(format.as_ref()))
             })
         })
     }
@@ -309,7 +309,7 @@ impl<M: SenderMode> Sender<M> {
                     // SAFETY: the sender lives for the wait. A null selector
                     // observes all updates without competing native selectors.
                     unsafe { table.NDIlib_send_wait_for_keyframe_request(
-                        self.native_instance(), timeout, std::ptr::null(),
+                        self.handle().instance(), timeout, std::ptr::null(),
                     ) }
                 },
                 |format| {
@@ -317,7 +317,7 @@ impl<M: SenderMode> Sender<M> {
                     // SAFETY: this non-consuming query reads only the live
                     // sender and the descriptor, which lasts through the call.
                     unsafe { table.NDIlib_send_is_keyframe_required(
-                        self.native_instance(), &format,
+                        self.handle().instance(), &format,
                     ) }
                 },
             ))
@@ -362,10 +362,7 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn request_keyframe(&self) -> Result<()> {
         let table = self.core.ndi().table::<KeyframeRequest>()?;
         native!(KeyframeRequest, table => {
-            let connection = self.core.lock_control();
-            // SAFETY: the live core and control permit cover this call;
-            // see the RecvInstance concurrency inventory.
-            unsafe { table.NDIlib_recv_request_keyframe(connection.instance()) };
+            self.core.lock_mutating_control()?.request_keyframe(table);
             Ok(())
         })
     }
@@ -390,7 +387,12 @@ impl<M: ReceiverMode> Receiver<M> {
                 StreamTier::Program => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
                 StreamTier::Preview => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
             };
-            // SAFETY: exclusive receiver authority excludes advertiser changes.
+            // SAFETY: the exclusive receiver borrow rules out other Rust
+            // stream writers. Advertiser membership uses a separate native
+            // registry lock over retained creation state. For the measured
+            // runtimes, the RecvInstance inventory records the native lock
+            // covering this setter's access to the connection. That locking
+            // evidence is specific to Linux and Advanced Windows.
             let switched = unsafe { table.NDIlib_recv_set_bandwidth(exclusive.instance(), bandwidth) };
             Ok(SettingChange::from_sdk(switched))
         })
@@ -413,7 +415,12 @@ impl<M: ReceiverMode> Receiver<M> {
         let exclusive = self.exclusive();
         let table = exclusive.ndi().table::<ReceiverStreamControl>()?;
         native!(ReceiverStreamControl, table, uses(streams) => {
-            // SAFETY: exclusive receiver authority excludes advertiser changes.
+            // SAFETY: the exclusive receiver borrow rules out other Rust
+            // stream writers. Advertiser membership uses a separate native
+            // registry lock over retained creation state. For the measured
+            // runtimes, the RecvInstance inventory records the native lock
+            // covering this setter's access to the connection. That locking
+            // evidence is specific to Linux and Advanced Windows.
             let changed = unsafe {
                 table.NDIlib_recv_set_enabled_streams(
                     exclusive.instance(),
@@ -430,7 +437,7 @@ impl<M: ReceiverMode> Receiver<M> {
 impl<M: ReceiverMode> std::fmt::Debug for ReceiverControls<'_, M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReceiverControls")
-            .field("mode", &std::any::type_name::<M>())
+            .field("receiver", self.receiver())
             .finish_non_exhaustive()
     }
 }

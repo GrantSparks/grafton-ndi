@@ -2,7 +2,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name, loopback);
+common_helpers!(runtime, name, loopback, stop);
 
 use grafton_ndi::{
     audio_conversion::{AudioConverter, AudioReferenceLevel},
@@ -14,13 +14,6 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
-
-struct Stop<'a>(&'a AtomicBool);
-impl Drop for Stop<'_> {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-}
 
 fn sender(ndi: &Ndi, name: &str) -> Sender {
     Sender::new(
@@ -215,7 +208,7 @@ fn receiver_and_framesync_captures_forward_and_convert_without_owned_adapters() 
                 std::thread::sleep(Duration::from_millis(10));
             }
         });
-        let _stop = Stop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         let frame = input
             .capture_video_ref(Duration::from_secs(10))
             .unwrap()

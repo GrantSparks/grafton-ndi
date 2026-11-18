@@ -13,6 +13,76 @@ ROOT = Path(__file__).resolve().parents[2]
 LINUX = 'x86_64-unknown-linux-gnu'
 WINDOWS = 'x86_64-pc-windows-msvc'
 MACOS = 'aarch64-apple-darwin'
+
+
+def listed(*names):
+    return ''.join(name + ': test\n' for name in names)
+
+
+class InventorySelectionTests(unittest.TestCase):
+    def test_miri_applies_literal_filters_in_group_order_with_exact_skips(self):
+        filters = {group: entries for group, entries in scope.FILTER_SELECTIONS.items()
+                   if group in scope.MIRI_GROUPS}
+        fixtures = {group: [entry + '_fixture' for entry in entries] for group, entries in filters.items()}
+        names = [name for group in fixtures.values() for name in group]
+        text = listed(*reversed(names), *scope.MIRI_SKIPS,
+                      scope.MIRI_SKIPS[1] + '_extra_coverage')
+        fixtures['miri-reads'].insert(1, scope.MIRI_SKIPS[1] + '_extra_coverage')
+        for group, expected in fixtures.items():
+            with self.subTest(group=group):
+                self.assertEqual(scope.selection_arguments(text, group), expected)
+
+    def test_missing_empty_and_overlapping_filters_fail(self):
+        cases = [
+            ({'miri': ()}, 'is empty'),
+            ({'miri': ('',)}, 'selects no tests'),
+            ({'miri': ('absent',)}, 'selects no tests'),
+            ({'miri': ('frames', 'padding')}, 'matches both'),
+            ({'miri': ('frames',), 'memcheck': ('padding',)}, 'matches both'),
+        ]
+        for groups, expected in cases:
+            with self.subTest(groups=groups), self.assertRaisesRegex(ValueError, expected):
+                scope.filter_groups(['frames::padding'], groups)
+
+    def test_missing_or_collateral_skip_fails(self):
+        with self.assertRaisesRegex(ValueError, 'skip .* does not name an inventory test'):
+            scope.filter_groups(['test_to_skip_renamed', 'test_to_keep'], {'run': ('test_to_keep',)},
+                                skips=('test_to_skip',))
+
+    def test_invalid_and_duplicate_inventory_lines_fail(self):
+        for text, expected in (
+            ('invalid: entry\n', 'unrecognized'),
+            ('-invalid: test\n', 'unrecognized'),
+            (listed('test', 'test'), 'duplicate'),
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, expected):
+                scope.test_names(text)
+        self.assertEqual(scope.test_names('a: test\nb: benchmark\n\n1 test, 1 benchmark\n'), ['a'])
+
+    def test_exact_group_rejects_renamed_fixture_or_new_unclassified_fixture(self):
+        for group, fixtures in scope.EXACT_SELECTIONS.items():
+            with self.subTest(group=group):
+                self.assertEqual(scope.selection_arguments(listed(*fixtures), group), list(fixtures))
+                with self.assertRaisesRegex(ValueError, 'inventory differs'):
+                    scope.selection_arguments(listed(*fixtures[1:], fixtures[0] + '_renamed'), group)
+                with self.assertRaisesRegex(ValueError, 'unexpected'):
+                    scope.selection_arguments(listed(*fixtures, 'unclassified'), group)
+
+    def test_cli_writes_one_exact_name_per_line(self):
+        names = ('frames::tests::video_padding_encoders_one', 'frames::tests::video_padding_encoders_two')
+        with tempfile.TemporaryDirectory() as directory:
+            inventory = Path(directory) / 'inventory'
+            selection = Path(directory) / 'selected'
+            inventory.write_text(listed(*names, 'other_fixture'), encoding='utf-8')
+            command = [sys.executable, str(ROOT / 'ci/sdk_test_scope.py'), 'select', '--group',
+                       'encoder-padding', '--inventory', str(inventory), '--output', str(selection)]
+            result = subprocess.run(command, text=True, capture_output=True, check=True)
+            self.assertEqual(selection.read_bytes(), ('\n'.join(names) + '\n').encode())
+            self.assertIn('selected 2 exact tests', result.stderr)
+            inventory.write_text(listed('other_fixture'), encoding='utf-8')
+            result = subprocess.run(command, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('selects no tests', result.stderr)
 # Native File tests share a module family with runtime-free worker mocks.
 # Those names, all new tests and the doctest must survive a compatibility run.
 NATIVE = (
@@ -63,6 +133,13 @@ class RuntimeTestScopeTests(unittest.TestCase):
                     remaining = [name for name in NATIVE if not any(skip in name for skip in skips)]
                     self.assertEqual(remaining, list(NATIVE))
                     self.assertGreater(len(skips), 0)
+
+    def test_compatibility_inventory_must_retain_the_promised_peer_exchange(self):
+        text = inventory(extra=(*NATIVE, scope.PEER_WITNESS))
+        self.assertTrue(scope.skip_arguments(text, LINUX, 'standard', require_peer=True))
+        for unavailable in (inventory(), text + listed(scope.PEER_WITNESS)):
+            with self.assertRaisesRegex(ValueError, 'retain one cross-SDK peer exchange'):
+                scope.skip_arguments(unavailable, LINUX, 'standard', require_peer=True)
 
     def test_an_empty_or_compiler_only_inventory_is_refused(self):
         for text in ('', '0 tests, 0 benchmarks\n', inventory(extra=())):

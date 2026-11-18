@@ -70,17 +70,28 @@ impl AdvancedConfig {
         &self.0[..self.0.len() - 1]
     }
 
-    /// `config`, or the empty configuration `{}` without one: the
-    /// configuration of an object whose only creation function takes one.
-    pub(crate) fn or_empty(config: Option<&Self>) -> Self {
-        config.cloned().unwrap_or_else(|| Self(Arc::from("{}\0")))
+    /// Lend the exact buffer, or NULL for the SDK's default configuration.
+    /// Retain the returned owner until the native instance is destroyed.
+    pub(crate) fn lend<R>(
+        config: Option<&Self>,
+        call: impl FnOnce(*const std::ffi::c_char) -> R,
+    ) -> (R, RetainedConfig) {
+        let config = config.cloned();
+        let result = call(config.as_ref().map_or(std::ptr::null(), Self::as_ptr));
+        (result, RetainedConfig { _config: config })
     }
 
     /// The text as a C string. Every clone shares this one buffer, which
     /// neither moves nor is freed while any clone of `self` lives.
-    pub(crate) fn as_ptr(&self) -> *const std::ffi::c_char {
+    fn as_ptr(&self) -> *const std::ffi::c_char {
         self.0.as_ptr().cast()
     }
+}
+
+/// The configuration that was lent to an SDK creation call.
+#[derive(Default)]
+pub(crate) struct RetainedConfig {
+    _config: Option<AdvancedConfig>,
 }
 
 impl fmt::Debug for AdvancedConfig {
@@ -131,16 +142,26 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_configuration_becomes_the_empty_object() {
-        let empty = AdvancedConfig::or_empty(None);
-        assert_eq!(empty.expose_json(), "{}");
+    fn lending_keeps_the_same_buffer_alive_and_passes_null_when_unset() {
+        let (pointer, retained) = AdvancedConfig::lend(None, |pointer| pointer);
+        assert!(pointer.is_null());
+        assert!(retained._config.is_none());
+
+        let input = r#"{"ndi":{}}"#;
+        let given = AdvancedConfig::parse(input).unwrap();
+        let (pointer, retained) = AdvancedConfig::lend(Some(&given), |pointer| pointer);
+        assert_eq!(pointer, given.as_ptr());
+        let buffer = Arc::downgrade(&given.0);
+        drop(given);
+        // SAFETY: the retained owner keeps this exact buffer alive.
         assert_eq!(
-            empty.expose_json(),
-            AdvancedConfig::parse("{}").unwrap().expose_json()
+            unsafe { std::ffi::CStr::from_ptr(pointer) }
+                .to_str()
+                .unwrap(),
+            input
         );
-        let given = AdvancedConfig::parse(r#"{"ndi":{}}"#).unwrap();
-        let kept = AdvancedConfig::or_empty(Some(&given));
-        // The same shared buffer, not a copy of the text.
-        assert_eq!(kept.as_ptr(), given.as_ptr());
+        assert!(buffer.upgrade().is_some());
+        drop(retained);
+        assert!(buffer.upgrade().is_none());
     }
 }

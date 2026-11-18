@@ -1,32 +1,29 @@
 //! Polling must retain the SDK's one-shot tally change for one waiter.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
-#[path = "support/fixture.rs"]
-mod fixture;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child, fixture);
+use common::TestChild;
+
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use fixture::FixtureDir;
 use grafton_ndi::{
     Ndi, Receiver, ReceiverOptions, RuntimeOptions, Sender, SenderOptions, Source, Tally,
 };
-use runtime_fixture::FakeRuntime;
+use runtime_fixture::{read_fake_log, FakeRuntime};
 use std::{
-    fs,
     path::PathBuf,
-    process::Command,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
-fn events() -> String {
-    fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap_or_default()
-}
-
 fn await_native_wait(count: usize) {
     let end = Instant::now() + Duration::from_secs(3);
-    while events()
+    while read_fake_log()
         .lines()
         .filter(|line| *line == "tally-wait-begin")
         .count()
@@ -35,7 +32,7 @@ fn await_native_wait(count: usize) {
         assert!(
             Instant::now() < end,
             "native tally wait did not start: {}",
-            events()
+            read_fake_log()
         );
         thread::sleep(Duration::from_millis(1));
     }
@@ -116,7 +113,7 @@ fn polls_preserve_changes_and_never_enter_a_waiters_native_query() {
                 None
             );
             assert_eq!(
-                events()
+                read_fake_log()
                     .lines()
                     .filter(|line| *line == "tally-wait-begin")
                     .count(),
@@ -157,7 +154,7 @@ fn polls_preserve_changes_and_never_enter_a_waiters_native_query() {
             );
         });
         let mut active = false;
-        for event in events().lines() {
+        for event in read_fake_log().lines() {
             match event {
                 "tally-wait-begin" => {
                     assert!(!active, "overlapping native waits");
@@ -176,27 +173,15 @@ fn polls_preserve_changes_and_never_enter_a_waiters_native_query() {
         assert!(!active);
         return;
     }
-    let directory = FixtureDir::create("sender-tally");
+    let directory = common::FixtureDir::create("sender-tally");
     let library = directory.path().join("libndi.so");
     FakeRuntime {
         cfgs: vec!["fake_objects", "fake_tally"],
         ..Default::default()
     }
     .build(&library);
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "polls_preserve_changes_and_never_enter_a_waiters_native_query",
-            "--nocapture",
-        ])
+    TestChild::new("polls_preserve_changes_and_never_enter_a_waiters_native_query")
         .env("GRAFTON_TALLY_LIBRARY", &library)
         .env("GRAFTON_FAKE_NDI_LOG", directory.path().join("tally.log"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .run();
 }

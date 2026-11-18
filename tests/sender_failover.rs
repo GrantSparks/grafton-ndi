@@ -3,7 +3,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name, loopback);
+common_helpers!(runtime, name, loopback, stop);
 
 use grafton_ndi::{
     Error, PixelFormat, Receiver, ReceiverOptions, Sender, SenderOptions, Timecode, VideoFrame,
@@ -22,14 +22,6 @@ fn marked_frame(value: u8) -> VideoFrame {
         .unwrap();
     frame.data_mut().fill(value);
     frame
-}
-
-/// End the background sender even when a delivery assertion unwinds.
-struct StopOnDrop<'a>(&'a AtomicBool);
-impl Drop for StopOnDrop<'_> {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
 }
 
 fn receive_marker(receiver: &Receiver, marker: u8, deadline: Instant, mut send: impl FnMut()) {
@@ -75,7 +67,7 @@ fn a_receiver_follows_failover_after_its_input_source_and_primary_are_dropped() 
     .unwrap();
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        let _stop_on_unwind = StopOnDrop(&stop);
+        let _stop_on_unwind = common::StopOnDrop(&stop);
         scope.spawn(|| {
             let frame = marked_frame(119);
             while !stop.load(Ordering::Acquire) {

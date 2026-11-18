@@ -9,12 +9,11 @@
 //! drop requests shutdown without joining another File thread, so notifications
 //! cannot stall behind cleanup or deadlock one another.
 
-use super::recorder::CheckedRecorderOptions;
-use super::types::path_string;
+use super::types::{path_string, CheckedRecorderOptions};
 use super::{
     EventText, FileApi, FileDuration, FileInfo, FilePlayer, FilePlayerOptions, FilePosition,
     FileRecorder, FileRecorderOptions, FinishStatus, PlayerEvent, PlayerStats, RecorderEvent,
-    RecorderState, RecorderStats, RecordingReport, RecordingTarget, RecordingTimecode,
+    RecorderState, RecorderStats, RecordingReport, RecordingTarget, RecordingTimecode, SessionEnd,
     SourceFormat, SourceSpec, StateConflict, StopRequest,
 };
 use crate::{timeout::Deadline, Error, MetadataSource, QueueLimit, Result, Source, Timecode};
@@ -784,9 +783,7 @@ impl<E: Send + 'static> EventQueue<E> {
             expiry: expiry as Weak<dyn Expire>,
             token: Arc::new(()),
             budget,
-            deadline: None,
-            timer: None,
-            taken: false,
+            state: EventWaitState::Unstarted,
         }
     }
 }
@@ -815,9 +812,12 @@ impl<E: Send> Expire for EventQueue<E> {
 /// [`Error::InvalidState`] and [`StateConflict::WaiterPending`]. Once the
 /// handle is closed and every queued event has been taken, the future fails
 /// with [`StateConflict::Closed`], or with [`StateConflict::OwnerFailed`] when the
-/// thread failed; that happens as soon as the handle's thread stops taking
-/// events, before the native object is destroyed. Dropping the
-/// future does not stop events from being pumped.
+/// thread failed. When recorder shutdown begins with no submitted
+/// [`finish`](AsyncFileRecorder::finish) or
+/// [`wait_for_finish`](AsyncFileRecorder::wait_for_finish) pending, the queue
+/// closes immediately. Cleanup events, including the last file-closed event,
+/// are never added to that queue. Await `finish` before `close` to observe them.
+/// Dropping the future leaves event pumping active.
 /// Executor callbacks run on File threads; a handle's last clone dropped
 /// there requests shutdown without waiting for native cleanup.
 ///
@@ -842,18 +842,27 @@ pub struct FileEventFuture<E> {
     token: Arc<()>,
     /// The caller's timeout, checked when the wait starts.
     budget: Duration,
-    /// The wait's budget, from its first poll on.
-    deadline: Option<Deadline>,
-    /// This wait's registration with the deadline timer, while it has one.
-    timer: Option<TimerKey>,
-    taken: bool,
+    state: EventWaitState,
+}
+
+enum EventWaitState {
+    Unstarted,
+    Waiting { deadline: Deadline },
+    Registered { deadline: Deadline, timer: TimerKey },
+    Done,
 }
 
 impl<E> std::fmt::Debug for FileEventFuture<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match self.state {
+            EventWaitState::Unstarted => "Unstarted",
+            EventWaitState::Waiting { .. } => "Waiting",
+            EventWaitState::Registered { .. } => "Registered",
+            EventWaitState::Done => "Done",
+        };
         f.debug_struct("FileEventFuture")
             .field("timeout", &self.budget)
-            .field("completed", &self.taken)
+            .field("state", &state)
             .finish_non_exhaustive()
     }
 }
@@ -861,15 +870,22 @@ impl<E> std::fmt::Debug for FileEventFuture<E> {
 impl<E> FileEventFuture<E> {
     /// Complete with `value`, giving up the timer registration.
     fn complete(&mut self, value: Result<Option<E>>) -> Poll<Result<Option<E>>> {
-        self.taken = true;
-        if let Some(key) = self.timer.take() {
-            TIMER.cancel(key);
-        }
+        self.finish_wait();
         Poll::Ready(value)
     }
 
+    fn finish_wait(&mut self) {
+        if let EventWaitState::Registered { timer, .. } =
+            std::mem::replace(&mut self.state, EventWaitState::Done)
+        {
+            TIMER.cancel(timer);
+        }
+    }
+
     /// Stop being the queue's waiter and return executor state for disposal
-    /// after unlocking. Another future's waiter is never removed.
+    /// after unlocking. An installed waiter belongs to a live future, or to
+    /// a leaked future whose token stays live. Another future's waiter is
+    /// never removed.
     fn release_waiter(&self) -> Option<Waker> {
         let token = Arc::downgrade(&self.token);
         let mut events = lock(&self.events.0);
@@ -890,22 +906,31 @@ impl<E> Future for FileEventFuture<E> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        assert!(!this.taken, "a completed FileEventFuture was polled again");
         // The wait starts at the first poll, which is also where a timeout
         // out of range is reported, before anything else.
-        let deadline = match this.deadline {
-            Some(deadline) => deadline,
-            None => match Deadline::after(this.budget) {
-                Ok(deadline) => *this.deadline.insert(deadline),
+        let deadline = match this.state {
+            EventWaitState::Waiting { deadline } | EventWaitState::Registered { deadline, .. } => {
+                deadline
+            }
+            EventWaitState::Unstarted => match Deadline::after(this.budget) {
+                Ok(deadline) => {
+                    this.state = EventWaitState::Waiting { deadline };
+                    deadline
+                }
                 Err(error) => return this.complete(Err(error)),
             },
+            #[expect(
+                clippy::panic,
+                reason = "polling a completed FileEventFuture violates its documented Future contract"
+            )]
+            EventWaitState::Done => panic!("a completed FileEventFuture was polled again"),
         };
         let token = Arc::downgrade(&this.token);
         let ready = WakerSlot::poll(&this.events.0, cx.waker(), |events, register| {
             if events
                 .waiter
                 .as_ref()
-                .is_some_and(|w| w.token.strong_count() != 0 && !w.token.ptr_eq(&token))
+                .is_some_and(|w| !w.token.ptr_eq(&token))
             {
                 return WakerPoll::Ready(
                     Err(Error::InvalidState(StateConflict::WaiterPending)),
@@ -928,13 +953,11 @@ impl<E> Future for FileEventFuture<E> {
                 );
             }
             if register {
-                let waiter = events.waiter.get_or_insert_with(|| EventWaiter {
+                events.waiter.get_or_insert_with(|| EventWaiter {
                     token: Weak::clone(&token),
                     deadline: deadline.end(),
                     waker: WakerSlot::default(),
                 });
-                waiter.token = Weak::clone(&token);
-                waiter.deadline = deadline.end();
             }
             WakerPoll::Pending(events.waiter.as_mut().map(|waiter| &mut waiter.waker))
         });
@@ -944,9 +967,9 @@ impl<E> Future for FileEventFuture<E> {
         // The deadline never changes, so one registration serves every poll.
         // It is made with no queue lock held: the timer may wake this future
         // at once, which then finds itself registered as the waiter.
-        if this.timer.is_none() {
+        if matches!(this.state, EventWaitState::Waiting { .. }) {
             match TIMER.register(deadline.end(), Weak::clone(&this.expiry), token) {
-                Ok(key) => this.timer = Some(key),
+                Ok(timer) => this.state = EventWaitState::Registered { deadline, timer },
                 Err(error) => {
                     WakerSlot::discard(this.release_waiter());
                     return this.complete(Err(Error::Io(error)));
@@ -960,9 +983,7 @@ impl<E> Future for FileEventFuture<E> {
 impl<E> Drop for FileEventFuture<E> {
     fn drop(&mut self) {
         let waker = self.release_waiter();
-        if let Some(key) = self.timer.take() {
-            TIMER.cancel(key);
-        }
+        self.finish_wait();
         WakerSlot::discard(waker);
     }
 }
@@ -1429,10 +1450,10 @@ impl Drop for Place {
     fn drop(&mut self) {
         if self.reserve {
             let previous = self.admission.state.fetch_and(!1, Ordering::AcqRel);
-            debug_assert_ne!(previous & 1, 0);
+            debug_invariant!(previous & 1 != 0);
         } else {
             let previous = self.admission.state.fetch_sub(2, Ordering::AcqRel);
-            debug_assert_ne!(previous >> 1, 0);
+            debug_invariant!(previous >> 1 != 0);
         }
     }
 }
@@ -1503,25 +1524,6 @@ impl<H: Owner> Worker<H> {
     where
         W: FnOnce(&mut H) -> Result<T> + Send + 'static,
     {
-        self.prepare_reply(
-            move || {
-                let work = prepare()?;
-                Ok(move |owner: &mut H, reply: CommandReply<T, H::Closed>| {
-                    reply.complete(work(owner));
-                })
-            },
-            stop,
-        )
-    }
-
-    fn prepare_reply<T: Send + 'static, W>(
-        &self,
-        prepare: impl FnOnce() -> Result<W> + Send + 'static,
-        stop: bool,
-    ) -> FileOperation<T>
-    where
-        W: FnOnce(&mut H, CommandReply<T, H::Closed>) + Send + 'static,
-    {
         // Keep submission state, not Worker: an unpolled future must not
         // delay last-handle shutdown or make its own drop join the owner.
         let sender = self.sender.clone();
@@ -1542,7 +1544,7 @@ impl<H: Owner> Worker<H> {
                         if !stop && reply.cancelled() {
                             return;
                         }
-                        work(owner, reply);
+                        reply.complete(work(owner));
                     }))
                 },
             )
@@ -2211,7 +2213,7 @@ impl AsyncFilePlayer {
 ///
 /// # Finishing
 ///
-/// Await [`finish`](Self::finish) and check for [`FinishStatus::Closed`] to
+/// Await [`finish`](Self::finish) and check for [`SessionEnd::Closed`] to
 /// know a recording is complete, then await [`close`](Self::close). Neither
 /// blocks the executor.
 /// Native event loss, unreadable lifecycle evidence or a file-tracking limit
@@ -2226,15 +2228,10 @@ impl AsyncFilePlayer {
 /// operation before receiving the handle requests cleanup without waiting.
 ///
 /// Dropping the last clone **blocks the dropping thread** until the
-/// recorder's thread has finished: it stops a session that is still open,
-/// waits for the SDK to finalize the file within one
-/// [`FileRecorderOptions::drop_wait`] budget measured from drop and including
-/// the native stop, then destroys the recorder. This is deliberate: when the drop
-/// returns, the file is finalized as far as the SDK reported within that
-/// wait, even when the drop happens as the program exits. The outcome cannot
-/// be reported. A caller that must not block, such as a task on an async
-/// executor, awaits [`close`](Self::close) instead, which does the same
-/// without blocking; dropping the clones afterwards does not block.
+/// recorder's thread has finished. Its cleanup follows
+/// [`FileRecorderOptions::drop_wait`]. Await [`close`](Self::close) to perform
+/// that cleanup without blocking the executor.
+///
 /// While a submitted close or abandon still has a live future, last-clone drop does not
 /// wait because that future reports completion. Dropping the future makes the
 /// last-clone drop wait for cleanup again.
@@ -2292,9 +2289,8 @@ impl AsyncFileRecorder {
     /// Events left by an earlier refused start are delivered through
     /// [`next_event`](Self::next_event) before the new session begins.
     /// A recording or stopping session returns [`StateConflict::PreviousSessionOpen`].
-    /// After it ends, incomplete file tracking returns
-    /// [`StateConflict::IncompleteFileTracking`] until [`reset`](Self::reset)
-    /// succeeds, even if all known files closed.
+    /// After it ends, see [`StateConflict::IncompleteFileTracking`] for when
+    /// a new session requires a reset.
     #[doc(alias = "NDIlib_file_recorder_start")]
     #[doc(alias = "NDIlib_file_recorder_start_with_timecode")]
     pub fn start(
@@ -2332,10 +2328,9 @@ impl AsyncFileRecorder {
     /// existing waits to restore admission; cancellation is reclaimed by the
     /// owner. Ordinary commands and explicit stop requests remain available.
     ///
-    /// If another clone closes the recorder during the wait, this wait ends
-    /// at [`FileRecorderOptions::drop_wait`] from that close's
-    /// submission, including the native stop, or this wait's deadline if earlier. Closure established in
-    /// that time is reported normally; an unsettled session reports
+    /// If another clone closes the recorder during the wait, the
+    /// [`FileRecorderOptions::drop_wait`] deadline can end the wait early.
+    /// Closure established in that time is reported normally; an unsettled session reports
     /// [`StateConflict::Closed`] instead of [`FinishStatus::TimedOut`], because
     /// the recorder is being destroyed and cannot be waited on again.
     ///
@@ -2357,7 +2352,7 @@ impl AsyncFileRecorder {
     /// [`FileRecorder::wait_for_finish`].
     ///
     /// Returns `None` when the timeout expires, or `Some` with
-    /// [`FinishStatus::Closed`] or [`FinishStatus::Indeterminate`] when the
+    /// [`SessionEnd::Closed`] or [`SessionEnd::Indeterminate`] when the
     /// session ends. The current report remains available through
     /// [`report`](Self::report), including after a timeout.
     ///
@@ -2373,7 +2368,7 @@ impl AsyncFileRecorder {
     /// Those of [`FileRecorder::wait_for_finish`], and those every
     /// [`FileOperation`] can fail with.
     #[doc(alias = "NDIlib_file_recorder_capture_event")]
-    pub fn wait_for_finish(&self, timeout: Duration) -> FileOperation<Option<FinishStatus>> {
+    pub fn wait_for_finish(&self, timeout: Duration) -> FileOperation<Option<SessionEnd>> {
         self.finish_inner(timeout, false, FinishResponse::Wait)
     }
 
@@ -2389,7 +2384,7 @@ impl AsyncFileRecorder {
         let options = options.clone();
         self.worker.prepare(
             move || {
-                let options = CheckedRecorderOptions::new(&options)?;
+                let options = options.check()?;
                 Ok(move |recorder: &mut RecorderOwner| recorder.reset(options))
             },
             false,
@@ -2504,17 +2499,11 @@ impl AsyncFileRecorder {
     /// Stop an open session, destroy the recorder and end its thread, for
     /// every clone of this handle.
     ///
-    /// A session that is still open is stopped and given up to
-    /// [`FileRecorderOptions::drop_wait`] from this close's submission to finalize
-    /// its file, including the native stop and time spent in a submitted finish
-    /// or wait. A finish, queued or running, keeps its own earlier deadline; destruction then uses
-    /// only the remainder of the close's budget. Pending files are given that
-    /// time even after an indeterminate report. Incomplete tracking consumes
-    /// that remainder even if every known file closes: late events cannot prove
-    /// the unknown files finalized or change the final report. The future
-    /// completes when the SDK has destroyed the recorder, and does not say
-    /// whether the file was finalized: await [`finish`](Self::finish) first to
-    /// learn that. Nothing blocks the calling thread. Once submitted by polling
+    /// Shutdown follows [`FileRecorderOptions::drop_wait`]. A submitted
+    /// [`finish`](Self::finish) or [`wait_for_finish`](Self::wait_for_finish)
+    /// keeps its own earlier deadline. The future completes when the SDK has
+    /// destroyed the recorder. Await [`finish`](Self::finish) first to learn
+    /// whether the SDK confirmed closure. Once submitted by polling
     /// or calling [`FileOperation::submit`], the close runs even if its future
     /// is dropped. Closing again, from this or another clone,
     /// while or after it runs completes at the same time, with the same
@@ -3351,11 +3340,7 @@ mod tests {
         );
         let fixture =
             include_str!("../../tests/ui/internal/fail/file_operation_cannot_defer_again.rs");
-        let directory = std::env::temp_dir().join(format!(
-            "grafton-file-operation-contract-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = crate::test_support::FixtureDir::create("file-operation-contract");
         for (name, body, succeeds) in [
             (
                 "live",
@@ -3368,7 +3353,7 @@ mod tests {
             std::fs::write(&path, format!("{definitions}\n{body}")).unwrap();
             let output = std::process::Command::new("rustc")
                 .args(["--edition=2021", "--emit=metadata", "--out-dir"])
-                .arg(&directory)
+                .arg(directory.path())
                 .arg(path)
                 .output()
                 .unwrap();
@@ -3381,7 +3366,6 @@ mod tests {
                 );
             }
         }
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -3486,6 +3470,10 @@ mod tests {
     /// A blocked destructor makes joining observable without timing how long
     /// normal native destruction takes. Both paths use the same created owner.
     fn check_delivered_creation_drop(claimed: bool) {
+        // These handoffs involve multiple threads waking and can be slow on
+        // a starved runner. Only the held-destructor check tests overlap.
+        const READY: Duration = Duration::from_secs(10);
+
         struct DeliveryWake(Sender<()>);
         impl Wake for DeliveryWake {
             fn wake(self: Arc<Self>) {
@@ -3518,9 +3506,9 @@ mod tests {
         }
         impl Drop for HeldDrop {
             fn drop(&mut self) {
-                self.entered.send(thread::current().id()).unwrap();
-                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
-                self.finished.send(()).unwrap();
+                let _ = self.entered.send(thread::current().id());
+                let _ = self.release.recv();
+                let _ = self.finished.send(());
             }
         }
         let (create_release, create_gate) = mpsc::channel();
@@ -3531,7 +3519,7 @@ mod tests {
         let mut creation = spawn_owner(
             "file-test-creation-handoff",
             move || {
-                create_gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                create_gate.recv_timeout(READY).unwrap();
                 Ok(HeldDrop {
                     entered: drop_entered,
                     release: drop_gate,
@@ -3546,7 +3534,10 @@ mod tests {
             .poll(&mut Context::from_waker(&waker))
             .is_pending());
         create_release.send(()).unwrap();
-        delivery.recv_timeout(Duration::from_secs(1)).unwrap();
+        if let Err(error) = delivery.recv_timeout(READY) {
+            drop(drop_release);
+            panic!("the owner did not deliver its creation: {error}");
+        }
         let (drop_returned, drop_return) = mpsc::channel();
         let dropper = if claimed {
             let worker = block_on(creation).unwrap();
@@ -3560,13 +3551,17 @@ mod tests {
                 drop_returned.send(()).unwrap();
             })
         };
-        let owner_thread = drop_entry.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_ne!(owner_thread, dropper.thread().id());
-        let returned = drop_return.recv_timeout(Duration::from_millis(100));
+        let owner_thread = drop_entry.recv_timeout(READY);
+        let dropper_thread = dropper.thread().id();
+        let returned = drop_return.recv_timeout(Duration::from_secs(2));
         // Always release and join before asserting, including on a regression.
         drop_release.send(()).unwrap();
-        drop_finish.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop_finish.recv_timeout(READY).unwrap();
         dropper.join().unwrap();
+        assert_ne!(
+            owner_thread.expect("owner did not begin destruction"),
+            dropper_thread
+        );
         assert_eq!(returned.is_ok(), !claimed);
     }
 
@@ -3780,17 +3775,37 @@ mod tests {
 
     #[test]
     fn unpolled_finish_does_not_consume_its_wait_budget() {
-        let (device, recorder) = mock_recorder(Closing::WhenTold);
+        // Inspect the job itself before any owner can register or settle it.
+        // This makes the submission boundary observable even on a slow runner.
+        let (sender, jobs) = mpsc::channel();
+        let recorder = AsyncFileRecorder {
+            worker: Arc::new(Worker {
+                sender,
+                admission: Arc::new(Admission::new(1)),
+                finish: RecorderFinish::admission(1),
+                control: Arc::new(Control::with_outcome()),
+                events: Arc::new(EventQueue::new(1)),
+                thread: OnceLock::new(),
+            }),
+        };
         let wait = Duration::from_millis(50);
         let finishing = recorder.finish(wait);
-        thread::sleep(wait + wait);
-        assert_eq!(device.stops.load(Ordering::Acquire), 0);
-        let finishing = finishing.submit();
-        await_finish(&recorder);
-        device.close();
-        let outcome = block_on(finishing).unwrap();
-        assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
-        block_on(recorder.close()).unwrap();
+        assert!(matches!(jobs.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let constructed = Instant::now();
+        let submitting = loop {
+            let now = Instant::now();
+            if now > constructed {
+                break now;
+            }
+            thread::yield_now();
+        };
+        let _finishing = finishing.submit();
+        let submitted = Instant::now();
+        let Job::Finish { finish, .. } = jobs.try_recv().unwrap() else {
+            panic!("finish must enqueue a finish request");
+        };
+        assert!(finish.deadline.end() >= submitting + wait);
+        assert!(finish.deadline.end() <= submitted + wait);
     }
 
     #[test]
@@ -3836,11 +3851,11 @@ mod tests {
                 if closes_file {
                     assert!(matches!(
                         block_on(finishing).unwrap(),
-                        FinishStatus::Closed(_)
+                        FinishStatus::Ended(SessionEnd::Closed(_))
                     ));
                     assert!(matches!(
                         block_on(waiting).unwrap(),
-                        Some(FinishStatus::Closed(_))
+                        Some(SessionEnd::Closed(_))
                     ));
                     assert!(device.closed_before_destroy.load(Ordering::Acquire));
                 } else {
@@ -3870,7 +3885,7 @@ mod tests {
                 }
                 assert!(matches!(
                     block_on(finishing).unwrap(),
-                    FinishStatus::Closed(_)
+                    FinishStatus::Ended(SessionEnd::Closed(_))
                 ));
                 assert_eq!(device.stops.load(Ordering::Acquire), 1);
                 assert_eq!(device.destroys.load(Ordering::Acquire), 1);
@@ -4014,7 +4029,7 @@ mod tests {
             block_on(blocked).unwrap();
             assert!(matches!(
                 block_on(FileOperation::live(finishing)).unwrap(),
-                FinishStatus::Closed(_)
+                FinishStatus::Ended(SessionEnd::Closed(_))
             ));
             block_on(closing).unwrap();
         });
@@ -4157,7 +4172,7 @@ mod tests {
         }
         assert!(matches!(
             block_on(recorder.finish(Duration::ZERO)).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
         assert_eq!(device.waits.load(Ordering::Acquire), 0);
         block_on(recorder.close()).unwrap();
@@ -4184,7 +4199,7 @@ mod tests {
             "report commands must remain available during a pending wait"
         );
         device.close();
-        let Some(FinishStatus::Closed(report)) = block_on(waiting).unwrap() else {
+        let Some(SessionEnd::Closed(report)) = block_on(waiting).unwrap() else {
             panic!("the later wait must observe confirmed closure");
         };
         assert!(report.closure_confirmed());
@@ -4202,7 +4217,7 @@ mod tests {
         );
         device.dropped_events.store(1, Ordering::Release);
         block_on(recorder.request_stop()).unwrap();
-        let Some(FinishStatus::Indeterminate(report)) =
+        let Some(SessionEnd::Indeterminate(report)) =
             block_on(recorder.wait_for_finish(Duration::ZERO)).unwrap()
         else {
             panic!("the lost SDK event prevents confirmation, not settlement");
@@ -4227,7 +4242,9 @@ mod tests {
         device.close();
         let first = block_on(first).unwrap();
         let second = block_on(second).unwrap();
-        assert!(matches!(first, FinishStatus::Closed(_)));
+        let FinishStatus::Ended(first @ SessionEnd::Closed(_)) = first else {
+            panic!("expected confirmed closure, got {first:?}");
+        };
         assert_eq!(Some(first), second);
         block_on(recorder.close()).unwrap();
     }
@@ -4249,7 +4266,7 @@ mod tests {
         device.close();
         assert!(matches!(
             block_on(retained).unwrap(),
-            Some(FinishStatus::Closed(_))
+            Some(SessionEnd::Closed(_))
         ));
         block_on(recorder.close()).unwrap();
     }
@@ -4295,7 +4312,7 @@ mod tests {
         );
         assert!(matches!(
             block_on(recorder.finish(Duration::ZERO)).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
         block_on(recorder.close()).unwrap();
     }
@@ -4699,12 +4716,12 @@ mod tests {
         check(
             true,
             |recorder| recorder.finish(Duration::from_secs(30)),
-            |outcome| matches!(outcome, FinishStatus::Closed(_)),
+            |outcome| matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
         );
         check(
             false,
             |recorder| recorder.wait_for_finish(Duration::from_secs(30)),
-            |outcome| matches!(outcome, Some(FinishStatus::Closed(_))),
+            |outcome| matches!(outcome, Some(SessionEnd::Closed(_))),
         );
     }
 
@@ -4776,7 +4793,7 @@ mod tests {
         device.close();
         let outcome = block_on(finishing).unwrap();
         assert!(
-            matches!(outcome, FinishStatus::Indeterminate(_)),
+            matches!(outcome, FinishStatus::Ended(SessionEnd::Indeterminate(_))),
             "{outcome:?}"
         );
         block_on(closing).unwrap();
@@ -4830,7 +4847,10 @@ mod tests {
         recorder.next_event(Duration::ZERO).unwrap();
         device.dropped_events.store(1, Ordering::Release);
         let outcome = recorder.finish(Duration::ZERO).unwrap();
-        assert!(matches!(outcome, FinishStatus::Indeterminate(_)));
+        assert!(matches!(
+            outcome,
+            FinishStatus::Ended(SessionEnd::Indeterminate(_))
+        ));
         assert!(matches!(
             recorder.start(&target, RecordingTimecode::Preserve),
             Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
@@ -4848,7 +4868,10 @@ mod tests {
         );
         device.dropped_events.store(1, Ordering::Release);
         let outcome = block_on(recorder.finish(Duration::ZERO)).unwrap();
-        assert!(matches!(outcome, FinishStatus::Indeterminate(_)));
+        assert!(matches!(
+            outcome,
+            FinishStatus::Ended(SessionEnd::Indeterminate(_))
+        ));
         block_on(recorder.close()).unwrap();
         assert!(device.closed_before_destroy.load(Ordering::Acquire));
     }
@@ -4870,7 +4893,7 @@ mod tests {
         device.dropped_events.store(1, Ordering::Release);
         assert!(matches!(
             recorder.finish(Duration::ZERO).unwrap(),
-            FinishStatus::Indeterminate(_)
+            FinishStatus::Ended(SessionEnd::Indeterminate(_))
         ));
         let report = recorder.report();
         assert!(matches!(
@@ -4914,7 +4937,7 @@ mod tests {
         device.dropped_events.store(1, Ordering::Release);
         assert!(matches!(
             block_on(recorder.finish(Duration::ZERO)).unwrap(),
-            FinishStatus::Indeterminate(_)
+            FinishStatus::Ended(SessionEnd::Indeterminate(_))
         ));
         let began = Instant::now();
         block_on(recorder.close()).unwrap();
@@ -4939,7 +4962,7 @@ mod tests {
             // The missing event is an open for hidden.mkv. The only known
             // path closes at stop, leaving no known path to await.
             device.dropped_events.store(1, Ordering::Release);
-            let FinishStatus::Indeterminate(report) =
+            let FinishStatus::Ended(SessionEnd::Indeterminate(report)) =
                 block_on(recorder.finish(Duration::ZERO)).unwrap()
             else {
                 panic!("losing an open must prevent confirmed closure");
@@ -4973,7 +4996,7 @@ mod tests {
             block_on(blocked).unwrap();
             assert_eq!(
                 block_on(finishing).unwrap(),
-                Some(FinishStatus::Indeterminate(report))
+                Some(SessionEnd::Indeterminate(report))
             );
             if delayed_hidden_close {
                 let limit = Instant::now() + Duration::from_secs(5);
@@ -5037,7 +5060,7 @@ mod tests {
             }
             device.push(mock::ROLLOVER, "hidden.mkv");
             device.push(mock::FILE_CLOSED, "hidden.mkv");
-            let FinishStatus::Indeterminate(report) =
+            let FinishStatus::Ended(SessionEnd::Indeterminate(report)) =
                 block_on(recorder.finish(Duration::ZERO)).unwrap()
             else {
                 panic!("lost file evidence prevents confirmed closure");
@@ -5064,7 +5087,7 @@ mod tests {
             ));
         }
         device.close();
-        let FinishStatus::Closed(report) =
+        let FinishStatus::Ended(SessionEnd::Closed(report)) =
             block_on(recorder.finish(Duration::from_secs(1))).unwrap()
         else {
             panic!("the known file closed");
@@ -5077,7 +5100,7 @@ mod tests {
             ));
             assert_eq!(
                 block_on(recorder.finish(Duration::ZERO)).unwrap(),
-                FinishStatus::Closed(report.clone())
+                FinishStatus::Ended(SessionEnd::Closed(report.clone()))
             );
         }
         let replacement = mock::Recorder::new(Closing::AtStop);
@@ -5109,7 +5132,7 @@ mod tests {
             Duration::from_millis(60),
         );
         device.dropped_events.store(1, Ordering::Release);
-        let FinishStatus::Indeterminate(report) =
+        let FinishStatus::Ended(SessionEnd::Indeterminate(report)) =
             block_on(recorder.finish(Duration::ZERO)).unwrap()
         else {
             panic!("lost native events must leave an indeterminate report");
@@ -5155,7 +5178,7 @@ mod tests {
         );
         assert!(matches!(
             block_on(recorder.finish(Duration::ZERO)).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
         block_on(recorder.close()).unwrap();
         assert_eq!(replacement.starts.load(Ordering::Acquire), 1);
@@ -5177,7 +5200,7 @@ mod tests {
         let requested = recorder.worker.control.shutdown_requested_at().unwrap();
         device.dropped_events.store(1, Ordering::Release);
         device.close();
-        let Some(FinishStatus::Indeterminate(report)) = block_on(waiting).unwrap() else {
+        let Some(SessionEnd::Indeterminate(report)) = block_on(waiting).unwrap() else {
             panic!("the remaining waiter must retain the loss verdict");
         };
         assert_eq!(report.dropped_events(), 1);
@@ -5203,7 +5226,7 @@ mod tests {
                 },
             );
             device.dropped_events.store(1, Ordering::Release);
-            let FinishStatus::Indeterminate(report) =
+            let FinishStatus::Ended(SessionEnd::Indeterminate(report)) =
                 block_on(recorder.finish(Duration::ZERO)).unwrap()
             else {
                 panic!("lost events must prevent confirmation");
@@ -5236,7 +5259,10 @@ mod tests {
             dropped.send(()).unwrap();
         });
         let outcome = block_on(finishing).unwrap();
-        assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
+            "{outcome:?}"
+        );
         drop_done.recv_timeout(Duration::from_secs(1)).unwrap();
         dropping.join().unwrap();
         assert!(device.closed_before_destroy.load(Ordering::Acquire));
@@ -5280,7 +5306,7 @@ mod tests {
         let waiting = recorder.wait_for_finish(Duration::from_secs(5)).submit();
         device.close();
         let outcome = block_on(waiting).unwrap();
-        let Some(FinishStatus::Closed(report)) = outcome else {
+        let Some(SessionEnd::Closed(report)) = outcome else {
             panic!("expected confirmed closure after the later close event: {outcome:?}")
         };
         assert!(report.closure_confirmed());
@@ -6017,21 +6043,13 @@ mod tests {
             block_on(player.close()).unwrap();
             return;
         }
-        let directory =
-            std::env::temp_dir().join(format!("grafton-file-start-path-{}", std::process::id()));
+        let directory = crate::test_support::FixtureDir::create("file-start-path");
         std::fs::create_dir_all(directory.join("submitted")).unwrap();
         std::fs::create_dir_all(directory.join("running")).unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "file::asynchronous::tests::a_relative_player_start_retains_the_directory_at_submission", "--nocapture"])
-            .env(CHILD, &directory)
-            .output().unwrap();
-        std::fs::remove_dir_all(directory).unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::test_support::TestChild::new("file::asynchronous::tests::a_relative_player_start_retains_the_directory_at_submission")
+
+            .env(CHILD, directory.path())
+            .run();
     }
 
     #[test]
@@ -6141,7 +6159,10 @@ mod tests {
     fn an_async_finish_whose_stop_outlasts_its_wait_takes_the_queued_close() {
         let (device, recorder) = mock_recorder(Closing::DuringSlowStop(Duration::from_millis(80)));
         let outcome = block_on(recorder.finish(Duration::from_millis(10))).unwrap();
-        assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
+            "{outcome:?}"
+        );
         assert_eq!(device.stops.load(Ordering::Acquire), 1);
         block_on(recorder.close()).unwrap();
     }
@@ -6214,7 +6235,7 @@ mod tests {
             matches!(&polled, Poll::Ready(Err(Error::InvalidInput(crate::InputDefect::TimeoutTooLong { requested }))) if *requested == crate::MAX_TIMEOUT + Duration::from_nanos(1)),
             "{polled:?}"
         );
-        assert!(waiting.timer.is_none());
+        assert!(matches!(waiting.state, EventWaitState::Done));
         // It took nothing and left no waiter behind.
         assert_eq!(block_on(events.wait(Duration::ZERO)).unwrap(), Some(7));
     }
@@ -6270,7 +6291,10 @@ mod tests {
         close.source_format_payload.video_track_count = 3;
         device.push_event(close);
         let outcome = block_on(finishing).unwrap();
-        assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
+            "{outcome:?}"
+        );
         // The start, pumped before the finish began, then the malformed close.
         let started = block_on(recorder.next_event(Duration::ZERO))
             .unwrap()
@@ -6414,7 +6438,9 @@ mod tests {
             .as_mut()
             .poll(&mut Context::from_waker(&idle_waker()))
             .is_pending());
-        let key = answered.timer.expect("a pending wait is timed");
+        let EventWaitState::Registered { timer: key, .. } = answered.state else {
+            panic!("a pending wait is timed");
+        };
         assert!(registered(key));
         events.push(Ok(7));
         assert!(matches!(
@@ -6430,7 +6456,9 @@ mod tests {
             .as_mut()
             .poll(&mut Context::from_waker(&idle_waker()))
             .is_pending());
-        let key = abandoned.timer.expect("a pending wait is timed");
+        let EventWaitState::Registered { timer: key, .. } = abandoned.state else {
+            panic!("a pending wait is timed");
+        };
         assert!(registered(key));
         drop(abandoned);
         assert!(!registered(key));
@@ -6530,7 +6558,7 @@ mod tests {
         let options = FileRecorderOptions::new(SourceSpec::new("mock").unwrap())
             .naming(FileNaming::Exact)
             .format_change_rollover(true);
-        let (resolved, expected) = crate::test_alloc::allocation_count(|| options.resolve());
+        let (resolved, expected) = crate::test_alloc::allocation_count(|| options.check());
         assert!(resolved.is_err());
         let operation = AsyncFileRecorder::create(&mock::recorder_api(), &options);
         let (operation, allocations) = crate::test_alloc::allocation_count(|| operation.submit());

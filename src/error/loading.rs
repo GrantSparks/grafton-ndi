@@ -55,8 +55,7 @@ pub enum LibraryKind {
 /// The payload is boxed so adding diagnostic context does not enlarge
 /// [`crate::Error`] on capture and send paths. Use the accessors for decisions
 /// and [`Display`](fmt::Display) for diagnostic text.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Error)]
-#[error("{0}")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SelectionFailure(Box<SelectionData>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -217,18 +216,34 @@ impl SelectionFailure {
     }
 }
 
-impl fmt::Display for SelectionData {
+impl std::error::Error for SelectionFailure {}
+
+impl fmt::Display for SelectionFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SelectionData::DifferentLibrary { selected, requested, .. } => write!(f, "{} is already selected; it cannot be switched to {}", selected.display(), requested.display()),
-            SelectionData::EditionNotMet { .. } => f.write_str("the selected NDI implementation is not an Advanced SDK"),
-            SelectionData::LinkedImplementation { library: LibraryKind::Runtime, requested } => write!(f, "the NDI SDK is linked into this program, so {} cannot be loaded instead", requested.display()),
-            SelectionData::LinkedImplementation { library: LibraryKind::File, .. } => f.write_str("a statically linked NDI File implementation cannot be replaced by a library"),
-            SelectionData::ReentrantSelection { .. } => f.write_str("native module loading re-entered NDI runtime selection"),
-            SelectionData::FileNeedsAdvancedRuntime { .. } => f.write_str("the NDI File library needs the Advanced SDK runtime, and the selected runtime is the Standard one"),
-            SelectionData::ForeignRuntimeInScope { candidate, origin, foreign_module, .. } => write!(f,
-                "{} ({origin}): the process's global symbol scope already holds another NDI runtime ({}); select that runtime or stop linking or preloading it", candidate.display(), foreign_module.display()),
+        write!(f, "{} selection: {}", self.library(), self.kind())?;
+        for (label, path) in [
+            ("selected", self.selected()),
+            ("requested", self.requested()),
+        ] {
+            if let Some(path) = path {
+                write!(f, ", {label} {}", path.display())?;
+            }
         }
+        if let SelectionData::ForeignRuntimeInScope {
+            candidate,
+            origin,
+            foreign_module,
+            ..
+        } = &*self.0
+        {
+            write!(
+                f,
+                ", candidate {} ({origin}), foreign runtime {}. Select that runtime or stop linking or preloading it",
+                candidate.display(),
+                foreign_module.display(),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -493,12 +508,12 @@ impl LoadFailure {
     }
 
     #[cfg(any(ndi_link_static, test))]
-    pub(crate) fn linked(library: LibraryKind, label: &str, refusal: LoadRefusal) -> Self {
+    pub(crate) fn linked(library: LibraryKind, refusal: LoadRefusal) -> Self {
         Self(Box::new(FailureData {
             library,
             description: None,
             attempts: vec![LoadAttempt::new(
-                PathBuf::from(label),
+                PathBuf::from(format!("{library} (linked SDK archive)")),
                 LoadOrigin::LinkedArchive,
                 refusal,
                 true,
@@ -618,109 +633,138 @@ mod tests {
 
     #[test]
     fn every_conflict_kind_preserves_its_typed_paths_and_diagnostic() {
+        fn check(
+            failure: SelectionFailure,
+            kind: SelectionConflict,
+            library: LibraryKind,
+            selected: Option<&Path>,
+            requested: Option<&Path>,
+            foreign: Option<&Path>,
+            candidate: Option<(&Path, LoadOrigin)>,
+        ) {
+            assert_eq!(failure.kind(), kind);
+            assert_eq!(failure.library(), library);
+            assert_eq!(failure.selected(), selected);
+            assert_eq!(failure.requested(), requested);
+            assert_eq!(failure.foreign_module(), foreign);
+            let diagnostic = failure.to_string();
+            assert!(diagnostic.starts_with(&format!("{library} selection: {kind}")));
+            for (label, path) in [
+                ("selected", selected),
+                ("requested", requested),
+                ("foreign runtime", foreign),
+            ] {
+                if let Some(path) = path {
+                    assert!(
+                        diagnostic.contains(&format!(", {label} {}", path.display())),
+                        "{diagnostic}"
+                    );
+                } else {
+                    assert!(!diagnostic.contains(&format!(", {label} ")), "{diagnostic}");
+                }
+            }
+            if let Some((path, origin)) = candidate {
+                assert!(
+                    diagnostic.contains(&format!(", candidate {} ({origin})", path.display())),
+                    "{diagnostic}"
+                );
+            }
+            assert_eq!(
+                Error::RuntimeConflict(failure).to_string(),
+                format!("Conflicting {diagnostic}")
+            );
+        }
+
         let selected = Path::new("selected/ndi.so");
         let requested = Path::new("requested/ndi.so");
         let foreign = Path::new("foreign/ndi.so");
+        let candidate = Path::new("candidate/ndi.so");
+
         for library in [LibraryKind::Runtime, LibraryKind::File] {
-            let failure = SelectionFailure::different_library(library, selected, requested);
-            assert_eq!(failure.kind(), SelectionConflict::DifferentLibrary);
-            assert_eq!(failure.library(), library);
-            assert_eq!(failure.selected(), Some(selected));
-            assert_eq!(failure.requested(), Some(requested));
-            assert_eq!(failure.foreign_module(), None);
-            assert_eq!(
-                failure.to_string(),
-                "selected/ndi.so is already selected; it cannot be switched to requested/ndi.so"
+            check(
+                SelectionFailure::different_library(library, selected, requested),
+                SelectionConflict::DifferentLibrary,
+                library,
+                Some(selected),
+                Some(requested),
+                None,
+                None,
             );
-
-            let failure = SelectionFailure::linked(library, requested);
-            assert_eq!(failure.kind(), SelectionConflict::LinkedImplementation);
-            assert_eq!(failure.library(), library);
-            assert_eq!(failure.selected(), None);
-            assert_eq!(failure.requested(), Some(requested));
-            assert_eq!(failure.foreign_module(), None);
-            assert_eq!(failure.to_string(), match library {
-                LibraryKind::Runtime => "the NDI SDK is linked into this program, so requested/ndi.so cannot be loaded instead",
-                LibraryKind::File => "a statically linked NDI File implementation cannot be replaced by a library",
-            });
-
-            let failure = SelectionFailure::reentrant(library);
-            assert_eq!(failure.kind(), SelectionConflict::ReentrantSelection);
-            assert_eq!(failure.library(), library);
-            assert_eq!(failure.selected(), None);
-            assert_eq!(failure.requested(), None);
-            assert_eq!(failure.foreign_module(), None);
-            assert_eq!(
-                failure.to_string(),
-                "native module loading re-entered NDI runtime selection"
+            check(
+                SelectionFailure::linked(library, requested),
+                SelectionConflict::LinkedImplementation,
+                library,
+                None,
+                Some(requested),
+                None,
+                None,
             );
-
+            check(
+                SelectionFailure::reentrant(library),
+                SelectionConflict::ReentrantSelection,
+                library,
+                None,
+                None,
+                None,
+                None,
+            );
             for (explicit, origin) in [
                 (Some(requested), LoadOrigin::Explicit),
                 (None, LoadOrigin::Companion),
             ] {
-                let failure = SelectionFailure::foreign(
+                check(
+                    SelectionFailure::foreign(
+                        library,
+                        Some(selected),
+                        explicit,
+                        foreign,
+                        candidate,
+                        origin,
+                    ),
+                    SelectionConflict::ForeignRuntimeInScope,
                     library,
                     Some(selected),
                     explicit,
-                    foreign,
-                    requested,
-                    origin,
-                );
-                assert_eq!(failure.kind(), SelectionConflict::ForeignRuntimeInScope);
-                assert_eq!(failure.library(), library);
-                assert_eq!(failure.selected(), Some(selected));
-                assert_eq!(failure.requested(), explicit);
-                assert_eq!(failure.foreign_module(), Some(foreign));
-                assert_eq!(
-                    failure.to_string(),
-                    format!(
-                        "requested/ndi.so ({origin}): {}",
-                        LoadRefusal::ForeignRuntimeInScope {
-                            module: foreign.into()
-                        }
-                    )
-                );
-                assert_eq!(
-                    Error::RuntimeConflict(failure.clone()).to_string(),
-                    format!("Conflicting NDI runtime selection: {failure}")
+                    Some(foreign),
+                    Some((candidate, origin)),
                 );
             }
         }
-        let failure = SelectionFailure::edition_not_met(Some(selected), Some(requested));
-        assert_eq!(failure.kind(), SelectionConflict::EditionNotMet);
-        assert_eq!(failure.library(), LibraryKind::Runtime);
-        assert_eq!(failure.selected(), Some(selected));
-        assert_eq!(failure.requested(), Some(requested));
-        assert_eq!(failure.foreign_module(), None);
-        assert_eq!(
-            failure.to_string(),
-            "the selected NDI implementation is not an Advanced SDK"
-        );
-
-        #[cfg(feature = "file-io")]
-        {
-            let failure = SelectionFailure::file_needs_advanced(Some(selected), Some(requested));
-            assert_eq!(failure.kind(), SelectionConflict::FileNeedsAdvancedRuntime);
-            assert_eq!(failure.library(), LibraryKind::File);
-            assert_eq!(failure.selected(), Some(selected));
-            assert_eq!(failure.requested(), Some(requested));
-            assert_eq!(failure.foreign_module(), None);
-            assert_eq!(failure.to_string(), "the NDI File library needs the Advanced SDK runtime, and the selected runtime is the Standard one");
+        for selected in [None, Some(selected)] {
+            for requested in [None, Some(requested)] {
+                check(
+                    SelectionFailure::edition_not_met(selected, requested),
+                    SelectionConflict::EditionNotMet,
+                    LibraryKind::Runtime,
+                    selected,
+                    requested,
+                    None,
+                    None,
+                );
+                #[cfg(feature = "file-io")]
+                check(
+                    SelectionFailure::file_needs_advanced(selected, requested),
+                    SelectionConflict::FileNeedsAdvancedRuntime,
+                    LibraryKind::File,
+                    selected,
+                    requested,
+                    None,
+                    None,
+                );
+            }
         }
     }
 
     #[test]
-    fn linked_failures_report_one_linked_attempt_without_changing_display() {
-        for (library, label) in [
-            (LibraryKind::Runtime, "the linked SDK"),
-            (LibraryKind::File, "the linked NDI SDK archive"),
-        ] {
-            let failure = LoadFailure::linked(library, label, LoadRefusal::EditionNotMet);
+    fn linked_failures_report_one_linked_attempt_with_a_library_label() {
+        for library in [LibraryKind::Runtime, LibraryKind::File] {
+            let label = format!("{library} (linked SDK archive)");
+            let failure = LoadFailure::linked(library, LoadRefusal::EditionNotMet);
             assert_eq!(failure.library(), library);
             assert!(failure.loaded_any());
             assert_eq!(failure.attempts().len(), 1);
             assert_eq!(failure.attempts()[0].origin(), LoadOrigin::LinkedArchive);
+            assert_eq!(failure.attempts()[0].location(), Path::new(&label));
             assert_eq!(
                 failure.to_string(),
                 format!("{label}: it does not export the Advanced SDK entry points")

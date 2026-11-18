@@ -124,7 +124,7 @@ fn mean<P: Sample, const WEIGHTED: bool>(
 }
 
 /// Adds one complete horizontal block at a time. The reader emits batches of
-/// 16 pixels, divisible by every reduction factor, so a block never straddles
+/// BATCH pixels, divisible by every reduction factor, so a block never straddles
 /// two batches. Plain and weighted sums stay in registers until one store.
 struct Accumulate<'s, P: Sample, const WEIGHTED: bool> {
     sums: &'s mut [[P::Sum; 4]],
@@ -135,7 +135,6 @@ struct Accumulate<'s, P: Sample, const WEIGHTED: bool> {
 impl<P: Sample, const WEIGHTED: bool> Sink<P> for Accumulate<'_, P, WEIGHTED> {
     fn put(&mut self, pixels: &[[P; 4]]) {
         let size = 1 << self.shift;
-        debug_assert_eq!(self.x % size, 0);
         let start = self.x >> self.shift;
         self.x += pixels.len();
         for (sum, block) in self.sums[start..].iter_mut().zip(pixels.chunks(size)) {

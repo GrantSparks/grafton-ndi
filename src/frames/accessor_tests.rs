@@ -110,7 +110,7 @@ fn captured_audio_surfaces_agree_for_packed_and_padded_channels() {
         // SAFETY: initialized samples and static metadata outlive each no-op
         // test loan. Each reference validates its delivered capture descriptor.
         let receiver = unsafe {
-            AudioFrameRef::new(RecvAudioGuard::with_test_free(
+            AudioFrameRef::new(Guard::<AudioKind>::with_test_free(
                 std::ptr::null_mut(),
                 raw,
                 |_, _| {},

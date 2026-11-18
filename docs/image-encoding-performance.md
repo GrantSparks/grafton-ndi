@@ -11,10 +11,11 @@ and color/HDR handling.
 PNG and JPEG convert rows incrementally. JPEG retains its final converted
 component row (three bytes per output pixel) for repeated padding requests.
 WebP borrows eligible contiguous RGBA input or constructs a complete converted
-image. Lossless WebP uses three bytes
-per output pixel with alpha discarded, otherwise four; lossy WebP always takes
-four, with opaque alpha when discarded. Both WebP formats also buffer the complete
-encoded result before `encode_image_to` writes it. These are conversion/output
+image. Lossless WebP uses three bytes per output pixel if the source has no
+alpha or alpha is discarded, and four if alpha is kept. Lossy WebP always takes
+four, with opaque alpha when the source has none or alpha is discarded. Both
+WebP formats also buffer the complete encoded result before `encode_image_to`
+writes it. These are conversion/output
 costs; codec state, source frames, reduction scratch and consumer buffers add to
 memory use.
 

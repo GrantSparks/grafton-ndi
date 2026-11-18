@@ -22,7 +22,8 @@ fn abandon(future: impl Future) {
     let mut future = Box::pin(future);
     let mut context = Context::from_waker(Waker::noop());
     assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
-    // Give the blocking work time to enter its first attempt, then abandon it.
+    // Give the worker a chance to start. The scripted checks in
+    // tests/async_receiver_cancellation.rs observe native entry directly.
     std::thread::sleep(Duration::from_millis(30));
     drop(future);
 }

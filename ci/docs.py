@@ -8,12 +8,14 @@ Rust fences are compiled (never run) against the current crate and locked
 versions of its dependencies. Use a linked runnable example for code fragments.
 With --rustdoc, GitHub Pages API URLs and current-version docs.rs URLs are
 checked against generated HTML. Prose API names in current guides are checked
-against the same item and member names.
+against the same item and member names. Migration instructions check old names
+against the tagged release they compare.
 Documented dependency features and the README feature table are checked against
 Cargo.toml so removed or renamed features cannot remain in install instructions.
 Native table entry points need public SDK search aliases or an explicit internal
-classification. Shared receiver controls keep KVM forwards and their attributes
-in step. Generated declarations also reject underscore-prefixed parameters.
+classification. Synchronous and asynchronous methods keep the same aliases,
+and shared receiver controls keep their KVM forwards and attributes. Generated
+declarations also reject underscore-prefixed parameters.
 """
 import argparse
 from collections import Counter
@@ -351,7 +353,7 @@ def sdk_alias_violations(root):
 
 
 @dataclass(frozen=True)
-class SharedReceiverMethod:
+class SharedMethod:
     line: int
     aliases: frozenset
     must_use: frozenset
@@ -372,13 +374,8 @@ def token_angle_end(words, start):
     return len(words)
 
 
-def shared_receiver_methods(text, owner):
-    """Collect literal shared controls from generic inherent receiver impls.
-
-    Capture methods already share an inventory macro. This checks handwritten
-    controls on ReceiverMode and EventMode, excluding private methods, consuming
-    or mutable receivers, trait impls, examples, test modules and method bodies.
-    """
+def shared_methods(text, owner, *, kvm_controls=False):
+    """Collect public borrowed methods from inherent impls of a named type."""
     tokens = rust_tokens(text)
     words, indices = production_words([word for word, _ in tokens], with_indices=True)
     methods, cursor = {}, 0
@@ -397,8 +394,12 @@ def shared_receiver_methods(text, owner):
             continue
         end = token_group_end(words, body)
         header = words[cursor + 1:body]
+        target_end = declaration + 1
+        if words[target_end:target_end + 1] == ['<']:
+            target_end = token_angle_end(words, target_end)
         if (words[declaration:declaration + 1] != [owner]
-                or not {'ReceiverMode', 'EventMode'}.intersection(header)):
+                or words[target_end:target_end + 1] == ['for']
+                or (kvm_controls and not {'ReceiverMode', 'EventMode'}.intersection(header))):
             cursor = end
             continue
         member = body + 1
@@ -418,9 +419,8 @@ def shared_receiver_methods(text, owner):
                     receiver = inputs[0] if inputs else []
                     if receiver[:1] == ['&'] and receiver[1:2] == ["'"]:
                         receiver = receiver[:1] + receiver[3:]
-                    if receiver == ['&', 'self']:
-                        # Compare every alias, not only NDIlib aliases: a future
-                        # additional search term must reach the KVM view too.
+                    if (receiver == ['&', 'self'] or
+                            (not kvm_controls and receiver == ['&', 'mut', 'self'])):
                         aliases = frozenset(
                             word for attribute in attributes
                             if attribute[:3] == ['doc', '(', 'alias']
@@ -430,7 +430,7 @@ def shared_receiver_methods(text, owner):
                         must_use = frozenset(tuple(attribute) for attribute in attributes
                                              if attribute[:1] == ['must_use'])
                         offset = tokens[indices[function + 1]][1]
-                        methods[name] = SharedReceiverMethod(
+                        methods[name] = SharedMethod(
                             text.count('\n', 0, offset) + 1, aliases, must_use)
                     member = arguments_end
                     continue
@@ -443,32 +443,63 @@ def shared_receiver_methods(text, owner):
     return methods
 
 
-def kvm_forward_violations(root):
-    """Every shared Receiver control retains its KVM forward and attributes."""
-    controls = {}
-    for relative in ('src/receiver.rs', 'src/advanced/controls.rs'):
-        path = root / relative
-        if path.exists():
-            for name, method in shared_receiver_methods(path.read_text(encoding='utf-8'), 'Receiver').items():
-                controls[name] = (relative, method)
-    relative = 'src/advanced/kvm_receiver.rs'
-    path = root / relative
-    forwards = (shared_receiver_methods(path.read_text(encoding='utf-8'), 'KvmReceiver')
-                if path.exists() else {})
+@dataclass(frozen=True)
+class MethodTwins:
+    original: str
+    original_files: tuple[str, ...]
+    twin: str
+    twin_file: str
+    exclusions: dict[str, str] | None = None
+    kvm_controls: bool = False
+
+
+RECEIVER_FILES = ('src/receiver.rs', 'src/advanced/controls.rs')
+FINDER_FILES = ('src/finder.rs',)
+ASYNC_DISCOVERY = 'src/asynchronous/discovery.rs'
+ASYNC_FILE = 'src/file/asynchronous.rs'
+METHOD_TWINS = (
+    MethodTwins('Receiver', RECEIVER_FILES, 'KvmReceiver', 'src/advanced/kvm_receiver.rs',
+                KVM_CONTROL_EXCLUSIONS, kvm_controls=True),
+    MethodTwins('Finder', FINDER_FILES, 'AsyncFinder', ASYNC_DISCOVERY),
+    MethodTwins('SourceCache', FINDER_FILES, 'AsyncFinder', ASYNC_DISCOVERY),
+    MethodTwins('SourceWatch', FINDER_FILES, 'AsyncSourceWatch', ASYNC_DISCOVERY),
+    MethodTwins('Receiver', RECEIVER_FILES, 'AsyncReceiver', 'src/asynchronous.rs'),
+    MethodTwins('FilePlayer', ('src/file/player.rs',), 'AsyncFilePlayer', ASYNC_FILE),
+    MethodTwins('FileRecorder', ('src/file/recorder.rs',), 'AsyncFileRecorder', ASYNC_FILE),
+)
+
+
+def method_twin_violations(root):
+    """Same-named twins share aliases. KVM also needs every forward and its must_use."""
+    def inventory(owner, files, kvm_controls):
+        methods = {}
+        for relative in files:
+            path = root / relative
+            if path.exists():
+                methods.update((name, (relative, method)) for name, method in
+                               shared_methods(path.read_text(encoding='utf-8'), owner,
+                                              kvm_controls=kvm_controls).items())
+        return methods
+
     found = []
-    for name, (source, method) in sorted(controls.items()):
-        if name in KVM_CONTROL_EXCLUSIONS:
-            continue
-        if name not in forwards:
-            found.append(f'{source}:{method.line}: shared Receiver::{name} needs a KvmReceiver forward')
-            continue
-        forward = forwards[name]
-        for attribute in ('must_use', 'aliases'):
-            expected, actual = getattr(method, attribute), getattr(forward, attribute)
-            if expected != actual:
-                label = 'doc(alias)' if attribute == 'aliases' else attribute
-                found.append(f'{relative}:{forward.line}: KvmReceiver::{name} {label} attributes '
-                             f'differ from Receiver::{name} at {source}:{method.line}')
+    for pair in METHOD_TWINS:
+        originals = inventory(pair.original, pair.original_files, pair.kvm_controls)
+        twins = inventory(pair.twin, (pair.twin_file,), pair.kvm_controls)
+        for name, (source, original) in sorted(originals.items()):
+            if pair.exclusions and name in pair.exclusions:
+                continue
+            if name not in twins:
+                if pair.kvm_controls:
+                    found.append(f'{source}:{original.line}: shared {pair.original}::{name} '
+                                 f'needs a {pair.twin} forward')
+                continue
+            relative, twin = twins[name]
+            attributes = ('must_use', 'aliases') if pair.kvm_controls else ('aliases',)
+            for attribute in attributes:
+                if getattr(original, attribute) != getattr(twin, attribute):
+                    label = 'doc(alias)' if attribute == 'aliases' else attribute
+                    found.append(f'{relative}:{twin.line}: {pair.twin}::{name} {label} attributes '
+                                 f'differ from {pair.original}::{name} at {source}:{original.line}')
     return found
 
 
@@ -673,11 +704,12 @@ def readme_feature_violations(root, manifest):
     return found
 
 
-def doc_comment_text(text):
+def doc_comment_text(text, *, inner_only=False):
     """Extract line doc comments as Markdown without changing line numbers."""
+    prefix = r'\s*//! ?(.*)' if inner_only else r'\s*(?:///(?!/)|//!) ?(.*)'
     lines = []
     for line in text.splitlines():
-        match = re.match(r'\s*(?:///(?!/)|//!) ?(.*)', line)
+        match = re.match(prefix, line)
         lines.append(match.group(1) if match else '')
     return '\n'.join(lines)
 
@@ -795,12 +827,26 @@ def link_violations(root, source, text, release, repository_only=False):
     return found
 
 
+MODULE_EXAMPLES = {
+    Path('src/file/mod.rs'), Path('src/framesync.rs'), Path('src/receiver.rs'),
+    Path('src/advanced/mod.rs'), Path('src/discovery/mod.rs'), Path('src/asynchronous.rs'),
+}
+RUSTDOC_EXAMPLE = re.compile(r'(?:rust|no_run|ignore(?:-[\w-]+)?|should_panic|edition\d+)')
+
+
+def has_nearby_example(root, source, release, lines, first, last, examples):
+    nearby = '\n'.join(lines[max(0, first - 13):min(len(lines), (last or first) + 12)])
+    targets = (destination(root, source, url, release) for url, _ in links(prose(nearby)))
+    return any(target and not target[2] and target[0].resolve() in examples for target in targets)
+
+
 def check(root):
     """Return (violations, standalone Rust snippets) for the current docs."""
     root = root.resolve()
     manifest = tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))
     release = manifest['package']['version']
     found, snippets = readme_feature_violations(root, manifest), []
+    examples = {example.resolve() for example in (root / 'examples').glob('*.rs')}
     for path in documents(root):
         text = path.read_text(encoding='utf-8')
         found.extend(link_violations(root, path, text, release))
@@ -820,10 +866,7 @@ def check(root):
             if re.search(r'^\s*#(?:\s|$)', code, re.MULTILINE):
                 found.append(f'{label}: rustdoc hidden lines are visible in Markdown; use a complete example')
             if 'ignore' in tags:
-                nearby = '\n'.join(lines[max(0, first - 13):min(len(lines), (last or first) + 12)])
-                examples = {example.resolve() for example in (root / 'examples').glob('*.rs')}
-                targets = [destination(root, path, url, release) for url, _ in links(prose(nearby))]
-                if not any(target and not target[2] and target[0].resolve() in examples for target in targets):
+                if not has_nearby_example(root, path, release, lines, first, last, examples):
                     found.append(f'{label}: an illustrative Rust fragment needs a nearby link to a runnable .rs example')
             elif not re.search(r'\bfn\s+main\s*\(', code):
                 found.append(f'{label}: Rust fence must be standalone, or rust,ignore with a linked runnable example')
@@ -842,6 +885,15 @@ def check(root):
     for path, rustdoc in source_documentation(root):
         found.extend(link_violations(root, path, rustdoc, release, repository_only=True))
         found.extend(release_link_violations(root, path, rustdoc, release))
+        relative = path.relative_to(root)
+        if relative in MODULE_EXAMPLES:
+            inner = doc_comment_text(path.read_text(encoding='utf-8'), inner_only=True)
+            lines = inner.splitlines()
+            for first, last, info, _ in fences(inner):
+                tags = info.split(',') if info else ['rust']
+                if ('compile_fail' not in tags and all(RUSTDOC_EXAMPLE.fullmatch(tag.strip()) for tag in tags)
+                        and not has_nearby_example(root, path, release, lines, first, last, examples)):
+                    found.append(f'{relative}:{first}: a module example needs a nearby link to a runnable .rs example')
     return found, snippets
 
 
@@ -941,6 +993,89 @@ def documented_api_names(directory):
     return names, qualified
 
 
+MIGRATION_GUIDE = Path('docs/migration/2.0-to-3.0.md')
+MIGRATION_INDEX = Path('docs/migration/README.md')
+INLINE_CODE = re.compile(r'(?P<ticks>`+)(?P<code>.+?)(?P=ticks)')
+MIGRATION_OLD_COLUMN = re.compile(r'^\s*\|\s*(?:2\.1\.0|2\.x|removed api|previous spelling or shape)\s*\|', re.I)
+MIGRATION_REMOVAL = re.compile(
+    r'(?:^|[.!?]\s+|^\s*(?:[-*]|[0-9]+[.)])\s+)'
+    r'(?:replace|remove|delete|rename)\b(?P<old>.*?)'
+    r'(?=\b(?:with|to|but|and\s+(?:use|call|enable|keep|handle))\b|[.!?;]|\Z)',
+    re.I | re.M | re.S,
+)
+
+
+def migration_old_spans(text):
+    """Identify code in old-API table cells and in removal instructions."""
+    lines = text.splitlines()
+    for first, last, _, _ in fences(text):
+        for index in range(first - 1, last or len(lines)):
+            lines[index] = ''
+    old = set()
+
+    def collect(line, column, code):
+        for span in INLINE_CODE.finditer(code):
+            old.add((line, column + span.start(), span.group('code').strip()))
+
+    in_old_table = False
+    for line, content in enumerate(lines, 1):
+        if (first := re.match(r'^\s*\|([^|]*)\|', content)) is None:
+            in_old_table = False
+        elif MIGRATION_OLD_COLUMN.match(content):
+            in_old_table = True
+        elif in_old_table:
+            collect(line, first.start(1), first.group(1))
+
+    # Mask code spans before finding sentence boundaries and directives so
+    # that punctuation or a directive within a Rust name cannot end a match.
+    first_line = 1
+    for paragraph in re.split(r'(?<=\n)\n', '\n'.join(lines)):
+        spans = list(INLINE_CODE.finditer(paragraph))
+        masked = INLINE_CODE.sub(lambda match: ' ' * len(match.group(0)), paragraph)
+        for removal in MIGRATION_REMOVAL.finditer(masked):
+            start, end = removal.span('old')
+            for span in spans:
+                if start <= span.start() < end:
+                    line = first_line + paragraph.count('\n', 0, span.start())
+                    column = span.start() - (paragraph.rfind('\n', 0, span.start()) + 1)
+                    old.add((line, column, span.group('code').strip()))
+        first_line += paragraph.count('\n') + 1
+    return old
+
+
+def previous_release_name_violations(root):
+    """Check API names presented as belonging to the guide's tagged baseline."""
+    source = root / MIGRATION_GUIDE
+    if not source.is_file():
+        return []
+    text = source.read_text(encoding='utf-8')
+    lines = text.splitlines()
+    first = next((index for index, line in enumerate(lines) if line.strip()
+                  and not HEADING.match(line)), len(lines))
+    last = next((index for index in range(first, len(lines)) if not lines[index].strip()), len(lines))
+    baseline = re.search(r'`(v[0-9]+\.[0-9]+\.[0-9]+)`', ' '.join(lines[first:last]))
+    if not baseline:
+        return [f'{MIGRATION_GUIDE}:{first + 1}: first paragraph must name the previous release tag']
+    tag = baseline.group(1)
+    # Use the full ref so a branch or other revision cannot stand in for a tag.
+    result = subprocess.run(
+        ['git', '-C', str(root), 'grep', '-h', '-I', '-E', '[A-Za-z_]',
+         f'refs/tags/{tag}', '--', 'src', 'Cargo.toml'],
+        text=True, encoding='utf-8', errors='replace', capture_output=True,
+    )
+    if result.returncode:
+        return [f'{MIGRATION_GUIDE}:{first + 1}: cannot read previous release tag {tag}']
+    released = set(re.findall(r'\b[A-Za-z_]\w*\b', result.stdout))
+    found = []
+    for line, _, code in sorted(migration_old_spans(text)):
+        path = re.match(r'\.?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)', code)
+        if path:
+            for name in path.group(1).split('::'):
+                if name not in released:
+                    found.append(f'{MIGRATION_GUIDE}:{line}: {name} did not occur at {tag} ({code})')
+    return found
+
+
 def guide_api_name_violations(root, directory):
     """Reject stale API identifiers in prose code spans, excluding history."""
     root, directory = root.resolve(), directory.resolve()
@@ -952,18 +1087,20 @@ def guide_api_name_violations(root, directory):
     found = []
     for source in documents(root):
         relative = source.relative_to(root)
-        if source.name == 'CHANGELOG.md' or relative == Path('docs/api-conventions.md') or relative.parts[:2] == ('docs', 'migration'):
+        if (source.name == 'CHANGELOG.md' or relative == Path('docs/api-conventions.md')
+                or (relative.parts[:2] == ('docs', 'migration') and relative not in (MIGRATION_GUIDE, MIGRATION_INDEX))):
             continue
         text = source.read_text(encoding='utf-8')
+        previous = migration_old_spans(text) if relative == MIGRATION_GUIDE else set()
         excluded = set()
         for first, last, _, _ in fences(text):
             excluded.update(range(first, (last or len(text.splitlines())) + 1))
         for line, content in enumerate(text.splitlines(), 1):
             if line in excluded:
                 continue
-            for span in re.finditer(r'(?P<ticks>`+)(?P<code>.+?)(?P=ticks)', content):
+            for span in INLINE_CODE.finditer(content):
                 token = span.group('code').strip()
-                if token in NON_API_CODE_NAMES:
+                if token in NON_API_CODE_NAMES or (line, span.start(), token) in previous:
                     continue
                 # Paths, files, target triples and globs cannot match either
                 # identifier form. Module paths contain no uppercase owner.
@@ -987,11 +1124,13 @@ def compile_snippets(root, snippets):
     """Compile complete Rust examples against all Cargo features, never run them."""
     if not snippets:
         return []
+    features = tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))['features']
+    optional = json.dumps(sorted(name for name in features if name != 'default'))
     with tempfile.TemporaryDirectory(prefix='grafton-ndi-docs-') as directory:
         directory = Path(directory)
         manifest = ('[package]\nname = "grafton-ndi-doc-snippets"\nversion = "0.0.0"\nedition = "2021"\n'
                     '[dependencies]\ngrafton-ndi = { path = ' + json.dumps(str(root)) + ', '
-                    'features = ["advanced", "file-io", "image-encoding", "tokio", "smol"] }\n'
+                    'features = ' + optional + ' }\n'
                     'tokio = { version = "1", features = ["macros", "rt-multi-thread"] }\n')
         (directory / 'Cargo.toml').write_text(manifest, encoding='utf-8')
         shutil.copyfile(root / 'Cargo.lock', directory / 'Cargo.lock')
@@ -1020,7 +1159,8 @@ def main():
     found, snippets = check(ROOT)
     found.extend(readme_link_violations(ROOT))
     found.extend(sdk_alias_violations(ROOT))
-    found.extend(kvm_forward_violations(ROOT))
+    found.extend(method_twin_violations(ROOT))
+    found.extend(previous_release_name_violations(ROOT))
     if args.rustdoc:
         found.extend(rustdoc_violations(ROOT, args.rustdoc))
         found.extend(parameter_name_violations(ROOT, args.rustdoc))

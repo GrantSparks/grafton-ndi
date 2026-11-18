@@ -546,7 +546,7 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
 }
 
 #[test]
-fn audio_timestamp_normalization_depends_on_the_capture_family() {
+fn timestamp_normalization_uses_audio_capture_family_marker() {
     fn check<S>(ticks: i64, expected: Option<SdkTimestamp>)
     where
         S: AudioTest,
@@ -804,4 +804,48 @@ fn metadata_constructors_select_the_capture_family_text_extent() {
 
     // Existing video/audio constructor cases exercise the embedded first-NUL
     // rule, including retaining media when optional metadata is malformed.
+}
+
+#[test]
+fn bounded_text_classification_drives_optional_and_strict_metadata() {
+    let unterminated = vec![b'x'; MAX_METADATA_BYTES];
+    let cases = [
+        (None, FrameMetadataStatus::Absent, None),
+        (Some(b"\0".as_slice()), FrameMetadataStatus::Text, Some("")),
+        (
+            Some("métadata\0".as_bytes()),
+            FrameMetadataStatus::Text,
+            Some("métadata"),
+        ),
+        (Some(b"abc\xe2\0"), FrameMetadataStatus::NotUtf8, None),
+        (Some(&unterminated), FrameMetadataStatus::Unterminated, None),
+    ];
+    for (bytes, status, expected) in cases {
+        let pointer = bytes.map_or(ptr::null(), |bytes| bytes.as_ptr().cast());
+        // SAFETY: every pointer is null or names held, initialized storage
+        // through its sole terminator or the metadata cap.
+        let (optional, strict) = unsafe {
+            let optional = FrameMetadataState::scan(pointer).view(pointer);
+            (optional, validate_frame_metadata(pointer))
+        };
+        assert_eq!(optional.status(), status);
+        assert_eq!(optional.text().map(MetadataText::as_str), expected);
+        match status {
+            FrameMetadataStatus::Absent | FrameMetadataStatus::Text => {
+                assert_eq!(strict.unwrap().map(MetadataText::as_str), expected);
+            }
+            FrameMetadataStatus::NotUtf8 => {
+                let expected = std::str::from_utf8(bytes.unwrap()).unwrap_err();
+                assert!(matches!(strict, Err(Error::InvalidUtf8(error)) if error == expected));
+            }
+            FrameMetadataStatus::Unterminated => {
+                assert!(matches!(
+                    strict,
+                    Err(Error::InvalidFrame(
+                        crate::FrameDefect::MetadataUnterminated
+                    ))
+                ));
+            }
+        }
+    }
 }

@@ -5,7 +5,7 @@ use std::ffi::CStr;
 
 #[cfg(test)]
 use crate::{
-    frames::{BorrowedVideoFrame, PixelFormat, ScanType},
+    frames::{BorrowedVideoFrame, PixelFormat, ScanType, ValidatedVideoLayout},
     pixels::send_room,
     FrameRate, PictureAspectRatio, Timecode,
 };
@@ -27,11 +27,11 @@ use crate::{
     finder::Source,
     frames::{AudioPartsExt, MetadataPartsExt},
     frames::{
-        AudioSource, MetadataFrame, MetadataFrameRef, MetadataSource, Sendable,
-        ValidatedVideoLayout, VideoFrame, VideoParts, VideoPartsExt, VideoSource,
+        AudioSource, MetadataFrame, MetadataFrameRef, MetadataSource, Sendable, VideoFrame,
+        VideoParts, VideoPartsExt, VideoSource,
     },
     marker::NotSync,
-    pixels::PackedStorage,
+    pixels::VideoStorage,
     receiver::Tally,
     source_retention::RetainedSources,
     sys::{self, bindings::*},
@@ -98,10 +98,13 @@ pub(crate) struct SendHandle<'a> {
     _owner: PhantomData<&'a SenderResource>,
 }
 
-impl SendHandle<'_> {
-    #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
+impl<'a> SendHandle<'a> {
     pub(crate) fn instance(self) -> NDIlib_send_instance_t {
         self.instance.0
+    }
+
+    pub(crate) fn core(self) -> &'a sys::Core {
+        self.core
     }
 }
 
@@ -113,10 +116,10 @@ struct Inner {
     keyframe_changes: crate::keyframe_changes::KeyframeChanges,
 }
 
-// A panic cannot leave metadata capture or tally half-changed: their locks
-// guard native queries, and no application code runs while held. Those locks
-// do not poison or declare this themselves, which would otherwise leave
-// senders short of `RefUnwindSafe`. The change feed uses unwind-safe standard locks.
+// The metadata gate's mutex protects a capture-lease bit that changes whole,
+// and native capture runs outside that mutex. The tally query mutex serializes
+// native queries. Neither lock holds application code. The change feed uses
+// unwind-safe standard locks.
 impl std::panic::RefUnwindSafe for Inner {}
 
 /// Exclusion spans capture through matching free, including a borrowed frame's
@@ -212,7 +215,7 @@ unsafe impl<'owner> crate::capture::FrameSource<'owner, crate::capture::SenderMe
 
     fn instance(&self) -> crate::capture::SenderMetadataInstance {
         crate::capture::SenderMetadataInstance {
-            instance: self.resource.instance(),
+            instance: self.resource.handle().instance(),
             free: self.table.NDIlib_send_free_metadata,
         }
     }
@@ -226,14 +229,14 @@ mod ownership {
     ///
     /// Nominally public only so that [`NativeOwner`] can name it; its implementation stays private.
     pub struct SenderResource {
-        pub(super) instance: SendInstance,
+        instance: SendInstance,
         pub(super) _name: CString,
         pub(super) _groups: Option<CString>,
         // A registration may keep this native sender alive after Sender drops.
         pub(super) failover: parking_lot::Mutex<RetainedSources>,
         #[cfg(feature = "advanced")]
-        pub(super) _config: Option<crate::advanced::AdvancedConfig>,
-        pub(super) sdk: crate::runtime::Bound<sys::Core>,
+        pub(super) _config: crate::advanced::RetainedConfig,
+        sdk: crate::runtime::Bound<sys::Core>,
     }
 
     // No application code runs under the failover lock. A replacement keeps
@@ -250,26 +253,34 @@ mod ownership {
     }
 
     impl SenderResource {
-        /// The native sender this token keeps alive.
-        pub(crate) fn instance(&self) -> NDIlib_send_instance_t {
-            self.instance.0
+        pub(super) fn new(
+            instance: SendInstance,
+            name: CString,
+            groups: Option<CString>,
+            #[cfg(feature = "advanced")] config: crate::advanced::RetainedConfig,
+            sdk: crate::runtime::Bound<sys::Core>,
+        ) -> Self {
+            Self {
+                instance,
+                _name: name,
+                _groups: groups,
+                failover: parking_lot::Mutex::new(RetainedSources::default()),
+                #[cfg(feature = "advanced")]
+                _config: config,
+                sdk,
+            }
         }
-    }
 
-    impl SenderResource {
         /// The runtime whose native instance this resource owns.
         pub(super) fn ndi(&self) -> &Ndi {
             self.sdk.ndi()
         }
 
-        pub(super) fn core(&self) -> &sys::Core {
-            &self.sdk
-        }
-
-        pub(super) fn handle(&self) -> SendHandle<'_> {
+        /// Lend the native identity with the runtime that created it.
+        pub(crate) fn handle(&self) -> SendHandle<'_> {
             SendHandle {
                 instance: self.instance,
-                core: self.core(),
+                core: &self.sdk,
                 _owner: PhantomData,
             }
         }
@@ -278,7 +289,7 @@ mod ownership {
     impl Drop for SenderResource {
         fn drop(&mut self) {
             // SAFETY: this token is the instance's final owner.
-            unsafe { self.core().NDIlib_send_destroy(self.instance()) };
+            unsafe { self.sdk.NDIlib_send_destroy(self.instance.0) };
         }
     }
 
@@ -469,7 +480,7 @@ pub struct Sender<M: SenderMode = RawSend> {
 // reserved tail remains inaccessible until the owning stream releases it.
 unsafe impl in_flight::Lend for Sendable<VideoFrame> {
     fn lend(&mut self) -> in_flight::Lent {
-        in_flight::Lent::Frame(self.owned_video_descriptor())
+        in_flight::Lent::Frame(self.video_descriptor())
     }
 }
 
@@ -502,8 +513,10 @@ pub(crate) mod in_flight {
     use super::{async_flush_frame_ptr, PreparedVideo, SendHandle, SenderResource};
     #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
     use crate::advanced::ScatterVideoLoan;
+    use crate::frames::VideoSource;
+    #[cfg(feature = "advanced")]
+    use crate::Result;
     use crate::{frames::Sendable, sys::bindings::NDIlib_video_frame_v2_t, VideoFrame};
-    use crate::{frames::VideoSource, Result};
     use std::sync::{Arc, Mutex};
 
     /// A slot paired by its owning pipeline or loan owner with its sender.
@@ -562,12 +575,11 @@ pub(crate) mod in_flight {
                 .paired(self.owner.handle())
         }
 
-        pub(super) fn send(&self, frame: Sendable<&(impl VideoSource + ?Sized)>) -> Result<()> {
+        pub(super) fn send(&self, frame: Sendable<&(impl VideoSource + ?Sized)>) {
             self.synchronize(|mut pair| {
                 let prepared = PreparedVideo::authorized(frame, pair.staging);
                 pair.stream.send(prepared);
             });
-            Ok(())
         }
 
         pub(super) fn submit(&mut self, frame: Sendable<VideoFrame>) -> Option<VideoFrame> {
@@ -672,7 +684,7 @@ pub(crate) mod in_flight {
     }
 
     #[cfg(feature = "advanced")]
-    const _: () = assert!(std::mem::size_of::<Destroyed>() == 0);
+    const_assert!(std::mem::size_of::<Destroyed>() == 0);
 
     /// The loan storage attached to one exclusive native sender.
     #[cfg(feature = "advanced")]
@@ -769,7 +781,7 @@ pub(crate) mod in_flight {
         /// Submit a frame whose type already proves send admission.
         pub(crate) fn submit_pending(
             &mut self,
-            frame: crate::advanced::CompressedVideoFrame,
+            frame: crate::advanced::CompressedFrame<crate::advanced::VideoPacketFormat>,
         ) -> Option<crate::advanced::SubmittedVideo> {
             self.submit_prepared(crate::advanced::PendingVideo::Contiguous(frame))
         }
@@ -778,10 +790,10 @@ pub(crate) mod in_flight {
         #[allow(clippy::result_large_err)]
         pub(crate) fn submit_scatter(
             &mut self,
-            frame: crate::advanced::ScatterVideoFrame,
+            frame: crate::advanced::ScatterFrame<crate::advanced::VideoPacketFormat>,
         ) -> std::result::Result<
             Option<crate::advanced::SubmittedVideo>,
-            crate::Rejected<crate::advanced::ScatterVideoFrame>,
+            crate::Rejected<crate::advanced::ScatterFrame<crate::advanced::VideoPacketFormat>>,
         > {
             let proof = crate::advanced::ScatterSendable::new(frame, self.sender.runtime())?;
             Ok(self.submit_prepared(crate::advanced::PendingVideo::Scatter(proof)))
@@ -794,27 +806,48 @@ pub(crate) mod in_flight {
             let tier = next.tier();
             Stream {
                 slot: self.loans.slot(tier),
-                sender: self.sender.resource().handle(),
+                sender: self.sender.handle(),
             }
             .submit(next)
             .map(crate::advanced::PendingVideo::into_submitted)
         }
 
-        /// A null asynchronous flush synchronizes this sender's two streams
-        /// together. Release both slots inside this owner operation, then
-        /// recover their owned frames.
+        /// A synchronous video send ends both native loans. The frames stay
+        /// in their original slots for reclamation or same-stream replacement.
+        pub(crate) fn send_video(
+            &mut self,
+            frame: &mut crate::advanced::CompressedFrame<crate::advanced::VideoPacketFormat>,
+        ) {
+            let descriptor = frame.raw();
+            // SAFETY: this descriptor lends exclusively borrowed storage
+            // through the synchronous call.
+            self.synchronize_video(|sender| unsafe { send_video_native(sender, &descriptor) });
+        }
+
+        pub(crate) fn send_scatter_video(
+            &mut self,
+            frame: &mut crate::advanced::ScatterFrame<crate::advanced::VideoPacketFormat>,
+        ) -> Result<()> {
+            let admitted =
+                crate::advanced::ScatterSendable::borrowed(frame, self.sender.runtime())?;
+            self.synchronize_video(|sender| admitted.send_video(sender));
+            Ok(())
+        }
+
+        fn synchronize_video(&mut self, submit: impl FnOnce(SendHandle<'_>)) {
+            Stream {
+                slot: self.loans.slot(crate::StreamTier::Program),
+                sender: self.sender.handle(),
+            }
+            .synchronize(submit);
+            self.loans.slot(crate::StreamTier::Preview).mark_released();
+        }
+
+        /// Flush when the SDK still owns a loan, then recover both slots.
         pub(crate) fn finish(&mut self) -> crate::advanced::ReclaimedVideo {
             use crate::StreamTier::{Preview, Program};
             if self.loans.slot(Program).is_in_flight() || self.loans.slot(Preview).is_in_flight() {
-                // One native flush synchronizes both slots of this paired
-                // sender. Keep both releases inside this owner operation.
-                let mut program = Stream {
-                    slot: self.loans.slot(Program),
-                    sender: self.sender.resource().handle(),
-                };
-                program.flush_native();
-                program.slot.mark_released();
-                self.loans.slot(Preview).mark_released();
+                self.synchronize_video(flush_video_native);
             }
             self.loans.take_retained()
         }
@@ -836,11 +869,7 @@ pub(crate) mod in_flight {
             // admission from its own sender and callback. Admission retains
             // every descriptor and pointee before dispatch; the callback may
             // complete synchronously after its state lock has been released.
-            unsafe {
-                admitted
-                    .lent
-                    .submit(self.sender.resource().handle(), admitted.pointer)
-            };
+            unsafe { admitted.lent.submit(self.sender.handle(), admitted.pointer) };
             Ok(admitted.id)
         }
     }
@@ -922,8 +951,8 @@ pub(crate) mod in_flight {
                     // SAFETY: the caller guarantees descriptor and loan lifetimes.
                     unsafe {
                         sender
-                            .core
-                            .NDIlib_send_send_video_async_v2(sender.instance.0, descriptor)
+                            .core()
+                            .NDIlib_send_send_video_async_v2(sender.instance(), descriptor)
                     };
                 }
                 #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
@@ -1019,7 +1048,7 @@ pub(crate) mod in_flight {
                 // Retain native pointees even if a future owner forgets proof.
                 mem::forget(frame);
                 if !std::thread::panicking() {
-                    debug_assert!(
+                    debug_invariant!(
                         false,
                         "in-flight frame dropped without synchronization or destruction"
                     );
@@ -1043,37 +1072,49 @@ pub(crate) mod in_flight {
         }
     }
 
+    fn flush_video_native(sender: SendHandle<'_>) {
+        // SAFETY: the handle retains the sender and its runtime. A true null
+        // descriptor drains that sender's asynchronous loans.
+        unsafe {
+            sender
+                .core()
+                .NDIlib_send_send_video_async_v2(sender.instance(), async_flush_frame_ptr())
+        };
+    }
+
+    /// # Safety
+    /// The caller retains the descriptor and all bytes it names through the
+    /// synchronous SDK call.
+    unsafe fn send_video_native(sender: SendHandle<'_>, frame: &NDIlib_video_frame_v2_t) {
+        // SAFETY: the handle retains the sender and its runtime. The caller
+        // keeps the descriptor and storage live.
+        unsafe {
+            sender
+                .core()
+                .NDIlib_send_send_video_v2(sender.instance(), frame)
+        };
+    }
+
     impl<T> Stream<'_, T> {
-        fn flush_native(&mut self) {
-            // SAFETY: this pair's owner retains its live sender and slots.
-            // A true null descriptor drains that sender's asynchronous loans.
-            unsafe {
-                self.sender.core.NDIlib_send_send_video_async_v2(
-                    self.sender.instance.0,
-                    async_flush_frame_ptr(),
-                )
-            };
+        /// Dispatch a synchronizing call through the handle paired with this
+        /// slot and release its loan after the call returns.
+        fn synchronize(&mut self, submit: impl FnOnce(SendHandle<'_>)) {
+            submit(self.sender);
+            self.slot.mark_released();
         }
 
         fn flush(&mut self) {
             if self.slot.is_in_flight() {
-                self.flush_native();
-                self.slot.mark_released();
+                self.synchronize(flush_video_native);
             }
         }
     }
 
     impl Stream<'_, Sendable<VideoFrame>> {
         fn send(&mut self, frame: PreparedVideo<'_>) {
-            // SAFETY: the pair retains the slot's live sender. PreparedVideo
-            // borrows initialized input or padded staging through this call;
-            // the synchronous send also ends this sender's previous loan.
-            unsafe {
-                self.sender
-                    .core
-                    .NDIlib_send_send_video_v2(self.sender.instance.0, &frame.raw)
-            };
-            self.slot.mark_released();
+            // SAFETY: PreparedVideo borrows initialized input or padded
+            // staging through the synchronous call.
+            self.synchronize(|sender| unsafe { send_video_native(sender, &frame.raw) });
         }
     }
 
@@ -1382,7 +1423,7 @@ impl RawVideo<'_> {
         &mut self,
         frame: VideoFrame,
     ) -> std::result::Result<Option<VideoFrame>, Rejected<VideoFrame>> {
-        let authorized = self.sender.require_video_layout(frame)?;
+        let authorized = Sendable::new(frame, self.sender.runtime())?;
         Ok(self.sender.native.video.submit_shared(authorized))
     }
 
@@ -1426,27 +1467,26 @@ trait StagingTestAccess {
 #[cfg(test)]
 impl StagingTestAccess for VideoStaging {
     fn as_ptr(&self) -> *const u8 {
-        self.as_ref()
-            .map_or(std::ptr::null(), PackedStorage::as_ptr)
+        self.as_ref().map_or(std::ptr::null(), VideoStorage::as_ptr)
     }
     fn bytes(&self) -> &[u8] {
-        self.as_ref().map_or(&[], PackedStorage::as_slice)
+        self.as_ref().map_or(&[], VideoStorage::as_slice)
     }
     fn len(&self) -> usize {
         self.bytes().len()
     }
     fn room(&self) -> usize {
-        self.as_ref().map_or(0, PackedStorage::room)
+        self.as_ref().map_or(0, VideoStorage::room)
     }
     fn capacity(&self) -> usize {
-        self.as_ref().map_or(0, PackedStorage::capacity)
+        self.as_ref().map_or(0, VideoStorage::capacity)
     }
     fn room_bytes(&self) -> &[u8] {
-        self.as_ref().map_or(&[], PackedStorage::room_bytes)
+        self.as_ref().map_or(&[], VideoStorage::room_bytes)
     }
 }
 
-type VideoStaging = Option<PackedStorage<ValidatedVideoLayout>>;
+type VideoStaging = Option<VideoStorage>;
 
 /// A descriptor borrowing either a proven direct input or initialized packed
 /// staging. Its lifetime keeps both input metadata and staging alive until the
@@ -1484,19 +1524,22 @@ impl<M: SenderMode> Sender<M> {
     /// Advanced configuration, the plain one otherwise.
     pub(crate) fn open(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
-        if let Some(config) = &options.config {
-            return Self::new_configured(ndi, options, config);
+        {
+            <Self as crate::advanced::Configurable>::create_from_options(ndi, options)
         }
+        #[cfg(not(feature = "advanced"))]
+        {
+            Self::create_plain(ndi, options)
+        }
+    }
+
+    pub(crate) fn create_plain(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
         // SAFETY: the SDK's sender creation returns null or a fresh sender
         // that nothing else owns, and the settings outlive the call.
         unsafe {
-            Self::create(
-                ndi,
-                options,
-                #[cfg(feature = "advanced")]
-                None,
-                |core, raw| core.named().NDIlib_send_create(raw),
-            )
+            Self::create(ndi, options, |core, raw| {
+                crate::runtime::NativeCreation::plain(core.named().NDIlib_send_create(raw))
+            })
         }
     }
 
@@ -1511,16 +1554,15 @@ impl<M: SenderMode> Sender<M> {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         options: &SenderOptions,
-        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
             &sys::Core,
             &NDIlib_send_create_t,
-        ) -> sys::table::Called<NDIlib_send_instance_t>,
+        ) -> crate::runtime::NativeCreation<NDIlib_send_instance_t>,
     ) -> Result<Self> {
         let name = CString::new(options.name.as_str())?;
-        let groups = crate::finder::list_cstring(options.groups.as_deref(), "groups")?;
+        let groups = crate::list_setting::list_cstring(options.groups.as_deref(), "groups")?;
         let core = ndi.bind_core();
-        let instance = create(
+        let created = create(
             &core,
             &NDIlib_send_create_t {
                 p_ndi_name: name.as_ptr(),
@@ -1528,9 +1570,8 @@ impl<M: SenderMode> Sender<M> {
                 clock_video: options.clock_video,
                 clock_audio: options.clock_audio,
             },
-        )
-        .created()?
-        .as_ptr();
+        );
+        let instance = created.call.created()?.as_ptr();
         let instance = SendInstance(instance);
         Ok(Self {
             inner: Inner {
@@ -1539,15 +1580,14 @@ impl<M: SenderMode> Sender<M> {
                 #[cfg(ndi_has_advanced_keyframe_demand)]
                 keyframe_changes: crate::keyframe_changes::KeyframeChanges::default(),
             },
-            native: NativeOwner::new(SenderResource {
+            native: NativeOwner::new(SenderResource::new(
                 instance,
-                _name: name,
-                _groups: groups,
-                failover: parking_lot::Mutex::new(RetainedSources::default()),
+                name,
+                groups,
                 #[cfg(feature = "advanced")]
-                _config: config,
-                sdk: core,
-            }),
+                created.config,
+                core,
+            )),
             _mode: PhantomData,
         })
     }
@@ -1559,8 +1599,9 @@ impl Sender {
     /// # Errors
     ///
     /// Returns [`Error::InvalidCString`] when the name contains a NUL byte,
-    /// [`Error::InvalidInput`] for a group containing a comma or NUL or an empty group, [`Error::UnsupportedCapability`] when the options carry an
-    /// Advanced configuration that the runtime or this build cannot take, and
+    /// [`Error::InvalidInput`] when the group list is empty or a group is empty
+    /// or contains a comma or NUL, [`Error::UnsupportedCapability`] when the
+    /// options carry an Advanced configuration that the runtime or this build cannot take, and
     /// [`Error::NativeOperationFailed`] when the SDK creates no sender.
     #[doc(alias = "NDIlib_send_create")]
     pub fn new(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
@@ -1685,7 +1726,8 @@ impl Sender {
     #[doc(alias = "NDIlib_send_send_video_v2")]
     pub fn send_video(&self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
         let authorized = Sendable::borrowed(frame, self.resource().ndi())?;
-        self.native.video.send(authorized)
+        self.native.video.send(authorized);
+        Ok(())
     }
 
     /// Submit an owned frame without copying its pixel or metadata allocations.
@@ -1720,7 +1762,7 @@ impl Sender {
         &mut self,
         frame: VideoFrame,
     ) -> std::result::Result<Option<VideoFrame>, Rejected<VideoFrame>> {
-        let authorized = self.require_video_layout(frame)?;
+        let authorized = Sendable::new(frame, self.runtime())?;
         Ok(self.native.video.submit(authorized))
     }
 
@@ -1827,19 +1869,20 @@ impl<M: AudioSendMode> Sender<M> {
     /// ```
     #[doc(alias = "NDIlib_send_send_audio_v3")]
     pub fn send_audio(&self, frame: &(impl AudioSource + ?Sized)) {
+        let handle = self.handle();
         // SAFETY: this borrow reaches the instance's owning resource, and every
         // pointer passed outlives the synchronous call.
         unsafe {
-            self.resource()
+            handle
                 .core()
-                .NDIlib_send_send_audio_v3(self.resource().instance(), &frame.audio_descriptor());
+                .NDIlib_send_send_audio_v3(handle.instance(), &frame.audio_descriptor());
         }
     }
 }
 
 impl<M: SenderMode> Sender<M> {
-    pub(crate) fn native_instance(&self) -> NDIlib_send_instance_t {
-        self.resource().instance()
+    pub(crate) fn handle(&self) -> SendHandle<'_> {
+        self.resource().handle()
     }
 
     /// All selectors consume the SDK's same one-shot report, including a
@@ -1855,23 +1898,8 @@ impl<M: SenderMode> Sender<M> {
         self.native.resource()
     }
 
-    /// The core entry points of the runtime that created this sender.
-    #[cfg(feature = "advanced")]
-    pub(crate) fn core(&self) -> &sys::Core {
-        self.resource().core()
-    }
-
     pub(crate) fn runtime(&self) -> &Ndi {
         self.resource().ndi()
-    }
-
-    /// Check that this sender's runtime can send `pixel_format`: the one
-    /// check every video send makes before anything reaches the SDK.
-    pub(crate) fn require_video_layout<F: VideoParts>(
-        &self,
-        frame: F,
-    ) -> std::result::Result<Sendable<F>, Rejected<F>> {
-        Sendable::new(frame, self.resource().ndi())
     }
 
     /// Capture metadata sent back by connected receivers.
@@ -1912,6 +1940,7 @@ impl<M: SenderMode> Sender<M> {
     /// As for [`Self::capture_metadata`].
     #[doc(alias = "NDIlib_send_capture")]
     pub fn capture_metadata_ref(&self, timeout: Duration) -> Result<Option<MetadataFrameRef<'_>>> {
+        let handle = self.handle();
         let source = SenderMetadataSource::new(self.resource())?;
         let metadata = source.table;
         let deadline = Deadline::after(timeout)?;
@@ -1929,7 +1958,7 @@ impl<M: SenderMode> Sender<M> {
         let called = unsafe {
             metadata
                 .named()
-                .NDIlib_send_capture(self.resource().instance(), &mut raw, remaining)
+                .NDIlib_send_capture(handle.instance(), &mut raw, remaining)
         };
         let kind = *called.value();
         if kind == NDIlib_frame_type_e_NDIlib_frame_type_metadata {
@@ -1960,14 +1989,15 @@ impl<M: SenderMode> Sender<M> {
     /// wrapper. The SDK copies the text before returning.
     #[doc(alias = "NDIlib_send_send_metadata")]
     pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) {
+        let handle = self.handle();
         let raw = metadata.metadata_raw();
         // The borrowed C string remains live through this synchronous SDK call.
         // SAFETY: this borrow reaches the instance's owning resource, and every
         // pointer passed outlives the synchronous call.
         unsafe {
-            self.resource()
+            handle
                 .core()
-                .NDIlib_send_send_metadata(self.resource().instance(), &raw);
+                .NDIlib_send_send_metadata(handle.instance(), &raw);
         }
     }
 
@@ -2060,15 +2090,14 @@ impl<M: SenderMode> Sender<M> {
     /// Query the SDK's tally, waiting up to `timeout_ms`; returns whether it
     /// changed, and the tally.
     fn get_tally(&self, timeout_ms: u32) -> (bool, Tally) {
+        let handle = self.handle();
         let mut raw_tally = Tally::default().to_sdk();
         // SAFETY: this borrow reaches the instance's owning resource, and every
         // pointer passed outlives the synchronous call.
         let changed = unsafe {
-            self.resource().core().NDIlib_send_get_tally(
-                self.resource().instance(),
-                &mut raw_tally,
-                timeout_ms,
-            )
+            handle
+                .core()
+                .NDIlib_send_get_tally(handle.instance(), &mut raw_tally, timeout_ms)
         };
         (
             changed,
@@ -2102,13 +2131,14 @@ impl<M: SenderMode> Sender<M> {
     }
 
     fn connection_count_with_timeout(&self, timeout_ms: u32) -> Result<u32> {
+        let handle = self.handle();
         // SAFETY: this borrow keeps the sender and its runtime alive through
         // the bounded query, which writes no Rust-owned state.
         let count = unsafe {
-            self.resource()
+            handle
                 .core()
                 .named()
-                .NDIlib_send_get_no_connections(self.resource().instance(), timeout_ms)
+                .NDIlib_send_get_no_connections(handle.instance(), timeout_ms)
         };
         count.count()
     }
@@ -2116,12 +2146,13 @@ impl<M: SenderMode> Sender<M> {
     /// Remove all metadata registered for delivery to each new connection.
     #[doc(alias = "NDIlib_send_clear_connection_metadata")]
     pub fn clear_connection_metadata(&self) {
+        let handle = self.handle();
         // SAFETY: this borrow reaches the instance's owning resource, and every
         // pointer passed outlives the synchronous call.
         unsafe {
-            self.resource()
+            handle
                 .core()
-                .NDIlib_send_clear_connection_metadata(self.resource().instance())
+                .NDIlib_send_clear_connection_metadata(handle.instance())
         }
     }
 
@@ -2131,20 +2162,22 @@ impl<M: SenderMode> Sender<M> {
     /// the input can be released as soon as this method returns.
     #[doc(alias = "NDIlib_send_add_connection_metadata")]
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) {
+        let handle = self.handle();
         let raw = metadata.metadata_raw();
         // The borrowed C string remains live through this synchronous SDK call.
         // SAFETY: this borrow reaches the instance's owning resource, and every
         // pointer passed outlives the synchronous call.
         unsafe {
-            self.resource()
+            handle
                 .core()
-                .NDIlib_send_add_connection_metadata(self.resource().instance(), &raw)
+                .NDIlib_send_add_connection_metadata(handle.instance(), &raw)
         }
     }
 
     /// Set the validated failover source.
     #[doc(alias = "NDIlib_send_set_failover")]
     pub fn set_failover(&self, source: &Source) {
+        let handle = self.handle();
         self.resource()
             .failover
             .lock()
@@ -2152,9 +2185,9 @@ impl<M: SenderMode> Sender<M> {
                 // SAFETY: the native owner and its locked retention slot keep the
                 // previous and replacement descriptors live through this request.
                 unsafe {
-                    self.resource()
+                    handle
                         .core()
-                        .NDIlib_send_set_failover(self.resource().instance(), source)
+                        .NDIlib_send_set_failover(handle.instance(), source)
                 }
             });
     }
@@ -2162,13 +2195,14 @@ impl<M: SenderMode> Sender<M> {
     /// Clear the failover source previously configured with [`Self::set_failover`].
     #[doc(alias = "NDIlib_send_set_failover")]
     pub fn clear_failover(&self) {
+        let handle = self.handle();
         self.resource().failover.lock().replace(None, |source| {
             // SAFETY: the sender is live and the retention helper keeps the
             // previous descriptor until this null replacement returns.
             unsafe {
-                self.resource()
+                handle
                     .core()
-                    .NDIlib_send_set_failover(self.resource().instance(), source)
+                    .NDIlib_send_set_failover(handle.instance(), source)
             }
         });
     }
@@ -2198,13 +2232,14 @@ impl<M: SenderMode> Sender<M> {
     /// ```
     #[doc(alias = "NDIlib_send_get_source_name")]
     pub fn source(&self) -> Result<Source> {
+        let handle = self.handle();
         // SAFETY: this borrow reaches the instance's owning resource, and every
         // pointer passed outlives the synchronous call.
         let source_ptr = unsafe {
-            self.resource()
+            handle
                 .core()
                 .named()
-                .NDIlib_send_get_source_name(self.resource().instance())
+                .NDIlib_send_get_source_name(handle.instance())
         };
         // SAFETY: the SDK sender owns this live descriptor and its strings
         // through the synchronous copy performed here.
@@ -2305,8 +2340,10 @@ impl SenderOptions {
         }
     }
 
-    /// Set the discovery groups the sender is advertised
-    /// in, instead of those of the NDI configuration.
+    /// Set a non-empty list of discovery groups the sender is advertised in,
+    /// replacing the NDI configuration. Use [`Self::clear_groups`] to inherit
+    /// the configuration. Creation refuses empty elements and elements
+    /// containing a comma or NUL.
     #[must_use]
     pub fn groups(mut self, groups: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.groups = Some(groups.into_iter().map(Into::into).collect());
@@ -2501,12 +2538,7 @@ mod tests {
                         .build()
                         .unwrap();
                     assert!(owned.can_send_direct(), "owned {format:?} {scan:?}");
-                    assert_eq!(
-                        owned.initialized(),
-                        Initialized::Storage {
-                            room_after: owned.tail_room()
-                        }
-                    );
+                    assert_eq!(owned.initialized(), Initialized::PackedSendReady);
                     assert_eq!(
                         <&VideoFrame as VideoParts>::initialized(&&owned),
                         owned.initialized()
@@ -2554,37 +2586,30 @@ mod tests {
     }
 
     #[test]
-    fn a_short_owned_extent_stages_synchronous_sends_and_is_repaired_before_lending() {
+    fn owned_send_keeps_allocation_and_capacity_when_lending() {
         use crate::frames::descriptor_tests::assert_extent;
-        if PixelFormat::Uyvy.send_tail_room() == 0 {
-            return;
-        }
+        let mut pixels = Vec::with_capacity(18 * 6 * 2 + 1024);
+        pixels.resize(18 * 6 * 2, 128);
+        let capacity = pixels.capacity();
         let frame = VideoFrame::builder()
             .resolution(18, 6)
             .pixel_format(PixelFormat::Uyvy)
             .scan_type(ScanType::Interlaced)
-            .data(vec![128; 18 * 6 * 2])
+            .data(pixels)
             .build()
-            .unwrap()
-            .without_send_room_for_test();
-        assert_eq!(frame.tail_room(), 0);
-        assert!(!frame.sends_in_place());
+            .unwrap();
+        let extent = frame.data().len() + frame.tail_room();
+        let pointer = frame.data().as_ptr();
         let mut staging = VideoStaging::default();
         let raw = PreparedVideo::new(&frame, &mut staging).raw;
-        assert_ne!(raw.p_data.cast_const(), frame.data().as_ptr());
-        assert_extent(&raw, staging.as_ptr(), staging.len() + staging.room());
+        assert_extent(&raw, pointer, extent);
+        assert!(staging.is_none());
         let mut owned = Sendable::for_test(frame);
-        let lent = in_flight::Lend::lend(&mut owned);
-        assert!(owned.frame().can_send_direct());
-        assert_eq!(
-            owned.tail_room(),
-            send_room(owned.layout(), owned.header().scan_type())
-        );
-        assert_extent(
-            lent.descriptor(),
-            owned.data().as_ptr(),
-            owned.data().len() + owned.tail_room(),
-        );
+        let (lent, allocations) =
+            crate::test_alloc::allocation_count(|| in_flight::Lend::lend(&mut owned));
+        assert_eq!(allocations, 0);
+        assert_extent(lent.descriptor(), pointer, extent);
+        assert_eq!(owned.into_frame().into_data().capacity(), capacity);
     }
 
     #[test]
@@ -2627,7 +2652,10 @@ mod tests {
                 assert!(staging.room_bytes().iter().all(|&byte| byte == 0));
                 assert_eq!(
                     staging.room(),
-                    send_room(&source.layout().packed(), source.header().scan_type())
+                    send_room(
+                        source.layout().packed().as_layout(),
+                        source.header().scan_type()
+                    )
                 );
             }
             let pointer = raw.p_data;
@@ -3134,7 +3162,10 @@ mod tests {
                                 } else {
                                     expected = Some(staging.bytes().to_vec());
                                 }
-                                assert_eq!(staging.room(), send_room(&layout.packed(), scan));
+                                assert_eq!(
+                                    staging.room(),
+                                    send_room(layout.packed().as_layout(), scan)
+                                );
                                 assert!(staging.room_bytes().iter().all(|&byte| byte == 0));
                                 let address = staging.as_ptr();
                                 let ((), allocations) = crate::test_alloc::allocation_count(|| {

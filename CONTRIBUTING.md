@@ -19,10 +19,14 @@ and loopback-only test runs.
 When reporting a bug, include a small reproducer, crate version, Cargo features,
 platform and native runtime version/edition. For fixes, add a regression test
 and explain the change in behavior. Keep native ownership and synchronization
-arguments beside unsafe operations.
+arguments beside unsafe operations. Use gates and observed events to prove
+ordering in concurrency tests. When a test holds one operation to show that
+another can complete, allow the second at least one second. Release the blocker
+before asserting the result.
 
-Production code may not panic except through an `#[expect]` whose reason states
-the invariant that justifies the site.
+Production code may panic only through an `#[expect]` whose reason states the
+invariant that justifies the site. Use `const_assert!` for compile-time assertions
+and reserve `assert!`, `assert_eq!` and `assert_ne!` for tests.
 
 Update API documentation and examples when behavior changes, and add migration
 notes when callers must change. Follow the [public API conventions](docs/api-conventions.md)
@@ -30,6 +34,9 @@ for names, signatures, traits, ownership and documentation. Keep issue investiga
 audit reports and measured results on the relevant GitHub issue. Include the
 workload, environment and limits with performance results; repository docs
 should explain how to use and maintain the library.
+
+Module examples follow the obligations documented by their module and link to
+the runnable example that covers the full workflow.
 
 Keep build outputs, test logs, recordings and reproducible fixture outputs out
 of Git. Commit generators and generate their outputs in temporary directories

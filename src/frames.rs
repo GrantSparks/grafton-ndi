@@ -7,12 +7,12 @@ use std::{ffi::CString, ptr, str};
 
 use crate::{
     capture::{
-        AudioKind, FrameFree, FrameSyncAudioFree, FrameSyncVideoFree, Guard, RecvAudioGuard,
-        RecvMetadataGuard, SenderMetadataFree, VideoKind,
+        AudioKind, FrameFree, FrameSyncAudioFree, FrameSyncVideoFree, Guard, RecvMetadataGuard,
+        SenderMetadataFree, VideoKind,
     },
     framesync::{AudioInputFormat, FrameSyncAudioRef, FrameSyncVideoRef},
     media::SdkQuantity,
-    pixels::{AudioCopy, PackedStorage, PackedVideo, VideoCopy},
+    pixels::{AudioCopy, PackedStorage, PackedVideo, VideoCopy, VideoStorage},
     sys::{self, bindings::*},
     Error, FourCc, FrameRate, PictureAspectRatio, Rejected, Result, SdkTimestamp, Timecode,
 };
@@ -242,6 +242,22 @@ crate::media::decoded_variants!(PixelFormat:
 );
 
 impl PixelFormat {
+    /// Packed storage bytes per pixel across all planes, rounded up for 4:2:0.
+    const fn packed_bytes_per_pixel_ceil(self) -> usize {
+        let info = self.info();
+        let first_plane = info.bytes_per_pixel() as usize;
+        match info.category() {
+            FormatCategory::PackedAlpha
+            | FormatCategory::Planar420
+            | FormatCategory::SemiPlanar420 => first_plane + first_plane.div_ceil(2),
+            FormatCategory::Packed
+            | FormatCategory::SemiPlanar422
+            | FormatCategory::SemiPlanar422Alpha
+            | FormatCategory::Planar444
+            | FormatCategory::Planar444Alpha => first_plane * info.plane_count(),
+        }
+    }
+
     /// The complete readable allocation size for sending this layout.
     ///
     /// `line_stride_bytes` is `None` for tightly packed rows; explicit values
@@ -635,14 +651,28 @@ impl ScanType {
     }
 }
 
-/// The header fields of a video frame besides its layout, validated
-/// together: they are the same for owned, borrowed and received frames.
+/// Video header values independent of the storage's scan-dependent send room.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct VideoHeader {
+pub(crate) struct VideoTiming {
     frame_rate: FrameRate,
     picture_aspect_ratio: PictureAspectRatio,
-    scan_type: ScanType,
     timecode: Timecode,
+}
+
+impl VideoTiming {
+    pub(crate) const fn with_scan_type(self, scan_type: ScanType) -> VideoHeader {
+        VideoHeader {
+            timing: self,
+            scan_type,
+        }
+    }
+}
+
+/// The complete header of a validated video frame besides its layout.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VideoHeader {
+    pub(crate) timing: VideoTiming,
+    scan_type: ScanType,
 }
 
 impl VideoHeader {
@@ -652,28 +682,29 @@ impl VideoHeader {
         scan_type: ScanType,
         timecode: Timecode,
     ) -> Self {
-        Self {
+        VideoTiming {
             frame_rate,
             picture_aspect_ratio,
-            scan_type,
             timecode,
         }
+        .with_scan_type(scan_type)
     }
 
     pub(crate) const fn frame_rate(self) -> FrameRate {
-        self.frame_rate
+        self.timing.frame_rate
     }
     pub(crate) const fn picture_aspect_ratio(self) -> PictureAspectRatio {
-        self.picture_aspect_ratio
+        self.timing.picture_aspect_ratio
     }
     pub(crate) const fn scan_type(self) -> ScanType {
         self.scan_type
     }
     pub(crate) const fn timecode(self) -> Timecode {
-        self.timecode
+        self.timing.timecode
     }
-    pub(crate) fn with_timecode(self, timecode: Timecode) -> Self {
-        Self { timecode, ..self }
+    pub(crate) fn with_timecode(mut self, timecode: Timecode) -> Self {
+        self.timing.timecode = timecode;
+        self
     }
 
     /// Validate the header of a frame the SDK delivered.
@@ -712,19 +743,20 @@ impl VideoHeader {
 /// storage that [`layout`](Self::layout) describes, with every active row
 /// initialized and unchanged while `self` is borrowed. Row padding need not
 /// be initialized. Metadata text must remain a bounded NUL-terminated UTF-8
-/// string for the borrow. An [`Initialized::Storage`] report guarantees every
-/// byte of the layout's storage, padding included, is initialized. Its
-/// `room_after` bytes after the last active pixel are also initialized and
-/// readable through the pointer `pixels()` returns: it must derive from a
-/// reference or allocation covering both storage and room. Final-row padding
-/// counts towards that room.
+/// string for the borrow. [`Initialized::Storage`] and
+/// [`Initialized::PackedSendReady`] each guarantee full initialization.
+/// For `Storage`, the reported room after the last active pixel is also
+/// initialized and readable, including final-row padding. For `PackedSendReady`,
+/// the packed allocation includes the zeroed SDK send tail for the layout and
+/// scan type. In each case the pointer returned by `pixels()` must derive from a
+/// reference or allocation covering both the storage and that trailing room.
 /// Copying, views and descriptors are non-overridable helpers.
 pub(crate) unsafe trait VideoParts {
     /// The validated layout of the frame's pixels; stable for the borrow.
     fn layout(&self) -> &ValidatedVideoLayout;
 
     /// The validated header.
-    fn header(&self) -> &VideoHeader;
+    fn header(&self) -> VideoHeader;
 
     /// The start of the frame's pixel storage.
     fn pixels(&self) -> *const u8;
@@ -752,6 +784,8 @@ pub(crate) enum Initialized {
     /// `VideoParts::pixels()`, whose provenance covers the storage and room.
     /// The final row's padding is part of that room.
     Storage { room_after: usize },
+    /// Tightly packed storage with the initialized SDK tail for its scan type.
+    PackedSendReady,
 }
 
 // SAFETY: a reference forwards every accessor and keeps its original owner
@@ -760,7 +794,7 @@ unsafe impl<T: VideoParts + ?Sized> VideoParts for &T {
     fn layout(&self) -> &ValidatedVideoLayout {
         (**self).layout()
     }
-    fn header(&self) -> &VideoHeader {
+    fn header(&self) -> VideoHeader {
         (**self).header()
     }
     fn pixels(&self) -> *const u8 {
@@ -785,16 +819,16 @@ pub(crate) trait VideoPartsExt: VideoParts {
         let frame = self;
         let layout = frame.layout();
         let header = frame.header();
-        let (frame_rate_n, frame_rate_d) = header.frame_rate.to_sdk();
+        let (frame_rate_n, frame_rate_d) = header.frame_rate().to_sdk();
         NDIlib_video_frame_v2_t {
             xres: layout.sdk_width(),
             yres: layout.sdk_height(),
             FourCC: FourCc::from(layout.pixel_format()).raw(),
             frame_rate_N: frame_rate_n,
             frame_rate_D: frame_rate_d,
-            picture_aspect_ratio: header.picture_aspect_ratio.to_sdk(),
+            picture_aspect_ratio: header.picture_aspect_ratio().to_sdk(),
             frame_format_type: header.scan_type.to_sdk(),
-            timecode: header.timecode.ticks(),
+            timecode: header.timecode().ticks(),
             p_data: frame.pixels().cast_mut(),
             __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
                 line_stride_in_bytes: layout.sdk_line_stride(),
@@ -806,12 +840,13 @@ pub(crate) trait VideoPartsExt: VideoParts {
 
     /// Whether one complete SDK read fits the owner's initialized extent.
     fn can_send_direct(&self) -> bool {
-        let layout = self.layout();
-        let room = crate::pixels::send_room(layout, self.header().scan_type);
+        let send_room = |layout| crate::pixels::send_room(layout, self.header().scan_type());
         match self.initialized() {
-            Initialized::Storage { room_after } => room_after >= room,
+            Initialized::PackedSendReady => true,
+            Initialized::Storage { room_after } => room_after >= send_room(self.layout()),
             Initialized::ActiveRows => {
-                layout.payload_len_bytes() == layout.data_len_bytes() && room == 0
+                let layout = self.layout();
+                layout.payload_len_bytes() == layout.data_len_bytes() && send_room(layout) == 0
             }
         }
     }
@@ -856,13 +891,13 @@ pub(crate) trait VideoPartsExt: VideoParts {
 
     /// Copy active pixels using a single snapshot of the source layout.
     fn owned_copy(&self) -> VideoFrame {
-        let header = *self.header();
+        let header = self.header();
         let metadata = OwnedFrameMetadata::copied(self.frame_metadata());
         let timestamp = self.sdk_timestamp();
-        let data = PackedStorage::copied(VideoCopy::new(self, header.scan_type));
+        let data = VideoStorage::copied(VideoCopy::new(self), header.scan_type());
         VideoFrame {
             data,
-            header,
+            timing: header.timing,
             metadata,
             timestamp,
         }
@@ -871,13 +906,13 @@ pub(crate) trait VideoPartsExt: VideoParts {
     /// Copy pixels and metadata, reusing their allocations when sufficient.
     /// The storage kernel preserves the previous layout/storage pairing on unwind.
     fn copy_into_owned(&self, destination: &mut VideoFrame) {
-        let header = *self.header();
+        let header = self.header();
         let timestamp = self.sdk_timestamp();
         destination.metadata.copy_from(self.frame_metadata());
         destination
             .data
-            .refill_from(VideoCopy::new(self, header.scan_type));
-        destination.header = header;
+            .refill_from(VideoCopy::new(self), header.scan_type());
+        destination.timing = header.timing;
         destination.timestamp = timestamp;
     }
 }
@@ -1398,26 +1433,25 @@ pub(crate) use video_accessors;
 /// sending requires no pixel copy or allocation growth.
 #[derive(Clone)]
 pub struct VideoFrame {
-    header: VideoHeader,
-    /// The layout and pixels, followed by their scan-dependent SDK room.
-    data: PackedStorage<ValidatedVideoLayout>,
+    timing: VideoTiming,
+    /// The layout, scan type, pixels and scan-dependent SDK room.
+    data: VideoStorage,
     metadata: OwnedFrameMetadata,
     timestamp: Option<SdkTimestamp>,
 }
 
-// SAFETY: Pixels owns and initializes the validated layout and scan-dependent
-// SDK tail. OwnedFrameMetadata owns bounded terminated text. Immutable borrows keep
-// both allocations unchanged. Its initialized report comes from Pixels'
-// tracked room; Pixels::as_ptr derives from the owning Vec and covers the whole
-// allocation, including every byte after its tightly packed active pixels.
+// SAFETY: VideoStorage owns the packed layout, initialized pixels and
+// scan-dependent SDK tail. OwnedFrameMetadata owns bounded terminated text.
+// Immutable borrows keep both allocations unchanged. VideoStorage::as_ptr
+// derives from the owning Vec and covers its initialized storage and tail.
 unsafe impl VideoParts for VideoFrame {
     #[inline]
     fn layout(&self) -> &ValidatedVideoLayout {
         self.data.layout()
     }
     #[inline]
-    fn header(&self) -> &VideoHeader {
-        &self.header
+    fn header(&self) -> VideoHeader {
+        self.timing.with_scan_type(self.data.scan_type())
     }
     #[inline]
     fn pixels(&self) -> *const u8 {
@@ -1433,9 +1467,7 @@ unsafe impl VideoParts for VideoFrame {
     }
 
     fn initialized(&self) -> Initialized {
-        Initialized::Storage {
-            room_after: self.data.room(),
-        }
+        Initialized::PackedSendReady
     }
 }
 
@@ -1528,7 +1560,7 @@ impl VideoFrame {
 
     /// Set the timecode without reallocating the pixels.
     pub fn set_timecode(&mut self, timecode: Timecode) {
-        self.header.timecode = timecode;
+        self.timing.timecode = timecode;
     }
 
     /// Set the scan type without changing the frame's validated layout.
@@ -1537,14 +1569,12 @@ impl VideoFrame {
     /// room. Existing capacity is reused and never shrunk, so switching
     /// among scan types allocates at most once after construction.
     pub fn set_scan_type(&mut self, scan_type: ScanType) {
-        self.data
-            .reserve_tail(crate::pixels::send_room(self.data.layout(), scan_type));
-        self.header.scan_type = scan_type;
+        self.data.set_scan_type(scan_type);
     }
 
     /// Set the frame rate.
     pub fn set_frame_rate(&mut self, frame_rate: FrameRate) {
-        self.header.frame_rate = frame_rate;
+        self.timing.frame_rate = frame_rate;
     }
 
     /// Set the picture aspect ratio, width over height as displayed; `0.0`
@@ -1552,7 +1582,7 @@ impl VideoFrame {
     ///
     /// The validated ratio is stored without further checks.
     pub fn set_picture_aspect_ratio(&mut self, ratio: PictureAspectRatio) {
-        self.header.picture_aspect_ratio = ratio;
+        self.timing.picture_aspect_ratio = ratio;
     }
 
     /// Recover the original pixel vector, retaining its allocation and capacity.
@@ -1572,10 +1602,7 @@ impl VideoFrame {
     /// Returns `data` unchanged with [`Error::InvalidFrame`] when its length
     /// differs from the validated layout. The frame is unchanged.
     pub fn swap_data(&mut self, data: Vec<u8>) -> std::result::Result<Vec<u8>, Rejected<Vec<u8>>> {
-        self.data.swap(
-            data,
-            crate::pixels::send_room(self.data.layout(), self.header.scan_type),
-        )
+        self.data.swap(data)
     }
 
     /// Get mutable access to the frame data without changing the validated
@@ -1589,14 +1616,6 @@ impl VideoFrame {
     #[cfg(test)]
     pub(crate) fn tail_room(&self) -> usize {
         self.data.room()
-    }
-
-    /// Deliberately omit the owned-send room to exercise loan-boundary repair.
-    #[cfg(test)]
-    pub(crate) fn without_send_room_for_test(mut self) -> Self {
-        self.data =
-            PackedStorage::adopt(*self.data.layout(), self.data.as_slice().to_vec(), 0).unwrap();
-        self
     }
 
     /// Replace the owned frame data while preserving the validated layout.
@@ -1655,59 +1674,6 @@ impl VideoFrame {
         // SAFETY: forwarded to the caller; the borrow holds the descriptor.
         let frame = unsafe { ValidatedVideo::video_descriptor(c_frame)? };
         Ok(frame.owned_copy())
-    }
-}
-
-#[cfg(all(test, feature = "image-encoding"))]
-impl VideoFrame {
-    /// A frame over `data` laid out with `line_stride`, which may pad its
-    /// rows, as received frames' strides do: owned frames are otherwise
-    /// packed.
-    pub(crate) fn with_line_stride(
-        pixel_format: PixelFormat,
-        width: u32,
-        height: u32,
-        line_stride: usize,
-        data: Vec<u8>,
-        metadata: Option<&str>,
-    ) -> Self {
-        let layout =
-            ValidatedVideoLayout::new_uncompressed(pixel_format, width, height, Some(line_stride))
-                .unwrap();
-        assert_eq!(data.len(), layout.data_len_bytes());
-        Self {
-            header: VideoHeader::new(
-                FrameRate::new(60, 1).unwrap(),
-                PictureAspectRatio::SQUARE_PIXELS,
-                ScanType::Progressive,
-                Timecode::from_ticks(0),
-            ),
-            data: PackedStorage::adopt(
-                layout,
-                data,
-                crate::pixels::send_room(&layout, ScanType::Progressive),
-            )
-            .unwrap(),
-            metadata: metadata
-                .map(|text| OwnedFrameMetadata::new(text).unwrap())
-                .unwrap_or_default(),
-            timestamp: None,
-        }
-    }
-
-    /// The frame as a captured reference to its own pixels, as a FrameSync
-    /// capture would lend it; dropping it frees nothing.
-    pub(crate) fn as_test_capture(&self) -> crate::FrameSyncVideoRef<'_> {
-        // SAFETY: the descriptor points into `self`, which the reference
-        // borrows, and the no-op free releases nothing it does not own.
-        unsafe {
-            FrameSyncVideoRef::new(Guard::<crate::capture::FrameSyncVideoFree>::with_test_free(
-                ptr::null_mut(),
-                self.as_test_raw(),
-                |_, _| {},
-            ))
-        }
-        .unwrap()
     }
 }
 
@@ -1873,49 +1839,38 @@ impl VideoFrameBuilder {
     /// valid frame, and [`Error::InvalidCString`] for metadata containing a
     /// NUL byte.
     pub fn build(mut self) -> std::result::Result<VideoFrame, Rejected<Self>> {
-        let mut validate = || -> Result<_> {
-            let picture_aspect_ratio = self.picture_aspect_ratio;
-            let layout = ValidatedVideoLayout::new_uncompressed(
-                self.pixel_format,
-                self.width,
-                self.height,
-                None,
-            )?;
-            if let Some(data) = &self.data {
-                PackedStorage::check_len(layout, data.len())?;
-            }
-            // The last fallible check transfers metadata only on success,
-            // preserving the complete builder on every rejected input.
-            let metadata = OwnedFrameMetadata::take_from(&mut self.metadata)?;
-            Ok((layout, metadata, picture_aspect_ratio))
-        };
-        let (layout, metadata, picture_aspect_ratio) = match validate() {
-            Ok(parts) => parts,
+        let layout = match PackedVideoLayout::new(self.pixel_format, self.width, self.height) {
+            Ok(layout) => layout,
             Err(error) => return Err(Rejected::new(error, self)),
         };
-        let room = crate::pixels::send_room(&layout, self.scan_type);
-        let data = match self.data.take() {
-            Some(data) => match PackedStorage::adopt(layout, data, room) {
-                Ok(data) => data,
+        let (data, metadata) = match self.data.take() {
+            Some(data) => match VideoStorage::adopt(layout, data, self.scan_type, || {
+                CheckedMetadata::take_from(&mut self.metadata)
+            }) {
+                Ok(checked) => checked,
                 Err(rejected) => {
                     let (error, data) = rejected.into_parts();
                     self.data = Some(data);
-                    self.metadata = metadata.into_supplied_text();
                     return Err(Rejected::new(error, self));
                 }
             },
-            None => PackedStorage::zeroed(layout, room),
+            None => {
+                let metadata = match CheckedMetadata::take_from(&mut self.metadata) {
+                    Ok(metadata) => metadata,
+                    Err(error) => return Err(Rejected::new(error, self)),
+                };
+                (VideoStorage::zeroed(layout, self.scan_type), metadata)
+            }
         };
 
         Ok(VideoFrame {
-            header: VideoHeader::new(
-                self.frame_rate,
-                picture_aspect_ratio,
-                self.scan_type,
-                self.timecode,
-            ),
+            timing: VideoTiming {
+                frame_rate: self.frame_rate,
+                picture_aspect_ratio: self.picture_aspect_ratio,
+                timecode: self.timecode,
+            },
             data,
-            metadata,
+            metadata: metadata.into_owned(),
             timestamp: None,
         })
     }
@@ -2008,7 +1963,7 @@ pub(crate) trait AudioPartsExt: AudioParts {
         let timecode = self.audio_timecode();
         let timestamp = self.sdk_timestamp();
         let metadata = OwnedFrameMetadata::copied(self.frame_metadata());
-        let data = PackedStorage::copied(AudioCopy::new(self));
+        let data = PackedStorage::copied(AudioCopy::new(self), 0);
         AudioFrame {
             data,
             timecode,
@@ -2023,7 +1978,7 @@ pub(crate) trait AudioPartsExt: AudioParts {
         let timecode = self.audio_timecode();
         let timestamp = self.sdk_timestamp();
         destination.metadata.copy_from(self.frame_metadata());
-        destination.data.refill_from(AudioCopy::new(self));
+        destination.data.refill_from(AudioCopy::new(self), 0);
         destination.timecode = timecode;
         destination.timestamp = timestamp;
     }
@@ -2250,7 +2205,7 @@ pub use borrowed::{
 #[derive(Clone)]
 pub struct AudioFrame {
     timecode: Timecode,
-    data: PackedStorage<ValidatedAudioLayout>,
+    data: PackedStorage<PackedAudioLayout>,
     metadata: OwnedFrameMetadata,
     timestamp: Option<SdkTimestamp>,
 }
@@ -2261,7 +2216,7 @@ pub struct AudioFrame {
 unsafe impl AudioParts for AudioFrame {
     #[inline]
     fn layout(&self) -> &ValidatedAudioLayout {
-        self.data.layout()
+        self.data.layout().as_layout()
     }
     #[inline]
     fn audio_timecode(&self) -> Timecode {
@@ -2326,8 +2281,8 @@ impl AudioFrame {
     /// SDK timestamp is `None`. Use [`Self::set_metadata`] to attach metadata.
     pub fn from_interleaved(source: &crate::audio_conversion::InterleavedAudioF32<'_>) -> Self {
         let mut frame = Self::from_validated_silence(source.layout(), source.timecode());
-        let channels = frame.data.layout().no_channels();
-        let samples = frame.data.layout().no_samples();
+        let channels = frame.layout().no_channels();
+        let samples = frame.layout().no_samples();
         // The input's validated shape proves it contains exactly `samples`
         // groups of `channels` initialized interleaved values.
         for (channel, output) in frame
@@ -2451,7 +2406,7 @@ impl AudioFrame {
 
     /// Get mutable samples for one channel without allocating.
     pub fn channel_data_mut(&mut self, channel: usize) -> Option<&mut [f32]> {
-        let range = self.data.layout().channel_range(channel)?;
+        let range = self.layout().channel_range(channel)?;
         Some(&mut self.data.as_mut_slice()[range])
     }
 }
@@ -2592,42 +2547,39 @@ impl AudioFrameBuilder {
     /// frame, and [`Error::InvalidCString`] for metadata containing a NUL
     /// byte.
     pub fn build(mut self) -> std::result::Result<AudioFrame, Rejected<Self>> {
-        let mut validate = || -> Result<_> {
-            let layout = validate_outbound_audio_layout(
-                self.sample_rate,
-                self.num_channels,
-                self.num_samples,
-                AudioFormat::Fltp,
-            )?;
-            if let Some(data) = &self.data {
-                PackedStorage::check_len(layout, data.len())?;
-            }
-            // Transfer metadata only after every rejection check, before
-            // changing sample storage.
-            let metadata = OwnedFrameMetadata::take_from(&mut self.metadata)?;
-            Ok((layout, metadata))
-        };
-        let (audio_layout, metadata) = match validate() {
-            Ok(parts) => parts,
+        let layout = match validate_outbound_audio_layout(
+            self.sample_rate,
+            self.num_channels,
+            self.num_samples,
+            AudioFormat::Fltp,
+        ) {
+            Ok(layout) => layout,
             Err(error) => return Err(Rejected::new(error, self)),
         };
-        let data = match self.data.take() {
-            Some(data) => match PackedStorage::adopt(audio_layout, data, 0) {
-                Ok(data) => data,
+        let (data, metadata) = match self.data.take() {
+            Some(data) => match PackedStorage::adopt(layout, data, 0, || {
+                CheckedMetadata::take_from(&mut self.metadata)
+            }) {
+                Ok(checked) => checked,
                 Err(rejected) => {
                     let (error, data) = rejected.into_parts();
                     self.data = Some(data);
-                    self.metadata = metadata.into_supplied_text();
                     return Err(Rejected::new(error, self));
                 }
             },
-            None => PackedStorage::zeroed(audio_layout, 0),
+            None => {
+                let metadata = match CheckedMetadata::take_from(&mut self.metadata) {
+                    Ok(metadata) => metadata,
+                    Err(error) => return Err(Rejected::new(error, self)),
+                };
+                (PackedStorage::zeroed(layout, 0), metadata)
+            }
         };
 
         Ok(AudioFrame {
             timecode: self.timecode,
             data,
-            metadata,
+            metadata: metadata.into_owned(),
             timestamp: None,
         })
     }
@@ -2671,8 +2623,31 @@ impl AudioFormat {
     }
 }
 
-/// Maximum allowed size for supported video frame data (256 MiB).
-pub(crate) const MAX_VIDEO_BYTES: usize = 256 * 1024 * 1024;
+const DCI_8K_WIDTH: u32 = 8192;
+const DCI_8K_HEIGHT: u32 = 4320;
+
+const fn widest_pixel_bytes() -> usize {
+    let mut widest = 0;
+    let mut index = 0;
+    while index < PixelFormat::ALL.len() {
+        let bytes = PixelFormat::ALL[index].packed_bytes_per_pixel_ceil();
+        if bytes > widest {
+            widest = bytes;
+        }
+        index += 1;
+    }
+    widest
+}
+
+// Revisit the frame and allocator limits when a wider format is introduced.
+const_assert!(widest_pixel_bytes() == PixelFormat::Nb4g.packed_bytes_per_pixel_ceil());
+
+/// Maximum extent in bytes of an uncompressed video frame, excluding SDK send tail room.
+///
+/// Sized to admit a tightly packed DCI 8K frame in every supported
+/// [pixel format](PixelFormat), including 16-bit planar NB4G.
+pub const MAX_VIDEO_BYTES: usize =
+    DCI_8K_WIDTH as usize * DCI_8K_HEIGHT as usize * widest_pixel_bytes();
 
 /// Maximum allowed size for audio frame data (64 MiB).
 /// Comfortably above typical NDI audio frames while preventing unbounded allocations.
@@ -2947,6 +2922,7 @@ pub use layout::{AudioChannels, VideoPlane, VideoPlanes, VideoRows};
 pub(crate) use received::*;
 
 mod metadata;
+use metadata::CheckedMetadata;
 pub(crate) use metadata::FrameMetadataState;
 #[cfg(test)]
 pub(crate) use metadata::{validate_frame_metadata, MetadataWithheld};
@@ -2974,6 +2950,8 @@ impl<F> std::ops::Deref for Sendable<F> {
 }
 
 impl<F: VideoParts> Sendable<F> {
+    /// The send-capability check every uncompressed video send makes before
+    /// reaching the SDK.
     fn checked(frame: F, ndi: &crate::Ndi) -> std::result::Result<Self, (Error, F)> {
         match frame
             .layout()
@@ -3016,7 +2994,7 @@ impl<F: VideoParts> Sendable<F> {
 
     pub(crate) fn packed<'a>(
         &'a self,
-        pixels: &'a mut Option<PackedStorage<ValidatedVideoLayout>>,
+        pixels: &'a mut Option<VideoStorage>,
     ) -> Sendable<PackedVideo<'a>> {
         Sendable {
             frame: crate::pixels::stage_video(&self.frame, pixels),
@@ -3046,20 +3024,6 @@ impl<'a, F: VideoParts + ?Sized> Sendable<&'a F> {
     /// Borrowed gates return their typed refusal without allocating recovery storage.
     pub(crate) fn borrowed(frame: &'a F, ndi: &crate::Ndi) -> Result<Self> {
         Self::checked(frame, ndi).map_err(|(error, _)| error)
-    }
-}
-
-impl Sendable<VideoFrame> {
-    /// Establish this owned loan's complete initialized read extent before
-    /// constructing the descriptor. Already sufficient room requires only the
-    /// comparison in `reserve_room` and never grows the allocation.
-    pub(crate) fn owned_video_descriptor(&mut self) -> NDIlib_video_frame_v2_t {
-        let frame = &mut self.frame;
-        frame.data.reserve_tail(crate::pixels::send_room(
-            frame.data.layout(),
-            frame.header.scan_type,
-        ));
-        self.video_descriptor()
     }
 }
 
@@ -3093,7 +3057,7 @@ macro_rules! borrowed_video_accessors {
         // concrete wrapper delegates every part to that same immutable core.
         unsafe impl VideoParts for $name<'_> {
             fn layout(&self) -> &ValidatedVideoLayout { VideoParts::layout(&self.inner) }
-            fn header(&self) -> &VideoHeader { VideoParts::header(&self.inner) }
+            fn header(&self) -> VideoHeader { VideoParts::header(&self.inner) }
             fn pixels(&self) -> *const u8 { VideoParts::pixels(&self.inner) }
             fn frame_metadata(&self) -> FrameMetadataRef<'_> { VideoParts::frame_metadata(&self.inner) }
             fn sdk_timestamp(&self) -> Option<SdkTimestamp> { VideoParts::sdk_timestamp(&self.inner) }
@@ -3195,6 +3159,14 @@ pub struct AudioFrameRef<'rx> {
 }
 
 macro_rules! borrowed_audio_accessors {
+    (new $name:ident, $strategy:ty) => {
+        impl<'a> $name<'a> {
+            pub(crate) fn new(guard: Guard<'a, $strategy>) -> Result<Self> {
+                Ok(Self { inner: ValidatedAudio::validate(guard)? })
+            }
+        }
+        borrowed_audio_accessors!($name, $strategy);
+    };
     ($name:ident, $strategy:ty) => {
         // SAFETY: all parts borrow the one validated descriptor retained by
         // this wrapper's private core, with no change to storage or freeing.
@@ -3279,26 +3251,10 @@ macro_rules! borrowed_audio_accessors {
             }
     };
 }
-borrowed_audio_accessors!(AudioFrameRef, AudioKind);
-borrowed_audio_accessors!(FrameSyncAudioRef, FrameSyncAudioFree);
+borrowed_audio_accessors!(new AudioFrameRef, AudioKind);
+borrowed_audio_accessors!(new FrameSyncAudioRef, FrameSyncAudioFree);
 #[cfg(feature = "advanced")]
 borrowed_audio_accessors!(AvSyncAudioRef, AvSyncAudioFree);
-
-impl<'rx> AudioFrameRef<'rx> {
-    pub(crate) fn new(guard: RecvAudioGuard<'rx>) -> Result<Self> {
-        Ok(Self {
-            inner: ValidatedAudio::validate(guard)?,
-        })
-    }
-}
-
-impl<'fs> FrameSyncAudioRef<'fs> {
-    pub(crate) fn new(guard: Guard<'fs, FrameSyncAudioFree>) -> Result<Self> {
-        Ok(Self {
-            inner: ValidatedAudio::validate(guard)?,
-        })
-    }
-}
 
 #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_av_sync)))]
 impl<'a> AvSyncAudioRef<'a> {
@@ -3519,8 +3475,11 @@ mod tests {
                         ValidatedVideoLayout::new_uncompressed(format, width, height, None)
                             .unwrap();
                     let packed = layout.packed();
-                    assert_eq!(format!("{packed:?}"), format!("{expected:?}"));
-                    assert_eq!(packed.data_len_bytes(), layout.payload_len_bytes());
+                    assert_eq!(format!("{:?}", packed.as_layout()), format!("{expected:?}"));
+                    assert_eq!(
+                        packed.as_layout().data_len_bytes(),
+                        layout.payload_len_bytes()
+                    );
                     packed_layouts += 1;
                 }
             }
@@ -3933,7 +3892,7 @@ mod tests {
                     ) else {
                         continue;
                     };
-                    for layout in [layout, layout.packed()] {
+                    for layout in [layout, *layout.packed().as_layout()] {
                         checked += 1;
                         for channel in 0..channels as usize {
                             let start = channel as i128 * layout.channel_stride_samples() as i128;
@@ -3978,6 +3937,7 @@ mod tests {
             assert_eq!(owned.is_ok(), valid);
             assert_eq!(request.is_ok(), valid);
             if let (Ok(packed), Ok(owned)) = (packed, owned) {
+                let owned = owned.as_layout();
                 assert_eq!(packed.sample_count() as i128 * 4, bytes);
                 assert_eq!(owned.channel_stride_bytes() as i128, stride);
                 assert_eq!(packed.no_channels(), owned.no_channels());
@@ -5376,8 +5336,6 @@ mod tests {
     /// Test that AudioFrameRef::new rejects unknown FourCC
     #[test]
     fn test_audioframeref_unknown_fourcc() {
-        use crate::capture::RecvAudioGuard;
-
         let num_samples = 1024;
         let num_channels = 2;
         let sample_count = (num_samples * num_channels) as usize;
@@ -5399,7 +5357,8 @@ mod tests {
         };
 
         let mock_instance = ptr::null_mut();
-        let guard = unsafe { RecvAudioGuard::with_test_free(mock_instance, c_frame, |_, _| {}) };
+        let guard =
+            unsafe { Guard::<AudioKind>::with_test_free(mock_instance, c_frame, |_, _| {}) };
 
         let result = AudioFrameRef::new(guard);
         assert!(result.is_err(), "Should reject unknown audio FourCC");
@@ -5421,8 +5380,6 @@ mod tests {
     /// Test that AudioFrameRef::new accepts known FourCC and stores validated format
     #[test]
     fn test_audioframeref_known_fourcc() {
-        use crate::capture::RecvAudioGuard;
-
         let num_samples = 1024;
         let num_channels = 2;
         let sample_count = (num_samples * num_channels) as usize;
@@ -5443,7 +5400,8 @@ mod tests {
         };
 
         let mock_instance = ptr::null_mut();
-        let guard = unsafe { RecvAudioGuard::with_test_free(mock_instance, c_frame, |_, _| {}) };
+        let guard =
+            unsafe { Guard::<AudioKind>::with_test_free(mock_instance, c_frame, |_, _| {}) };
 
         let frame_ref = AudioFrameRef::new(guard).expect("Should accept FLTP FourCC");
         assert_eq!(
@@ -5627,11 +5585,96 @@ mod tests {
         ));
     }
 
-    /// Test that MAX_VIDEO_BYTES constant is properly defined
     #[test]
-    fn test_max_video_bytes_constant() {
-        // Verify the crate resource cap is set to 256 MiB
-        assert_eq!(MAX_VIDEO_BYTES, 256 * 1024 * 1024);
+    fn dci_8k_fits_every_supported_pixel_format() {
+        for format in PixelFormat::ALL {
+            let stride = format.line_stride_bytes(DCI_8K_WIDTH).unwrap();
+            let extent = format
+                .buffer_len(DCI_8K_WIDTH, DCI_8K_HEIGHT, Some(stride))
+                .unwrap();
+            let sdk_layout = ValidatedVideoLayout::from_sdk_checked(
+                format,
+                DCI_8K_WIDTH as i32,
+                DCI_8K_HEIGHT as i32,
+                stride as i32,
+            )
+            .unwrap();
+            assert_eq!(sdk_layout.data_len_bytes(), extent, "{format:?}");
+            assert!(extent <= MAX_VIDEO_BYTES, "{format:?}");
+
+            // An empty input lets each builder report its admitted extent
+            // without allocating hundreds of megabytes for the test.
+            let owned = VideoFrame::builder()
+                .resolution(DCI_8K_WIDTH, DCI_8K_HEIGHT)
+                .pixel_format(format)
+                .data(Vec::new())
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(owned.error(), Error::InvalidFrame(
+                crate::FrameDefect::VideoDataLength { actual: 0, expected }
+            ) if *expected == extent),
+                "{format:?}: {owned}"
+            );
+            let borrowed = BorrowedVideoFrame::builder(&[], DCI_8K_WIDTH, DCI_8K_HEIGHT, format)
+                .line_stride_bytes(stride)
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(borrowed, Error::InvalidFrame(
+                crate::FrameDefect::VideoBufferTooSmall { actual: 0, minimum, .. }
+            ) if minimum == extent),
+                "{format:?}: {borrowed}"
+            );
+        }
+    }
+
+    #[test]
+    fn nb4g_dci_8k_sets_the_video_extent_limit() {
+        let format = PixelFormat::Nb4g;
+        let stride = format.line_stride_bytes(DCI_8K_WIDTH).unwrap();
+        assert_eq!(
+            format
+                .buffer_len(DCI_8K_WIDTH, DCI_8K_HEIGHT, Some(stride))
+                .unwrap(),
+            MAX_VIDEO_BYTES
+        );
+
+        let height = DCI_8K_HEIGHT + 1;
+        let extent = MAX_VIDEO_BYTES + stride * format.info().plane_count();
+        let expected = crate::LayoutDefect::VideoBytes((extent as u64).into());
+        let matches_extent = |error: &Error| {
+            matches!(error, Error::InvalidFrame(
+            crate::FrameDefect::Layout(cause)
+        ) if *cause == expected)
+        };
+        let sdk_layout = ValidatedVideoLayout::from_sdk_checked(
+            format,
+            DCI_8K_WIDTH as i32,
+            height as i32,
+            stride as i32,
+        );
+        assert_eq!(sdk_layout.unwrap_err(), expected);
+        assert!(matches_extent(
+            &format
+                .buffer_len(DCI_8K_WIDTH, height, Some(stride))
+                .unwrap_err()
+        ));
+        assert!(matches_extent(
+            VideoFrame::builder()
+                .resolution(DCI_8K_WIDTH, height)
+                .pixel_format(format)
+                .data(Vec::new())
+                .build()
+                .unwrap_err()
+                .error()
+        ));
+        assert!(matches_extent(
+            &BorrowedVideoFrame::builder(&[], DCI_8K_WIDTH, height, format)
+                .line_stride_bytes(stride)
+                .build()
+                .unwrap_err()
+        ));
     }
 
     /// Test that MAX_AUDIO_BYTES constant is properly defined
@@ -5989,40 +6032,80 @@ mod tests {
     }
 
     #[test]
-    fn rejected_metadata_keeps_builder_text_and_sample_storage() {
-        for text in ["bad\0metadata".to_owned(), "x".repeat(MAX_METADATA_BYTES)] {
-            let video_text = text.clone();
-            let pointer = video_text.as_ptr();
+    fn rejected_builders_preserve_the_supplied_text_and_media_allocations() {
+        for (valid_length, text) in [
+            (true, "bad\0metadata".to_owned()),
+            (true, "x".repeat(MAX_METADATA_BYTES)),
+            (false, "valid metadata".to_owned()),
+            (false, "bad\0metadata".to_owned()),
+        ] {
+            let (pixel_len, sample_len) = if valid_length { (16, 4) } else { (15, 3) };
+            let mut video_text = String::with_capacity(text.len() + 16);
+            video_text.push_str(&text);
+            let (pointer, text_capacity) = (video_text.as_ptr(), video_text.capacity());
             let mut pixels = Vec::with_capacity(64);
-            pixels.resize(16, 7);
-            let pixels_pointer = pixels.as_ptr();
-            let builder = VideoFrame::builder()
+            pixels.resize(pixel_len, 7);
+            let (pixels_pointer, pixels_capacity) = (pixels.as_ptr(), pixels.capacity());
+            let refused = VideoFrame::builder()
                 .resolution(2, 2)
                 .data(pixels)
                 .metadata(video_text)
                 .build()
-                .unwrap_err()
-                .into_inner();
-            assert_eq!(builder.supplied_metadata(), Some(text.as_str()));
-            assert_eq!(builder.metadata.as_ref().unwrap().as_ptr(), pointer);
-            assert_eq!(builder.supplied_data().unwrap().as_ptr(), pixels_pointer);
+                .unwrap_err();
+            assert_eq!(
+                matches!(
+                    refused.error(),
+                    Error::InvalidFrame(crate::FrameDefect::VideoDataLength { .. })
+                ),
+                !valid_length
+            );
+            let mut builder = refused.into_inner();
+            let metadata = builder.take_metadata().unwrap();
+            let pixels = builder.into_data().unwrap();
+            assert_eq!(metadata.as_str(), text);
+            assert_eq!(
+                (metadata.as_ptr(), metadata.capacity()),
+                (pointer, text_capacity)
+            );
+            assert_eq!(pixels, vec![7; pixel_len]);
+            assert_eq!(
+                (pixels.as_ptr(), pixels.capacity()),
+                (pixels_pointer, pixels_capacity)
+            );
 
-            let audio_text = text.clone();
-            let pointer = audio_text.as_ptr();
-            let samples = vec![1.0, 3.0, 2.0, 4.0];
-            let samples_pointer = samples.as_ptr();
-            let builder = AudioFrame::builder()
+            let mut audio_text = String::with_capacity(text.len() + 16);
+            audio_text.push_str(&text);
+            let (pointer, text_capacity) = (audio_text.as_ptr(), audio_text.capacity());
+            let mut samples = Vec::with_capacity(16);
+            samples.extend_from_slice(&[1.0, 3.0, 2.0, 4.0][..sample_len]);
+            let (samples_pointer, samples_capacity) = (samples.as_ptr(), samples.capacity());
+            let refused = AudioFrame::builder()
                 .num_channels(2)
                 .num_samples(2)
                 .data(samples)
                 .metadata(audio_text)
                 .build()
-                .unwrap_err()
-                .into_inner();
-            assert_eq!(builder.supplied_metadata(), Some(text.as_str()));
-            assert_eq!(builder.metadata.as_ref().unwrap().as_ptr(), pointer);
-            assert_eq!(builder.supplied_data().unwrap().as_ptr(), samples_pointer);
-            assert_eq!(builder.supplied_data().unwrap(), [1.0, 3.0, 2.0, 4.0]);
+                .unwrap_err();
+            assert_eq!(
+                matches!(
+                    refused.error(),
+                    Error::InvalidFrame(crate::FrameDefect::AudioDataLength { .. })
+                ),
+                !valid_length
+            );
+            let mut builder = refused.into_inner();
+            let metadata = builder.take_metadata().unwrap();
+            let samples = builder.into_data().unwrap();
+            assert_eq!(metadata.as_str(), text);
+            assert_eq!(
+                (metadata.as_ptr(), metadata.capacity()),
+                (pointer, text_capacity)
+            );
+            assert_eq!(samples, [1.0, 3.0, 2.0, 4.0][..sample_len]);
+            assert_eq!(
+                (samples.as_ptr(), samples.capacity()),
+                (samples_pointer, samples_capacity)
+            );
         }
     }
 
@@ -6405,8 +6488,6 @@ mod tests {
 
     #[test]
     fn test_audio_frame_ref_metadata_is_text_and_owned_conversion_preserves_it() {
-        use crate::capture::RecvAudioGuard;
-
         let no_samples = 4;
         let no_channels = 2;
         let sample_count = (no_samples * no_channels) as usize;
@@ -6427,7 +6508,7 @@ mod tests {
             timestamp: 456,
         };
 
-        let guard = unsafe { RecvAudioGuard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
+        let guard = unsafe { Guard::<AudioKind>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         let frame_ref = AudioFrameRef::new(guard).expect("valid audio ref");
 
         assert_eq!(frame_ref.metadata(), Some("audio meta"));
@@ -7370,7 +7451,7 @@ mod tests {
         assert_eq!(layout.sdk_channel_stride(), 1 << 30);
         assert_ne!(
             layout.channel_stride_bytes(),
-            layout.packed().channel_stride_bytes()
+            layout.packed().as_layout().channel_stride_bytes()
         );
         assert_eq!(
             ValidatedAudioLayout::new_uncompressed_checked(
@@ -7408,10 +7489,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(implicit, explicit);
-        assert_eq!(implicit, explicit.packed());
+        assert_eq!(&implicit, explicit.packed().as_layout());
         assert_eq!(
             explicit.channel_stride_bytes(),
-            explicit.packed().channel_stride_bytes()
+            explicit.packed().as_layout().channel_stride_bytes()
         );
     }
 
@@ -7913,8 +7994,6 @@ mod tests {
     /// Test that AudioFrameRef::data() uses cached sample count
     #[test]
     fn test_audio_frame_ref_uses_cached_sample_count() {
-        use crate::capture::RecvAudioGuard;
-
         let no_samples = 1024;
         let no_channels = 2;
         let sample_count = (no_samples * no_channels) as usize;
@@ -7934,7 +8013,7 @@ mod tests {
             timestamp: 67890,
         };
 
-        let guard = unsafe { RecvAudioGuard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
+        let guard = unsafe { Guard::<AudioKind>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
 
         // Create the AudioFrameRef
         let frame_ref = AudioFrameRef::new(guard);
@@ -8214,13 +8293,13 @@ mod tests {
         }
         fn assert_same(&self, expected: &Self) {
             let Self {
-                header,
+                timing,
                 data,
                 metadata,
                 timestamp,
             } = self;
             let Self {
-                header: expected_header,
+                timing: expected_timing,
                 data: expected_data,
                 metadata: expected_metadata,
                 timestamp: expected_timestamp,
@@ -8228,10 +8307,11 @@ mod tests {
             let layout = data.layout();
             let expected_layout = expected_data.layout();
             assert_eq!(data.len(), layout.data_len_bytes());
-            let room = crate::pixels::send_room(layout, header.scan_type);
+            let room = crate::pixels::send_room(layout, data.scan_type());
             assert_eq!(data.room_bytes(), vec![0; room]);
             assert_eq!(format!("{layout:?}"), format!("{expected_layout:?}"));
-            assert_eq!(format!("{header:?}"), format!("{expected_header:?}"));
+            assert_eq!(format!("{timing:?}"), format!("{expected_timing:?}"));
+            assert_eq!(data.scan_type(), expected_data.scan_type());
             assert_eq!(data.as_slice(), expected_data.as_slice());
             assert_eq!(metadata.view().status(), expected_metadata.view().status());
             assert_eq!(
@@ -8274,7 +8354,7 @@ mod tests {
             } = expected;
             let layout = data.layout();
             let expected_layout = expected_data.layout();
-            assert_eq!(data.len(), layout.sample_count());
+            assert_eq!(data.len(), layout.as_layout().sample_count());
             assert_eq!(format!("{layout:?}"), format!("{expected_layout:?}"));
             assert_eq!(timecode, expected_timecode);
             assert_eq!(data.as_slice(), expected_data.as_slice());
@@ -8414,12 +8494,12 @@ mod tests {
         let (framesync, received, bare) = unsafe {
             (
                 FrameSyncAudioRef::new(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})),
-                AudioFrameRef::new(RecvAudioGuard::with_test_free(
+                AudioFrameRef::new(Guard::<AudioKind>::with_test_free(
                     ptr::null_mut(),
                     raw,
                     |_, _| {},
                 )),
-                AudioFrameRef::new(RecvAudioGuard::with_test_free(
+                AudioFrameRef::new(Guard::<AudioKind>::with_test_free(
                     ptr::null_mut(),
                     bare,
                     |_, _| {},

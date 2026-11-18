@@ -15,11 +15,11 @@
 //! concatenating them. The first block must hold the codec's complete header:
 //!
 //! ```no_run
-//! use grafton_ndi::advanced::{QueuedVideo, ScatterVideoFrame, VideoPacketFormat};
+//! use grafton_ndi::advanced::{QueuedVideo, ScatterFrame, VideoPacketFormat};
 //! fn submit_encoded(
 //!     queue: &mut QueuedVideo<'_>, format: VideoPacketFormat, blocks: Vec<Vec<u8>>,
 //! ) -> grafton_ndi::Result<()> {
-//!     let frame = ScatterVideoFrame::new(format, blocks)?;
+//!     let frame = ScatterFrame::<VideoPacketFormat>::new(format, blocks)?;
 //!     queue.try_submit(frame)?;
 //!     Ok(())
 //! }

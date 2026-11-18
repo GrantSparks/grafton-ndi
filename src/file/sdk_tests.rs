@@ -9,6 +9,7 @@
 mod async_shutdown;
 
 use super::*;
+use crate::test_support::FixtureDir;
 use crate::{
     test_support::{self, file_api},
     MediaTypes,
@@ -27,43 +28,6 @@ use std::{
 
 /// The longest any single SDK step is given before a test fails.
 const PATIENCE: Duration = Duration::from_secs(15);
-
-/// A directory for one test's recordings, removed when the test ends.
-///
-/// Its name is taken exclusively, so runs that share a temporary directory,
-/// even with the same process identifier in different namespaces, cannot use
-/// or remove each other's recordings.
-pub(super) struct Scratch(PathBuf);
-
-impl Scratch {
-    pub(super) fn new(test: &str) -> Self {
-        let mut attempt = 0u32;
-        loop {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.subsec_nanos());
-            let directory = std::env::temp_dir().join(format!(
-                "grafton-ndi-file-{test}-{}-{nanos:09}-{attempt}",
-                std::process::id()
-            ));
-            match std::fs::create_dir(&directory) {
-                Ok(()) => return Self(directory),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
-                Err(error) => panic!("cannot create {}: {error}", directory.display()),
-            }
-        }
-    }
-
-    pub(super) fn path(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// A sender that produces video until dropped, reachable over loopback.
 pub(super) struct LiveSource {
@@ -334,7 +298,7 @@ fn record_clip(api: &FileApi, source: &LiveSource, file: &PathBuf) -> RecordingR
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
     thread::sleep(Duration::from_millis(300));
     match recorder.finish(PATIENCE).unwrap() {
-        FinishStatus::Closed(report) => report,
+        FinishStatus::Ended(SessionEnd::Closed(report)) => report,
         other => panic!("the recording was not confirmed closed: {other:?}"),
     }
 }
@@ -365,10 +329,10 @@ fn the_longest_exact_event_path_records_closes_and_starts_again() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("path-limit");
+    let scratch = FixtureDir::create("path-limit");
     let source = LiveSource::start(&ndi, "path-limit");
     let limit = crate::sys::bindings::NDIlib_file_recorder_event_path_max_size as usize - 2;
-    let mut directory = scratch.0.clone();
+    let mut directory = scratch.path().to_owned();
     while directory.to_str().unwrap().len() + 1 + 255 < limit {
         directory.push("d".repeat(200));
         std::fs::create_dir(&directory).unwrap();
@@ -402,7 +366,8 @@ fn the_longest_exact_event_path_records_closes_and_starts_again() {
             recorder.reported_current_file().unwrap().as_bytes(),
             target.path().to_str().unwrap().as_bytes()
         );
-        let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+        let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap()
+        else {
             panic!("the boundary-length file did not close exactly");
         };
         assert!(report.closure_confirmed());
@@ -416,9 +381,9 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("record");
+    let scratch = FixtureDir::create("record");
     let source = LiveSource::start(&ndi, "record");
-    let file = scratch.path("take.mkv");
+    let file = scratch.join("take.mkv");
 
     let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     assert_eq!(recorder.state(), RecorderState::Idle);
@@ -444,7 +409,7 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
     let stats = recorder.stats().unwrap().expect("counters while recording");
     assert!(stats.video_frames_written() > 0);
 
-    let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap() else {
         panic!("the recording was not confirmed closed");
     };
     assert!(report.closure_confirmed());
@@ -461,7 +426,7 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
     assert!(info.duration().is_final());
     assert!(info.duration().value().ticks() > 0);
     assert!(matches!(
-        crate::file::FilePlayer::probe(&api, scratch.path("absent.mkv")),
+        crate::file::FilePlayer::probe(&api, scratch.join("absent.mkv")),
         Err(Error::NativeOperationFailed { .. })
     ));
 }
@@ -471,7 +436,7 @@ fn a_rollover_requested_just_before_the_stop_still_ends_in_a_confirmed_close() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("late-rollover");
+    let scratch = FixtureDir::create("late-rollover");
     let source = LiveSource::start(&ndi, "late-rollover");
     let options = FileRecorderOptions::new(source.spec.clone())
         .proxy(false)
@@ -479,16 +444,16 @@ fn a_rollover_requested_just_before_the_stop_still_ends_in_a_confirmed_close() {
     let mut recorder = crate::file::FileRecorder::new(&api, &options).unwrap();
     recorder
         .start(
-            &RecordingTarget::new(scratch.path("first")).unwrap(),
+            &RecordingTarget::new(scratch.join("first")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
     recorder
-        .rollover(&RecordingTarget::new(scratch.path("second")).unwrap())
+        .rollover(&RecordingTarget::new(scratch.join("second")).unwrap())
         .unwrap();
     let outcome = recorder.finish(PATIENCE).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the session did not reach a confirmed close: {outcome:?}");
     };
     assert!(report.closed_files() >= 1);
@@ -499,7 +464,7 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("rollovers");
+    let scratch = FixtureDir::create("rollovers");
     let source = LiveSource::start(&ndi, "rollovers");
     let replacement = LiveSource::start(&ndi, "rollovers-replacement");
     assert_ne!(source.spec, replacement.spec);
@@ -511,7 +476,7 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
     let started = timeline.mark();
     recorder
         .start(
-            &RecordingTarget::new(scratch.path("first")).unwrap(),
+            &RecordingTarget::new(scratch.join("first")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
@@ -525,7 +490,7 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
 
     let since = timeline.mark();
     recorder
-        .rollover(&RecordingTarget::new(scratch.path("second")).unwrap())
+        .rollover(&RecordingTarget::new(scratch.join("second")).unwrap())
         .unwrap();
     let second = timeline.await_change(&mut recorder, since, &first);
     let since = timeline.mark();
@@ -535,11 +500,11 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
     let files = [first, second, third];
 
     let outcome = recorder.finish(PATIENCE).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the session did not reach a confirmed close: {outcome:?}\n{timeline}");
     };
     assert_eq!(report.closed_files(), 3, "{timeline}");
-    let mut written: Vec<_> = std::fs::read_dir(&scratch.0)
+    let mut written: Vec<_> = std::fs::read_dir(scratch.path())
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect();
@@ -571,7 +536,7 @@ fn rollovers_open_the_next_file_before_closing_the_previous_file() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("rollover-order");
+    let scratch = FixtureDir::create("rollover-order");
     let source = LiveSource::start(&ndi, "rollover-order");
     // Sixteen changes per case pin thirty-two rollovers for each mechanism,
     // including recording both with and without the source's proxy stream.
@@ -588,7 +553,7 @@ fn rollovers_open_the_next_file_before_closing_the_previous_file() {
             let mut timeline = Timeline::new();
             recorder
                 .start(
-                    &RecordingTarget::new(scratch.path(&prefix)).unwrap(),
+                    &RecordingTarget::new(scratch.join(&prefix)).unwrap(),
                     RecordingTimecode::Preserve,
                 )
                 .unwrap();
@@ -605,7 +570,7 @@ fn rollovers_open_the_next_file_before_closing_the_previous_file() {
                 match mechanism {
                     "explicit" => recorder
                         .rollover(
-                            &RecordingTarget::new(scratch.path(&format!("{prefix}-{index}")))
+                            &RecordingTarget::new(scratch.join(format!("{prefix}-{index}")))
                                 .unwrap(),
                         )
                         .unwrap(),
@@ -616,7 +581,7 @@ fn rollovers_open_the_next_file_before_closing_the_previous_file() {
                 current = timeline.await_change(&mut recorder, since, &current);
             }
             let outcome = recorder.finish(PATIENCE).unwrap();
-            let FinishStatus::Closed(report) = outcome else {
+            let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
                 panic!("{prefix} did not reach confirmed closure: {outcome:?}\n{timeline}");
             };
             assert!(report.closure_confirmed(), "{prefix}: {timeline}");
@@ -634,9 +599,9 @@ fn generated_recording_timecode_replays_its_explicit_start() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("generated-timecode");
+    let scratch = FixtureDir::create("generated-timecode");
     let source = LiveSource::start(&ndi, "generated-timecode");
-    let file = scratch.path("timecode.mkv");
+    let file = scratch.join("timecode.mkv");
     let start = crate::Timecode::from_ticks(360_000_000_000);
     let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     recorder
@@ -649,7 +614,7 @@ fn generated_recording_timecode_replays_its_explicit_start() {
     thread::sleep(Duration::from_millis(500));
     assert!(matches!(
         recorder.finish(PATIENCE).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     assert!(crate::file::FilePlayer::probe(&api, &file)
         .unwrap()
@@ -700,9 +665,9 @@ fn injected_metadata_is_recorded_on_the_metadata_track() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("metadata");
+    let scratch = FixtureDir::create("metadata");
     let source = LiveSource::start(&ndi, "metadata");
-    let file = scratch.path("marked.mkv");
+    let file = scratch.join("marked.mkv");
     let options = FileRecorderOptions::new(source.spec.clone())
         .naming(FileNaming::Exact)
         .proxy(false)
@@ -728,7 +693,7 @@ fn injected_metadata_is_recorded_on_the_metadata_track() {
     thread::sleep(Duration::from_millis(200));
     assert!(matches!(
         recorder.finish(PATIENCE).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     assert_eq!(
         crate::file::FilePlayer::probe(&api, &file)
@@ -750,9 +715,9 @@ fn dropping_a_recorder_leaves_a_finalized_file() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("drop");
+    let scratch = FixtureDir::create("drop");
     let source = LiveSource::start(&ndi, "drop");
-    let file = scratch.path("dropped.mkv");
+    let file = scratch.join("dropped.mkv");
     let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     recorder
         .start(
@@ -773,9 +738,9 @@ fn dropping_an_async_recorder_leaves_a_finalized_file() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("async-drop");
+    let scratch = FixtureDir::create("async-drop");
     let source = LiveSource::start(&ndi, "async-drop");
-    let file = scratch.path("dropped.mkv");
+    let file = scratch.join("dropped.mkv");
     let recorder = block_on(AsyncFileRecorder::create(&api, &exact_video(&source))).unwrap();
     block_on(recorder.start(
         &RecordingTarget::new(&file).unwrap(),
@@ -807,9 +772,9 @@ fn an_async_recorder_finishes_and_closes_without_blocking() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("async-finish");
+    let scratch = FixtureDir::create("async-finish");
     let source = LiveSource::start(&ndi, "async-finish");
-    let file = scratch.path("finished.mkv");
+    let file = scratch.join("finished.mkv");
     let recorder = block_on(AsyncFileRecorder::create(&api, &exact_video(&source))).unwrap();
     block_on(recorder.start(
         &RecordingTarget::new(&file).unwrap(),
@@ -818,7 +783,7 @@ fn an_async_recorder_finishes_and_closes_without_blocking() {
     .unwrap();
     thread::sleep(Duration::from_millis(800));
     let outcome = block_on(recorder.finish(PATIENCE)).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the recording was not confirmed closed: {outcome:?}");
     };
     assert_eq!(report.closed_files(), 1);
@@ -826,7 +791,7 @@ fn an_async_recorder_finishes_and_closes_without_blocking() {
     assert_eq!(previous.session(), report.session());
     assert!(previous.closure_confirmed());
     assert_eq!(block_on(recorder.state()).unwrap(), RecorderState::Idle);
-    let next_file = scratch.path("after-reset.mkv");
+    let next_file = scratch.join("after-reset.mkv");
     let next_session = block_on(recorder.start(
         &RecordingTarget::new(&next_file).unwrap(),
         RecordingTimecode::Preserve,
@@ -846,7 +811,7 @@ fn an_async_recorder_finishes_and_closes_without_blocking() {
     }
     assert!(matches!(
         block_on(recorder.finish(PATIENCE)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     assert!(crate::file::FilePlayer::probe(&api, &next_file)
         .unwrap()
@@ -869,8 +834,8 @@ fn a_player_plays_a_recording_and_keeps_its_source_between_files() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("player");
-    let clip = scratch.path("clip.mkv");
+    let scratch = FixtureDir::create("player");
+    let clip = scratch.join("clip.mkv");
     record_clip(&api, &LiveSource::start(&ndi, "player"), &clip);
 
     let name = format!("grafton-file-player-{}", std::process::id());
@@ -885,7 +850,7 @@ fn a_player_plays_a_recording_and_keeps_its_source_between_files() {
     );
     player.set_looping(true);
     assert!(matches!(
-        player.start(scratch.path("absent.mkv")),
+        player.start(scratch.join("absent.mkv")),
         Err(Error::NativeOperationFailed { .. })
     ));
 
@@ -945,8 +910,8 @@ fn an_async_player_runs_on_its_own_thread_and_closes_every_clone() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("async-player");
-    let clip = scratch.path("clip.mkv");
+    let scratch = FixtureDir::create("async-player");
+    let clip = scratch.join("clip.mkv");
     record_clip(&api, &LiveSource::start(&ndi, "async-player"), &clip);
 
     assert_eq!(
@@ -1026,13 +991,13 @@ fn a_session_the_library_ended_on_a_format_change_can_be_followed_by_another() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("format-stop");
+    let scratch = FixtureDir::create("format-stop");
     let source = LiveSource::start(&ndi, "format-stop");
     let mut recorder =
         crate::file::FileRecorder::new(&api, &stop_on_format_change(&source)).unwrap();
     recorder
         .start(
-            &RecordingTarget::new(scratch.path("first")).unwrap(),
+            &RecordingTarget::new(scratch.join("first")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
@@ -1054,7 +1019,7 @@ fn a_session_the_library_ended_on_a_format_change_can_be_followed_by_another() {
 
     let session = recorder
         .start(
-            &RecordingTarget::new(scratch.path("second")).unwrap(),
+            &RecordingTarget::new(scratch.join("second")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
@@ -1062,7 +1027,7 @@ fn a_session_the_library_ended_on_a_format_change_can_be_followed_by_another() {
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
     assert!(matches!(
         recorder.finish(PATIENCE).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -1071,7 +1036,7 @@ fn an_async_session_the_library_ended_on_a_format_change_can_be_followed_by_anot
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("async-format-stop");
+    let scratch = FixtureDir::create("async-format-stop");
     let source = LiveSource::start(&ndi, "async-format-stop");
     let recorder = block_on(AsyncFileRecorder::create(
         &api,
@@ -1079,7 +1044,7 @@ fn an_async_session_the_library_ended_on_a_format_change_can_be_followed_by_anot
     ))
     .unwrap();
     block_on(recorder.start(
-        &RecordingTarget::new(scratch.path("first")).unwrap(),
+        &RecordingTarget::new(scratch.join("first")).unwrap(),
         RecordingTimecode::Preserve,
     ))
     .unwrap();
@@ -1106,7 +1071,7 @@ fn an_async_session_the_library_ended_on_a_format_change_can_be_followed_by_anot
     source.change_format();
     state_becomes(RecorderState::Closed);
     let session = block_on(recorder.start(
-        &RecordingTarget::new(scratch.path("second")).unwrap(),
+        &RecordingTarget::new(scratch.join("second")).unwrap(),
         RecordingTimecode::Preserve,
     ))
     .unwrap();
@@ -1114,7 +1079,7 @@ fn an_async_session_the_library_ended_on_a_format_change_can_be_followed_by_anot
     state_becomes(RecorderState::Recording);
     assert!(matches!(
         block_on(recorder.finish(PATIENCE)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     block_on(recorder.close()).unwrap();
 }
@@ -1124,9 +1089,9 @@ fn a_rollover_into_a_missing_directory_is_refused_and_the_session_goes_on() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("missing-directory");
+    let scratch = FixtureDir::create("missing-directory");
     let source = LiveSource::start(&ndi, "missing-directory");
-    let missing = || RecordingTarget::new(scratch.path("absent/take")).unwrap();
+    let missing = || RecordingTarget::new(scratch.join("absent/take")).unwrap();
     let not_found = |result: Result<()>| match result {
         Err(Error::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
         other => panic!("expected the directory to be reported missing: {other:?}"),
@@ -1139,7 +1104,7 @@ fn a_rollover_into_a_missing_directory_is_refused_and_the_session_goes_on() {
     );
     recorder
         .start(
-            &RecordingTarget::new(scratch.path("take.mkv")).unwrap(),
+            &RecordingTarget::new(scratch.join("take.mkv")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
@@ -1150,7 +1115,7 @@ fn a_rollover_into_a_missing_directory_is_refused_and_the_session_goes_on() {
     assert_eq!(recorder.state(), RecorderState::Recording);
     assert!(recorder.is_recording());
     thread::sleep(Duration::from_millis(200));
-    let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap() else {
         panic!("the recording was not confirmed closed");
     };
     assert_eq!(report.closed_files(), 1);
@@ -1162,7 +1127,7 @@ fn a_file_that_received_nothing_is_reported_as_empty() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("empty-file");
+    let scratch = FixtureDir::create("empty-file");
     let source = LiveSource::start(&ndi, "empty-file");
     let options = FileRecorderOptions::new(source.spec.clone())
         .proxy(false)
@@ -1170,7 +1135,7 @@ fn a_file_that_received_nothing_is_reported_as_empty() {
     let mut recorder = crate::file::FileRecorder::new(&api, &options).unwrap();
     recorder
         .start(
-            &RecordingTarget::new(scratch.path("take")).unwrap(),
+            &RecordingTarget::new(scratch.join("take")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
@@ -1182,7 +1147,7 @@ fn a_file_that_received_nothing_is_reported_as_empty() {
     await_event(&mut recorder, RecorderEventKind::Rollover);
 
     // The library reports both files closed all the same.
-    let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap() else {
         panic!("the recording was not confirmed closed");
     };
     assert_eq!(report.closed_files(), 2);
@@ -1209,11 +1174,11 @@ fn the_library_copies_every_string_a_recorder_gives_it() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("recorder-strings");
+    let scratch = FixtureDir::create("recorder-strings");
     let source = LiveSource::start(&ndi, "recorder-strings");
     let recording = api.table::<crate::sys::FileRecording>().unwrap();
     let address = source.spec.url().unwrap().to_owned();
-    let file = |name: &str| scratch.path(name).to_str().unwrap().to_owned();
+    let file = |name: &str| scratch.join(name).to_str().unwrap().to_owned();
 
     let mut url = c_buffer(&address);
     let mut pattern = c_buffer("{prefix}_{index:03}.mkv");
@@ -1301,8 +1266,8 @@ fn the_library_copies_every_string_a_player_gives_it() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("player-strings");
-    let clip = scratch.path("clip.mkv");
+    let scratch = FixtureDir::create("player-strings");
+    let clip = scratch.join("clip.mkv");
     record_clip(&api, &LiveSource::start(&ndi, "player-strings"), &clip);
     let playback = api.table::<crate::sys::FilePlayback>().unwrap();
 
@@ -1369,9 +1334,9 @@ fn an_exact_recording_ends_at_a_format_change_with_its_file_finalized() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("exact-format");
+    let scratch = FixtureDir::create("exact-format");
     let source = LiveSource::start(&ndi, "exact-format");
-    let file = scratch.path("take.mkv");
+    let file = scratch.join("take.mkv");
     let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     recorder
         .start(
@@ -1390,7 +1355,8 @@ fn an_exact_recording_ends_at_a_format_change_with_its_file_finalized() {
     assert!(report.stopped_by_sdk());
     assert_eq!(report.closed_files(), 1);
     assert_eq!(report.empty_files(), 0);
-    let FinishStatus::Closed(finished) = recorder.finish(PATIENCE).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(finished)) = recorder.finish(PATIENCE).unwrap()
+    else {
         panic!("the session had been closed");
     };
     assert!(finished.stopped_by_sdk());
@@ -1404,9 +1370,9 @@ fn an_exact_session_refuses_a_change_of_source_and_keeps_recording() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("exact-source");
+    let scratch = FixtureDir::create("exact-source");
     let source = LiveSource::start(&ndi, "exact-source");
-    let file = scratch.path("take.mkv");
+    let file = scratch.join("take.mkv");
     let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     recorder
         .start(
@@ -1437,7 +1403,7 @@ fn an_exact_session_refuses_a_change_of_source_and_keeps_recording() {
     assert!(recorder.is_recording());
     assert_eq!(recorder.state(), RecorderState::Recording);
 
-    let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap() else {
         panic!("the recording was not confirmed closed");
     };
     assert!(!report.stopped_by_sdk());
@@ -1454,9 +1420,9 @@ fn an_exact_target_that_exists_is_refused_before_the_library_sees_it() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("exact-exists");
+    let scratch = FixtureDir::create("exact-exists");
     let source = LiveSource::start(&ndi, "exact-exists");
-    let file = scratch.path("taken.mkv");
+    let file = scratch.join("taken.mkv");
     std::fs::write(&file, b"kept").unwrap();
     let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     match recorder.start(
@@ -1483,9 +1449,9 @@ fn finishing_without_a_wait_reports_the_close_the_stop_queued() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("finish-now");
+    let scratch = FixtureDir::create("finish-now");
     let source = LiveSource::start(&ndi, "finish-now");
-    let file = scratch.path("take.mkv");
+    let file = scratch.join("take.mkv");
     let mut recorder = crate::file::FileRecorder::new(&api, &exact_video(&source)).unwrap();
     recorder
         .start(
@@ -1498,7 +1464,7 @@ fn finishing_without_a_wait_reports_the_close_the_stop_queued() {
     // The 6.4 library finalizes the file inside the stop call and queues its
     // close before returning, so no wait is needed to see it.
     let outcome = recorder.finish(Duration::ZERO).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the close was already queued: {outcome:?}");
     };
     assert!(report.closure_confirmed());

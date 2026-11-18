@@ -252,7 +252,7 @@ macro_rules! runtime_features {
         // requirement is circular and `Capabilities::detect` finds each
         // requirement's status already derived.
         $($($(
-            const _: () = assert!(
+            const_assert!(
                 (Index::$required as usize) < (Index::$Variant as usize),
                 concat!(
                     stringify!($Variant), " requires ", stringify!($required),
@@ -274,6 +274,14 @@ macro_rules! runtime_features {
             /// Every variant without a field, in declaration order: the
             /// capabilities whose statuses [`Capabilities`] keeps.
             pub(crate) const UNIT: [Self; [$(Index::$Variant),+].len()] = [$(Self::$Variant),+];
+
+            /// Every capability, including variants with a preset.
+            pub(crate) fn all() -> impl Iterator<Item = Self> {
+                let features = Self::UNIT.into_iter();
+                #[cfg(feature = "advanced")]
+                let features = features.chain(PassthroughPreset::ALL.map(Self::Passthrough));
+                features
+            }
 
             /// Where [`Capabilities`] finds the capability's status. The
             /// variant at each index of [`Self::UNIT`] is kept at that index.
@@ -383,6 +391,10 @@ runtime_features! {
     /// Discovery Server receiver registration and removal. Needs NDI 6.4.0 or
     /// later: earlier runtimes can crash when an advertiser is destroyed.
     core ReceiverAdvertising as "receiver advertising" since NDI_6_4;
+    /// Letting Discovery Server clients change an advertised receiver's source.
+    /// On Windows this requires an Advanced runtime, whose connection lock
+    /// also protects controls from SDK-internal connection changes.
+    core RemoteReceiverControl as "remote receiver control" requires ReceiverAdvertising;
     /// Sender snapshots, subscriptions and owned event batches. Needs NDI
     /// 6.4.0 or later: earlier runtimes can crash when a listener is destroyed.
     core SenderDiscovery as "sender discovery" since NDI_6_4;
@@ -488,7 +500,7 @@ pub enum CapabilityUnavailable {
     #[error("the selected library does not export a required function")]
     SymbolUnavailable,
     /// This build lacks the locally generated ABI required by the optional feature.
-    #[error("this build was made without the Advanced SDK declarations")]
+    #[error("this build lacks the Advanced SDK declarations this capability needs")]
     BuildAbiUnavailable,
     /// The selected native SDK edition does not implement this API family.
     #[error("the selected runtime is not an Advanced SDK runtime")]
@@ -591,6 +603,7 @@ impl CapabilityStatus {
 /// one recorded decision for every [`RuntimeFeature`].
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Capabilities {
+    native_receiver_connection_exclusion: bool,
     decisions: [std::result::Result<(), CapabilityRefusal>; RuntimeFeature::UNIT.len()],
     #[cfg(feature = "advanced")]
     presets:
@@ -601,7 +614,7 @@ pub struct Capabilities {
 impl fmt::Debug for Capabilities {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map()
-            .entries(RuntimeFeature::UNIT.map(|feature| (feature, self.status(feature))))
+            .entries(RuntimeFeature::all().map(|feature| (feature, self.status(feature))))
             .finish()
     }
 }
@@ -614,6 +627,17 @@ impl Capabilities {
         version: Option<SdkVersion>,
         edition: SdkEdition,
     ) -> Self {
+        Self::detect_on(api, advanced, version, edition, cfg!(windows))
+    }
+
+    pub(crate) fn detect_on(
+        api: &ResolvedApi,
+        advanced: &ResolvedAdvancedApi,
+        version: Option<SdkVersion>,
+        edition: SdkEdition,
+        windows: bool,
+    ) -> Self {
+        let native_receiver_connection_exclusion = !windows || edition == SdkEdition::Advanced;
         let versioned = |feature: RuntimeFeature| match (feature.minimum_version(), version) {
             (None, _) => Ok(()),
             (Some(required), Some(version)) if version >= *required => Ok(()),
@@ -621,6 +645,9 @@ impl Capabilities {
             (Some(required), None) => Err(CapabilityRefusal::RuntimeVersionUnknown { required }),
         };
         let own = |feature: RuntimeFeature| {
+            if feature.is_ungated() {
+                return Ok(());
+            }
             if !feature.is_advanced() {
                 return api.missing(feature).map_or_else(|| versioned(feature), Err);
             }
@@ -637,6 +664,7 @@ impl Capabilities {
             missing.map_or_else(|| versioned(feature), Err)
         };
         let mut capabilities = Self {
+            native_receiver_connection_exclusion,
             decisions: [Ok(()); RuntimeFeature::UNIT.len()],
             #[cfg(feature = "advanced")]
             presets: [Ok(0); PassthroughPreset::ALL.len()],
@@ -646,7 +674,13 @@ impl Capabilities {
                 feature
                     .requirements()
                     .iter()
-                    .try_for_each(|&required| capabilities.decision(required))
+                    .try_for_each(|&required| capabilities.decision(required))?;
+                if feature == RuntimeFeature::RemoteReceiverControl
+                    && !native_receiver_connection_exclusion
+                {
+                    return Err(CapabilityRefusal::WrongEdition(None));
+                }
+                Ok(())
             });
         }
         #[cfg(feature = "advanced")]
@@ -661,6 +695,12 @@ impl Capabilities {
             });
         }
         capabilities
+    }
+
+    /// Whether the runtime excludes connection replacement inside its controls.
+    /// This basis is independent of advertising's version and export gates.
+    pub(crate) fn has_native_receiver_connection_exclusion(&self) -> bool {
+        self.native_receiver_connection_exclusion
     }
 
     pub(crate) fn decision(
@@ -724,13 +764,6 @@ mod tests {
         }
     }
 
-    fn every_feature() -> Vec<RuntimeFeature> {
-        let features = RuntimeFeature::UNIT.into_iter();
-        #[cfg(feature = "advanced")]
-        let features = features.chain(PassthroughPreset::ALL.map(RuntimeFeature::Passthrough));
-        features.collect()
-    }
-
     fn refusal<T>(
         result: crate::Result<T>,
     ) -> std::result::Result<(), (RuntimeFeature, CapabilityRefusal)> {
@@ -785,7 +818,7 @@ mod tests {
     #[test]
     fn every_feature_is_listed_once_under_its_own_name() {
         use std::collections::HashSet;
-        let features = every_feature();
+        let features: Vec<_> = RuntimeFeature::all().collect();
         assert_eq!(
             features.iter().copied().collect::<HashSet<_>>().len(),
             features.len()
@@ -809,6 +842,21 @@ mod tests {
                 "compressed passthrough preset"
             );
         }
+    }
+
+    #[test]
+    fn capabilities_debug_lists_every_feature_and_its_status() {
+        let fixture = Fixture::new(|_| true, Some("6.4.0.2"), SdkEdition::Advanced);
+        let capabilities = fixture.gates.capabilities();
+        let diagnostic = format!("{capabilities:?}");
+        for feature in RuntimeFeature::all() {
+            let expected = format!("{feature:?}: {:?}", capabilities.status(feature));
+            assert!(diagnostic.contains(&expected), "{diagnostic}");
+        }
+        assert_eq!(
+            CapabilityRefusal::BuildAbiUnavailable(c"NDIlib_recv_create_v4").to_string(),
+            "this build lacks the Advanced SDK declarations this capability needs: it does not declare NDIlib_recv_create_v4"
+        );
     }
 
     #[test]
@@ -840,7 +888,7 @@ mod tests {
                     edition,
                 );
                 let evidence = fixture.evidence();
-                for feature in every_feature() {
+                for feature in RuntimeFeature::all() {
                     let expected = fixture
                         .gates
                         .capabilities()
@@ -1092,7 +1140,7 @@ mod tests {
         // Build the fixture and feature list before tracking. Exercise real
         // refusal paths, including declarations, edition, symbols and versions,
         // rather than only constructing the public refusal enum.
-        let features = every_feature();
+        let features: Vec<_> = RuntimeFeature::all().collect();
         let mut total_refused = 0;
         for (version, edition) in [
             (Some("6.4.0.2"), SdkEdition::Advanced),

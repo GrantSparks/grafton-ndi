@@ -10,15 +10,15 @@
 //! Run with: `cargo run --example find_sources`
 //!
 //! Optional arguments:
-//! - IP address or subnet to search: `cargo run --example find_sources -- 192.168.0.100`
-//! - Multiple IPs: `cargo run --example find_sources -- 192.168.0.100 10.0.0.0/24`
+//! - IP address to search: `cargo run --example find_sources -- 192.168.0.100`
+//! - Multiple IPs: `cargo run --example find_sources -- 192.168.0.100 10.0.0.8`
 //!
 //! Troubleshooting:
 //! - If no sources are found, try adding specific IP addresses with extra_ips()
 //! - Ensure NDI sources are running on your network
 //! - Check firewall settings (NDI uses UDP port 5353 for discovery)
 
-use grafton_ndi::{Error, Ndi};
+use grafton_ndi::Ndi;
 
 use std::{
     env,
@@ -30,7 +30,7 @@ mod finder;
 
 use finder::finder_with_extra_ips;
 
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments for extra IPs
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();

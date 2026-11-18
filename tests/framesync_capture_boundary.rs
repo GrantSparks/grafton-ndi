@@ -1,7 +1,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name, loopback);
+common_helpers!(runtime, name, loopback, stop);
 
 use grafton_ndi::{
     AudioFrame, Error, FrameRate, FrameSync, FrameSyncAudioRequest, MetadataFrame, Receiver,
@@ -39,12 +39,6 @@ fn framesync_pulls_leave_sequenced_metadata_for_the_attached_receiver() -> Resul
         .build()?;
     let request = FrameSyncAudioRequest::capture_at(48_000, 2, 768)?;
     let stop = AtomicBool::new(false);
-    struct Stop<'a>(&'a AtomicBool);
-    impl Drop for Stop<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-        }
-    }
 
     std::thread::scope(|scope| -> Result<(), Error> {
         let send = scope.spawn(|| -> Result<u64, Error> {
@@ -59,7 +53,7 @@ fn framesync_pulls_leave_sequenced_metadata_for_the_attached_receiver() -> Resul
             }
             Ok(sequence)
         });
-        let _stop = Stop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         let mut received = BTreeSet::new();
         let pull = |received: &mut BTreeSet<u64>| -> Result<bool, Error> {
             let live_video = framesync
@@ -178,7 +172,7 @@ fn uniform<'a>(rows: impl Iterator<Item = &'a [u8]>) -> bool {
 /// `FrameSync` is `Sync`: one FrameSync serves video and audio captures, the
 /// input-format query and the queue depth from several threads at once, with
 /// a live source. Every call succeeds, every video frame is whole and every
-/// audio sample is one the source could have sent.
+/// audio sample is finite and has an absolute value of at most 2.0.
 #[test]
 fn one_framesync_serves_captures_from_several_threads_at_once() {
     let Some(ndi) = common::ndi() else {
@@ -203,12 +197,6 @@ fn one_framesync_serves_captures_from_several_threads_at_once() {
         .build()
         .unwrap();
     let stop = AtomicBool::new(false);
-    struct Stop<'a>(&'a AtomicBool);
-    impl Drop for Stop<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-        }
-    }
 
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -230,7 +218,7 @@ fn one_framesync_serves_captures_from_several_threads_at_once() {
             }
         });
         // Ends the sender however the captures below end.
-        let _stop = Stop(&stop);
+        let _stop = common::StopOnDrop(&stop);
 
         let deadline = Instant::now() + Duration::from_secs(15);
         while framesync

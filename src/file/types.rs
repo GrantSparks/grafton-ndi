@@ -27,9 +27,14 @@ pub enum StateConflict {
     #[error("finish the previous session before starting another")]
     PreviousSessionOpen,
     /// The session ended with incomplete file tracking after native event
-    /// loss, unreadable lifecycle evidence or a tracking limit. Only a
-    /// successful [`FileRecorder::reset`](super::FileRecorder::reset) replaces the native
-    /// recorder and permits another session, even if every known file closes.
+    /// loss, unreadable lifecycle evidence or a tracking limit. Even after
+    /// every known file closes, unknown files may still be open and cleanup
+    /// uses the remaining [`FileRecorderOptions::drop_wait`] budget. Later
+    /// events do not change the indeterminate report. Start another session
+    /// only after a successful [`FileRecorder::reset`](super::FileRecorder::reset)
+    /// replaces the recorder. A failed reset preserves the recorder and its
+    /// cleanup obligation. Eviction from the async application event queue
+    /// does not affect native file tracking.
     #[error("file tracking is incomplete; reset the recorder before starting another session")]
     IncompleteFileTracking,
     /// Events from an earlier session kept arriving, so a new session was not
@@ -84,19 +89,6 @@ impl StateConflict {
     }
 }
 
-/// `value` as a C string for the SDK.
-///
-/// # Errors
-///
-/// [`Error::InvalidInput`] naming `what` when `value` is empty, and
-/// [`Error::InvalidCString`] when it contains a NUL.
-fn cstring(value: &str, what: &'static str) -> Result<CString> {
-    if value.is_empty() {
-        return Err(Error::InvalidInput(crate::InputDefect::Empty { what }));
-    }
-    Ok(CString::new(value)?)
-}
-
 /// UTF-8 text whose only NUL is its final byte, proven at construction.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) struct FileText(Box<str>);
@@ -106,14 +98,12 @@ impl FileText {
         if value.is_empty() {
             return Err(Error::InvalidInput(crate::InputDefect::Empty { what }));
         }
-        if value.contains('\0') {
-            #[expect(
-                clippy::unwrap_used,
-                reason = "contains proved an interior NUL; NulError has no public constructor"
-            )]
-            return Err(CString::new(value).unwrap_err().into());
-        }
-        Ok(Self::from_checked(value))
+        let bytes = CString::new(value)?.into_bytes_with_nul();
+        // SAFETY: CString preserves the bytes of the UTF-8 input, adding only
+        // its ASCII NUL terminator.
+        Ok(Self(
+            unsafe { String::from_utf8_unchecked(bytes) }.into_boxed_str(),
+        ))
     }
 
     // Only constructors that proved the text nonempty and NUL-free call this.
@@ -255,8 +245,9 @@ impl FilePlayerOptions {
         }
     }
 
-    /// Set the NDI groups the player's source is advertised in, instead of
-    /// those of the NDI configuration. An empty list advertises no groups.
+    /// Set a non-empty list of NDI groups the player's source is advertised in,
+    /// replacing the NDI configuration. Use [`Self::clear_groups`] to inherit
+    /// the configuration.
     /// Each group is checked when the player is created: it must be nonempty
     /// and contain neither a comma nor a NUL.
     #[must_use]
@@ -269,13 +260,13 @@ impl FilePlayerOptions {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when the name is empty or a group is empty
-    /// or contains a comma or NUL. [`Error::InvalidCString`] when the name
+    /// [`Error::InvalidInput`] when the name or group list is empty, or a group
+    /// is empty or contains a comma or NUL. [`Error::InvalidCString`] when the name
     /// contains a NUL.
     pub(super) fn resolve(&self) -> Result<ResolvedPlayerOptions> {
         Ok(ResolvedPlayerOptions {
-            name: cstring(&self.name, "player name")?,
-            groups: crate::finder::list_cstring(self.groups.as_deref(), "player groups")?,
+            name: FileText::new(&self.name, "player name")?,
+            groups: crate::list_setting::list_cstring(self.groups.as_deref(), "player groups")?,
         })
     }
 }
@@ -283,7 +274,7 @@ impl FilePlayerOptions {
 /// A player's options, checked and converted for the SDK.
 #[derive(Debug)]
 pub(super) struct ResolvedPlayerOptions {
-    pub(super) name: CString,
+    pub(super) name: FileText,
     pub(super) groups: Option<CString>,
 }
 
@@ -477,11 +468,10 @@ impl FileRecorderOptions {
     /// closure events after it returns. Synchronous
     /// [`FileRecorder::finish`](super::FileRecorder::finish) instead starts its
     /// wait after the stop returns, giving closure its full requested wait.
-    /// Cleanup ends early only when complete tracking establishes every file
-    /// closed. Native event loss, unreadable lifecycle evidence or a tracking
-    /// limit leaves an unknown cleanup obligation: even after every known file
-    /// closes, cleanup consumes the remaining original budget. The final
-    /// indeterminate report does not change. `Duration::ZERO` waits for no future events:
+    /// Async close shares its budget with any finish or wait already submitted.
+    /// Cleanup can end early once there are no known files left to finalize,
+    /// subject to [`StateConflict::IncompleteFileTracking`]. `Duration::ZERO`
+    /// waits for no future events:
     /// the stop is requested and a bounded nonblocking drain takes queued
     /// events before destruction. [`FileRecorder::abandon`](super::FileRecorder::abandon)
     /// takes no events.
@@ -580,7 +570,7 @@ impl FileRecorderOptions {
     /// pattern is malformed, or an exact file name is combined with a
     /// rollover, and [`Error::InvalidCString`] when the filename pattern
     /// contains a NUL.
-    pub(super) fn resolve(&self) -> Result<ResolvedRecorderOptions> {
+    pub(super) fn check(&self) -> Result<CheckedRecorderOptions> {
         let drop_wait = crate::timeout::Timeout::new(self.drop_wait)?;
         if self.tracks.is_empty() {
             return Err(Error::InvalidInput(
@@ -588,15 +578,11 @@ impl FileRecorderOptions {
             ));
         }
         // The SDK is given no pattern for its own indexed default.
-        let (pattern, given) = match &self.naming {
-            FileNaming::Exact => (EXACT_PATTERN, true),
-            FileNaming::Indexed => (DEFAULT_PATTERN, false),
-            FileNaming::Pattern(pattern) => (pattern.as_str(), true),
-        };
-        let naming = NamePattern::new(pattern)?;
-        let pattern = given
-            .then(|| cstring(pattern, "filename pattern"))
-            .transpose()?;
+        let naming = NamePattern::new(match &self.naming {
+            FileNaming::Exact => Some(EXACT_PATTERN),
+            FileNaming::Indexed => None,
+            FileNaming::Pattern(pattern) => Some(pattern.as_str()),
+        })?;
         if naming.is_exact() {
             if self.format_change_rollover == Some(true) {
                 return Err(Error::InvalidInput(
@@ -609,23 +595,29 @@ impl FileRecorderOptions {
                 ));
             }
         }
-        Ok(ResolvedRecorderOptions {
+        Ok(CheckedRecorderOptions {
+            source: self.source.clone(),
+            tracks: self.tracks,
+            planar_audio: self.planar_audio,
+            proxy: self.proxy,
+            rollover_size: self.rollover_size,
             drop_wait,
             format_change_rollover: self.format_change_rollover.unwrap_or(!naming.is_exact()),
             naming,
-            pattern,
         })
     }
 }
 
-/// What a recorder's options settle once they are checked against each other.
+/// Every option needed for creation, retaining the validated naming pattern.
 #[derive(Debug)]
-pub(super) struct ResolvedRecorderOptions {
+pub(super) struct CheckedRecorderOptions {
+    pub(super) source: SourceSpec,
+    pub(super) tracks: MediaTypes,
+    pub(super) planar_audio: bool,
+    pub(super) proxy: bool,
+    pub(super) rollover_size: u64,
     pub(super) drop_wait: crate::timeout::Timeout,
     pub(super) naming: NamePattern,
-    /// The pattern the SDK is given, or `None` for its own indexed default.
-    pub(super) pattern: Option<CString>,
-    /// Whether a format change rolls over to a new file.
     pub(super) format_change_rollover: bool,
 }
 
@@ -695,7 +687,8 @@ fn pattern_parts(pattern: &str) -> Result<Vec<PatternPart>> {
 /// The filename pattern a recorder names its files with.
 #[derive(Debug, Clone)]
 pub(super) struct NamePattern {
-    pattern: String,
+    /// None selects the SDK default and passes a null pointer.
+    pattern: Option<FileText>,
     parts: Vec<PatternPart>,
     /// The pattern has no index, so each target names exactly one file.
     exact: bool,
@@ -706,7 +699,8 @@ pub(super) struct NamePattern {
 impl NamePattern {
     /// Parse `pattern`, failing with [`Error::InvalidInput`] when it is
     /// malformed.
-    fn new(pattern: &str) -> Result<Self> {
+    fn new(explicit: Option<&str>) -> Result<Self> {
+        let pattern = explicit.unwrap_or(DEFAULT_PATTERN);
         let parts = pattern_parts(pattern)?;
         let mut indexed = false;
         for part in &parts {
@@ -739,11 +733,19 @@ impl NamePattern {
             })
             .fold(0usize, usize::saturating_add);
         Ok(Self {
-            pattern: pattern.to_owned(),
+            pattern: explicit
+                .map(|value| FileText::new(value, "filename pattern"))
+                .transpose()?,
             parts,
             exact,
             index_digits_reserved,
         })
+    }
+
+    pub(super) fn as_sdk_ptr(&self) -> *const c_char {
+        self.pattern
+            .as_ref()
+            .map_or(std::ptr::null(), FileText::as_ptr)
     }
 
     /// Whether each target names exactly one file.
@@ -758,10 +760,14 @@ impl NamePattern {
     /// resolves it, against the current directory.
     pub(super) fn first_file(&self, target: &RecordingTarget) -> Result<PathBuf> {
         let prefix = target.prefix.as_str();
+        let pattern = self
+            .pattern
+            .as_ref()
+            .map_or(DEFAULT_PATTERN, FileText::as_str);
         let mut name = String::new();
         for part in &self.parts {
             match part {
-                PatternPart::Text(range) => name.push_str(&self.pattern[range.clone()]),
+                PatternPart::Text(range) => name.push_str(&pattern[range.clone()]),
                 PatternPart::Prefix => name.push_str(prefix),
                 PatternPart::Index(width) => {
                     name.push_str(&format!("{:0width$}", 1, width = *width))
@@ -891,7 +897,7 @@ impl RecordingTarget {
     /// [`Error::InvalidCString`] when it contains a NUL, and [`Error::Io`]
     /// when the operating system cannot resolve a relative path.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
-        let (_, prefix) = resolve_path(path.as_ref(), "recording target")?;
+        let prefix = resolve_path(path.as_ref(), "recording target")?;
         Ok(Self { prefix })
     }
 
@@ -910,7 +916,7 @@ impl RecordingTarget {
 /// [`Error::InvalidInput`] naming `what` when the path is empty or is not
 /// UTF-8, [`Error::InvalidCString`] when it contains a NUL, and
 /// [`Error::Io`] when the operating system cannot resolve a relative path.
-pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<(PathBuf, FileText)> {
+pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<FileText> {
     if path.as_os_str().is_empty() {
         return Err(Error::InvalidInput(crate::InputDefect::Empty { what }));
     }
@@ -919,34 +925,26 @@ pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<(PathBuf, 
         .ok_or(Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
             what,
         }))?;
-    // Windows path resolution rejects NULs as an I/O error. Keep the SDK
-    // string error consistent with absolute paths and the other platforms.
-    if text.contains('\0') {
-        #[expect(
-            clippy::unwrap_used,
-            reason = "contains proved an interior NUL; NulError has no public constructor"
-        )]
-        return Err(CString::new(text).unwrap_err().into());
+    // Validate before resolving. Windows reports a relative path containing
+    // NUL as an I/O error, while the File API reports the original NUL index.
+    let checked = FileText::new(text, what)?;
+    if path.is_absolute() {
+        return Ok(checked);
     }
-    let absolute = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        // Joining a drive-relative Windows path (C:take.mkv) discards the
-        // current directory and leaves it relative. Resolve its drive too.
-        std::path::absolute(path)?
-    };
+    // Windows drive-relative paths (C:take.mkv) need their drive resolved too.
+    let absolute = std::path::absolute(path)?;
     let text = absolute
         .to_str()
         .ok_or(Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
             what,
         }))?;
-    let text = FileText::new(text, what)?;
-    Ok((absolute, text))
+    // Resolving the checked path against the OS directory cannot add a NUL.
+    Ok(FileText::from_checked(text))
 }
 
 /// A path to play or probe, as the SDK takes it.
 pub(super) fn path_string(path: &Path) -> Result<FileText> {
-    Ok(resolve_path(path, "file path")?.1)
+    resolve_path(path, "file path")
 }
 
 /// Original SDK event bytes, retaining invalid UTF-8 and truncation evidence.
@@ -1978,7 +1976,7 @@ mod tests {
             nul_position(
                 FileRecorderOptions::new(SourceSpec::new("camera").unwrap())
                     .naming(pattern)
-                    .resolve()
+                    .check()
             ),
             8
         );
@@ -2003,13 +2001,11 @@ mod tests {
 
     #[test]
     fn relative_paths_are_made_absolute_once() {
-        let (absolute, text) = resolve_path(Path::new("take.mkv"), "file path").unwrap();
+        let text = resolve_path(Path::new("take.mkv"), "file path").unwrap();
+        let absolute = Path::new(text.as_str());
         assert!(absolute.is_absolute());
-        assert_eq!(text.as_str(), absolute.to_str().unwrap());
-        assert_eq!(
-            RecordingTarget::new("take.mkv").unwrap().path(),
-            absolute.as_path()
-        );
+        assert_eq!(RecordingTarget::new("take.mkv").unwrap().path(), absolute);
+        assert_eq!(path_string(absolute).unwrap(), text);
     }
 
     #[test]
@@ -2023,10 +2019,10 @@ mod tests {
     #[test]
     fn windows_drive_relative_paths_are_made_absolute() {
         for path in [r"C:take.mkv", r"C:folder\take.mkv", r"\take.mkv"] {
-            let (absolute, text) = resolve_path(Path::new(path), "file path").unwrap();
+            let text = resolve_path(Path::new(path), "file path").unwrap();
+            let absolute = Path::new(text.as_str());
             assert!(absolute.is_absolute(), "{absolute:?}");
             assert!(absolute.ends_with("take.mkv"));
-            assert_eq!(text.as_str(), absolute.to_str().unwrap());
             assert_eq!(path_string(Path::new(path)).unwrap(), text);
             assert_eq!(RecordingTarget::new(path).unwrap().path(), absolute);
         }
@@ -2037,7 +2033,7 @@ mod tests {
     fn windows_drive_relative_patterns_name_absolute_files() {
         let target = RecordingTarget::new("take").unwrap();
         for pattern in [r"C:take_{index:03}.mkv", r"\take_{index:03}.mkv"] {
-            let file = NamePattern::new(pattern)
+            let file = NamePattern::new(Some(pattern))
                 .unwrap()
                 .first_file(&target)
                 .unwrap();
@@ -2094,9 +2090,22 @@ mod tests {
     }
 
     #[test]
+    fn recorder_option_check_keeps_one_copy_of_the_explicit_pattern() {
+        let options = FileRecorderOptions::new(SourceSpec::new("camera").unwrap())
+            .naming(FileNaming::Pattern("{prefix}_{index}.mkv".into()));
+        let (checked, allocations) =
+            crate::test_alloc::allocation_count(|| options.check().unwrap());
+        // The source name, the filename pattern, and the four compiled parts.
+        assert_eq!(allocations, 3);
+        let pattern = checked.naming.pattern.as_ref().unwrap();
+        assert_eq!(pattern.as_str(), "{prefix}_{index}.mkv");
+        assert_eq!(checked.naming.as_sdk_ptr(), pattern.as_ptr());
+    }
+
+    #[test]
     fn cached_pattern_parts_avoid_preflight_parse_allocation() {
         let target = RecordingTarget::new("take").unwrap();
-        let pattern = NamePattern::new(DEFAULT_PATTERN).unwrap();
+        let pattern = NamePattern::new(Some(DEFAULT_PATTERN)).unwrap();
         let (file, allocations) =
             crate::test_alloc::allocation_count(|| pattern.first_file(&target).unwrap());
         assert!(file.ends_with("take_001.mkv"));
@@ -2114,7 +2123,7 @@ mod tests {
             "{prefix}/{index}_{index}/clip.mkv",
         ] {
             assert_eq!(
-                invalid_cause(NamePattern::new(pattern)),
+                invalid_cause(NamePattern::new(Some(pattern))),
                 crate::InputDefect::FilenamePatternIndexInDirectory,
                 "{pattern}"
             );
@@ -2127,15 +2136,15 @@ mod tests {
             "{prefix}_{index}_{index:03}.mkv",
             "{prefix}{prefix}_{index}.mkv",
         ] {
-            assert!(NamePattern::new(pattern).is_ok(), "{pattern}");
+            assert!(NamePattern::new(Some(pattern)).is_ok(), "{pattern}");
         }
         #[cfg(windows)]
         assert_eq!(
-            invalid_cause(NamePattern::new(r"{prefix}\{index}\clip.mkv")),
+            invalid_cause(NamePattern::new(Some(r"{prefix}\{index}\clip.mkv"))),
             crate::InputDefect::FilenamePatternIndexInDirectory
         );
         #[cfg(unix)]
-        assert!(NamePattern::new(r"{prefix}_{index}\clip.mkv").is_ok());
+        assert!(NamePattern::new(Some(r"{prefix}_{index}\clip.mkv")).is_ok());
     }
 
     #[test]
@@ -2209,12 +2218,16 @@ mod tests {
 
     #[test]
     fn player_options_are_checked_when_they_are_resolved() {
-        let resolved = FilePlayerOptions::new("Replay")
-            .groups([] as [&str; 0])
-            .resolve()
-            .unwrap();
-        assert_eq!(resolved.name.as_bytes(), b"Replay");
-        assert_eq!(resolved.groups.unwrap().as_bytes(), b"");
+        assert_eq!(
+            invalid_cause(
+                FilePlayerOptions::new("Replay")
+                    .groups([] as [&str; 0])
+                    .resolve()
+            ),
+            crate::InputDefect::Empty {
+                what: "player groups"
+            }
+        );
         assert!(FilePlayerOptions::new("Replay")
             .resolve()
             .unwrap()
@@ -2235,11 +2248,11 @@ mod tests {
         options
             .clone()
             .drop_wait(crate::MAX_TIMEOUT)
-            .resolve()
+            .check()
             .unwrap();
         let requested = crate::MAX_TIMEOUT + Duration::from_millis(1);
         assert_eq!(
-            invalid_cause(options.drop_wait(requested).resolve()),
+            invalid_cause(options.drop_wait(requested).check()),
             crate::InputDefect::TimeoutTooLong {
                 requested: requested.into()
             }
@@ -2250,24 +2263,25 @@ mod tests {
     fn tracks_do_not_silently_map_empty_to_all() {
         let options = FileRecorderOptions::new(SourceSpec::new("camera").unwrap());
         assert_eq!(options.tracks, MediaTypes::ALL);
-        assert!(options.resolve().is_ok());
+        assert!(options.check().is_ok());
         let empty = options.clone().tracks(MediaTypes::NONE);
         assert_eq!(
-            invalid_cause(empty.resolve()),
+            invalid_cause(empty.check()),
             crate::InputDefect::EmptyRecordingTracks
         );
         let some = options.tracks(MediaTypes::AUDIO | MediaTypes::METADATA);
         assert_eq!(some.tracks, MediaTypes::AUDIO | MediaTypes::METADATA);
-        assert!(some.resolve().is_ok());
+        assert!(some.check().is_ok());
     }
 
     /// The pattern the SDK is given for `naming`.
     fn sdk_pattern(naming: FileNaming) -> Result<Option<String>> {
         let options = FileRecorderOptions::new(SourceSpec::new("camera").unwrap()).naming(naming);
         Ok(options
-            .resolve()?
+            .check()?
+            .naming
             .pattern
-            .map(|pattern| pattern.into_string().unwrap()))
+            .map(|pattern| pattern.as_str().to_owned()))
     }
 
     #[test]
@@ -2363,7 +2377,7 @@ mod tests {
     }
 
     fn refused(options: FileRecorderOptions) -> crate::InputDefect {
-        match options.resolve() {
+        match options.check() {
             Err(Error::InvalidInput(reason)) => reason,
             Err(other) => panic!("expected the options to be refused as input: {other}"),
             Ok(_) => panic!("expected the options to be refused"),
@@ -2380,12 +2394,12 @@ mod tests {
             ("{prefix}/{index:03}.mkv", false),
         ] {
             assert_eq!(
-                NamePattern::new(pattern).unwrap().is_exact(),
+                NamePattern::new(Some(pattern)).unwrap().is_exact(),
                 exact,
                 "{pattern:?}"
             );
         }
-        let exact = |options: FileRecorderOptions| options.resolve().unwrap().naming.is_exact();
+        let exact = |options: FileRecorderOptions| options.check().unwrap().naming.is_exact();
         assert!(!exact(options()));
         assert!(exact(options().naming(FileNaming::Exact)));
         assert!(exact(
@@ -2400,8 +2414,7 @@ mod tests {
 
     #[test]
     fn format_change_rollover_follows_the_naming_unless_set() {
-        let rolls =
-            |options: FileRecorderOptions| options.resolve().unwrap().format_change_rollover;
+        let rolls = |options: FileRecorderOptions| options.check().unwrap().format_change_rollover;
         assert!(rolls(options()));
         assert!(!rolls(options().naming(FileNaming::Exact)));
         assert!(!rolls(options().format_change_rollover(false)));
@@ -2420,22 +2433,18 @@ mod tests {
     #[test]
     fn clearing_rollover_override_recomputes_the_policy_for_the_final_template() {
         let template = options().format_change_rollover(true);
-        assert!(template
-            .clone()
-            .naming(FileNaming::Exact)
-            .resolve()
-            .is_err());
+        assert!(template.clone().naming(FileNaming::Exact).check().is_err());
         let exact = template
             .clone()
             .naming(FileNaming::Exact)
             .clear_format_change_rollover()
-            .resolve()
+            .check()
             .unwrap();
         assert!(!exact.format_change_rollover);
         let indexed = template
             .format_change_rollover(false)
             .clear_format_change_rollover()
-            .resolve()
+            .check()
             .unwrap();
         assert!(indexed.format_change_rollover);
     }
@@ -2443,10 +2452,14 @@ mod tests {
     #[test]
     fn player_template_clear_groups_restores_the_native_null_default() {
         let template = FilePlayerOptions::new("Replay A").groups([] as [&str; 0]);
-        let override_groups = template.resolve().unwrap();
-        assert!(override_groups.groups.is_some());
+        assert_eq!(
+            invalid_cause(template.resolve()),
+            crate::InputDefect::Empty {
+                what: "player groups"
+            }
+        );
         let inherited = template.name("Replay B").clear_groups().resolve().unwrap();
-        assert_eq!(inherited.name.as_bytes(), b"Replay B");
+        assert_eq!(inherited.name.as_str(), "Replay B");
         assert!(inherited.groups.is_none());
     }
 
@@ -2478,21 +2491,8 @@ mod tests {
         options()
             .rollover_size(1 << 20)
             .format_change_rollover(true)
-            .resolve()
+            .check()
             .unwrap();
-    }
-
-    /// A fresh directory under the system temporary directory.
-    fn scratch(name: &str) -> PathBuf {
-        let directory = std::env::temp_dir().join(format!(
-            "grafton-ndi-naming-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        directory
     }
 
     fn io_kind(result: Result<()>) -> std::io::ErrorKind {
@@ -2504,10 +2504,10 @@ mod tests {
 
     #[test]
     fn the_file_a_pattern_names_is_where_it_is_checked() {
-        let directory = scratch("check");
+        let directory = crate::test_support::FixtureDir::create("check");
         let target = RecordingTarget::new(directory.join("take")).unwrap();
         let first = |pattern: &str| {
-            NamePattern::new(pattern)
+            NamePattern::new(Some(pattern))
                 .unwrap()
                 .first_file(&target)
                 .unwrap()
@@ -2520,7 +2520,7 @@ mod tests {
         );
 
         // The default pattern checks the target's own directory.
-        let indexed = NamePattern::new(DEFAULT_PATTERN).unwrap();
+        let indexed = NamePattern::new(Some(DEFAULT_PATTERN)).unwrap();
         indexed.check(&target).unwrap();
         let missing = RecordingTarget::new(directory.join("absent/take")).unwrap();
         assert_eq!(
@@ -2528,13 +2528,13 @@ mod tests {
             std::io::ErrorKind::NotFound
         );
         // A pattern that names a directory of its own checks that one.
-        let nested = NamePattern::new("{prefix}/{index:03}.mkv").unwrap();
+        let nested = NamePattern::new(Some("{prefix}/{index:03}.mkv")).unwrap();
         assert_eq!(io_kind(nested.check(&target)), std::io::ErrorKind::NotFound);
         std::fs::create_dir(directory.join("take")).unwrap();
         nested.check(&target).unwrap();
 
         // An exact name refuses a file that exists, and an indexed one does not.
-        let exact = NamePattern::new("{prefix}.mkv").unwrap();
+        let exact = NamePattern::new(Some("{prefix}.mkv")).unwrap();
         exact.check(&target).unwrap();
         std::fs::write(directory.join("take.mkv"), b"kept").unwrap();
         assert_eq!(
@@ -2544,7 +2544,6 @@ mod tests {
         std::fs::write(directory.join("take_001.mkv"), b"kept").unwrap();
         indexed.check(&target).unwrap();
         assert_eq!(std::fs::read(directory.join("take.mkv")).unwrap(), b"kept");
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -2558,7 +2557,7 @@ mod tests {
             ))
             .unwrap()
         };
-        let exact = NamePattern::new(EXACT_PATTERN).unwrap();
+        let exact = NamePattern::new(Some(EXACT_PATTERN)).unwrap();
         assert!(matches!(
             exact.check(&target_at_length(RECORDER_PATH_LIMIT)),
             Err(Error::Io(_))
@@ -2568,7 +2567,7 @@ mod tests {
             Err(Error::InvalidInput(_))
         ));
 
-        let indexed = NamePattern::new(DEFAULT_PATTERN).unwrap();
+        let indexed = NamePattern::new(Some(DEFAULT_PATTERN)).unwrap();
         let first_suffix = "_001.mkv".len();
         assert_eq!(indexed.index_digits_reserved, 17);
         assert!(matches!(
@@ -2581,7 +2580,7 @@ mod tests {
         ));
 
         // Every index token counts; padding wider than u64 needs no growth.
-        let multiple = NamePattern::new("{prefix}_{index}_{index:03}_{index:24}").unwrap();
+        let multiple = NamePattern::new(Some("{prefix}_{index}_{index:03}_{index:24}")).unwrap();
         assert_eq!(multiple.index_digits_reserved, 19 + 17);
         let suffix = "_1_001_000000000000000000000001".len();
         let boundary = RECORDER_PATH_LIMIT - multiple.index_digits_reserved - suffix;
@@ -2601,7 +2600,7 @@ mod tests {
         let base = directory.to_str().unwrap().len() + 1;
         let remaining = RECORDER_PATH_LIMIT - base;
         let name = format!("{}{}", "é".repeat(remaining / 2), "x".repeat(remaining % 2));
-        let exact = NamePattern::new(EXACT_PATTERN).unwrap();
+        let exact = NamePattern::new(Some(EXACT_PATTERN)).unwrap();
         assert!(matches!(
             exact.check(&RecordingTarget::new(directory.join(&name)).unwrap()),
             Err(Error::Io(_))
@@ -2621,7 +2620,9 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             let target = RecordingTarget::new("/grafton-ndi-valid-target").unwrap();
             assert!(matches!(
-                NamePattern::new("take_{index}.mkv").unwrap().check(&target),
+                NamePattern::new(Some("take_{index}.mkv"))
+                    .unwrap()
+                    .check(&target),
                 Err(Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
                     what: "recording file path"
                 }))
@@ -2632,20 +2633,15 @@ mod tests {
         // Changing the working directory only in a child avoids racing other
         // tests. A pattern omitting {prefix} resolves relative to that directory.
         use std::os::unix::ffi::OsStringExt;
-        let directory = scratch("non-utf8-output");
+        let directory = crate::test_support::FixtureDir::create("non-utf8-output");
         let non_utf8 = directory.join(std::ffi::OsString::from_vec(vec![0xff]));
         std::fs::create_dir(&non_utf8).unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "file::types::tests::non_utf8_output_paths_are_refused_without_panicking",
-            ])
-            .env(CHILD, "1")
-            .current_dir(non_utf8)
-            .output()
-            .unwrap();
-        let _ = std::fs::remove_dir_all(directory);
-        assert!(output.status.success(), "{output:?}");
+        let output = crate::test_support::TestChild::new(
+            "file::types::tests::non_utf8_output_paths_are_refused_without_panicking",
+        )
+        .env(CHILD, "1")
+        .current_dir(non_utf8)
+        .run();
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 

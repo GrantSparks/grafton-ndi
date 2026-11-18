@@ -4,7 +4,7 @@ use super::{Retained, ServerApi, ServerObject};
 use crate::{
     receiver::{ReceiverCore, ReceiverMode},
     sender::SenderResource,
-    sys, Error, Ndi, Receiver, Rejected, Result, Sender,
+    sys, Error, Ndi, Receiver, Rejected, Result, RuntimeFeature, Sender,
 };
 use std::{
     collections::BTreeMap,
@@ -60,7 +60,8 @@ impl AdvertiserOptions {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Use explicit endpoints instead of the SDK configuration.
+    /// Use a non-empty list of endpoints in place of the SDK configuration.
+    /// Use [`Self::clear_servers`] to inherit the configuration.
     ///
     /// Each endpoint is a host name or IP address, optionally followed by a
     /// colon and a port (5959 when omitted). Several elements register with
@@ -157,6 +158,10 @@ impl RecvAdvertisement {
     /// They do not update [`Receiver::connection_target`], the latest local
     /// request; [`Receiver::reconnect`] requests that local target again and
     /// replaces any remote routing.
+    ///
+    /// Registering with this enabled requires
+    /// [remote receiver control](RuntimeFeature::RemoteReceiverControl),
+    /// which is unavailable on Standard Windows runtimes.
     #[must_use]
     pub fn allow_controlling(mut self, enabled: bool) -> Self {
         self.controlling = enabled;
@@ -212,7 +217,7 @@ impl AdvertiserApi for sys::SenderAdvertising {
         unsafe {
             self.named().NDIlib_send_advertiser_add_sender(
                 instance.0,
-                member.instance(),
+                member.handle().instance(),
                 options.monitoring,
             )
         }
@@ -225,7 +230,7 @@ impl AdvertiserApi for sys::SenderAdvertising {
         // SAFETY: forwarded to the caller's live-owner obligation.
         unsafe {
             self.named()
-                .NDIlib_send_advertiser_del_sender(instance.0, member.instance())
+                .NDIlib_send_advertiser_del_sender(instance.0, member.handle().instance())
         }
     }
 }
@@ -303,11 +308,11 @@ struct Advertiser<A: AdvertiserApi> {
     server: ServerObject<A, Members<A>>,
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send<T: Send>() {}
     assert_send::<Advertiser<sys::SenderAdvertising>>();
     assert_send::<Advertiser<sys::ReceiverAdvertising>>();
-};
+});
 
 impl<A: AdvertiserApi> Advertiser<A>
 where
@@ -466,11 +471,11 @@ pub struct RecvAdvertiser {
     inner: Advertiser<sys::ReceiverAdvertising>,
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send<T: Send>() {}
     assert_send::<SendAdvertiser>();
     assert_send::<RecvAdvertiser>();
-};
+});
 
 /// Names one sender registration for [`SendAdvertiser::unregister`].
 ///
@@ -518,9 +523,9 @@ impl SendAdvertiser {
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
     /// cannot provide [sender advertising], which needs NDI 6.4.0 or later, or
     /// the options carry an Advanced configuration that the runtime or this
-    /// build cannot take; [`Error::InvalidInput`] when a server element is
-    /// empty or contains a comma or NUL, or when the SDK creates
-    /// no advertiser. Without an explicit server the SDK uses its configuration;
+    /// build cannot take; [`Error::InvalidInput`] when the server list is empty,
+    /// a server element is empty or contains a comma or NUL, or the SDK
+    /// creates no advertiser. Without an explicit server the SDK uses its configuration;
     /// creation fails when it names no server or one the SDK cannot use. An
     /// explicit address the SDK cannot parse is also refused.
     ///
@@ -598,9 +603,9 @@ impl RecvAdvertiser {
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
     /// cannot provide [receiver advertising], which needs NDI 6.4.0 or later,
     /// or the options carry an Advanced configuration that the runtime or this
-    /// build cannot take; [`Error::InvalidInput`] when a server element is
-    /// empty or contains a comma or NUL, or when the SDK creates
-    /// no advertiser. Without an explicit server the SDK uses its configuration;
+    /// build cannot take; [`Error::InvalidInput`] when the server list is empty,
+    /// a server element is empty or contains a comma or NUL, or the SDK
+    /// creates no advertiser. Without an explicit server the SDK uses its configuration;
     /// creation fails when it names no server or one the SDK cannot use. An
     /// explicit address the SDK cannot parse is also refused.
     ///
@@ -631,13 +636,21 @@ impl RecvAdvertiser {
     /// Returns [`Error::InvalidCString`] when the input-group name contains a
     /// NUL byte, [`Error::InvalidInput`] when this advertiser already
     /// advertises the receiver, and [`Error::NativeOperationFailed`] when the
-    /// SDK refuses the registration.
+    /// SDK refuses the registration. Returns [`Error::UnsupportedCapability`]
+    /// when the options request remote control and the selected runtime
+    /// lacks [remote receiver control](RuntimeFeature::RemoteReceiverControl).
     #[doc(alias = "NDIlib_recv_advertiser_add_receiver")]
     pub fn register<M: ReceiverMode>(
         &mut self,
         receiver: &Receiver<M>,
         options: &RecvAdvertisement,
     ) -> Result<RecvRegistration> {
+        if options.controlling {
+            receiver
+                .core
+                .ndi()
+                .require_feature(RuntimeFeature::RemoteReceiverControl)?;
+        }
         let input_group = options
             .input_group
             .as_deref()

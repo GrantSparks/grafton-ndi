@@ -91,11 +91,7 @@ struct SdkTimestamp;
 enum Initialized { ActiveRows, Storage { room_after: usize } }
 mod pixels { pub fn send_room(_: &super::ValidatedVideoLayout, _: ()) -> usize { 0 } }
 "#;
-    let directory = std::env::temp_dir().join(format!(
-        "grafton-video-parts-contract-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = crate::test_support::FixtureDir::create("video-parts-contract");
     let permitted = directory.join("accessors_only.rs");
     std::fs::write(
         &permitted,
@@ -107,7 +103,7 @@ mod pixels { pub fn send_room(_: &super::ValidatedVideoLayout, _: ()) -> usize {
     .unwrap();
     let accepted = std::process::Command::new("rustc")
         .args(["--edition=2021", "--emit=metadata", "--out-dir"])
-        .arg(&directory)
+        .arg(directory.path())
         .arg(&permitted)
         .output()
         .unwrap();
@@ -134,7 +130,7 @@ mod pixels { pub fn send_room(_: &super::ValidatedVideoLayout, _: ()) -> usize {
         .unwrap();
         let output = std::process::Command::new("rustc")
             .args(["--edition=2021", "--emit=metadata", "--out-dir"])
-            .arg(&directory)
+            .arg(directory.path())
             .arg(&path)
             .output()
             .unwrap();
@@ -145,7 +141,6 @@ mod pixels { pub fn send_room(_: &super::ValidatedVideoLayout, _: ()) -> usize {
             "unexpected compiler refusal: {error}"
         );
     }
-    std::fs::remove_dir_all(directory).unwrap();
 }
 
 /// Pin the accessor boundary against the declarations compiled by the crate.
@@ -235,9 +230,7 @@ struct SdkTimestamp;
 enum Initialized { ActiveRows, Storage { room_after: usize } }
 struct Timecode;
 "#;
-        let directory =
-            std::env::temp_dir().join(format!("grafton-{name}-contract-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = crate::test_support::FixtureDir::create(&format!("{name}-contract"));
         for helper in std::iter::once(None).chain(helpers.iter().copied().map(Some)) {
             let path = directory.join(format!("{}.rs", helper.unwrap_or("accessors")));
             let fixture = match helper {
@@ -247,7 +240,7 @@ struct Timecode;
             std::fs::write(&path, format!("{stubs}\n{declaration}\n{fixture}")).unwrap();
             let output = std::process::Command::new("rustc")
                 .args(["--edition=2021", "--emit=metadata", "--out-dir"])
-                .arg(&directory)
+                .arg(directory.path())
                 .arg(&path)
                 .output()
                 .unwrap();
@@ -260,7 +253,6 @@ struct Timecode;
                 None => assert!(output.status.success(), "accessors must compile: {error}"),
             }
         }
-        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -288,8 +280,8 @@ fn a_growing_video_layout_is_read_once_and_keeps_the_destination_paired() {
                 self.frame.layout()
             }
         }
-        fn header(&self) -> &VideoHeader {
-            &self.frame.header
+        fn header(&self) -> VideoHeader {
+            self.frame.header()
         }
         fn pixels(&self) -> *const u8 {
             self.frame.data.as_ptr()
@@ -402,8 +394,8 @@ fn a_video_accessor_panic_leaves_the_reused_destination_whole() {
         fn layout(&self) -> &ValidatedVideoLayout {
             self.frame.layout()
         }
-        fn header(&self) -> &VideoHeader {
-            &self.frame.header
+        fn header(&self) -> VideoHeader {
+            self.frame.header()
         }
         fn pixels(&self) -> *const u8 {
             self.frame.data.as_ptr()

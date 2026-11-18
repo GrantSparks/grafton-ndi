@@ -11,7 +11,7 @@
 //!
 //! Optional arguments:
 //! - The router's name: `cargo run --example routing -- --name Program`
-//! - IP addresses or subnets to search: `cargo run --example routing -- 192.168.0.100`
+//! - IP addresses to search: `cargo run --example routing -- 192.168.0.100`
 
 use grafton_ndi::{
     routing::{Router, RouterOptions},

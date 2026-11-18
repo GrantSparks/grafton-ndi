@@ -37,7 +37,9 @@ fn native_loans_and_slot_keys_require_their_owner() {
         ),
         (
             "ndi_test_send_ownership_types",
-            &["flush", "handle", "clone", "claim", "E0382", "E0599"][..],
+            &[
+                "flush", "handle", "clone", "claim", "E0382", "E0599", "E0616", "instance",
+            ][..],
         ),
     ] {
         let rejected = compile(cfg);

@@ -11,8 +11,9 @@ in its cached lint job. Pushes to `main` upload that HTML for GitHub Pages;
 the deployment job publishes it only after `required-ci` succeeds. Pull
 requests, manual CI runs and release-tag runs validate docs without publishing.
 Pages write permissions are confined to the deployment job, which runs no
-repository scripts. The release caller forwards those permissions for reusable
-workflow validation; its tag ref keeps the Pages job disabled.
+repository scripts. A run skips deployment when its commit is no longer the
+tip of `main`. The release caller forwards those permissions for reusable
+workflow validation. Its tag ref keeps the Pages job disabled.
 
 Use the pinned Rust toolchain with Clippy and rustfmt:
 
@@ -30,21 +31,21 @@ done
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 python ci/docs.py --compile --rustdoc target/doc
 cargo build --locked --examples --all-features
-cargo test --locked --all-features
+cargo test --locked --no-fail-fast --all-features
 scope_dir="${RUNNER_TEMP:-target/ci}"
 mkdir -p "$scope_dir"
-cargo test --locked -- --list > "$scope_dir/default-tests.txt"
+cargo test --locked --no-fail-fast -- --list > "$scope_dir/default-tests.txt"
 python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/default-tests.txt" --output "$scope_dir/default-skips.txt"
 scope_args=()
 while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/default-skips.txt"
-cargo test --locked -- "${scope_args[@]}"
+cargo test --locked --no-fail-fast -- "${scope_args[@]}"
 scope_dir="${RUNNER_TEMP:-target/ci}"
 mkdir -p "$scope_dir"
-cargo test --locked --no-default-features --features file-io -- --list > "$scope_dir/file-tests.txt"
+cargo test --locked --no-fail-fast --no-default-features --features file-io -- --list > "$scope_dir/file-tests.txt"
 python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/file-tests.txt" --output "$scope_dir/file-skips.txt"
 scope_args=()
 while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/file-skips.txt"
-cargo test --locked --no-default-features --features file-io -- "${scope_args[@]}"
+cargo test --locked --no-fail-fast --no-default-features --features file-io -- "${scope_args[@]}"
 ```
 
 Tests that require an unavailable NDI runtime report a skip. Runtime
@@ -72,9 +73,11 @@ SDK files, generated bindings and SDK-derived binaries stay on their runner.
 
 When adding or changing a test, leave it included unless its inputs prove that
 an existing owner covers it. Add exact names and the source rationale to
-`sdk_test_scope.py` only after that audit. The helper rejects missing, duplicate,
-colliding or mismatched inventory entries; workflow guards require the owner.
-SDK-private caches and artifacts are not part of this design.
+[`sdk_test_scope.py`](sdk_test_scope.py) only after that audit. The helper
+rejects missing, duplicate, colliding or mismatched inventory entries. Its
+`select` mode validates named Miri, Memcheck and measurement groups against an
+inventory before returning exact test names. Workflow guards require the owner.
+SDK-private caches and artifacts are excluded.
 
 The Linux test job also runs the manual measurement fixtures with `--ignored`
 in release mode. Its configurable image sweep uses one 64×64 BGRA input and
@@ -109,12 +112,11 @@ descriptor retention, guards and send-path aliasing with `nightly-2026-11-10`,
 using both Stacked Borrows and Tree Borrows. Native tests report visible skips
 under Miri; source-parsing and subprocess tests are outside its filters. The
 long descriptor churn, exhaustive UTF-8 pairs and multi-megabyte copy-budget
-fixtures are explicitly skipped; smaller synthetic tests retain their exact
-charges, malformed-entry handling and scan bounds. Both memory-checker steps
-check every filter and skip against one interpreted inventory per model. Filters
-use libtest's literal substring rules; missing or overlapping selections fail.
-After applying skips, the job passes concrete names with `--exact` to three
-fixed batches: bounded reads, media frames, and ownership. Serial test cases
+fixtures are explicitly skipped. Smaller synthetic tests retain their exact
+charges, malformed-entry handling and scan bounds. The
+[`sdk_test_scope.py` selector](sdk_test_scope.py) applies the audited skips and
+filters to one interpreted inventory per model. The job runs three batches
+with `--exact` for bounded reads, media frames and ownership. Serial test cases
 preserve the audited local and thread-local state boundaries; explicit worker
 threads in the tests still run. Both borrowing models execute the same selected
 cases, with a fresh process per batch. This avoids repeating interpreter startup
@@ -140,13 +142,39 @@ MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly-2026-11-10 miri test --locked --l
 The Ubuntu `test` job runs the scripted capture fixtures and full encoder padding
 matrix under Valgrind Memcheck. It traces child test processes, skips compiler
 children and fails on errors. The Standard 6.3.2 Linux SDK row also checks live
-padding through the loopback runner. A narrowly scoped suppression covers only
-glibc loader token comparisons reported by Valgrind 3.19:
+padding through the loopback runner. Install Valgrind before running either recipe.
+
+SDK-free capture and encoder padding:
 
 ```sh
-cargo test --locked --all-features --config 'target.x86_64-unknown-linux-gnu.runner=["valgrind","--tool=memcheck","--error-exitcode=99","--trace-children=yes","--trace-children-skip=*/rustc,*/rustc-*"]' --test mixed_capture_boundary --test frame_metadata_boundary
-GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --locked --features image-encoding --config ci/offline.toml --config 'target.x86_64-unknown-linux-gnu.runner=["ci/offline/linux.sh","valgrind","--tool=memcheck","--error-exitcode=99","--suppressions=ci/valgrind.supp"]' --test video_padding_sdk -- --test-threads=1
+runner='target.x86_64-unknown-linux-gnu.runner=["valgrind","--tool=memcheck","--error-exitcode=99","--trace-children=yes","--trace-children-skip=*/rustc,*/rustc-*"]'
+cargo test --locked --no-fail-fast --all-features --config "$runner" --test mixed_capture_boundary --test frame_metadata_boundary -- --test-threads=1
+memcheck_dir="${RUNNER_TEMP:-target/ci}"
+mkdir -p "$memcheck_dir"
+inventory="$memcheck_dir/ndi-encoder-padding-tests.txt"
+selection="$memcheck_dir/ndi-encoder-padding-selected.txt"
+cargo test --locked --no-fail-fast --all-features --lib -- --list > "$inventory"
+python3 ci/sdk_test_scope.py select --group encoder-padding --inventory "$inventory" --output "$selection"
+mapfile -t tests < "$selection"
+cargo test --locked --no-fail-fast --all-features --config "$runner" --lib -- --exact "${tests[@]}" --test-threads=1
 ```
+
+Live SDK padding on Linux x64:
+
+```sh
+memcheck_dir="${RUNNER_TEMP:-target/ci}"
+mkdir -p "$memcheck_dir"
+inventory="$memcheck_dir/ndi-sdk-padding-tests.txt"
+selection="$memcheck_dir/ndi-sdk-padding-selected.txt"
+GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --locked --config ci/offline.toml --target x86_64-unknown-linux-gnu --no-fail-fast --features image-encoding --test video_padding_sdk -- --list > "$inventory"
+python3 ci/sdk_test_scope.py select --group sdk-padding --inventory "$inventory" --output "$selection"
+mapfile -t tests < "$selection"
+GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --locked --config ci/offline.toml --config 'target.x86_64-unknown-linux-gnu.runner=["ci/offline/linux.sh","valgrind","--tool=memcheck","--track-origins=yes","--error-exitcode=99"]' --target x86_64-unknown-linux-gnu --no-fail-fast --features image-encoding --test video_padding_sdk -- --exact "${tests[@]}" --test-threads=1
+```
+
+On Debian 12 with Valgrind 3.19 and glibc 2.36, the live SDK recipe may report
+reads from glibc's loader token comparisons. Add
+`"--suppressions=ci/valgrind.supp"` to its runner array on that host.
 
 ## Test against an installed runtime
 
@@ -168,22 +196,33 @@ GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --locked --all-features --config ci/off
 | `1` | NDI runtime; implied by every other token |
 | `advanced` | Advanced runtime and compiled Advanced declarations |
 | `file` | Usable separate File library, with `file-io` enabled |
+| `peer` | A second pinned SDK for cross-version transport, selected with `GRAFTON_NDI_PEER_RUNTIME`, `GRAFTON_NDI_PEER_VERSION` and `GRAFTON_NDI_PEER_EDITION` |
 | `discovery-server` | Compatible runtime and SDK Discovery Server, on Linux |
 | `h264-decoder` | Implies `advanced`; runtime can decode the H.264 fixture |
 | `hevc-444-decoder` | Implies `advanced`; runtime can decode the HEVC 4:4:4 fixture with the 6.4 Best444 receiver |
 
 For example, use `advanced,file` when both are installed. Unknown tokens and
-requirements that the build cannot exercise are errors. Decoder fixtures do
+requirements that the build cannot exercise are errors. The compatibility
+steps promise `peer` and verify that their test inventory includes the exchange.
+Decoder fixtures do
 not establish compatibility with every third-party stream or hardware codec.
 
-Native NDI|HX tests need Python 3 and FFmpeg with the `libx264` and `libx265`
-encoders. They generate their synthetic H.264/HEVC pictures once per test
-process in a temporary directory and remove the files after reading them.
-SDK-free tests do not need these tools. To inspect the pictures separately:
+CI generates the synthetic H.264 and HEVC pictures in a separate job and
+passes the downloaded directory to the Advanced rows as
+`GRAFTON_NDI_HX_PICTURES`. Each row logs the SHA-256 of both files.
+The Windows Advanced rows use the builtin headers and libclang DLL from the
+same hash-verified LLVM release and log the resource path and compiler version.
+
+For local native NDI|HX tests, leave `GRAFTON_NDI_HX_PICTURES` unset to
+generate the pictures on demand with Python 3 and FFmpeg's `libx264` and
+`libx265` encoders. To generate the pictures once for reuse:
 
 ```sh
 python3 tests/support/generate_hx.py --output-dir target/test-data/ndi-hx
+export GRAFTON_NDI_HX_PICTURES="$PWD/target/test-data/ndi-hx"
 ```
+
+When you set the variable, both files must already be in that directory.
 
 ### Loopback-only test runs
 
@@ -213,20 +252,22 @@ include SDK archives, credentials or private recordings.
 
 ## Release controls
 
-Workflows cannot establish repository settings. Before publishing, verify these
-controls in order:
+Configure the repository before publishing. The release job verifies the first
+three controls through read-only GitHub API requests. Verify items 4 and 5
+before pushing a release tag. [Release check](release.py)
 
-1. The `crates-io` environment requires reviewers, an appropriate self-review
-   rule, and deployment restricted to `v*` tags.
-2. A tag ruleset restricts creating, moving and deleting `v*` tags.
-3. Protection of `main` requires pull requests, Code Owner review and
-   `required-ci`. [CODEOWNERS](../.github/CODEOWNERS) covers files that control CI
-   and publishing.
+1. The `crates-io` environment requires reviewers and has exactly one custom
+   deployment policy for `v*` tags.
+2. An active tag ruleset includes `refs/tags/v*` without exclusions and
+   restricts creating, updating and deleting those tags.
+3. Active rules on `main` require pull requests, Code Owner review and
+   the `required-ci` status check. [CODEOWNERS](../.github/CODEOWNERS)
 4. The crates.io trusted publisher binds this repository, `publish.yml` and the
-   `crates-io` environment.
+   `crates-io` environment. The GitHub API cannot read crates.io settings.
 5. SDK CI has `NDI_SDK_SOURCES_JSON`, a scoped `NDI_SDK_ARCHIVE_TOKEN`, and
-   `NDI_CI_RELEASED=true` when enabled.
+   `NDI_CI_RELEASED=true` when enabled. The release check has no access to
+   secret values.
 
 Anyone who can replace a workflow on a tag or branch can replace its checks.
-Repository rules and review enforce these boundaries; the tag-on-main check
-catches mistakes.
+Repository rules and review enforce these boundaries. The release job catches
+configuration mistakes before the jobs that build or publish the release.

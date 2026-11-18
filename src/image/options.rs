@@ -1,6 +1,9 @@
 //! What to encode and how: [`ImageOptions`] and the settings it holds.
 
-use crate::YuvMatrix;
+use std::ops::RangeInclusive;
+
+use super::{jpeg::JpegQuality, webp::WebpQuality};
+use crate::{Error, ImageCodecKind, ImageSettingKind, InputDefect, Result, YuvMatrix};
 
 /// The image format a video frame is encoded to.
 ///
@@ -32,15 +35,18 @@ pub enum ImageFormat {
     Png,
     /// JPEG at a quality from 1, the lowest, to 100, the highest; 8 bits a
     /// channel and no alpha. Below 90 chroma is halved in both directions
-    /// (4:2:0); from 90 it is kept whole (4:4:4).
+    /// (4:2:0). From 90 it is kept whole (4:4:4). Frames that need a color
+    /// tag require PNG. See [`HdrPolicy`].
     Jpeg(u8),
-    /// Lossless WebP: 8 bits a channel, with or without alpha.
+    /// Lossless WebP: 8 bits a channel, with or without alpha. Frames that
+    /// need a color tag require PNG. See [`HdrPolicy`].
     WebpLossless,
     /// Lossy WebP at a quality from 0, the lowest, to 100, the highest;
     /// 8 bits a channel, with or without alpha. Alpha is preserved exactly.
     /// Color uses 4:2:0 chroma sampling and, by default, SharpYUV conversion;
     /// even quality 100 can change RGB values. Use [`Self::WebpLossless`]
-    /// for exact pixels.
+    /// for exact pixels. Frames that need a color tag require PNG. See
+    /// [`HdrPolicy`].
     WebpLossy(u8),
 }
 
@@ -49,10 +55,9 @@ pub enum ImageFormat {
 pub(super) struct ImageFormatInfo {
     pub(super) codec: crate::ImageCodecKind,
     pub(super) media_type: &'static str,
-    pub(super) quality: Option<std::ops::RangeInclusive<u8>>,
     pub(super) alpha: AlphaChannel,
     pub(super) sixteen_bit: bool,
-    pub(super) hdr_code_values: bool,
+    pub(super) carries_color_tag: bool,
     pub(super) aspect_tag: bool,
 }
 
@@ -69,60 +74,70 @@ impl ImageFormat {
             Self::Png => ImageFormatInfo {
                 codec: crate::ImageCodecKind::Png,
                 media_type: "image/png",
-                quality: None,
                 alpha: AlphaChannel::Optional,
                 sixteen_bit: true,
-                hdr_code_values: true,
+                carries_color_tag: true,
                 aspect_tag: true,
             },
             Self::Jpeg(_) => ImageFormatInfo {
                 codec: crate::ImageCodecKind::Jpeg,
                 media_type: "image/jpeg",
-                quality: Some(1..=100),
                 alpha: AlphaChannel::None,
                 sixteen_bit: false,
-                hdr_code_values: false,
+                carries_color_tag: false,
                 aspect_tag: true,
             },
             Self::WebpLossless => ImageFormatInfo {
                 codec: crate::ImageCodecKind::Webp,
                 media_type: "image/webp",
-                quality: None,
                 alpha: AlphaChannel::Optional,
                 sixteen_bit: false,
-                hdr_code_values: false,
+                carries_color_tag: false,
                 aspect_tag: false,
             },
             Self::WebpLossy(_) => ImageFormatInfo {
                 codec: crate::ImageCodecKind::Webp,
                 media_type: "image/webp",
-                quality: Some(0..=100),
                 alpha: AlphaChannel::AlwaysRgba,
                 sixteen_bit: false,
-                hdr_code_values: false,
+                carries_color_tag: false,
                 aspect_tag: false,
             },
         }
     }
 
-    pub(super) fn validate_quality(self) -> crate::Result<()> {
-        let info = self.info();
-        if let Self::Jpeg(quality) | Self::WebpLossy(quality) = self {
-            if let Some(bounds) = info.quality {
-                if !bounds.contains(&quality) {
-                    return Err(crate::Error::InvalidInput(
-                        crate::InputDefect::ImageQuality {
-                            codec: info.codec,
-                            quality,
-                            minimum: *bounds.start(),
-                            maximum: *bounds.end(),
-                        },
-                    ));
-                }
-            }
+    pub(super) fn quality(self) -> Option<(u8, RangeInclusive<u8>)> {
+        match self {
+            Self::Png | Self::WebpLossless => None,
+            Self::Jpeg(value) => Some((value, JpegQuality::RANGE)),
+            Self::WebpLossy(value) => Some((value, WebpQuality::RANGE)),
+        }
+    }
+
+    pub(super) fn validate_quality(self) -> Result<()> {
+        if let Some((value, bounds)) = self.quality() {
+            check_image_setting(self.info().codec, ImageSettingKind::Quality, value, bounds)?;
         }
         Ok(())
     }
+}
+
+pub(super) fn check_image_setting(
+    codec: ImageCodecKind,
+    setting: ImageSettingKind,
+    value: u8,
+    bounds: RangeInclusive<u8>,
+) -> Result<()> {
+    if !bounds.contains(&value) {
+        return Err(Error::InvalidInput(InputDefect::ImageSetting {
+            codec,
+            setting,
+            value,
+            minimum: *bounds.start(),
+            maximum: *bounds.end(),
+        }));
+    }
+    Ok(())
 }
 
 // One list supplies representative formats and an exhaustive coverage check,
@@ -131,20 +146,21 @@ impl ImageFormat {
 macro_rules! image_format_variants {
     ($($variant:ident $(($argument:pat))? => $sample:expr),+ $(,)?) => {
         impl ImageFormat {
-            pub(super) const ALL: [Self; [$(stringify!($variant)),+].len()] = [$($sample),+];
+            pub(super) const ALL: [Self; [$(stringify!($variant)),+].len()] = {
+                let variants = [$($sample),+];
+                let mut index = 0;
+                while index < variants.len() {
+                    assert!(variants[index].variant_index() == index);
+                    index += 1;
+                }
+                variants
+            };
 
             const fn variant_index(self) -> usize {
                 enum Index { $($variant),+ }
                 match self { $(Self::$variant $(($argument))? => Index::$variant as usize),+ }
             }
         }
-        const _: () = {
-            let mut index = 0;
-            while index < ImageFormat::ALL.len() {
-                assert!(ImageFormat::ALL[index].variant_index() == index);
-                index += 1;
-            }
-        };
     };
 }
 #[cfg(test)]
@@ -202,10 +218,10 @@ image_format_variants!(
 ///
 /// | Output | Channels | Bits a channel |
 /// |---|---|---|
-/// | PNG, [`AlphaMode::Keep`] | RGBA; a source without alpha gets alpha 255 | 8 or 16 |
+/// | PNG, [`AlphaMode::Keep`] | RGBA if the source has alpha, otherwise RGB | 8 or 16 |
 /// | PNG, [`AlphaMode::Discard`] | RGB | 8 or 16 |
 /// | JPEG | YCbCr; alpha is dropped | 8 |
-/// | Lossless WebP | RGBA, or RGB with [`AlphaMode::Discard`] | 8 |
+/// | Lossless WebP | RGBA if the source has alpha and it is kept, otherwise RGB | 8 |
 /// | Lossy WebP | Lossy color, exact alpha unless discarded | 8 |
 ///
 /// # Color
@@ -218,7 +234,7 @@ image_format_variants!(
 /// The SDK's own YUV-to-RGB conversion always uses BT.709 limited range,
 /// whatever the tag says. RGB-received frames already carry that conversion:
 /// encoding keeps their RGB pixels, so the tag's matrix can no longer be
-/// applied. Readable tags still decide HDR refusal and the PNG `cICP` chunk.
+/// applied. Readable tags still govern color admission and the PNG `cICP` chunk.
 /// [`ReceiverColorFormat::UyvyBgra`](crate::ReceiverColorFormat::UyvyBgra) and
 /// [`UyvyRgba`](crate::ReceiverColorFormat::UyvyRgba) keep opaque sources in
 /// YUV, but deliver BGRA or RGBA for sources with alpha. When a tagged source
@@ -238,8 +254,9 @@ image_format_variants!(
 /// [`ReceiverColorFormat::Best`](crate::ReceiverColorFormat::Best) to retain
 /// high bit depth and HDR code values: an RGB-received frame already holds
 /// the SDK's BT.709 limited-range conversion, which encoding at 16 bits cannot
-/// undo. The passed-through tag still controls HDR refusal and the PNG `cICP`
-/// chunk. See [`HdrPolicy`].
+/// undo. The passed-through tag still governs color admission and the PNG
+/// `cICP` chunk. Frames with BT.2020 primaries also require tagged PNG output.
+/// See [`HdrPolicy`].
 ///
 /// # Performance
 ///
@@ -264,13 +281,15 @@ image_format_variants!(
 /// # Memory
 ///
 /// PNG and JPEG convert one output row at a time, so conversion scratch
-/// does not grow with frame height. PNG borrows eligible RGBA rows or
+/// does not grow with frame height. PNG borrows contiguous full-size 8-bit
+/// RGBA rows or
 /// retains one row; JPEG converts into the codec's rows and retains its
 /// final component row to avoid converting padding requests again.
 /// WebP encodes from one buffer, so it holds the whole converted
 /// image, unless full-size contiguous RGBA can be borrowed with alpha kept.
-/// Lossless WebP uses three channels with alpha discarded; lossy WebP
-/// uses four with opaque alpha. Both WebP formats buffer the complete encoded
+/// Lossless WebP uses three channels when the source has no alpha or alpha is
+/// discarded. Lossy WebP uses four channels, with opaque alpha in those cases.
+/// Both WebP formats buffer the complete encoded
 /// image before writing it. Codec state and encoded output take memory besides.
 /// Each concurrent encode owns its own buffers, so worker and queue limits
 /// matter alongside compressed image size.
@@ -286,7 +305,7 @@ image_format_variants!(
 /// | A lossy WebP quality outside 0 to 100 | [`Error::InvalidInput`] |
 /// | A lossy WebP effort outside 0 to 6 | [`Error::InvalidInput`] |
 /// | JPEG or WebP with [`SampleDepth::Sixteen`] | [`Error::InvalidInput`] |
-/// | JPEG or WebP with [`HdrPolicy::CodeValues`] for a PQ or HLG frame | [`Error::InvalidInput`] |
+/// | JPEG or WebP for a frame that needs a color tag (BT.2020 primaries, or PQ or HLG with [`HdrPolicy::CodeValues`]) | [`Error::InvalidInput`] |
 /// | A PQ or HLG frame with [`HdrPolicy::Refuse`] | [`Error::InvalidFrame`] |
 /// | Unreadable `ndi_color_info` with [`ColorPolicy::Sdk`] | [`Error::InvalidFrame`] |
 /// | An image wider or taller than JPEG's 65,535, lossless WebP's 16,384 or lossy WebP's 16,383 pixels | [`Error::InvalidFrame`] |
@@ -491,7 +510,7 @@ pub enum ColorPolicy {
     ///
     /// RGB-received frames already hold the SDK's BT.709 limited-range
     /// conversion, which ignores the tag; this policy cannot apply its matrix
-    /// afterward. Tags still decide HDR refusal and the PNG `cICP` chunk.
+    /// afterward. Tags still govern color admission and the PNG `cICP` chunk.
     /// See [the color guidance](ImageOptions#color) for receiving YUV when the
     /// tag's matrix matters, including sources with alpha.
     ///
@@ -568,8 +587,9 @@ impl SampleDepth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum AlphaMode {
-    /// Write RGBA. A source with alpha keeps it, converted to the image's
-    /// depth; one without gets alpha 255, or 65535 at 16 bits.
+    /// Keep the source's alpha, converted to the image's depth. PNG and
+    /// lossless WebP use RGBA for a source with alpha and RGB otherwise.
+    /// Lossy WebP's encoder takes RGBA, using opaque alpha for an opaque source.
     /// Colors are treated as straight (not premultiplied by alpha), and PNG
     /// and WebP store straight alpha. The [SDK frame-type reference] documents
     /// this for BGRA and RGBA. It does not specify the convention for UYVA,
@@ -592,13 +612,17 @@ impl AlphaMode {
 }
 
 /// What happens to a frame whose `ndi_color_info` gives the PQ or HLG
-/// transfer function.
+/// transfer function. Frames with BT.2020 primaries or either HDR transfer
+/// need a color tag, which the encoder can write only in PNG.
 ///
-/// | The frame's transfer | [`HdrPolicy::Refuse`] | [`HdrPolicy::CodeValues`] |
-/// |---|---|---|
-/// | None, `bt_601`, `bt_709` or `bt_2020` | Encoded | Encoded |
-/// | `bt_2100_pq` | [`Error::InvalidFrame`] | PNG of the PQ code values, tagged |
-/// | `bt_2100_hlg` | [`Error::InvalidFrame`] | PNG of the HLG code values, tagged |
+/// | The frame's primaries | The frame's transfer | [`HdrPolicy::Refuse`] | [`HdrPolicy::CodeValues`] |
+/// |---|---|---|---|
+/// | Unspecified, BT.601 or BT.709 | Unspecified or SDR | Every format, untagged | Every format, untagged |
+/// | BT.2020 | Unspecified or SDR | PNG, tagged | PNG, tagged |
+/// | Any | PQ or HLG | [`Error::InvalidFrame`] | PNG of the code values, tagged |
+///
+/// When PNG is required, JPEG and WebP return [`Error::InvalidInput`]
+/// with [`InputDefect::ColorTagNeedsPng`](crate::InputDefect::ColorTagNeedsPng).
 ///
 /// The check applies to every pixel format, RGB as well as YUV. The encoder
 /// does not tone-map. A program that wants an SDR rendering of HDR video
@@ -610,6 +634,7 @@ impl AlphaMode {
 /// without a breaking change.
 ///
 /// [`Error::InvalidFrame`]: crate::Error::InvalidFrame
+/// [`Error::InvalidInput`]: crate::Error::InvalidInput
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum HdrPolicy {
@@ -628,9 +653,7 @@ pub enum HdrPolicy {
     /// [`ReceiverColorFormat::Best`](crate::ReceiverColorFormat::Best) to keep
     /// them. The tag still decides HDR refusal and the PNG `cICP` chunk.
     ///
-    /// JPEG and WebP refuse such a frame with
-    /// [`Error::InvalidInput`](crate::Error::InvalidInput): this encoder only
-    /// writes the required HDR color tag in PNG.
+    /// JPEG and WebP refuse such a frame with [`Error::InvalidInput`](crate::Error::InvalidInput).
     CodeValues,
 }
 
@@ -672,7 +695,22 @@ pub enum Downscale {
     Eighth,
 }
 
+crate::media::decoded_variants!(Downscale: Off, Half, Quarter, Eighth);
+
 impl Downscale {
+    pub(super) const MAX_SHIFT: u32 = {
+        let mut max = 0;
+        let mut index = 0;
+        while index < Self::ALL.len() {
+            let shift = Self::ALL[index].shift();
+            if shift > max {
+                max = shift;
+            }
+            index += 1;
+        }
+        max
+    };
+
     /// log2 of the factor.
     pub(super) const fn shift(self) -> u32 {
         match self {

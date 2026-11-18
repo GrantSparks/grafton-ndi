@@ -6,12 +6,15 @@
 //! it returns the rejected module again instead of searching its path.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
-#[path = "support/fixture.rs"]
-mod fixture;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child, fixture);
+use common::TestChild;
+
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use fixture::FixtureDir;
 use grafton_ndi::{
     capabilities::SdkEdition, runtime::RuntimeOptions, Error, LibraryKind, LoadFailure, LoadOrigin,
     LoadRefusal, Ndi,
@@ -20,7 +23,6 @@ use runtime_fixture::FakeRuntime;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 /// The name the Standard runtime is searched for and carries as its SONAME.
@@ -52,7 +54,7 @@ fn loader_search_reports_what_the_platform_resolved() {
         child(&name, &root);
         return;
     }
-    let fixtures = FixtureDir::create("shadow");
+    let fixtures = common::FixtureDir::create("shadow");
     let root = fixtures.path();
     for directory in ["rejected", "anchorless", "usable"] {
         fs::create_dir(root.join(directory)).unwrap();
@@ -77,13 +79,8 @@ fn loader_search_reports_what_the_platform_resolved() {
     runtime_fixture::run(rustc, &anchorless);
 
     for (scenario, runtime_directory, loader_directory) in SCENARIOS {
-        let mut command = Command::new(std::env::current_exe().unwrap());
+        let mut command = TestChild::new("loader_search_reports_what_the_platform_resolved");
         command
-            .args([
-                "--exact",
-                "loader_search_reports_what_the_platform_resolved",
-                "--nocapture",
-            ])
             .env("GRAFTON_SHADOW_CHILD", scenario)
             .env("GRAFTON_SHADOW_FIXTURES", root)
             .env_remove("NDI_RUNTIME_DIR_V6")
@@ -91,13 +88,7 @@ fn loader_search_reports_what_the_platform_resolved() {
         if let Some(directory) = runtime_directory {
             command.env("NDI_RUNTIME_DIR_V6", root.join(directory));
         }
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{scenario}: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        command.run();
     }
 }
 

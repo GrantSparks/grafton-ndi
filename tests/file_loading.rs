@@ -3,12 +3,15 @@
 //! library stays selected and loaded for the life of the process.
 #![cfg(all(target_os = "linux", not(ndi_link_static), feature = "file-io"))]
 
-#[path = "support/fixture.rs"]
-mod fixture;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child, fixture);
+use common::TestChild;
+
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use fixture::FixtureDir;
 use grafton_ndi::{
     capabilities::{CapabilityUnavailable, SdkEdition},
     file::{
@@ -17,11 +20,10 @@ use grafton_ndi::{
     runtime::RuntimeOptions,
     Error, LibraryKind, LoadFailure, LoadOrigin, LoadRefusal, Ndi, SelectionConflict,
 };
-use runtime_fixture::FakeRuntime;
+use runtime_fixture::{read_fake_log, FakeRuntime};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 /// The library names the loader searches for on this target. The vendor's
@@ -166,6 +168,7 @@ const fn scenario(name: &'static str) -> Scenario {
 
 const SCENARIOS: &[Scenario] = &[
     scenario("relative_path_selects_nothing"),
+    scenario("explicit_path_is_exclusive"),
     Scenario {
         runtime_directory: Some("runtime"),
         ..scenario("beside_the_runtime_first_and_pinned")
@@ -198,12 +201,11 @@ fn file_library_loader_contract() {
         child(&name, &Fixtures { root });
         return;
     }
-    let directory = FixtureDir::create("file-loader");
+    let directory = common::FixtureDir::create("file-loader");
     let fixtures = Fixtures::build(directory.path());
     for scenario in SCENARIOS {
-        let mut command = Command::new(std::env::current_exe().unwrap());
+        let mut command = TestChild::new("file_library_loader_contract");
         command
-            .args(["--exact", "file_library_loader_contract", "--nocapture"])
             .env("GRAFTON_FILE_LOADER_CHILD", scenario.name)
             .env("GRAFTON_FILE_LOADER_FIXTURES", directory.path())
             .env_remove("NDI_RUNTIME_DIR_V6")
@@ -218,14 +220,7 @@ fn file_library_loader_contract() {
         if let Some(arrangement) = scenario.preloaded {
             command.env("LD_PRELOAD", fixtures.core(arrangement));
         }
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}: {}\n{}",
-            scenario.name,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        command.run();
     }
 }
 
@@ -293,6 +288,21 @@ fn child(name: &str, fixtures: &Fixtures) {
                 Err(Error::InvalidInput(_))
             ));
             assert!(!is_loaded("libndifile.so.6"));
+            let api = FileApi::new(&ndi, &defaults).unwrap();
+            assert_eq!(bound_runtime(&api), PAIRED.build);
+        }
+        "explicit_path_is_exclusive" => {
+            let ndi = select(fixtures, &PAIRED);
+            let absent = fixtures.root.join("missing").join(FILE_LIBRARY);
+            let refusal = unavailable(FileApi::new(&ndi, &explicit(absent.clone())));
+            assert!(!refusal.loaded_any());
+            let [attempt] = refusal.attempts() else {
+                panic!("expected only the explicit attempt, got {refusal}");
+            };
+            assert_eq!(attempt.location(), absent);
+            assert_eq!(attempt.origin(), LoadOrigin::Explicit);
+            assert_eq!(attempt.refusal(), &LoadRefusal::Absent);
+            assert!(!is_loaded(FILE_LIBRARY));
             let api = FileApi::new(&ndi, &defaults).unwrap();
             assert_eq!(bound_runtime(&api), PAIRED.build);
         }
@@ -524,10 +534,8 @@ fn child(name: &str, fixtures: &Fixtures) {
             wait_for(|| !Ndi::is_running());
             // Stopping is already not running, before the native destroy
             // callback has necessarily appended its evidence.
-            wait_for(|| {
-                fs::read_to_string(&log).is_ok_and(|log| log.lines().any(|line| line == "destroy"))
-            });
-            let log = fs::read_to_string(log).unwrap();
+            wait_for(|| read_fake_log().lines().any(|line| line == "destroy"));
+            let log = read_fake_log();
             assert_eq!(log.lines().filter(|line| *line == "initialize").count(), 1);
             assert_eq!(log.lines().filter(|line| *line == "destroy").count(), 1);
         }

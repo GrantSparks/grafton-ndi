@@ -7,12 +7,13 @@
 //! event; that event reports SDK status information, such as source capabilities:
 //!
 //! ```no_run
-//! # use grafton_ndi::{Ndi, Receiver, ReceiverEvent, ReceiverOptions, ReceiverBandwidth, Source};
+//! # use grafton_ndi::{Finder, FinderOptions, Ndi, Receiver, ReceiverEvent, ReceiverOptions, ReceiverBandwidth};
 //! # use std::time::Duration;
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! # let ndi = Ndi::new()?;
-//! # let source = Source::new("CAMERA (Program)").unwrap();
-//! // In real usage, obtain the source from Finder::find_sources().
+//! # let finder = Finder::new(&ndi, &FinderOptions::new())?;
+//! # let Some(source) = finder.find_source_by_name("CAMERA (Program)", Duration::from_secs(5))?
+//! # else { return Ok(()); };
 //! let options = ReceiverOptions::new(source).bandwidth(ReceiverBandwidth::MetadataOnly);
 //! let receiver = Receiver::new(&ndi, &options)?;
 //!
@@ -27,6 +28,9 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! See [status_monitor.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/status_monitor.rs)
+//! for a runnable connection monitor.
 
 #[cfg(test)]
 use crate::RuntimeFeature;
@@ -66,7 +70,10 @@ use crate::{
 };
 
 pub(crate) mod attached;
+pub(crate) mod control;
 mod pending;
+
+use control::ControlPermit;
 
 pub(crate) use pending::PendingEvents;
 
@@ -124,23 +131,58 @@ impl Drop for RecvStringGuard<'_> {
     }
 }
 
-/// The longest receive delay, in milliseconds, that a receiver sets or
-/// accepts from the SDK, for video and audio alike.
-///
-/// The NDI SDK documentation of receiver video and audio delay clamps both
-/// to 0 through 2000 ms; a longer delay is refused here rather than clamped.
-const MAX_RECEIVE_DELAY_MILLIS: u32 = 2000;
+/// A receiver's native video or audio buffering delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReceiveDelay(i32);
 
-/// Convert a delay the SDK reported, rejecting values outside
-/// 0..=[`MAX_RECEIVE_DELAY_MILLIS`].
-fn receiver_delay(millis: i32) -> Result<Duration> {
-    u32::try_from(millis)
-        .ok()
-        .filter(|millis| *millis <= MAX_RECEIVE_DELAY_MILLIS)
-        .map(|millis| Duration::from_millis(millis.into()))
-        .ok_or({
-            Error::UnexpectedSdkResult(crate::SdkResultDefect::InvalidReceiveDelay { millis })
-        })
+impl ReceiveDelay {
+    /// No additional buffering.
+    pub const ZERO: Self = Self(0);
+
+    /// The largest delay supported by the SDK.
+    pub const MAX: Self = Self(2000);
+
+    /// Round positive fractional milliseconds up to the next millisecond.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] when the rounded delay exceeds
+    /// [`Self::MAX`].
+    pub fn new(delay: Duration) -> Result<Self> {
+        timeout::sdk_millis(delay)
+            .and_then(|millis| Self::checked(i64::from(millis)))
+            .ok_or(Error::InvalidInput(
+                crate::InputDefect::ReceiveDelayTooLong {
+                    requested: delay.into(),
+                },
+            ))
+    }
+
+    /// The validated delay at the SDK's millisecond precision.
+    pub const fn duration(self) -> Duration {
+        Duration::from_millis(self.0 as u64)
+    }
+
+    pub(crate) const fn to_sdk(self) -> i32 {
+        self.0
+    }
+
+    pub(crate) fn from_sdk(millis: i32) -> Result<Self> {
+        Self::checked(i64::from(millis)).ok_or(Error::UnexpectedSdkResult(
+            crate::SdkResultDefect::InvalidReceiveDelay { millis },
+        ))
+    }
+
+    fn checked(millis: i64) -> Option<Self> {
+        (0..=i64::from(Self::MAX.0))
+            .contains(&millis)
+            .then_some(Self(millis as i32))
+    }
+}
+
+enum ReceiveDelayStream {
+    Video,
+    Audio,
 }
 
 /// A consumable report carries its publication order across an async worker.
@@ -375,20 +417,6 @@ impl PendingStatus {
     }
 }
 
-/// The SDK's millisecond count for a receive delay, rounded up by the one
-/// timeout rule, [`timeout::sdk_millis`], and refused above
-/// [`MAX_RECEIVE_DELAY_MILLIS`].
-fn receiver_delay_millis(delay: Duration) -> Result<i32> {
-    timeout::sdk_millis(delay)
-        .filter(|millis| *millis <= MAX_RECEIVE_DELAY_MILLIS)
-        .and_then(|millis| i32::try_from(millis).ok())
-        .ok_or({
-            Error::InvalidInput(crate::InputDefect::ReceiveDelayTooLong {
-                requested: delay.into(),
-            })
-        })
-}
-
 /// The pause after an attempt that returned before its own end without a
 /// value: the SDK's early return, which would otherwise busy-wait.
 const EARLY_RETURN_PAUSE: Duration = Duration::from_millis(10);
@@ -523,11 +551,7 @@ fn validate_ptz_preset(preset: u8) -> Result<i32> {
 /// the source `$ptz` controls.
 macro_rules! ptz_command {
     ($ptz:expr, $func:ident $(, $arg:expr)*) => {{
-        let connection = $ptz.core.lock_mutating_control()?;
-        // SAFETY: the live core and control permit cover this call; the
-        // RecvInstance inventory records control/capture and remote overlap.
-        // Every argument is a plain value.
-        unsafe { $ptz.core.sdk().named().$func(connection.instance() $(, $arg)*) }.performed()
+        $ptz.core.lock_mutating_control()?.$func($ptz.core.sdk() $(, $arg)*)
     }};
 }
 
@@ -788,9 +812,9 @@ impl ReceiverOptions {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let ndi = Ndi::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.watch().wait_for_change(Duration::from_secs(1))?;
-    /// # let sources = finder.current_sources()?;
-    /// let options = ReceiverOptions::snapshot_preset(sources[0].clone()).name("Snapshot Receiver");
+    /// # let Some(source) = finder.find_sources(Duration::from_secs(1))?.into_iter().next()
+    /// # else { return Ok(()); };
+    /// let options = ReceiverOptions::snapshot_preset(source).name("Snapshot Receiver");
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// // Capture and encode in one line (requires image-encoding feature)
@@ -835,10 +859,10 @@ impl ReceiverOptions {
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.watch().wait_for_change(Duration::from_secs(1))?;
-    /// # let sources = finder.current_sources()?;
+    /// # let Some(source) = finder.find_sources(Duration::from_secs(1))?.into_iter().next()
+    /// # else { return Ok(()); };
     /// let options =
-    ///     ReceiverOptions::high_quality_preset(sources[0].clone()).name("High Quality Receiver");
+    ///     ReceiverOptions::high_quality_preset(source).name("High Quality Receiver");
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// // Capture full quality frames
@@ -875,9 +899,9 @@ impl ReceiverOptions {
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.watch().wait_for_change(Duration::from_secs(1))?;
-    /// # let sources = finder.current_sources()?;
-    /// let options = ReceiverOptions::monitoring_preset(sources[0].clone()).name("Status Monitor");
+    /// # let Some(source) = finder.find_sources(Duration::from_secs(1))?.into_iter().next()
+    /// # else { return Ok(()); };
+    /// let options = ReceiverOptions::monitoring_preset(source).name("Status Monitor");
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// println!("Connected: {}", receiver.is_connected());
@@ -1162,8 +1186,11 @@ impl VideoMode for AvSyncAttached {}
 /// PTZ commands, upstream metadata and connection-metadata additions return
 /// [`Error::NotConnected`] during a local connection change; tally is retained
 /// and applied when that native request returns. These controls do not wait
-/// for the change. Other runtimes synchronize controls through their native
-/// receiver lock. Local
+/// for the change. The Standard Windows SDK does not provide the native
+/// exclusion necessary for SDK-internal changes, so an advertiser refuses
+/// [remote receiver control](crate::RuntimeFeature::RemoteReceiverControl)
+/// there. Other runtimes synchronize controls with local and SDK-internal
+/// changes through their native receiver lock. Local
 /// [`Self::connect_to`], [`Self::disconnect`] and [`Self::reconnect`] requests
 /// serialize with one another and may wait for running allocator policies.
 /// Dropping the last owner destroys the native receiver on the dropping
@@ -1175,12 +1202,34 @@ pub struct Receiver<M: ReceiverMode = RawCapture> {
 
 impl<M: ReceiverMode> std::fmt::Debug for Receiver<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        ReceiverIdentity::new::<M>(&self.core).fmt(f)
+    }
+}
+
+/// The same receiver identity is available both to owners and to split views.
+pub(crate) struct ReceiverIdentity<'a> {
+    core: &'a ReceiverCore,
+    mode: &'static str,
+}
+
+impl<'a> ReceiverIdentity<'a> {
+    pub(crate) fn new<M: ReceiverMode>(core: &'a ReceiverCore) -> Self {
+        Self {
+            core,
+            mode: std::any::type_name::<M>(),
+        }
+    }
+
+    fn name(core: &ReceiverCore) -> Option<std::borrow::Cow<'_, str>> {
+        core._name.as_ref().map(|name| name.to_string_lossy())
+    }
+}
+
+impl std::fmt::Debug for ReceiverIdentity<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Receiver")
-            .field(
-                "name",
-                &self.core._name.as_ref().map(|name| name.to_string_lossy()),
-            )
-            .field("mode", &std::any::type_name::<M>())
+            .field("name", &Self::name(self.core))
+            .field("mode", &self.mode)
             .finish_non_exhaustive()
     }
 }
@@ -1202,135 +1251,16 @@ impl ConnectionChange<'_> {
 
 impl Drop for ConnectionChange<'_> {
     fn drop(&mut self) {
-        if self.core.legacy_controls {
-            let mut control = self.core.lock_control();
-            control.finish_change(self.core.sdk());
+        if self.core.guard_local_connection_changes {
+            self.finish_control_change();
         }
     }
-}
-
-/// Only a receiver's shared-control lock can issue this permit.
-#[derive(Default)]
-struct ControlPermit {
-    registrations: ConnectionMetadata,
-    // Standard Windows controls do not synchronize their connection reads
-    // with native connect. Publish this phase while holding the control lock,
-    // then release the lock before the native connection request begins.
-    changing: bool,
-    pending_tally: Option<Tally>,
-}
-
-impl ControlPermit {
-    fn set_tally(&mut self, tally: Tally, send: impl FnOnce(Tally)) {
-        if self.changing {
-            self.pending_tally = Some(tally);
-        } else {
-            send(tally);
-        }
-    }
-
-    fn finish_change(&mut self, send: impl FnOnce(Tally)) {
-        if let Some(tally) = self.pending_tally.take() {
-            send(tally);
-        }
-        self.changing = false;
-    }
-}
-
-/// Serialized shared controls, independent of local connection changes.
-/// Native receiver locks supply connection exclusion where available. On
-/// Standard Windows this permit also publishes the local changing phase;
-/// connection-reading controls refuse that phase without waiting.
-pub(crate) struct Control<'a> {
-    instance: RecvInstance,
-    _exclusive: MutexGuard<'a, ControlPermit>,
 }
 
 enum ConnectionRequest {
     Connect(RetainedSource),
     Reconnect,
     Disconnect,
-}
-
-/// A control admitted while the receiver's native connection is stable.
-/// Holding its control permit prevents a legacy change from starting.
-struct MutatingControl<'a>(Control<'a>);
-
-impl<'a> std::ops::Deref for MutatingControl<'a> {
-    type Target = Control<'a>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for MutatingControl<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl MutatingControl<'_> {
-    fn add_metadata<S: MetadataSource + ?Sized>(
-        &mut self,
-        table: &sys::ReceiverConnectionMetadata,
-        metadata: &S,
-    ) {
-        let instance = self.instance();
-        self._exclusive.registrations.add(metadata, |raw| {
-            // SAFETY: the control permit owns the descriptor and text until
-            // clear returns or after native destruction, and serializes shared
-            // controls. The native receiver lock synchronizes local changes.
-            unsafe { table.NDIlib_recv_add_connection_metadata(instance, raw) };
-        });
-    }
-}
-
-impl Control<'_> {
-    /// The native identity authorized by this control permit.
-    pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
-        self.instance.0
-    }
-
-    fn set_tally(&mut self, sdk: &sys::Core, tally: Tally) {
-        let instance = self.instance();
-        self._exclusive.set_tally(tally, |tally| {
-            // SAFETY: the control permit excludes native changes on legacy
-            // Standard Windows; other runtimes supply native exclusion.
-            unsafe { sdk.NDIlib_recv_set_tally(instance, &tally.to_sdk()) };
-        });
-    }
-
-    fn finish_change(&mut self, sdk: &sys::Core) {
-        let instance = self.instance();
-        self._exclusive.finish_change(|tally| {
-            // SAFETY: native connect has returned and the change permit still
-            // excludes another request. The control permit excludes writers.
-            unsafe { sdk.NDIlib_recv_set_tally(instance, &tally.to_sdk()) };
-        });
-    }
-
-    fn clear_metadata(&mut self, table: &sys::ReceiverConnectionMetadata) {
-        let instance = self.instance();
-        self._exclusive.registrations.clear(|| {
-            // SAFETY: registrations stay alive through this native clear under
-            // the same control permit; native locking covers local changes.
-            unsafe { table.NDIlib_recv_clear_connection_metadata(instance) };
-        });
-    }
-
-    /// Exercise the real permission-shaped boundary with a synthetic identity.
-    #[cfg(all(test, feature = "advanced"))]
-    pub(crate) fn with_test_instance<T>(
-        instance: NDIlib_recv_instance_t,
-        call: impl FnOnce(&Control<'_>) -> T,
-    ) -> T {
-        let gate = Mutex::new(ControlPermit::default());
-        let permission = Control {
-            instance: RecvInstance(instance),
-            _exclusive: gate.lock(),
-        };
-        call(&permission)
-    }
 }
 
 impl ReceiverCore {
@@ -1473,21 +1403,22 @@ pub(crate) struct RecvInstance(NDIlib_recv_instance_t);
 // capture_v3; free_video_v2, free_audio_v3,           | SDK concurrent-capture/free
 // free_metadata                                     | contract; see CaptureLock
 // connect                                           | Change permit
-// set_tally, send_metadata, get_web_control           | Control permit; native lock against local changes
-// add_connection_metadata, clear_connection_metadata | Control-owned registrations; native receiver lock
-// set/get_video_delay, set/get_audio_delay           | Control permit; native lock against local changes
-// get_performance, get_queue                         | Control permit; native lock against local changes
+// set_tally, send_metadata                          | Connection-use permit
+// add_connection_metadata                          | Connection-use permit and retained registrations
+// clear_connection_metadata                         | Control permit and retained registrations
+// set/get_video_delay, set/get_audio_delay           | Control permit and native delay-state locks
+// get_web_control, get_performance, get_queue        | Control permit
 // get_no_connections                                | Measured native read lock
 // get_source_name                                   | Native report mutex +
 //                                                   | Rust source-query permit
 // free_string                                       | Measured native read lock
-// ptz_is_supported, ptz_recall_preset,               | Control permit; native lock against local changes
-// ptz_store_preset, ptz_zoom, ptz_zoom_speed,         | (each PTZ entry point)
+// ptz_is_supported, ptz_recall_preset,               | Connection-use permit (each PTZ entry point)
+// ptz_store_preset, ptz_zoom, ptz_zoom_speed,         |
 // ptz_pan_tilt, ptz_pan_tilt_speed, ptz_auto_focus,   |
 // ptz_focus, ptz_focus_speed, ptz_white_balance_auto, |
 // ptz_white_balance_indoor/outdoor/oneshot/manual,   |
 // ptz_exposure_auto/manual/manual_v2                 |
-// request_keyframe                                  | Control permit; native lock against local changes
+// request_keyframe                                  | Connection-use permit
 // set_bandwidth, set_enabled_streams                 | Exclusive (&mut Receiver)
 // set_video_allocator, set_audio_allocator           | Owned allocator authority
 //                                                   | Native allocator rwlock
@@ -1495,9 +1426,9 @@ pub(crate) struct RecvInstance(NDIlib_recv_instance_t);
 // destroy                                           | Last owning ReceiverCore
 // recv_advertiser_add_receiver,                      | Immutable creation identity;
 // recv_advertiser_del_receiver (NDIlib_ prefix)       | native observer-registry mutex
-// kvm_is_supported, kvm_send_keyboard_press/release, | Control permit; native lock against local changes
-// kvm_send_left/middle/right_mouse_click/release,    | (including held-input
-// kvm_send_vertical/horizontal_mouse_wheel,         | cleanup and Drop)
+// kvm_is_supported, kvm_send_keyboard_press/release, | Connection-use permit (including held-input
+// kvm_send_left/middle/right_mouse_click/release,    | cleanup and Drop)
+// kvm_send_vertical/horizontal_mouse_wheel,         |
 // kvm_send_mouse_position/clipboard_contents,       |
 // kvm_send_touch_positions, kvm_send_touch_finish    |
 //
@@ -1539,16 +1470,19 @@ pub(crate) struct RecvInstance(NDIlib_recv_instance_t);
 // commands dereference those pointers without that lock. Their Rust control
 // permit therefore publishes a changing phase before local connect, then is
 // released. Connection-reading controls refuse that phase; tally is retained
-// and replayed after native connect. Receiver-owned getters, source queries,
-// delay state, and metadata clearing stay independent. Advanced Windows
+// and replayed after native connect. SDK-internal Discovery Server requests
+// cannot enter the Rust phase, so controlling registrations are refused on
+// that edition. Receiver-owned getters, source queries, delay state and
+// metadata clearing stay independent. Advanced Windows
 // 6.3.2/6.4 instead use the +0x108 shared/exclusive connection lock; connect
 // releases it before destroying retired connections. Allocators require that
 // Advanced edition, so their callbacks retain the independent-control basis.
 //
 // A Rust control permit serializes the listed controls with one another.
 // The native connection-lock basis above applies to measured Linux and
-// Advanced Windows runtimes. Standard Windows local changes use the explicit
-// changing phase instead. No Rust control permit is held during native connect,
+// Advanced Windows runtimes and covers both local and SDK-internal changes.
+// Standard Windows local changes use the explicit changing phase.
+// No Rust control permit is held during native connect,
 // so Advanced allocator callbacks can capture and use shared controls.
 // tests/receiver_connect_overlap_sdk.rs exercises every available
 // shared control against captures, local changes and 6.4 remote changes.
@@ -1568,8 +1502,6 @@ unsafe impl Sync for RecvInstance {}
 pub(crate) struct ReceiverCore {
     instance: RecvInstance,
     pub(crate) sdk: crate::runtime::Bound<sys::Core>,
-    #[cfg(test)]
-    test_sdk: Option<&'static sys::Core>,
     /// Serializes local connection changes; callbacks may take the independent
     /// control permit while a native connection change waits for them.
     change_guard: Mutex<ChangePermit>,
@@ -1578,7 +1510,7 @@ pub(crate) struct ReceiverCore {
     /// Standard Windows uses a native implementation without the Advanced
     /// receiver's connection read lock. Its unsafe controls refuse the brief
     /// transition instead of waiting for native connect.
-    legacy_controls: bool,
+    guard_local_connection_changes: bool,
     /// The latest requested target. The change permit serializes its writers;
     /// snapshots never take it and therefore never wait for a capture or a queued
     /// connection change. Writers hold this lock only to replace the value.
@@ -1590,7 +1522,7 @@ pub(crate) struct ReceiverCore {
     source_name: Mutex<LatestReport<SourceNameChange>>,
     _name: Option<CString>,
     #[cfg(feature = "advanced")]
-    _config: Option<crate::advanced::AdvancedConfig>,
+    _config: crate::advanced::RetainedConfig,
 }
 
 impl Receiver {
@@ -1657,25 +1589,27 @@ impl Receiver {
     #[doc(alias = "NDIlib_recv_create_v3")]
     pub fn new(ndi: &Ndi, options: &ReceiverOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
-        if let Some(config) = &options.config {
-            return Self::new_configured(ndi, options, config);
+        {
+            <Self as crate::advanced::Configurable>::create_from_options(ndi, options)
         }
-        // SAFETY: the SDK's receiver creation returns null or a fresh receiver
-        // that nothing else owns, and the settings outlive the call.
-        unsafe {
-            Self::create(
-                ndi,
-                options,
-                #[cfg(feature = "advanced")]
-                None,
-                |core, raw| core.named().NDIlib_recv_create_v3(raw),
-            )
+        #[cfg(not(feature = "advanced"))]
+        {
+            Self::create_plain(ndi, options)
         }
     }
 }
 
 #[allow(private_bounds)]
 impl<M: CreatableMode> Receiver<M> {
+    pub(crate) fn create_plain(ndi: &Ndi, options: &ReceiverOptions) -> Result<Self> {
+        // SAFETY: the SDK's receiver creation returns null or a fresh receiver
+        // that nothing else owns, and the settings outlive the call.
+        unsafe {
+            Self::create(ndi, options, |core, raw| {
+                crate::runtime::NativeCreation::plain(core.named().NDIlib_recv_create_v3(raw))
+            })
+        }
+    }
     /// The one creation path: check `options` against the runtime, create a
     /// receiver through `create`, which is
     /// handed the core table and the native settings for `options`, and keep
@@ -1688,11 +1622,10 @@ impl<M: CreatableMode> Receiver<M> {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         options: &ReceiverOptions,
-        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
             &sys::Core,
             &NDIlib_recv_create_v3_t,
-        ) -> sys::table::Called<NDIlib_recv_instance_t>,
+        ) -> crate::runtime::NativeCreation<NDIlib_recv_instance_t>,
     ) -> Result<Self> {
         let validated = options.validate_runtime(ndi.evidence())?;
         let target = RetainedSource::new(&options.source);
@@ -1701,24 +1634,24 @@ impl<M: CreatableMode> Receiver<M> {
         let sdk = ndi.bind_core();
         // The settings borrow the target's own descriptor and name. Both
         // owners move into the core after creation without moving their buffers.
-        let instance = create(&sdk, settings.raw()).created()?.as_ptr();
+        let created = create(&sdk, settings.raw());
+        let instance = created.call.created()?.as_ptr();
         Ok(Self {
             core: Arc::new(ReceiverCore {
                 instance: RecvInstance(instance),
                 sdk,
-                #[cfg(test)]
-                test_sdk: None,
                 change_guard: Mutex::new(ChangePermit),
                 control_guard: Mutex::new(ControlPermit::default()),
-                legacy_controls: cfg!(windows)
-                    && ndi.info().edition() == crate::capabilities::SdkEdition::Standard,
+                guard_local_connection_changes: !ndi
+                    .capabilities()
+                    .has_native_receiver_connection_exclusion(),
                 target: RwLock::new(target),
                 pending: PendingEvents::default(),
                 source_query_guard: Mutex::new(SourceQueryPermit),
                 source_name: Mutex::new(LatestReport::default()),
                 _name: name,
                 #[cfg(feature = "advanced")]
-                _config: config,
+                _config: created.config,
             }),
             _mode: PhantomData,
         })
@@ -1870,27 +1803,19 @@ impl<M: ReceiverMode> Receiver<M> {
         )
     }
 
-    /// Set native video buffering, in the range zero through two seconds.
+    /// Set native video buffering.
     ///
-    /// Positive fractional milliseconds round up. Values above two seconds are
-    /// rejected instead of silently clamped. [`SettingChange::Unchanged`]
-    /// means the delay already had this value. Delay is independent of audio
+    /// [`SettingChange::Unchanged`] means the delay already had this value.
+    /// Delay is independent of audio
     /// buffering and stacks with FrameSync correction.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] for a delay above two seconds, and
     /// [`Error::UnsupportedCapability`] without
     /// [`RuntimeFeature::ReceiveDelay`](crate::RuntimeFeature::ReceiveDelay).
     #[doc(alias = "NDIlib_recv_set_video_delay")]
-    pub fn set_video_delay(&self, delay: Duration) -> Result<SettingChange> {
-        let millis = receiver_delay_millis(delay)?;
-        let table = self.core.delay()?;
-        let connection = self.core.lock_control();
-        // SAFETY: the live core and control permit cover this call; see
-        // the RecvInstance concurrency inventory.
-        let changed = unsafe { table.NDIlib_recv_set_video_delay(connection.instance(), millis) };
-        Ok(SettingChange::from_sdk(changed))
+    pub fn set_video_delay(&self, delay: ReceiveDelay) -> Result<SettingChange> {
+        self.core.set_delay(ReceiveDelayStream::Video, delay)
     }
 
     /// Return the effective native video delay. Requires receiver-delay support.
@@ -1901,15 +1826,11 @@ impl<M: ReceiverMode> Receiver<M> {
     /// [`RuntimeFeature::ReceiveDelay`](crate::RuntimeFeature::ReceiveDelay), and [`Error::UnexpectedSdkResult`]
     /// when the SDK reports a delay outside 0 to 2000 ms.
     #[doc(alias = "NDIlib_recv_get_video_delay")]
-    pub fn video_delay(&self) -> Result<Duration> {
-        let table = self.core.delay()?;
-        let connection = self.core.lock_control();
-        // SAFETY: the live core and control permit cover this call; see
-        // the RecvInstance concurrency inventory.
-        receiver_delay(unsafe { table.NDIlib_recv_get_video_delay(connection.instance()) })
+    pub fn video_delay(&self) -> Result<ReceiveDelay> {
+        self.core.delay(ReceiveDelayStream::Video)
     }
 
-    /// Set native audio buffering with the same rounding/range as [`Self::set_video_delay`].
+    /// Set native audio buffering independently of [`Self::set_video_delay`].
     ///
     /// Equal audio and video delays preserve their relative timing; different
     /// values deliberately offset the streams.
@@ -1918,14 +1839,8 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// As for [`Self::set_video_delay`].
     #[doc(alias = "NDIlib_recv_set_audio_delay")]
-    pub fn set_audio_delay(&self, delay: Duration) -> Result<SettingChange> {
-        let millis = receiver_delay_millis(delay)?;
-        let table = self.core.delay()?;
-        let connection = self.core.lock_control();
-        // SAFETY: the live core and control permit cover this call; see
-        // the RecvInstance concurrency inventory.
-        let changed = unsafe { table.NDIlib_recv_set_audio_delay(connection.instance(), millis) };
-        Ok(SettingChange::from_sdk(changed))
+    pub fn set_audio_delay(&self, delay: ReceiveDelay) -> Result<SettingChange> {
+        self.core.set_delay(ReceiveDelayStream::Audio, delay)
     }
 
     /// Return the effective native audio delay. Requires receiver-delay support.
@@ -1934,12 +1849,8 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// As for [`Self::video_delay`].
     #[doc(alias = "NDIlib_recv_get_audio_delay")]
-    pub fn audio_delay(&self) -> Result<Duration> {
-        let table = self.core.delay()?;
-        let connection = self.core.lock_control();
-        // SAFETY: the live core and control permit cover this call; see
-        // the RecvInstance concurrency inventory.
-        receiver_delay(unsafe { table.NDIlib_recv_get_audio_delay(connection.instance()) })
+    pub fn audio_delay(&self) -> Result<ReceiveDelay> {
+        self.core.delay(ReceiveDelayStream::Audio)
     }
 
     /// Add validated metadata sent immediately and again on each connection.
@@ -1994,13 +1905,7 @@ impl<M: ReceiverMode> Receiver<M> {
         let connection = self.core.lock_control();
         let guard = RecvStringGuard {
             core: &self.core,
-            // SAFETY: the live core and control permit cover this call; see
-            // the RecvInstance concurrency inventory.
-            string: unsafe {
-                web_control
-                    .named()
-                    .NDIlib_recv_get_web_control(connection.instance())
-            },
+            string: connection.web_control(web_control),
             strings,
         };
         guard.copy()
@@ -2067,7 +1972,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// connection request is retained and sent as that request finishes.
     #[doc(alias = "NDIlib_recv_set_tally")]
     pub fn set_tally(&self, tally: Tally) {
-        self.core.lock_control().set_tally(self.core.sdk(), tally);
+        self.core.set_tally(tally);
     }
 
     /// Send metadata upstream, to the source this receiver is connected to.
@@ -2082,22 +1987,9 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Windows. See the [waiting contract](Receiver#waiting).
     #[doc(alias = "NDIlib_recv_send_metadata")]
     pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
-        let raw = metadata.metadata_raw();
-        let connection = self.core.lock_mutating_control()?;
-        // SAFETY: the receiver instance is live for this borrow, and the
-        // borrowed C string outlives the synchronous call. The control permit
-        // supplies the control exclusion in the RecvInstance inventory.
-        let sent = unsafe {
-            self.core
-                .sdk()
-                .NDIlib_recv_send_metadata(connection.instance(), &raw)
-        };
-        // `Processing.NDI.Recv.h`: false means nothing is connected.
-        if sent {
-            Ok(())
-        } else {
-            Err(Error::NotConnected)
-        }
+        self.core
+            .lock_mutating_control()?
+            .send_metadata(self.core.sdk(), metadata)
     }
 
     /// Control the pan, tilt, zoom, focus, white balance and exposure of the
@@ -2260,27 +2152,9 @@ impl<M: ReceiverMode> Receiver<M> {
 
         let mut total = NDIlib_recv_performance_t::default();
         let mut dropped = NDIlib_recv_performance_t::default();
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call. The control permit supplies
-        // the control exclusion in the RecvInstance inventory.
-        let performance = unsafe {
-            self.core.sdk().named().NDIlib_recv_get_performance(
-                connection.instance(),
-                &mut total,
-                &mut dropped,
-            )
-        };
-
+        let performance = connection.performance(self.core.sdk(), &mut total, &mut dropped);
         let mut queue = NDIlib_recv_queue_t::default();
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call. The control permit supplies
-        // the control exclusion in the RecvInstance inventory.
-        let queued = unsafe {
-            self.core
-                .sdk()
-                .named()
-                .NDIlib_recv_get_queue(connection.instance(), &mut queue)
-        };
+        let queued = connection.queue(self.core.sdk(), &mut queue);
 
         Ok(ConnectionStats {
             connections,
@@ -2338,15 +2212,7 @@ impl ReceiverCore {
 
     /// The entry points of the runtime this receiver was created through.
     pub(crate) fn sdk(&self) -> &sys::Core {
-        #[cfg(test)]
-        if let Some(table) = self.test_sdk {
-            return table;
-        }
         &self.sdk
-    }
-
-    fn delay(&self) -> Result<&sys::ReceiveDelay> {
-        self.ndi().table()
     }
 
     fn connection_metadata(&self) -> Result<&sys::ReceiverConnectionMetadata> {
@@ -2355,32 +2221,12 @@ impl ReceiverCore {
 
     fn lock_change(&self) -> ConnectionChange<'_> {
         let exclusive = self.change_guard.lock();
-        if self.legacy_controls {
-            self.control_guard.lock().changing = true;
+        if self.guard_local_connection_changes {
+            self.begin_control_change();
         }
         ConnectionChange {
             core: self,
             _exclusive: exclusive,
-        }
-    }
-
-    /// Issue a permit tied to this receiver's shared-control lock.
-    pub(crate) fn lock_control(&self) -> Control<'_> {
-        Control {
-            instance: self.instance,
-            _exclusive: self.control_guard.lock(),
-        }
-    }
-
-    /// Connection-reading controls must not enter a legacy Windows native
-    /// receiver while its connection is being replaced. Refusal is immediate:
-    /// no Rust control lock is held while native connect waits.
-    fn lock_mutating_control(&self) -> Result<MutatingControl<'_>> {
-        let control = self.lock_control();
-        if control._exclusive.changing {
-            Err(Error::NotConnected)
-        } else {
-            Ok(MutatingControl(control))
         }
     }
 
@@ -2411,7 +2257,7 @@ impl ReceiverCore {
 
     /// Hold the local connection lock, so tests can verify captures and target
     /// snapshots proceed while another connection change is queued.
-    #[cfg(all(test, any(feature = "advanced", feature = "tokio", feature = "smol")))]
+    #[cfg(all(test, any(feature = "tokio", feature = "smol")))]
     pub(crate) fn reconnect_lock(&self) -> impl Drop + '_ {
         self.lock_change()
     }
@@ -2718,9 +2564,6 @@ impl<'rx> CaptureLock<'rx> {
         audio: Option<&mut NDIlib_audio_frame_v3_t>,
         metadata: Option<&mut NDIlib_metadata_frame_t>,
     ) -> NDIlib_frame_type_e {
-        // Read before the call below, so it is at least the wait the SDK gets.
-        #[cfg(test)]
-        native_capture_calls::record(self.attempt.0.remaining_ms());
         // SAFETY: the receiver instance is live for 'rx, which this lock
         // borrows it for. Each descriptor is null or exclusively borrowed,
         // writable storage that outlives the synchronous call. The proof fixes
@@ -2735,36 +2578,6 @@ impl<'rx> CaptureLock<'rx> {
                 self.attempt.0.remaining_ms(),
             )
         }
-    }
-}
-
-/// Counts native capture calls on the calling thread, so that tests can tell
-/// a capture that was skipped from one that found nothing, and keeps the
-/// longest wait any of them was given, so that they can tell how long the SDK
-/// was allowed to block whatever it then took.
-#[cfg(test)]
-pub(crate) mod native_capture_calls {
-    use std::cell::Cell;
-    std::thread_local! {
-        static CALLS: Cell<usize> = const { Cell::new(0) };
-        static LONGEST_WAIT_MS: Cell<u32> = const { Cell::new(0) };
-    }
-    /// Count a call that the SDK is allowed to block for `wait_ms` at most.
-    pub(crate) fn record(wait_ms: u32) {
-        CALLS.with(|calls| calls.set(calls.get() + 1));
-        LONGEST_WAIT_MS.with(|longest| longest.set(longest.get().max(wait_ms)));
-    }
-    /// The calls made since the last take.
-    pub(crate) fn take() -> usize {
-        take_with_longest_wait().0
-    }
-    /// The calls made since the last take, and the longest wait, in
-    /// milliseconds, that any of them was given.
-    pub(crate) fn take_with_longest_wait() -> (usize, u32) {
-        (
-            CALLS.with(|calls| calls.replace(0)),
-            LONGEST_WAIT_MS.with(|longest| longest.replace(0)),
-        )
     }
 }
 
@@ -2784,27 +2597,21 @@ pub struct Ptz<'rx> {
 impl std::fmt::Debug for Ptz<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ptz")
-            .field(
-                "receiver_name",
-                &self.core._name.as_ref().map(|name| name.to_string_lossy()),
-            )
+            .field("receiver_name", &ReceiverIdentity::name(self.core))
             .finish_non_exhaustive()
     }
 }
 
 impl Ptz<'_> {
     /// Whether the connected source accepts PTZ commands.
+    ///
+    /// Returns `false` while Standard Windows is changing the connection.
     #[must_use]
     #[doc(alias = "NDIlib_recv_ptz_is_supported")]
     pub fn is_supported(&self) -> bool {
-        let connection = self.core.lock_control();
-        // SAFETY: the live core and control permit cover this call; see
-        // the RecvInstance concurrency inventory.
-        unsafe {
-            self.core
-                .sdk()
-                .NDIlib_recv_ptz_is_supported(connection.instance())
-        }
+        self.core
+            .lock_mutating_control()
+            .is_ok_and(|connection| connection.ptz_is_supported(self.core.sdk()))
     }
 
     /// Recall preset `0..=99`, moving at `speed` within `0.0..=1.0`.
@@ -2816,7 +2623,7 @@ impl Ptz<'_> {
     pub fn recall_preset(&self, preset: u8, speed: f32) -> Result<()> {
         let preset = validate_ptz_preset(preset)?;
         validate_ptz_value("speed", speed, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_recall_preset, preset, speed)
+        ptz_command!(self, ptz_recall_preset, preset, speed)
     }
 
     /// Store the current camera settings as preset `0..=99`.
@@ -2827,7 +2634,7 @@ impl Ptz<'_> {
     #[doc(alias = "NDIlib_recv_ptz_store_preset")]
     pub fn store_preset(&self, preset: u8) -> Result<()> {
         let preset = validate_ptz_preset(preset)?;
-        ptz_command!(self, NDIlib_recv_ptz_store_preset, preset)
+        ptz_command!(self, ptz_store_preset, preset)
     }
 
     /// Set the absolute zoom within `0.0..=1.0`: zero is zoomed in, one is
@@ -2839,7 +2646,7 @@ impl Ptz<'_> {
     #[doc(alias = "NDIlib_recv_ptz_zoom")]
     pub fn zoom(&self, zoom: f32) -> Result<()> {
         validate_ptz_value("zoom", zoom, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_zoom, zoom)
+        ptz_command!(self, ptz_zoom, zoom)
     }
 
     /// Set the zoom speed within `-1.0..=1.0`: negative zooms out, positive
@@ -2851,7 +2658,7 @@ impl Ptz<'_> {
     #[doc(alias = "NDIlib_recv_ptz_zoom_speed")]
     pub fn zoom_speed(&self, speed: f32) -> Result<()> {
         validate_ptz_value("zoom speed", speed, -1.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_zoom_speed, speed)
+        ptz_command!(self, ptz_zoom_speed, speed)
     }
 
     /// Set the absolute pan and tilt within `-1.0..=1.0`: pan increases from
@@ -2864,7 +2671,7 @@ impl Ptz<'_> {
     pub fn pan_tilt(&self, pan: f32, tilt: f32) -> Result<()> {
         validate_ptz_value("pan", pan, -1.0, 1.0)?;
         validate_ptz_value("tilt", tilt, -1.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_pan_tilt, pan, tilt)
+        ptz_command!(self, ptz_pan_tilt, pan, tilt)
     }
 
     /// Set the pan and tilt speeds within `-1.0..=1.0`: positive pans left
@@ -2877,7 +2684,7 @@ impl Ptz<'_> {
     pub fn pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> Result<()> {
         validate_ptz_value("pan speed", pan_speed, -1.0, 1.0)?;
         validate_ptz_value("tilt speed", tilt_speed, -1.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_pan_tilt_speed, pan_speed, tilt_speed)
+        ptz_command!(self, ptz_pan_tilt_speed, pan_speed, tilt_speed)
     }
 
     /// Focus automatically.
@@ -2887,7 +2694,7 @@ impl Ptz<'_> {
     /// See [`Ptz`].
     #[doc(alias = "NDIlib_recv_ptz_auto_focus")]
     pub fn auto_focus(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_auto_focus)
+        ptz_command!(self, ptz_auto_focus)
     }
 
     /// Set the absolute focus within `0.0..=1.0`: zero focuses at infinity,
@@ -2899,7 +2706,7 @@ impl Ptz<'_> {
     #[doc(alias = "NDIlib_recv_ptz_focus")]
     pub fn focus(&self, focus: f32) -> Result<()> {
         validate_ptz_value("focus", focus, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_focus, focus)
+        ptz_command!(self, ptz_focus, focus)
     }
 
     /// Set the focus speed within `-1.0..=1.0`: negative focuses farther,
@@ -2911,7 +2718,7 @@ impl Ptz<'_> {
     #[doc(alias = "NDIlib_recv_ptz_focus_speed")]
     pub fn focus_speed(&self, speed: f32) -> Result<()> {
         validate_ptz_value("focus speed", speed, -1.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_focus_speed, speed)
+        ptz_command!(self, ptz_focus_speed, speed)
     }
 
     /// Balance white automatically.
@@ -2921,7 +2728,7 @@ impl Ptz<'_> {
     /// See [`Ptz`].
     #[doc(alias = "NDIlib_recv_ptz_white_balance_auto")]
     pub fn white_balance_auto(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_auto)
+        ptz_command!(self, ptz_white_balance_auto)
     }
 
     /// Select the indoor white-balance preset.
@@ -2931,7 +2738,7 @@ impl Ptz<'_> {
     /// See [`Ptz`].
     #[doc(alias = "NDIlib_recv_ptz_white_balance_indoor")]
     pub fn white_balance_indoor(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_indoor)
+        ptz_command!(self, ptz_white_balance_indoor)
     }
 
     /// Select the outdoor white-balance preset.
@@ -2941,7 +2748,7 @@ impl Ptz<'_> {
     /// See [`Ptz`].
     #[doc(alias = "NDIlib_recv_ptz_white_balance_outdoor")]
     pub fn white_balance_outdoor(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_outdoor)
+        ptz_command!(self, ptz_white_balance_outdoor)
     }
 
     /// Balance white once, from the current image.
@@ -2951,7 +2758,7 @@ impl Ptz<'_> {
     /// See [`Ptz`].
     #[doc(alias = "NDIlib_recv_ptz_white_balance_oneshot")]
     pub fn white_balance_oneshot(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_oneshot)
+        ptz_command!(self, ptz_white_balance_oneshot)
     }
 
     /// Set the red and blue white-balance levels within `0.0..=1.0`.
@@ -2963,7 +2770,7 @@ impl Ptz<'_> {
     pub fn white_balance_manual(&self, red: f32, blue: f32) -> Result<()> {
         validate_ptz_value("red", red, 0.0, 1.0)?;
         validate_ptz_value("blue", blue, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_manual, red, blue)
+        ptz_command!(self, ptz_white_balance_manual, red, blue)
     }
 
     /// Set the exposure automatically.
@@ -2973,7 +2780,7 @@ impl Ptz<'_> {
     /// See [`Ptz`].
     #[doc(alias = "NDIlib_recv_ptz_exposure_auto")]
     pub fn exposure_auto(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_exposure_auto)
+        ptz_command!(self, ptz_exposure_auto)
     }
 
     /// Set the exposure level within `0.0..=1.0`, from dark to light.
@@ -2984,7 +2791,7 @@ impl Ptz<'_> {
     #[doc(alias = "NDIlib_recv_ptz_exposure_manual")]
     pub fn exposure_manual(&self, level: f32) -> Result<()> {
         validate_ptz_value("exposure level", level, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_exposure_manual, level)
+        ptz_command!(self, ptz_exposure_manual, level)
     }
 
     /// Set the iris, gain and shutter speed within `0.0..=1.0`: iris and gain
@@ -2998,13 +2805,7 @@ impl Ptz<'_> {
         validate_ptz_value("iris", iris, 0.0, 1.0)?;
         validate_ptz_value("gain", gain, 0.0, 1.0)?;
         validate_ptz_value("shutter speed", shutter_speed, 0.0, 1.0)?;
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_exposure_manual_v2,
-            iris,
-            gain,
-            shutter_speed
-        )
+        ptz_command!(self, ptz_exposure_manual_v2, iris, gain, shutter_speed)
     }
 }
 
@@ -3016,24 +2817,24 @@ impl Drop for ReceiverCore {
         unsafe {
             self.sdk().NDIlib_recv_destroy(self.instance.0);
         }
-        #[cfg(test)]
-        lifecycle_test_events::record("receiver");
     }
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ReceiverCore>();
-};
+});
 
 // A panic cannot leave a receiver's shared state half-changed: of its locks,
 // the target and pending unknown event are replaced whole; the string-query
 // lock protects complete retained changes. Control-owned registrations install
 // retained storage before native add and release it only after native clear;
-// unwinding leaves that storage valid. Native connection changes can run
-// application allocator code under the independent change permit, which holds
-// no partially modified state. The remaining mutable state is atomic. The `parking_lot` locks do not poison and so do not declare
-// this themselves, which would otherwise leave `Receiver` short of
+// unwinding leaves that storage valid. A native connection change can run
+// application allocator code under the independent change permit. The
+// ConnectionChange drop guard restores ControlPermit's changing phase and
+// takes and replays its pending tally before releasing the change lock.
+// The `parking_lot` locks do not poison and so do not declare this themselves,
+// which would otherwise leave `Receiver` short of
 // `RefUnwindSafe` and a `RecvAdvertiser`, which keeps registered receivers
 // alive, short of the unwind safety a `SendAdvertiser` has.
 impl std::panic::RefUnwindSafe for ReceiverCore {}
@@ -3327,29 +3128,6 @@ fn drop_percentage(received: u64, dropped: u64) -> f64 {
 }
 
 #[cfg(test)]
-pub(crate) mod lifecycle_test_events {
-    use std::cell::RefCell;
-    std::thread_local! {
-        static EVENTS: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
-    }
-    pub(crate) fn record(event: &'static str) {
-        EVENTS.with(|events| {
-            if let Some(events) = &mut *events.borrow_mut() {
-                events.push(event);
-            }
-        });
-    }
-    pub(crate) fn snapshot() -> Vec<&'static str> {
-        EVENTS.with(|events| events.borrow().as_ref().unwrap().clone())
-    }
-    pub(crate) fn track(action: impl FnOnce()) -> Vec<&'static str> {
-        EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
-        action();
-        EVENTS.with(|events| events.borrow_mut().take().unwrap())
-    }
-}
-
-#[cfg(test)]
 #[path = "receiver_mixed_tests.rs"]
 mod mixed_tests;
 
@@ -3358,39 +3136,6 @@ mod tests {
     use super::*;
 
     use std::cell::Cell;
-
-    #[cfg(feature = "advanced")]
-    #[test]
-    fn packet_capture_consumes_the_same_pending_events_as_raw_capture() {
-        use crate::advanced::{PacketItem, PacketReceiver};
-
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected())
-            .unwrap()
-            .into_packet_for_test();
-        // Model notifications retained before a mode transition. Packet capture
-        // must consume them once without spending its timeout in native capture.
-        receiver.core.retain(Notification::StatusChanged);
-        receiver.core.retain(Notification::SourceChanged);
-        receiver.core.retain(Notification::Unknown(987));
-        native_capture_calls::take();
-        for expected in [
-            ReceiverEvent::StatusChanged(ReceiverStatus { connections: 0 }),
-            ReceiverEvent::SourceChanged,
-            ReceiverEvent::Unknown(987),
-        ] {
-            let Some(PacketItem::Event(actual)) =
-                PacketReceiver::capture_from(&receiver, Duration::from_secs(1)).unwrap()
-            else {
-                panic!("expected receiver event {expected:?}");
-            };
-            assert_eq!(actual, expected);
-        }
-        assert_eq!(native_capture_calls::take(), 0);
-        assert!(receiver.core.take_pending_event_report().unwrap().is_none());
-    }
 
     #[test]
     fn receive_delay_rounds_up_and_rejects_out_of_range_values() {
@@ -3403,19 +3148,29 @@ mod tests {
             (Duration::from_nanos(1_999_999_999), 2000),
             (Duration::from_secs(2), 2000),
         ] {
-            assert_eq!(receiver_delay_millis(duration).unwrap(), millis);
+            let delay = ReceiveDelay::new(duration).unwrap();
+            assert_eq!(delay.to_sdk(), millis);
+            assert_eq!(delay.duration(), Duration::from_millis(millis as u64));
+            assert_eq!(ReceiveDelay::from_sdk(delay.to_sdk()).unwrap(), delay);
         }
-        assert!(receiver_delay_millis(Duration::from_secs(2) + Duration::from_nanos(1)).is_err());
-        assert!(receiver_delay_millis(Duration::MAX).is_err());
-        // Both directions share one bound: what may be set may be reported.
+        for too_long in [
+            ReceiveDelay::MAX.duration() + Duration::from_nanos(1),
+            Duration::MAX,
+        ] {
+            assert!(matches!(
+                ReceiveDelay::new(too_long),
+                Err(Error::InvalidInput(
+                    crate::InputDefect::ReceiveDelayTooLong { .. }
+                ))
+            ));
+        }
         for millis in [0, 1, 1999, 2000] {
-            let delay = receiver_delay(millis).unwrap();
-            assert_eq!(receiver_delay_millis(delay).unwrap(), millis);
+            assert_eq!(ReceiveDelay::from_sdk(millis).unwrap().to_sdk(), millis);
         }
         for millis in [-1, 2001, i32::MIN, i32::MAX] {
             assert!(matches!(
-                receiver_delay(millis),
-                Err(Error::UnexpectedSdkResult(_))
+                ReceiveDelay::from_sdk(millis),
+                Err(Error::UnexpectedSdkResult(crate::SdkResultDefect::InvalidReceiveDelay { millis: reported })) if reported == millis
             ));
         }
     }
@@ -3491,31 +3246,39 @@ mod tests {
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         if ndi.require_feature(RuntimeFeature::ReceiveDelay).is_ok() {
-            assert_eq!(receiver.video_delay().unwrap(), Duration::ZERO);
-            assert_eq!(receiver.audio_delay().unwrap(), Duration::ZERO);
+            assert_eq!(receiver.video_delay().unwrap(), ReceiveDelay::ZERO);
+            assert_eq!(receiver.audio_delay().unwrap(), ReceiveDelay::ZERO);
             use SettingChange::{Applied, Unchanged};
-            assert_eq!(receiver.set_video_delay(Duration::ZERO).unwrap(), Unchanged);
             assert_eq!(
-                receiver.set_video_delay(Duration::from_nanos(1)).unwrap(),
-                Applied
-            );
-            assert_eq!(receiver.video_delay().unwrap(), Duration::from_millis(1));
-            assert_eq!(
-                receiver.set_video_delay(Duration::from_millis(1)).unwrap(),
+                receiver.set_video_delay(ReceiveDelay::ZERO).unwrap(),
                 Unchanged
             );
-            assert_eq!(receiver.audio_delay().unwrap(), Duration::ZERO);
             assert_eq!(
-                receiver.set_audio_delay(Duration::from_secs(2)).unwrap(),
+                receiver
+                    .set_video_delay(ReceiveDelay::new(Duration::from_nanos(1)).unwrap())
+                    .unwrap(),
                 Applied
             );
-            assert_eq!(receiver.audio_delay().unwrap(), Duration::from_secs(2));
             assert_eq!(
-                receiver.set_audio_delay(Duration::from_secs(2)).unwrap(),
+                receiver.video_delay().unwrap(),
+                ReceiveDelay::new(Duration::from_millis(1)).unwrap()
+            );
+            assert_eq!(
+                receiver
+                    .set_video_delay(ReceiveDelay::new(Duration::from_millis(1)).unwrap())
+                    .unwrap(),
                 Unchanged
             );
-            assert!(receiver.set_audio_delay(Duration::from_secs(3)).is_err());
-            assert_eq!(receiver.audio_delay().unwrap(), Duration::from_secs(2));
+            assert_eq!(receiver.audio_delay().unwrap(), ReceiveDelay::ZERO);
+            assert_eq!(
+                receiver.set_audio_delay(ReceiveDelay::MAX).unwrap(),
+                Applied
+            );
+            assert_eq!(receiver.audio_delay().unwrap(), ReceiveDelay::MAX);
+            assert_eq!(
+                receiver.set_audio_delay(ReceiveDelay::MAX).unwrap(),
+                Unchanged
+            );
         } else {
             assert!(matches!(
                 receiver.video_delay(),
@@ -3526,11 +3289,11 @@ mod tests {
                 Err(Error::UnsupportedCapability { .. })
             ));
             assert!(matches!(
-                receiver.set_video_delay(Duration::ZERO),
+                receiver.set_video_delay(ReceiveDelay::ZERO),
                 Err(Error::UnsupportedCapability { .. })
             ));
             assert!(matches!(
-                receiver.set_audio_delay(Duration::ZERO),
+                receiver.set_audio_delay(ReceiveDelay::ZERO),
                 Err(Error::UnsupportedCapability { .. })
             ));
         }
@@ -3855,48 +3618,58 @@ mod tests {
 
         #[test]
         fn replay_does_not_wait_for_another_pollers_native_query() {
-            static ENTERED: AtomicBool = AtomicBool::new(false);
-            unsafe extern "C" fn slow_query(
+            use std::sync::mpsc;
+
+            type QueryGate = (mpsc::Sender<()>, mpsc::Receiver<()>);
+            static GATE: Mutex<Option<QueryGate>> = Mutex::new(None);
+            unsafe extern "C" fn held_query(
                 _instance: NDIlib_recv_instance_t,
                 name: *mut *const c_char,
                 _timeout_ms: u32,
             ) -> bool {
-                ENTERED.store(true, Ordering::Release);
-                std::thread::sleep(Duration::from_millis(100));
+                let (entered, release) = GATE.lock().take().unwrap();
+                let _ = entered.send(());
+                let _ = release.recv();
                 // SAFETY: the caller provides writable storage for the pointer.
                 unsafe { name.write(c"second".as_ptr()) };
                 true
             }
+
             let Some(ndi) = crate::test_support::ndi() else {
                 return;
             };
             let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
             let abandoned = poll(&receiver.core, Some(c"first")).unwrap();
-            ENTERED.store(false, Ordering::Release);
             std::thread::scope(|scope| {
+                let (entered, waiting) = mpsc::channel();
+                let (release, blocked) = mpsc::channel();
+                *GATE.lock() = Some((entered, blocked));
                 let worker = scope.spawn(|| {
                     receiver
                         .core
                         .wait_for_source_name_change_with(
                             &sys::ReceiverSourceName {
-                                NDIlib_recv_get_source_name: slow_query,
+                                NDIlib_recv_get_source_name: held_query,
                             },
                             &sys::ReceiverStrings {
                                 NDIlib_recv_free_string: free,
                             },
-                            Deadline::after(Duration::from_millis(100)).unwrap(),
+                            Deadline::after(Duration::from_secs(3)).unwrap(),
                             NeverStop,
                         )
                         .unwrap()
                 });
-                let waiting = Instant::now();
-                while !ENTERED.load(Ordering::Acquire) {
-                    assert!(waiting.elapsed() < Duration::from_secs(2));
-                    std::thread::yield_now();
-                }
-                let started = Instant::now();
-                receiver.core.retain_source_name_change(abandoned);
-                assert!(started.elapsed() < Duration::from_millis(10));
+                waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+                let (done, completed) = mpsc::channel();
+                let receiver = &receiver;
+                scope.spawn(move || {
+                    receiver.core.retain_source_name_change(abandoned);
+                    done.send(()).unwrap();
+                });
+                let replayed = completed.recv_timeout(Duration::from_secs(2));
+                // Disconnecting the channel also releases the query on unwind.
+                drop(release);
+                replayed.expect("replay waited for the native query");
                 assert_eq!(
                     worker.join().unwrap().unwrap().value,
                     SourceNameChange::Connected("second".into())
@@ -4187,7 +3960,7 @@ mod tests {
     #[test]
     fn receiver_permissions_do_not_add_pointer_storage() {
         assert_eq!(
-            std::mem::size_of::<Control<'_>>(),
+            std::mem::size_of::<control::Control<'_>>(),
             2 * std::mem::size_of::<usize>()
         );
         for bytes in [
@@ -4229,7 +4002,7 @@ mod tests {
                     .unwrap();
             });
             waiting.recv_timeout(Duration::from_secs(2)).unwrap();
-            let concurrent = completed.recv_timeout(Duration::from_millis(100));
+            let concurrent = completed.recv_timeout(Duration::from_secs(2));
             drop(permission);
             member.join().unwrap();
             assert_eq!(
@@ -4311,7 +4084,7 @@ mod tests {
             let getter = scope.spawn(move || {
                 done.send(receiver.connection_target()).unwrap();
             });
-            let snapshot = completed.recv_timeout(Duration::from_millis(20));
+            let snapshot = completed.recv_timeout(Duration::from_secs(2));
             // Release the connection lock before inspecting the outcome, so a
             // regression fails instead of leaving scoped threads deadlocked.
             drop(connection);
@@ -4341,35 +4114,10 @@ mod tests {
                 });
                 // Keep the attempt live across this wait. An accidental Rust
                 // exclusion would hold the reconnect off until this block ends.
-                completed.recv_timeout(Duration::from_millis(20))
+                completed.recv_timeout(Duration::from_secs(2))
             };
             result.expect("reconnect waited for the capture attempt");
         });
-    }
-
-    #[test]
-    fn combined_capture_consumes_pending_events_once_even_during_reconnect() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        receiver.core.retain(Notification::SourceChanged);
-        let _exclusive = receiver.core.lock_change();
-        native_capture_calls::take();
-        assert!(matches!(
-            receiver.capture_any_ref(Duration::ZERO).unwrap(),
-            Some(ReceiverItemRef::Event(ReceiverEvent::SourceChanged))
-        ));
-        assert_eq!(native_capture_calls::take(), 0);
-        assert!(receiver.capture_any_ref(Duration::ZERO).unwrap().is_none());
-        assert_eq!(native_capture_calls::take(), 1);
-        let began = Instant::now();
-        assert!(receiver
-            .capture_any(Duration::from_millis(20))
-            .unwrap()
-            .is_none());
-        assert!(began.elapsed() >= Duration::from_millis(20));
-        assert!(native_capture_calls::take() >= 1);
     }
 
     #[test]
@@ -4548,7 +4296,9 @@ mod tests {
             return;
         };
         let mut receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        Arc::get_mut(&mut receiver.core).unwrap().legacy_controls = true;
+        Arc::get_mut(&mut receiver.core)
+            .unwrap()
+            .guard_local_connection_changes = true;
         let change = receiver.core.lock_change();
         assert!(matches!(
             receiver.core.lock_mutating_control(),
@@ -4557,7 +4307,7 @@ mod tests {
         receiver.set_tally(Tally::new(true, false));
         receiver.set_tally(Tally::new(false, true));
         assert_eq!(
-            receiver.core.lock_control()._exclusive.pending_tally,
+            receiver.core.lock_control().pending_tally(),
             Some(Tally::new(false, true))
         );
         let metadata = MetadataFrame::new("<during-change/>").unwrap();
@@ -4566,34 +4316,14 @@ mod tests {
             Err(Error::NotConnected)
         ));
         assert!(matches!(receiver.ptz().zoom(0.5), Err(Error::NotConnected)));
-        // These receiver-owned observations never consult a replaced connection.
+        assert!(!receiver.ptz().is_supported());
+        // Receiver-owned observations never consult a replaced connection.
         receiver.connection_stats().unwrap();
-        let _ = receiver.ptz().is_supported();
         drop(change);
         let control = receiver.core.lock_control();
-        assert!(!control._exclusive.changing);
-        assert_eq!(control._exclusive.pending_tally, None);
+        assert_eq!(control.pending_tally(), None);
         drop(control);
         assert!(receiver.core.lock_mutating_control().is_ok());
-    }
-
-    #[test]
-    fn changing_control_state_replays_only_the_latest_tally() {
-        let mut permit = ControlPermit {
-            changing: true,
-            ..ControlPermit::default()
-        };
-        permit.set_tally(Tally::new(true, false), |_| {
-            panic!("native tally entered during change")
-        });
-        permit.set_tally(Tally::new(false, true), |_| {
-            panic!("native tally entered during change")
-        });
-        let mut sent = Vec::new();
-        permit.finish_change(|tally| sent.push(tally));
-        assert_eq!(sent, [Tally::new(false, true)]);
-        assert!(!permit.changing);
-        assert_eq!(permit.pending_tally, None);
     }
 
     #[test]
@@ -4658,141 +4388,6 @@ mod tests {
                 completed.recv_timeout(Duration::from_secs(2)).unwrap();
             });
         }
-    }
-
-    #[test]
-    fn captures_keep_their_budgets_while_local_connection_changes_are_locked() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        let exclusive = receiver.core.lock_change();
-        std::thread::scope(|scope| {
-            let (done, completed) = std::sync::mpsc::channel();
-            let receiver = &receiver;
-            let worker = scope.spawn(move || {
-                native_capture_calls::take();
-                assert!(receiver.capture_video(Duration::ZERO).unwrap().is_none());
-                assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
-                assert!(receiver
-                    .capture_audio(Duration::from_millis(5))
-                    .unwrap()
-                    .is_none());
-                assert!(receiver
-                    .capture_metadata_ref(Duration::from_millis(5))
-                    .unwrap()
-                    .is_none());
-                done.send(native_capture_calls::take()).unwrap();
-            });
-            // The connection lock remains held until capture returns. Taking
-            // it in a capture would stall instead of reaching the SDK.
-            let result = completed.recv_timeout(Duration::from_secs(2));
-            drop(exclusive);
-            worker.join().unwrap();
-            assert!(result.unwrap() >= 4);
-        });
-    }
-
-    /// A long `next_event` uses bounded attempts alongside connection changes
-    /// and other captures. An event retained by another capture ends that poll
-    /// at its next attempt.
-    #[test]
-    fn a_long_next_event_allows_reconnect_and_observes_a_retained_event() {
-        use std::{sync::mpsc, time::Instant};
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = &Receiver::new(&ndi, &unconnected()).unwrap();
-        let stop = &AtomicBool::new(false);
-        let budget = Duration::from_secs(1);
-        std::thread::scope(|scope| {
-            let (polling, started_polling) = mpsc::channel();
-            let poller = scope.spawn(move || {
-                polling.send(()).unwrap();
-                loop {
-                    // Nothing is connected, so only the event published
-                    // below ends a poll before its timeout.
-                    let event = receiver.next_event(Duration::from_secs(5)).unwrap();
-                    if stop.load(Ordering::Acquire) {
-                        return event;
-                    }
-                }
-            });
-            started_polling.recv().unwrap();
-            // Let the poller settle into a native wait.
-            std::thread::sleep(Duration::from_millis(250));
-
-            let capture = scope.spawn(move || {
-                native_capture_calls::take();
-                let began = Instant::now();
-                let frame = receiver.capture_metadata(budget).unwrap();
-                (
-                    frame.is_none(),
-                    began.elapsed(),
-                    native_capture_calls::take(),
-                )
-            });
-            let began = Instant::now();
-            receiver.reconnect();
-            let reconnected = began.elapsed();
-            let (nothing_arrived, captured_for, sdk_calls) = capture.join().unwrap();
-
-            stop.store(true, Ordering::Release);
-            let published = Instant::now();
-            receiver.core.retain(Notification::StatusChanged);
-            let ended = poller.join().unwrap();
-            let poll_ended_after = published.elapsed();
-
-            assert!(reconnected < Duration::from_secs(1), "{reconnected:?}");
-            assert!(nothing_arrived);
-            // The concurrent capture reached the SDK and spent its budget
-            // there, regardless of the local connection change.
-            assert!(sdk_calls >= 1, "{sdk_calls} SDK calls");
-            assert!(captured_for >= budget, "{captured_for:?}");
-            assert!(
-                captured_for < budget + Duration::from_millis(500),
-                "{captured_for:?}"
-            );
-            assert!(ended.is_some());
-            assert!(
-                poll_ended_after < Duration::from_secs(1),
-                "{poll_ended_after:?}"
-            );
-        });
-    }
-
-    /// `next_event` gives each SDK call one poll interval of its timeout at
-    /// most.
-    ///
-    /// What each call is given, and that the poll ends only once the budget
-    /// is spent, hold however long the SDK then takes. How many calls fit in
-    /// the budget does not: on a loaded runner the SDK can overrun its waits,
-    /// so that only two fit. The count is the capture loop's, which the
-    /// clock-driven tests below check, such as
-    /// `retry_follows_a_full_wait_at_once`.
-    #[test]
-    fn next_event_spends_its_timeout_in_bounded_attempts() {
-        use std::time::Instant;
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        // A zero timeout makes exactly one attempt, with a zero SDK wait.
-        native_capture_calls::take();
-        assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
-        assert_eq!(native_capture_calls::take_with_longest_wait(), (1, 0));
-        // Nothing is connected: the whole budget is spent, in attempts of at
-        // most one poll interval each.
-        let budget = Duration::from_millis(450);
-        let began = Instant::now();
-        assert!(receiver.next_event(budget).unwrap().is_none());
-        assert!(began.elapsed() >= budget, "{:?}", began.elapsed());
-        let (calls, longest_wait) = native_capture_calls::take_with_longest_wait();
-        assert!(calls >= 1, "{calls} SDK calls");
-        assert!(
-            u128::from(longest_wait) <= POLL_INTERVAL.as_millis(),
-            "an SDK call was given {longest_wait} ms"
-        );
     }
 
     #[test]

@@ -22,6 +22,7 @@ concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# The test and SDK jobs run every test binary with --no-fail-fast.
 defaults:
   run:
     shell: bash
@@ -30,6 +31,8 @@ env:
   CARGO_TERM_COLOR: always
   ACTIONLINT_VERSION: 1.7.12
   ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+  WINDOWS_LLVM_VERSION: 20.1.8
+  WINDOWS_LLVM_SHA256: 3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b
 
 jobs:
   # The crate builds without an NDI SDK, so everything in lint, test and cross
@@ -102,6 +105,8 @@ jobs:
         with:
           path: target/doc
       - name: Minimum supported Rust version
+        env:
+          RUSTFLAGS: -D warnings
         run: |
           rustup toolchain install 1.88.0 --profile minimal
           cargo +1.88.0 check --locked --workspace --all-targets --all-features
@@ -141,25 +146,25 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # No NDI runtime is installed here: tests that need one report a skip.
       - name: Tests, all features
-        run: cargo test --locked --all-features
+        run: cargo test --locked --no-fail-fast --all-features
       - name: Tests, default features
         run: |
           scope_dir="${RUNNER_TEMP:-target/ci}"
           mkdir -p "$scope_dir"
-          cargo test --locked -- --list > "$scope_dir/default-tests.txt"
+          cargo test --locked --no-fail-fast -- --list > "$scope_dir/default-tests.txt"
           python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/default-tests.txt" --output "$scope_dir/default-skips.txt"
           scope_args=()
           while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/default-skips.txt"
-          cargo test --locked -- "${scope_args[@]}"
+          cargo test --locked --no-fail-fast -- "${scope_args[@]}"
       - name: Tests, File API without Advanced wrappers
         run: |
           scope_dir="${RUNNER_TEMP:-target/ci}"
           mkdir -p "$scope_dir"
-          cargo test --locked --no-default-features --features file-io -- --list > "$scope_dir/file-tests.txt"
+          cargo test --locked --no-fail-fast --no-default-features --features file-io -- --list > "$scope_dir/file-tests.txt"
           python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/file-tests.txt" --output "$scope_dir/file-skips.txt"
           scope_args=()
           while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/file-skips.txt"
-          cargo test --locked --no-default-features --features file-io -- "${scope_args[@]}"
+          cargo test --locked --no-fail-fast --no-default-features --features file-io -- "${scope_args[@]}"
       - name: Manual measurement fixtures
         if: runner.os == 'Linux'
         timeout-minutes: 5
@@ -169,12 +174,12 @@ jobs:
           GRAFTON_NDI_CONTENTS: photographic
           GRAFTON_NDI_OUTPUTS: jpeg85
         run: |
-          selected=$(cargo test --locked --release --all-features --lib -- --ignored --list)
-          if ! grep -q ': test$' <<< "$selected"; then
-            echo '::error::No tests selected for --ignored measurement fixtures'
-            exit 1
-          fi
-          cargo test --locked --release --all-features --lib -- --ignored --test-threads=1
+          inventory="$RUNNER_TEMP/ndi-measurement-tests.txt"
+          selection="$RUNNER_TEMP/ndi-measurement-selected.txt"
+          cargo test --locked --no-fail-fast --release --all-features --lib -- --ignored --list > "$inventory"
+          python3 ci/sdk_test_scope.py select --group measurements --inventory "$inventory" --output "$selection"
+          mapfile -t tests < "$selection"
+          cargo test --locked --no-fail-fast --release --all-features --lib -- --ignored --exact "${tests[@]}" --test-threads=1
       - name: Memcheck over scripted capture and encoder padding
         if: runner.os == 'Linux'
         timeout-minutes: 10
@@ -182,16 +187,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends valgrind
           runner='target.x86_64-unknown-linux-gnu.runner=["valgrind","--tool=memcheck","--error-exitcode=99","--trace-children=yes","--trace-children-skip=*/rustc,*/rustc-*"]'
-          cargo test --locked --all-features --config "$runner" --test mixed_capture_boundary --test frame_metadata_boundary -- --test-threads=1
-          filters=(frames::tests::video_padding_encoders)
-          for filter in "${filters[@]}"; do
-            selected=$(cargo test --locked --all-features --lib -- --list "$filter")
-            if ! grep -q ': test$' <<< "$selected"; then
-              echo "::error::No tests selected for filter: $filter"
-              exit 1
-            fi
-            cargo test --locked --all-features --config "$runner" --lib "$filter" -- --test-threads=1
-          done
+          cargo test --locked --no-fail-fast --all-features --config "$runner" --test mixed_capture_boundary --test frame_metadata_boundary -- --test-threads=1
+          memcheck_dir="${RUNNER_TEMP:-target/ci}"
+          mkdir -p "$memcheck_dir"
+          inventory="$memcheck_dir/ndi-encoder-padding-tests.txt"
+          selection="$memcheck_dir/ndi-encoder-padding-selected.txt"
+          cargo test --locked --no-fail-fast --all-features --lib -- --list > "$inventory"
+          python3 ci/sdk_test_scope.py select --group encoder-padding --inventory "$inventory" --output "$selection"
+          mapfile -t tests < "$selection"
+          cargo test --locked --no-fail-fast --all-features --config "$runner" --lib -- --exact "${tests[@]}" --test-threads=1
 
   miri:
     name: miri (${{ matrix.model }})
@@ -211,134 +215,15 @@ jobs:
           cargo +nightly-2026-11-10 miri setup
       - name: Initialized rows, metadata and synthetic native guards
         run: |
-          inventory=$(cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio -- --list)
-          tests=()
-          while IFS= read -r line; do
-            case "$line" in
-              *': test') tests+=("${line%: test}") ;;
-            esac
-          done <<< "$inventory"
-          select_tests() {
-            local filter=$1 apply_skips=$2 test skip excluded
-            selected=()
-            for test in "${tests[@]}"; do
-              [[ "$test" == *"$filter"* ]] || continue
-              excluded=false
-              if [ "$apply_skips" = true ]; then
-                for skip in "${skips[@]}"; do
-                  if [[ "$test" == *"$skip"* ]]; then excluded=true; break; fi
-                done
-              fi
-              if [ "$excluded" = false ]; then selected+=("$test"); fi
-            done
-          }
-          skips=(
-            descriptor_admission_and_collection_stay_allocation_free_under_churn
-            exact_copies_match_standard_utf8_replacement
-            sdk_copy::tests::expanded_text_cannot_allocate_past_the_snapshot_limit
-            sdk_copy::tests::omitting_malformed_entries_keeps_their_scan_cost_and_fatal_errors
-            sdk_copy::tests::rejected_scans_stay_charged_and_short_budgets_are_fatal
-            finder::budget::tests::aggregate_bytes_are_checked_before_string_allocation
-            finder::budget::tests::count_and_span_are_checked_before_dereferencing_or_reserving
-            finder::budget::tests::lossy_expansion_is_charged_before_allocating_the_output
-            finder::budget::tests::rejected_entries_still_consume_the_scan_budget
-          )
-          skip_args=()
-          for skip in "${skips[@]}"; do
-            select_tests "$skip" false
-            if [ "${#selected[@]}" -eq 0 ]; then
-              echo "::error::No tests selected for skip: $skip"
-              exit 1
-            elif [ "${#selected[@]}" -ne 1 ]; then
-              echo "::error::Ambiguous skip selection: $skip (${#selected[@]} matches)"
-              exit 1
-            fi
-            skip_args+=(--skip "$skip")
-          done
-          # These fixtures use local/TLS state and immutable synthetic tables;
-          # no selected test changes the environment or selects a native runtime.
-          # Serial test cases preserve their state boundaries. Explicit worker
-          # threads and the two borrowing-model processes remain independent.
-          batches=(reads media ownership)
-          batch_filters() {
-            case "$1" in
-              reads) filters=(
-                sdk_copy::tests::
-                source_retention::tests::
-                connection_metadata::tests::
-                finder::budget::tests::
-                file::out_param::tests::
-              );;
-              media) filters=(
-                frames::descriptor_tests::
-                pixels::tests::
-                frames::tests::video_padding_all_formats
-                frames::tests::video_padding_single_rows
-                frames::tests::video_padding_encoders
-                frames::metadata_tests::metadata_constructors
-                frames::metadata_tests::owned_metadata_states
-                frames::metadata_tests::audio_timestamp
-                receiver::mixed_tests
-                receiver::latest_report_tests::
-                receiver::pending::tests::
-                asynchronous::receiver_tests::receiver_delivery_replays_only_while_armed
-                asynchronous::scoped_tests
-                framesync::tests::test_framesync_video_ref_uses
-                framesync::tests::test_framesync_audio_ref_supports
-                advanced::sync::tests::returned_audio_is_released
-                advanced::sync::tests::borrowed_avsync_audio
-              );;
-              ownership) filters=(
-                finder::cache_retirement_tests::retirement_
-                finder::cache_retirement_tests::snapshot_remains_live_
-                finder::tests::invalidation_prevents_pending_lookup_
-                advanced::kvm::ownership_tests::
-                advanced::reserved_map::tests::
-                advanced::send_slots::tests::
-                advanced::aliasable::tests::
-                advanced::packets::payload::tests::
-                advanced::packets::received::tests::
-                advanced::queued::boundary_tests::
-                sender::in_flight::tests::
-                advanced::send::tests::
-                advanced::queued::tests::
-                sender::tests::
-              );;
-              *) echo "::error::Unknown Miri batch: $1"; exit 1 ;;
-            esac
-          }
-          selected_names=()
-          for batch in "${batches[@]}"; do
-            batch_filters "$batch"
-            for filter in "${filters[@]}"; do
-              select_tests "$filter" true
-              if [ "${#selected[@]}" -eq 0 ]; then
-                echo "::error::No tests selected for filter: $filter"
-                exit 1
-              fi
-              for test in "${selected[@]}"; do
-                for previous in "${selected_names[@]}"; do
-                  if [ "$test" = "$previous" ]; then
-                    echo "::error::Ambiguous test selection: $test ($filter)"
-                    exit 1
-                  fi
-                done
-                selected_names+=("$test")
-              done
-            done
-          done
-          echo "Selected ${#selected_names[@]} tests in ${#batches[@]} batches"
-          for batch in "${batches[@]}"; do
-            batch_filters "$batch"
-            # --exact also affects skip matching: exclude every substring skip
-            # here before supplying concrete names to the interpreter.
-            batch_tests=()
-            for filter in "${filters[@]}"; do
-              select_tests "$filter" true
-              batch_tests+=("${selected[@]}")
-            done
-            echo "Running Miri batch: $batch (${#batch_tests[@]} tests)"
-            cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio -- --exact "${batch_tests[@]}" "${skip_args[@]}" --test-threads=1
+          inventory="$RUNNER_TEMP/ndi-miri-tests.txt"
+          selection="$RUNNER_TEMP/ndi-miri-selected.txt"
+          cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio -- --list > "$inventory"
+          # Local/TLS guards require serial cases. Explicit worker threads and
+          # the borrowing-model processes remain independent.
+          for group in miri-reads miri-media miri-ownership; do
+            python3 ci/sdk_test_scope.py select --group "$group" --inventory "$inventory" --output "$selection"
+            mapfile -t tests < "$selection"
+            cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio -- --exact "${tests[@]}" --test-threads=1
           done
 
   cross:
@@ -373,6 +258,27 @@ jobs:
       - name: Link the examples for Android
         run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/build-android.sh aarch64-linux-android
 
+  hx-pictures:
+    name: NDI HX test pictures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Generate test pictures
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+          python3 tests/support/generate_hx.py --output-dir "$RUNNER_TEMP/ndi-hx-pictures"
+      - name: Upload test pictures
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ndi-hx-pictures
+          path: |
+            ${{ runner.temp }}/ndi-hx-pictures/quadrants-420.h264
+            ${{ runner.temp }}/ndi-hx-pictures/chroma-444.hevc
+          if-no-files-found: error
+          retention-days: 1
+
   # This job needs the private SDK archives, so it runs only where the secrets
   # exist: not for pull requests from forks, and not for Dependabot, whose runs
   # are given none. The repository variable NDI_CI_RELEASED switches it on, and
@@ -387,6 +293,7 @@ jobs:
   # generated into the target directory must stay on the runner.
   sdk:
     name: sdk (${{ matrix.name }})
+    needs: hx-pictures
     if: >-
       vars.NDI_CI_RELEASED == 'true' && github.actor != 'dependabot[bot]' &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
@@ -619,18 +526,45 @@ jobs:
         if: runner.os == 'Windows' && contains(matrix.package, 'advanced')
         shell: pwsh
         run: |
-          if (!(Test-Path 'C:\Program Files\LLVM\bin\clang.exe')) { choco install llvm --version=20.1.8 -y }
-          'LIBCLANG_PATH=C:\Program Files\LLVM\bin' | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-      - name: NDI HX fixture encoder
+          $version = $env:WINDOWS_LLVM_VERSION
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-$version-win64.exe"
+          $directory = Join-Path $env:RUNNER_TEMP "llvm-$version"
+          Invoke-WebRequest "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe" -OutFile $installer
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash
+          if ($digest -ne $env:WINDOWS_LLVM_SHA256) { throw "LLVM $version SHA-256 mismatch: $digest" }
+          Write-Host "Verified LLVM $version SHA-256: $digest"
+          $process = Start-Process -Wait -PassThru -FilePath $installer -ArgumentList "/S /D=$directory"
+          if ($process.ExitCode -ne 0) { throw "LLVM installer exited $($process.ExitCode)" }
+          $env:LIBCLANG_PATH = Join-Path $directory 'bin'
+          $clang = Join-Path $env:LIBCLANG_PATH 'clang.exe'
+          $resource = & $clang -print-resource-dir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path -LiteralPath (Join-Path $resource 'include/stdbool.h') -PathType Leaf)) { throw "LLVM builtin headers are missing from $resource" }
+          python ci/libclang_version.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Use the pinned installation for both Clang's include discovery and
+          # the builtin headers opened by libclang.
+          $bindgenArgs = 'BINDGEN_EXTRA_CLANG_ARGS="-resource-dir={0}"' -f $resource.Replace('\', '/')
+          Write-Host "LLVM resource directory: $resource"
+          "LIBCLANG_PATH=$env:LIBCLANG_PATH" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "CLANG_PATH=$clang" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          $bindgenArgs | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Download test pictures
+        if: contains(matrix.package, 'advanced')
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ndi-hx-pictures
+          path: '${{ runner.temp }}/ndi-hx-pictures'
+      - name: Use the same test pictures in every Advanced row
         if: contains(matrix.package, 'advanced')
         run: |
-          if ! command -v ffmpeg >/dev/null; then
-            case "$RUNNER_OS" in
-              Linux) sudo apt-get install --yes --no-install-recommends ffmpeg ;;
-              macOS) brew install ffmpeg ;;
-              Windows) choco install ffmpeg --no-progress -y ;;
-            esac
+          pictures="$RUNNER_TEMP/ndi-hx-pictures"
+          if [ "$RUNNER_OS" = macOS ]; then
+            shasum -a 256 "$pictures/quadrants-420.h264" "$pictures/chroma-444.hevc"
+          else
+            sha256sum "$pictures/quadrants-420.h264" "$pictures/chroma-444.hevc"
           fi
+          echo "GRAFTON_NDI_HX_PICTURES=$pictures" >> "$GITHUB_ENV"
       # The only step that is given the acquisition secrets. It exports
       # NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 for the steps that follow, and copies
       # a row's `hx-driver` beside that runtime. The compatibility runs' baseline
@@ -661,8 +595,7 @@ jobs:
             Windows) echo 'Windows runs the runtime tests without a loopback-only runner.' ;;
           esac
       # Each runtime step is bounded inside the job's limit, so a test that
-      # never returns fails its step. Every test binary runs, so one failing
-      # does not hide the rest. Every step from here on runs
+      # never returns fails its step. Every step from here on runs
       # whatever the steps before it did, once the runner was shown to isolate:
       # a run then reports everything that is wrong with a row, not the first
       # thing.
@@ -696,12 +629,20 @@ jobs:
           GRAFTON_NDI_REQUIRE_RUNTIME: '1'
         run: |
           sudo apt-get install --yes --no-install-recommends valgrind
-          cargo test --locked --config ci/offline.toml --config 'target.x86_64-unknown-linux-gnu.runner=["ci/offline/linux.sh","valgrind","--tool=memcheck","--track-origins=yes","--error-exitcode=99","--suppressions=ci/valgrind.supp"]' --target "$TARGET" --no-fail-fast --features image-encoding --test video_padding_sdk -- --test-threads=1
+          memcheck_dir="${RUNNER_TEMP:-target/ci}"
+          mkdir -p "$memcheck_dir"
+          inventory="$memcheck_dir/ndi-sdk-padding-tests.txt"
+          selection="$memcheck_dir/ndi-sdk-padding-selected.txt"
+          cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --features image-encoding --test video_padding_sdk -- --list > "$inventory"
+          python3 ci/sdk_test_scope.py select --group sdk-padding --inventory "$inventory" --output "$selection"
+          mapfile -t tests < "$selection"
+          cargo test --locked --config ci/offline.toml --config 'target.x86_64-unknown-linux-gnu.runner=["ci/offline/linux.sh","valgrind","--tool=memcheck","--track-origins=yes","--error-exitcode=99"]' --target "$TARGET" --no-fail-fast --features image-encoding --test video_padding_sdk -- --exact "${tests[@]}" --test-threads=1
       # Without the Advanced headers the advanced feature compiles to stubs, so
       # only a build that has them lints and documents the real implementation.
       - name: Lint and document the Advanced implementation
         if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.role == 'primary' && contains(matrix.package, 'advanced') }}
         env:
+          RUSTFLAGS: -D warnings
           RUSTDOCFLAGS: -D warnings
         run: |
           rustup toolchain install 1.88.0 --profile minimal --target "$TARGET"
@@ -729,14 +670,14 @@ jobs:
           inventory="$RUNNER_TEMP/ndi-current-headers-tests.txt"
           skip_file="$RUNNER_TEMP/ndi-current-headers-skips.txt"
           cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- --list > "$inventory"
-          python ci/sdk_test_scope.py --inventory "$inventory" --target "$TARGET" --headers advanced --output "$skip_file"
+          python ci/sdk_test_scope.py --inventory "$inventory" --target "$TARGET" --headers advanced --require-peer --output "$skip_file"
           skip_args=()
           while IFS= read -r argument; do skip_args+=("$argument"); done < "$skip_file"
           failed=0
           for edition in standard advanced; do
             while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
             export NDI_SDK_DIR="${{ steps.sdk.outputs.NDI_SDK_DIR }}"
-            if [ "$edition" = advanced ]; then export GRAFTON_NDI_REQUIRE_RUNTIME=advanced; else export GRAFTON_NDI_REQUIRE_RUNTIME=1; fi
+            if [ "$edition" = advanced ]; then export GRAFTON_NDI_REQUIRE_RUNTIME=advanced,peer; else export GRAFTON_NDI_REQUIRE_RUNTIME=1,peer; fi
             cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}" || failed=1
           done
           exit "$failed"
@@ -760,11 +701,11 @@ jobs:
             require="${{ matrix.require }}"
             require="${require/,h264-decoder/}"; require="${require/,hevc-444-decoder/}"
             if [ "$edition" = standard ]; then require="${require/advanced/1}"; fi
-            export GRAFTON_NDI_REQUIRE_RUNTIME="$require"
+            export GRAFTON_NDI_REQUIRE_RUNTIME="$require,peer"
             inventory="$RUNNER_TEMP/ndi-baseline-$edition-tests.txt"
             skip_file="$RUNNER_TEMP/ndi-baseline-$edition-skips.txt"
             cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- --list > "$inventory" || { failed=1; continue; }
-            python ci/sdk_test_scope.py --inventory "$inventory" --target "$TARGET" --headers "$edition" --output "$skip_file" || { failed=1; continue; }
+            python ci/sdk_test_scope.py --inventory "$inventory" --target "$TARGET" --headers "$edition" --require-peer --output "$skip_file" || { failed=1; continue; }
             skip_args=()
             while IFS= read -r argument; do skip_args+=("$argument"); done < "$skip_file"
             cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}" || failed=1
@@ -774,7 +715,7 @@ jobs:
   required-ci:
     name: required-ci
     if: always()
-    needs: [lint, test, cross, sdk, miri]
+    needs: [lint, test, cross, hx-pictures, sdk, miri]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -805,6 +746,22 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Confirm this commit is still the tip of main
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tip=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          if [[ ! "$tip" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Could not determine the current tip of main'
+            exit 1
+          fi
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice::Skipping Pages deployment for $GITHUB_SHA because main is now $tip"
+            exit 0
+          fi
+          echo 'deploy=true' >> "$GITHUB_OUTPUT"
       - name: Deploy to GitHub Pages
         id: deployment
+        if: steps.latest.outputs.deploy == 'true'
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

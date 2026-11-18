@@ -23,7 +23,7 @@ pub(crate) struct ValidatedVideoLayout {
 
 // The width, height and line stride of a valid layout are each at most its
 // storage extent, so every one of them fits the SDK's signed 32-bit fields.
-const _: () = {
+const_assert!({
     assert!(usize::BITS >= 32);
     assert!(MAX_VIDEO_BYTES <= i32::MAX as usize);
     // An image row has at most eight bytes per validated source pixel.
@@ -32,13 +32,17 @@ const _: () = {
     // at most the complete data size, even for a one-row frame.
     assert!(3 * MAX_VIDEO_BYTES + 64 < usize::MAX);
     assert!(MAX_METADATA_BYTES < i32::MAX as usize);
-};
+});
 
 /// Plane views whose names carry the format's component ordering.
 #[cfg(feature = "image-encoding")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PlaneRoles<'a> {
-    Packed {
+    PackedRgb {
+        pixels: VideoPlane<'a>,
+        order: RgbOrder,
+    },
+    Packed422 {
         pixels: VideoPlane<'a>,
     },
     PackedAlpha {
@@ -65,6 +69,28 @@ pub(crate) enum PlaneRoles<'a> {
         cr: VideoPlane<'a>,
         alpha: Option<VideoPlane<'a>>,
     },
+}
+
+/// Component order in a packed RGB plane.
+#[cfg(feature = "image-encoding")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RgbOrder {
+    Rgb,
+    Bgr,
+}
+
+/// A video layout with contiguous active pixels and no row or plane padding.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PackedVideoLayout(ValidatedVideoLayout);
+
+impl PackedVideoLayout {
+    pub(crate) fn new(format: PixelFormat, width: u32, height: u32) -> Result<Self> {
+        ValidatedVideoLayout::new_uncompressed(format, width, height, None).map(Self)
+    }
+
+    pub(crate) const fn as_layout(&self) -> &ValidatedVideoLayout {
+        &self.0
+    }
 }
 
 impl ValidatedVideoLayout {
@@ -135,7 +161,10 @@ impl ValidatedVideoLayout {
         // so the refusal and byte count are identical on every target.
         if minimum > MAX_VIDEO_BYTES as u64 {
             let stride = line_stride.map_or(minimum, |stride| (stride as u64).max(minimum));
-            video_plane_layouts(pixel_format.info(), stride, minimum, height as u64)?;
+            let info = pixel_format.info();
+            let dimensions = video_plane_dimensions(info, stride, minimum, height as u64)?;
+            let storage = video_storage_extent(&dimensions[..info.plane_count()]);
+            return Err(crate::LayoutDefect::VideoBytes(storage.into()));
         }
         let min_stride = minimum as usize;
         let line_stride = match line_stride {
@@ -210,7 +239,7 @@ impl ValidatedVideoLayout {
     /// [`MAX_VIDEO_BYTES`]. It is the layout [`video_plane_layouts`] gives
     /// the packed stride, `width` times the bytes per pixel, which a test
     /// checks for every format.
-    pub(crate) fn packed(&self) -> Self {
+    pub(crate) fn packed(&self) -> PackedVideoLayout {
         let mut plane_layouts = self.plane_layouts;
         let mut offset = 0;
         for plane in &mut plane_layouts[..self.plane_count()] {
@@ -218,10 +247,10 @@ impl ValidatedVideoLayout {
             plane.row_stride = plane.active_row_bytes;
             offset += plane.active_row_bytes * plane.row_count;
         }
-        Self {
+        PackedVideoLayout(Self {
             plane_layouts,
             ..*self
-        }
+        })
     }
 
     /// The SDK's `xres`.
@@ -291,17 +320,25 @@ impl ValidatedVideoLayout {
         // category; each constant index below names one of its active planes.
         // The caller retains and initializes its storage for the returned borrow.
         let plane = |index| unsafe { VideoPlane::new(data, self.plane_layouts[index]) };
-        match info.category() {
-            FormatCategory::Packed => PlaneRoles::Packed { pixels: plane(0) },
-            FormatCategory::PackedAlpha => PlaneRoles::PackedAlpha {
+        match self.pixel_format {
+            PixelFormat::Rgba | PixelFormat::Rgbx => PlaneRoles::PackedRgb {
+                pixels: plane(0),
+                order: RgbOrder::Rgb,
+            },
+            PixelFormat::Bgra | PixelFormat::Bgrx => PlaneRoles::PackedRgb {
+                pixels: plane(0),
+                order: RgbOrder::Bgr,
+            },
+            PixelFormat::Uyvy => PlaneRoles::Packed422 { pixels: plane(0) },
+            PixelFormat::Uyva => PlaneRoles::PackedAlpha {
                 pixels: plane(0),
                 alpha: plane(1),
             },
-            FormatCategory::SemiPlanar420 => PlaneRoles::SemiPlanar420 {
+            PixelFormat::Nv12 => PlaneRoles::SemiPlanar420 {
                 luma: plane(0),
                 chroma: plane(1),
             },
-            FormatCategory::Planar420 => {
+            PixelFormat::I420 | PixelFormat::Yv12 => {
                 let (cb, cr) = match info.chroma_order() {
                     ChromaOrder::CbCr => (plane(1), plane(2)),
                     ChromaOrder::CrCb => (plane(2), plane(1)),
@@ -312,19 +349,19 @@ impl ValidatedVideoLayout {
                     cr,
                 }
             }
-            FormatCategory::SemiPlanar422 | FormatCategory::SemiPlanar422Alpha => {
-                PlaneRoles::SemiPlanar422 {
+            PixelFormat::P216 | PixelFormat::Pa16 => PlaneRoles::SemiPlanar422 {
+                luma: plane(0),
+                chroma: plane(1),
+                alpha: info.has_alpha().then(|| plane(2)),
+            },
+            PixelFormat::Na48 | PixelFormat::Nb48 | PixelFormat::Na4g | PixelFormat::Nb4g => {
+                PlaneRoles::Planar444 {
                     luma: plane(0),
-                    chroma: plane(1),
-                    alpha: info.has_alpha().then(|| plane(2)),
+                    cb: plane(1),
+                    cr: plane(2),
+                    alpha: info.has_alpha().then(|| plane(3)),
                 }
             }
-            FormatCategory::Planar444 | FormatCategory::Planar444Alpha => PlaneRoles::Planar444 {
-                luma: plane(0),
-                cb: plane(1),
-                cr: plane(2),
-                alpha: info.has_alpha().then(|| plane(3)),
-            },
         }
     }
 
@@ -386,7 +423,7 @@ pub(super) fn validate_video_width(width: i64) -> LayoutResult<()> {
 }
 
 pub(super) fn validate_video_data_len(data_len_bytes: u64) -> LayoutResult<()> {
-    debug_assert!(
+    debug_invariant!(
         data_len_bytes > 0,
         "validated dimensions and stride are positive"
     );
@@ -480,12 +517,14 @@ impl VideoPlaneLayout {
 /// Plane offsets include preceding storage padding; payload lengths do not.
 const MAX_VIDEO_PLANES: usize = 4;
 
-fn video_plane_layouts(
+// Rows are (storage stride, active row bytes, row count). Keep them wide
+// until their complete storage extent has passed the frame size bound.
+fn video_plane_dimensions(
     info: PixelFormatInfo,
     stride: u64,
     active: u64,
     height: u64,
-) -> LayoutResult<[VideoPlaneLayout; MAX_VIDEO_PLANES]> {
+) -> LayoutResult<[(u64, u64, u64); MAX_VIDEO_PLANES]> {
     let mut dimensions = [(stride, active, height); MAX_VIDEO_PLANES];
     match info.category() {
         FormatCategory::Packed => {}
@@ -515,20 +554,29 @@ fn video_plane_layouts(
         FormatCategory::SemiPlanar422Alpha | FormatCategory::Planar444 => {}
         FormatCategory::Planar444Alpha => {}
     }
-    let count = info.plane_count();
+    Ok(dimensions)
+}
+
+fn video_storage_extent(dimensions: &[(u64, u64, u64)]) -> u64 {
     // Saturation retains one size cause even when an explicit stride near
     // usize::MAX makes the mathematical extent exceed u64::MAX.
-    let storage = dimensions[..count]
-        .iter()
-        .fold(0u64, |total, &(stride, _, rows)| {
-            total.saturating_add(stride.saturating_mul(rows))
-        });
-    validate_video_data_len(storage)?;
+    dimensions.iter().fold(0, |total, &(stride, _, rows)| {
+        total.saturating_add(stride.saturating_mul(rows))
+    })
+}
+
+fn video_plane_layouts(
+    info: PixelFormatInfo,
+    stride: u64,
+    active: u64,
+    height: u64,
+) -> LayoutResult<[VideoPlaneLayout; MAX_VIDEO_PLANES]> {
+    let dimensions = video_plane_dimensions(info, stride, active, height)?;
+    let dimensions = &dimensions[..info.plane_count()];
+    validate_video_data_len(video_storage_extent(dimensions))?;
     let mut planes = [VideoPlaneLayout::default(); MAX_VIDEO_PLANES];
     let mut offset = 0usize;
-    for (plane, &(row_stride, active_row_bytes, row_count)) in
-        planes.iter_mut().zip(&dimensions[..count])
-    {
+    for (plane, &(row_stride, active_row_bytes, row_count)) in planes.iter_mut().zip(dimensions) {
         // Each plane and partial sum fits the cap, which fits usize.
         let (row_stride, active_row_bytes, row_count) = (
             row_stride as usize,
@@ -542,7 +590,7 @@ fn video_plane_layouts(
             row_count,
         };
         offset += row_stride * row_count;
-        debug_assert!(active_row_bytes <= row_stride);
+        debug_invariant!(active_row_bytes <= row_stride);
     }
     // The complete storage extent and each partial sum fit MAX_VIDEO_BYTES.
     // Active rows fit their strides, so payload products and sums fit too.
@@ -578,7 +626,7 @@ pub(crate) struct ValidatedAudioLayout {
 }
 
 // Keep the layout no larger than the previous representation on every target.
-const _: () = {
+const_assert!({
     #[allow(dead_code)]
     struct PreviousLayout {
         format: AudioFormat,
@@ -589,7 +637,7 @@ const _: () = {
         sample_count: usize,
     }
     assert!(size_of::<ValidatedAudioLayout>() <= size_of::<PreviousLayout>());
-};
+});
 
 /// Initialized audio channel slices in channel order, without allocation.
 ///
@@ -653,7 +701,7 @@ impl std::iter::FusedIterator for AudioChannels<'_> {}
 // Packed channel strides are bounded by the audio byte cap. Explicit padded
 // strides retain their own SDK-range proof, including for a single channel
 // whose stride does not contribute to its byte extent.
-const _: () = assert!(MAX_AUDIO_BYTES <= i32::MAX as usize);
+const_assert!(MAX_AUDIO_BYTES <= i32::MAX as usize);
 
 impl ValidatedAudioLayout {
     /// The validated `format` value.
@@ -823,12 +871,12 @@ impl ValidatedAudioLayout {
     }
 
     /// The same frame with channels stored back to back, without padding.
-    pub(crate) fn packed(self) -> Self {
-        Self {
+    pub(crate) fn packed(self) -> PackedAudioLayout {
+        PackedAudioLayout(Self {
             padded_stride: None,
             sample_count: self.no_channels() * self.no_samples(),
             ..self
-        }
+        })
     }
 
     pub(crate) fn num_channels(self) -> u32 {
@@ -880,7 +928,7 @@ impl ValidatedAudioLayout {
         // packed() preserves that proof when removing inter-channel padding.
         let start = channel * self.channel_stride_samples();
         let end = start + self.no_samples();
-        debug_assert!(end <= self.sample_count);
+        debug_invariant!(end <= self.sample_count);
         Some(start..end)
     }
 
@@ -938,8 +986,19 @@ pub(super) fn validate_outbound_audio_layout(
     no_channels: u32,
     no_samples: u32,
     format: AudioFormat,
-) -> Result<ValidatedAudioLayout> {
+) -> Result<PackedAudioLayout> {
     ValidatedAudioLayout::new_uncompressed(format, sample_rate, no_channels, no_samples, None)
+        .map(PackedAudioLayout)
+}
+
+/// An audio layout whose planar channels are stored back to back.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PackedAudioLayout(ValidatedAudioLayout);
+
+impl PackedAudioLayout {
+    pub(crate) const fn as_layout(&self) -> &ValidatedAudioLayout {
+        &self.0
+    }
 }
 
 /// The one sample-rate check for every audio path, for values from the API

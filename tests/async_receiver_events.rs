@@ -7,7 +7,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name, loopback);
+common_helpers!(runtime, name, loopback, unsupported, feature);
 
 use grafton_ndi::{
     asynchronous::{AsyncReceiver, AsyncRuntime},
@@ -52,15 +52,11 @@ async fn async_capture_retains_capability_notifications<R: AsyncRuntime>(
         });
         while media.next_event(Duration::from_millis(50)).await?.is_some() {}
         assert!(!media.receiver().ptz().is_supported());
-        // The same two capability invalidations as the synchronous test, with
-        // its single-invalidation coverage on Windows.
-        let updates = if cfg!(target_os = "windows") { 1 } else { 2 };
         for (update, capabilities) in [
             "<ndi_capabilities ntk_ptz=\"true\"/>",
             "<ndi_capabilities ntk_ptz=\"true\" web_control=\"http://127.0.0.1/status-control\"/>",
         ]
         .into_iter()
-        .take(updates)
         .enumerate()
         {
             eprintln!("{runtime} capture case {kind}: capability update {update}");
@@ -135,10 +131,7 @@ async fn async_connection_changes_reach_the_receiver<R: AsyncRuntime>(
 
     media.connect_to(&source).await?;
     wait_until("connect_to", || media.receiver().is_connected());
-    if ndi
-        .require_feature(RuntimeFeature::ConnectedSourceName)
-        .is_ok()
-    {
+    if common::require_feature(ndi.require_feature(RuntimeFeature::ConnectedSourceName)) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             assert!(Instant::now() < deadline, "no source-name change reported");

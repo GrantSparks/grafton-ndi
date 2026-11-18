@@ -1,41 +1,14 @@
-//! Creating objects with a per-instance Advanced SDK configuration.
+//! Select the plain or configured native constructor from the typed options.
 //!
-//! Every object the SDK can also create with a JSON configuration (the
-//! finder, sender, receiver and router, and the Discovery Server advertisers
-//! and listeners) takes it from its options, whose `config` setter exists
-//! with the `advanced` feature. Each object has one creation path: an unsafe
-//! `create` function beside its `new`. It builds the native settings from the
-//! options, hands them to the SDK entry point it is given, turns a null result
-//! into the object's creation error, and constructs the native owner holding
-//! the configuration it is given, in a field that exists only with the
-//! `advanced` feature.
-//!
-//! This module adds the configured half once, for all of them.
-//! [`Configurable`] is that creation path as generic code sees it, and
-//! [`Configurable::configured`] is the one place a configuration reaches the
-//! SDK: it takes the configured entry point's table before anything is built
-//! or created, then hands the SDK the configuration's own buffer and the owner
-//! a clone of it to keep. `configurable!` implements the trait for the finder,
-//! the sender in each of its modes, the receiver and the router, so that the
-//! Advanced senders create theirs in their own mode, and defines each one's
-//! `new_configured` on
-//! that path; the object's `new` calls `new_configured` when its options carry
-//! a configuration, and otherwise gives the creation path the SDK's plain
-//! entry point and no configuration. The advertisers and listeners share one
-//! lifecycle owner, which implements the trait once for all four object kinds,
-//! beside its creation path, and makes the same choice in its own `new`.
-//!
-//! Taking the configured table applies its capability's gate, which includes
-//! the gates of the capabilities it requires: the router's includes source
-//! routing, and each Discovery Server object's includes the core capability
-//! whose functions it goes on to use. A configured object is therefore refused
-//! under its own capability before its creation path takes any other table.
+//! The configured path takes its capability before constructing settings.
+//! Its returned instance carries the configuration it may have retained.
 
 use std::ffi::c_char;
 
 use super::AdvancedConfig;
 use crate::{
     routing::{Router, RouterOptions},
+    runtime::NativeCreation,
     sys::{
         advanced::{
             native, FinderConfiguration, ReceiverConfiguration, RouterConfiguration,
@@ -58,9 +31,22 @@ pub(crate) trait Configurable: Sized {
     /// The native handle.
     type Instance;
 
-    /// Run the object's creation path with `create` as its entry point, which
-    /// retains its function name, and keep `config` for as long
-    /// as the object lives.
+    fn config(options: &Self::Options) -> Option<&AdvancedConfig>;
+    fn create_plain(ndi: &Ndi, options: &Self::Options) -> Result<Self>;
+    fn create_configured(
+        ndi: &Ndi,
+        options: &Self::Options,
+        config: Option<&AdvancedConfig>,
+    ) -> Result<Self>;
+
+    fn create_from_options(ndi: &Ndi, options: &Self::Options) -> Result<Self> {
+        match Self::config(options) {
+            Some(config) => Self::create_configured(ndi, options, Some(config)),
+            None => Self::create_plain(ndi, options),
+        }
+    }
+
+    /// The object's fresh-instance creation path with its own settings.
     ///
     /// # Safety
     ///
@@ -69,8 +55,7 @@ pub(crate) trait Configurable: Sized {
     unsafe fn create_with(
         ndi: &Ndi,
         options: &Self::Options,
-        config: AdvancedConfig,
-        create: impl FnOnce(&Self::Settings) -> crate::sys::table::Called<Self::Instance>,
+        create: impl FnOnce(&Self::Settings) -> NativeCreation<Self::Instance>,
     ) -> Result<Self>;
 
     /// Create the object with `config` through `create`, the entry point
@@ -88,7 +73,7 @@ pub(crate) trait Configurable: Sized {
     unsafe fn configured<C: Table>(
         ndi: &Ndi,
         options: &Self::Options,
-        config: &AdvancedConfig,
+        config: Option<&AdvancedConfig>,
         create: impl FnOnce(
             &C,
             &Self::Settings,
@@ -96,25 +81,19 @@ pub(crate) trait Configurable: Sized {
         ) -> crate::sys::table::Called<Self::Instance>,
     ) -> Result<Self> {
         let table = ndi.table::<C>()?;
-        let text = config.as_ptr();
-        // SAFETY: the SDK is handed `text`, the buffer that every clone of
-        // `config` shares, and the object is handed one of those clones to
-        // keep. The buffer neither moves nor is freed while a clone lives, and
-        // every owner destroys its native object before it releases the
-        // clone, so the text stays readable for as long as the SDK may read
-        // it, whether it copies the text or keeps the pointer. What `create`
-        // returns is the caller's obligation.
+        // SAFETY: the caller promises a fresh instance from these settings.
+        // The returned creation result pairs it with the lent allocation.
         unsafe {
-            Self::create_with(ndi, options, config.clone(), |settings| {
-                create(table, settings, text)
+            Self::create_with(ndi, options, |settings| {
+                let (call, config) =
+                    AdvancedConfig::lend(config, |text| create(table, settings, text));
+                NativeCreation { call, config }
             })
         }
     }
 }
 
-/// Implement [`Configurable`] for `$Object` on its creation path, and define
-/// its `new_configured` on the entry point `$create` of table `$Table`. An
-/// object generic over its mode names the mode parameter and its bound.
+/// Implement the shared selection path for each constructor pair.
 macro_rules! configurable {
     (
         $Object:ty $(where $Mode:ident: $Bound:path)? => ($Options:ty, $Settings:ty) -> $Instance:ty,
@@ -125,35 +104,21 @@ macro_rules! configurable {
             type Settings = $Settings;
             type Instance = $Instance;
 
-            unsafe fn create_with(
-                ndi: &Ndi,
-                options: &$Options,
-                        config: AdvancedConfig,
-                create: impl FnOnce(&$Settings) -> crate::sys::table::Called<$Instance>,
-            ) -> Result<Self> {
-                // SAFETY: forwarded to the caller's obligation.
-                unsafe {
-                    Self::create(ndi, options, Some(config), |_, settings| {
-                        create(settings)
-                    })
-                }
+            fn config(options: &$Options) -> Option<&AdvancedConfig> {
+                options.configured_config()
             }
-        }
 
-        // These creation helpers are crate-private, including their mode bounds.
-        #[allow(private_bounds)]
-        impl$(<$Mode: $Bound>)? $Object {
-            /// Create the object through its configured entry point with
-            /// `config`, which it keeps for as long as it lives: what `new`
-            /// does for options that carry a configuration. Without an
-            /// Advanced runtime, or in a build without the Advanced SDK, it is
-            /// refused with `Error::UnsupportedCapability`.
-            pub(crate) fn new_configured(
+            fn create_plain(ndi: &Ndi, options: &$Options) -> Result<Self> {
+                Self::create_plain(ndi, options)
+            }
+
+            fn create_configured(
                 ndi: &Ndi,
                 options: &$Options,
-                config: &AdvancedConfig,
+                config: Option<&AdvancedConfig>,
             ) -> Result<Self> {
-                // SAFETY: the closure returns what the entry point returned.
+                // SAFETY: the closure returns this SDK constructor's fresh
+                // instance for the supplied settings and configuration.
                 unsafe {
                     Self::configured(
                         ndi,
@@ -164,6 +129,15 @@ macro_rules! configurable {
                         },
                     )
                 }
+            }
+
+            unsafe fn create_with(
+                ndi: &Ndi,
+                options: &$Options,
+                create: impl FnOnce(&$Settings) -> NativeCreation<$Instance>,
+            ) -> Result<Self> {
+                // SAFETY: forwarded to the caller's fresh-instance obligation.
+                unsafe { Self::create(ndi, options, |_, settings| create(settings)) }
             }
         }
     };

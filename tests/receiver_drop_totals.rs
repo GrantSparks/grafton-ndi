@@ -2,7 +2,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name, loopback);
+common_helpers!(runtime, name, loopback, stop);
 
 use grafton_ndi::{
     AudioFrame, Receiver, ReceiverBandwidth, ReceiverOptions, Sender, SenderOptions,
@@ -48,13 +48,7 @@ fn audio_queue_drops_are_part_of_received_total() {
                 thread::sleep(Duration::from_millis(10));
             }
         });
-        struct Stop<'a>(&'a AtomicBool);
-        impl Drop for Stop<'_> {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Relaxed);
-            }
-        }
-        let _stop = Stop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut observed_progress = false;
         loop {

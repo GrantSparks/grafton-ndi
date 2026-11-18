@@ -20,10 +20,10 @@ use std::{env, time::Duration};
 
 use grafton_ndi::{
     advanced::{
-        CompressedAudioFrame, CompressedSender, CompressedVideoFrame, PacketItemRef,
-        PacketReceiver, PassthroughPreset, ReceivedAudioRef, ReceivedVideoRef,
+        AudioPacketFormat, CompressedFrame, CompressedSender, PacketItemRef, PacketReceiver,
+        PassthroughPreset, ReceivedAudioRef, ReceivedVideoRef, VideoPacketFormat,
     },
-    Error, Ndi, ReceiverOptions, RuntimeOptions, SdkEdition, SenderOptions, Tally,
+    Ndi, ReceiverOptions, RuntimeOptions, SdkEdition, SenderOptions, Tally,
 };
 
 #[path = "common/finder.rs"]
@@ -31,7 +31,7 @@ mod finder;
 
 use finder::finder_with_extra_ips;
 
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
 
@@ -66,8 +66,8 @@ fn main() -> Result<(), Error> {
     )?;
 
     let (mut video, mut audio) = (0u32, 0u32);
-    let mut video_storage: Option<CompressedVideoFrame> = None;
-    let mut audio_storage: Option<CompressedAudioFrame> = None;
+    let mut video_storage: Option<CompressedFrame<VideoPacketFormat>> = None;
+    let mut audio_storage: Option<CompressedFrame<AudioPacketFormat>> = None;
     for _ in 0..600 {
         // A viewer that has just connected cannot decode until it sees a keyframe.
         if sender.sender().keyframe_required(None)? {
@@ -87,7 +87,7 @@ fn main() -> Result<(), Error> {
                 // Reuse one copy per medium instead of allocating per capture.
                 let admitted = match video_storage.as_mut() {
                     Some(storage) => packet.try_copy_into(storage),
-                    None => CompressedVideoFrame::try_from(&packet)
+                    None => CompressedFrame::<VideoPacketFormat>::try_from(&packet)
                         .map(|frame| video_storage = Some(frame)),
                 };
                 match admitted {
@@ -101,7 +101,7 @@ fn main() -> Result<(), Error> {
             Some(PacketItemRef::Audio(ReceivedAudioRef::Compressed(packet))) => {
                 let admitted = match audio_storage.as_mut() {
                     Some(storage) => packet.try_copy_into(storage),
-                    None => CompressedAudioFrame::try_from(&packet)
+                    None => CompressedFrame::<AudioPacketFormat>::try_from(&packet)
                         .map(|frame| audio_storage = Some(frame)),
                 };
                 match admitted {

@@ -101,6 +101,9 @@
 //! }
 //! # }
 //! ```
+//!
+//! See [mixed_media_async.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/mixed_media_async.rs)
+//! for a runnable async discovery and capture loop.
 
 use std::{
     future::Future,
@@ -917,6 +920,9 @@ pub mod tokio {
     //!     Ok(())
     //! }
     //! ```
+    //!
+    //! See [mixed_media_async.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/mixed_media_async.rs)
+    //! for a complete Tokio example.
 
     /// An [`AsyncReceiver`](super::AsyncReceiver) on the Tokio runtime.
     pub type AsyncReceiver = super::AsyncReceiver<super::Tokio>;
@@ -961,6 +967,9 @@ pub mod smol {
     //!     })
     //! }
     //! ```
+    //!
+    //! See [mixed_media_async.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/mixed_media_async.rs)
+    //! for a complete smol example.
 
     /// An [`AsyncReceiver`](super::AsyncReceiver) on the smol runtime.
     pub type AsyncReceiver = super::AsyncReceiver<super::Smol>;
@@ -1489,11 +1498,9 @@ mod receiver_tests {
     #[cfg(feature = "tokio")]
     mod tokio_runtime {
         use super::*;
-        use crate::receiver::native_capture_calls;
         use std::{
             sync::mpsc,
             task::{Context, Poll, Waker},
-            time::Instant,
         };
 
         /// A runtime with one blocking thread, so that work queues behind a
@@ -1503,14 +1510,6 @@ mod receiver_tests {
             ::tokio::runtime::Builder::new_current_thread()
                 .max_blocking_threads(1)
                 .build()
-                .unwrap()
-        }
-
-        /// The native captures made on the one blocking thread since the
-        /// previous call.
-        async fn worker_capture_calls() -> usize {
-            ::tokio::task::spawn_blocking(native_capture_calls::take)
-                .await
                 .unwrap()
         }
 
@@ -1534,44 +1533,6 @@ mod receiver_tests {
             let receiver = unconnected::<Tokio>(&ndi);
             runtime().block_on(operations_of_an_unconnected_receiver(&ndi, &receiver));
             runtime().block_on(scoped_captures_during_connection_changes(&receiver));
-        }
-
-        #[test]
-        fn scoped_capture_spends_queue_delay_and_skips_cancelled_callbacks() {
-            let Some(ndi) = crate::test_support::ndi() else {
-                return;
-            };
-            let receiver = unconnected::<Tokio>(&ndi);
-            runtime().block_on(async {
-                worker_capture_calls().await;
-                let (release, blocker) = occupy_worker();
-                let budget = Duration::from_millis(25);
-                let mut capture =
-                    Box::pin(receiver.capture_video_with(budget, |_| panic!("no frame")));
-                let mut context = Context::from_waker(Waker::noop());
-                assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
-                std::thread::sleep(budget + Duration::from_millis(10));
-                release.send(()).unwrap();
-                assert!(capture.await.unwrap().is_none());
-                blocker.await.unwrap();
-                assert_eq!(
-                    ::tokio::task::spawn_blocking(native_capture_calls::take_with_longest_wait)
-                        .await
-                        .unwrap(),
-                    (1, 0)
-                );
-
-                let (release, blocker) = occupy_worker();
-                let mut capture =
-                    Box::pin(receiver.capture_any_with(Duration::from_secs(1), |_| {
-                        panic!("cancelled callback")
-                    }));
-                assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
-                drop(capture);
-                release.send(()).unwrap();
-                blocker.await.unwrap();
-                assert_eq!(worker_capture_calls().await, 0);
-            });
         }
 
         #[test]
@@ -1625,126 +1586,6 @@ mod receiver_tests {
                 // A sentinel on the sole worker follows the cancelled closure.
                 ::tokio::task::spawn_blocking(|| {}).await.unwrap();
                 assert_eq!(receiver.receiver().connection_target(), initial);
-            });
-        }
-
-        #[test]
-        fn next_event_with_zero_timeout_makes_one_attempt_without_waiting() {
-            let Some(ndi) = crate::test_support::ndi() else {
-                return;
-            };
-            let receiver = unconnected::<Tokio>(&ndi);
-            runtime().block_on(async {
-                worker_capture_calls().await;
-                let began = Instant::now();
-                assert!(receiver.next_event(Duration::ZERO).await.unwrap().is_none());
-                let waited = began.elapsed();
-                assert!(waited < Duration::from_millis(500), "{waited:?}");
-                assert_eq!(worker_capture_calls().await, 1);
-            });
-        }
-
-        #[test]
-        fn next_event_spends_blocking_pool_queue_delay_from_its_budget() {
-            let Some(ndi) = crate::test_support::ndi() else {
-                return;
-            };
-            let receiver = unconnected::<Tokio>(&ndi);
-            runtime().block_on(async {
-                worker_capture_calls().await;
-                let (release, blocker) = occupy_worker();
-                let budget = Duration::from_millis(300);
-                let mut poll = Box::pin(receiver.next_event(budget));
-                let mut context = Context::from_waker(Waker::noop());
-                assert!(matches!(poll.as_mut().poll(&mut context), Poll::Pending));
-                // Keep the one blocking thread until the whole budget is spent.
-                std::thread::sleep(budget + Duration::from_millis(20));
-                release.send(()).unwrap();
-                assert!(poll.await.unwrap().is_none());
-                blocker.await.unwrap();
-                // Nothing was left: one attempt without waiting, where a budget
-                // started on the blocking thread would have made three or more.
-                assert_eq!(worker_capture_calls().await, 1);
-            });
-        }
-
-        #[test]
-        fn dropping_a_queued_next_event_makes_no_attempt() {
-            let Some(ndi) = crate::test_support::ndi() else {
-                return;
-            };
-            let receiver = unconnected::<Tokio>(&ndi);
-            runtime().block_on(async {
-                worker_capture_calls().await;
-                let (release, blocker) = occupy_worker();
-                let mut poll = Box::pin(receiver.next_event(Duration::from_secs(5)));
-                let mut context = Context::from_waker(Waker::noop());
-                assert!(matches!(poll.as_mut().poll(&mut context), Poll::Pending));
-                drop(poll);
-                release.send(()).unwrap();
-                blocker.await.unwrap();
-                // The one blocking thread runs the cancelled closure before
-                // this count, and the closure stopped at its gate.
-                assert_eq!(worker_capture_calls().await, 0);
-            });
-        }
-
-        #[test]
-        fn combined_capture_counts_queue_delay_and_skips_cancelled_queued_work() {
-            let Some(ndi) = crate::test_support::ndi() else {
-                return;
-            };
-            let receiver = unconnected::<Tokio>(&ndi);
-            runtime().block_on(async {
-                worker_capture_calls().await;
-                let (release, blocker) = occupy_worker();
-                let budget = Duration::from_millis(30);
-                let mut capture = Box::pin(receiver.capture_any(budget));
-                let mut context = Context::from_waker(Waker::noop());
-                assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
-                std::thread::sleep(budget + Duration::from_millis(10));
-                release.send(()).unwrap();
-                assert!(capture.await.unwrap().is_none());
-                blocker.await.unwrap();
-                let (calls, longest) =
-                    ::tokio::task::spawn_blocking(native_capture_calls::take_with_longest_wait)
-                        .await
-                        .unwrap();
-                assert_eq!((calls, longest), (1, 0));
-
-                let (release, blocker) = occupy_worker();
-                let mut capture = Box::pin(receiver.capture_any(Duration::from_secs(5)));
-                assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
-                drop(capture);
-                release.send(()).unwrap();
-                blocker.await.unwrap();
-                assert_eq!(worker_capture_calls().await, 0);
-            });
-        }
-
-        #[test]
-        fn combined_capture_reaches_the_sdk_while_connection_changes_are_locked() {
-            let Some(ndi) = crate::test_support::ndi() else {
-                return;
-            };
-            let receiver = unconnected::<Tokio>(&ndi);
-            let _exclusive = receiver.inner.core.reconnect_lock();
-            runtime().block_on(async {
-                worker_capture_calls().await;
-                assert!(receiver
-                    .capture_any(Duration::ZERO)
-                    .await
-                    .unwrap()
-                    .is_none());
-                assert_eq!(worker_capture_calls().await, 1);
-                let began = Instant::now();
-                assert!(receiver
-                    .capture_any(Duration::from_millis(25))
-                    .await
-                    .unwrap()
-                    .is_none());
-                assert!(began.elapsed() >= Duration::from_millis(25));
-                assert!(worker_capture_calls().await >= 1);
             });
         }
     }

@@ -210,6 +210,50 @@ class Documentation(unittest.TestCase):
         self.write('docs/usage.md', 'The `removed_method` is gone.')
         self.assertIn('docs/usage.md:1:', docs.guide_api_name_violations(self.root, self.root / 'target/doc')[0])
 
+    def test_migration_checks_removed_names_at_its_tag(self):
+        self.write('src/lib.rs', 'pub struct Foo; impl Foo { pub fn old_api() {} }')
+        subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
+        subprocess.run(['git', '-C', str(self.root), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=Test',
+                        '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'release'],
+                       check=True)
+        subprocess.run(['git', '-C', str(self.root), 'tag', 'v2.1.0'], check=True)
+        self.write('src/lib.rs', 'pub fn current_api() {} pub fn unreleased_api() {}')
+        guide = self.write(docs.MIGRATION_GUIDE,
+                           '# Upgrade\n\nCompare against `v2.1.0`.\n\n'
+                           'Replace `Foo::old_api()` with `current_api()`.\n'
+                           'Use `absent_but_not_a_removed_name` for this check.\n'
+                           'Use `current_api()` to remove data from a local buffer.\n'
+                           '\n```text\nRemove `example_only`.\n```\n')
+        self.assertEqual(docs.previous_release_name_violations(self.root), [])
+        text = guide.read_text(encoding='utf-8')
+        guide.write_text(text + '\nRemove this\n`unreleased_api`.\n', encoding='utf-8')
+        errors = docs.previous_release_name_violations(self.root)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('docs/migration/2.0-to-3.0.md:14:', errors[0])
+        self.assertIn('unreleased_api did not occur at v2.1.0', errors[0])
+        guide.write_text(text.replace('v2.1.0', 'v9.9.9'), encoding='utf-8')
+        self.assertIn('cannot read previous release tag v9.9.9',
+                      docs.previous_release_name_violations(self.root)[0])
+        guide.write_text(text.replace('`v2.1.0`', 'the previous version'), encoding='utf-8')
+        self.assertIn('first paragraph must name the previous release tag',
+                      docs.previous_release_name_violations(self.root)[0])
+
+    def test_migration_checks_replacements_against_current_rustdoc(self):
+        self.write('target/doc/grafton_ndi/index.html', '<a href="struct.Foo.html">Foo</a>')
+        self.write('target/doc/grafton_ndi/struct.Foo.html',
+                   '<section id="method.current_api"></section>')
+        preamble = '# Upgrade\n\nCompare against `v2.1.0`.\n\n'
+        changes = ('| 2.1.0 | 3.0 |\n| --- | --- |\n'
+                   '| `Foo::old_api()` | `Foo::current_api()` |\n'
+                   '\nRename `Foo::old_api()` to `Foo::missing_api()`.\n')
+        self.write(docs.MIGRATION_GUIDE, preamble + changes)
+        self.write('docs/migration/1.x-to-2.0.md', 'Use `Foo::archived_api()`.\n')
+        errors = docs.guide_api_name_violations(self.root, self.root / 'target/doc')
+        self.assertEqual(errors, [
+            'docs/migration/2.0-to-3.0.md:9: unknown documented API name: Foo::missing_api()',
+        ])
+
     def test_rustdoc_cli_rejects_a_missing_prose_method(self):
         self.write('target/doc/grafton_ndi/index.html', '<a href="struct.Foo.html">Foo</a>')
         self.write('target/doc/grafton_ndi/struct.Foo.html', '<section id="method.new"></section>')
@@ -298,6 +342,16 @@ class Documentation(unittest.TestCase):
         self.write('examples/README.md', '[One](one.rs)')
         self.assertEqual(self.check('# Example')[0], [])
 
+    def test_module_example_requires_a_nearby_runnable_link(self):
+        self.write('examples/receive.rs', 'fn main() {}')
+        self.write('examples/README.md', '[Run](receive.rs)')
+        module = '//! # Example\n//! ```no_run\n//! fn main() {}\n//! ```\n'
+        self.write('src/receiver.rs', module + '/// [Item example](../examples/receive.rs)\n')
+        errors, _ = self.check('# Example')
+        self.assertTrue(any('src/receiver.rs:2: a module example needs' in error for error in errors))
+        self.write('src/receiver.rs', module + '//! [Run](../examples/receive.rs)\n')
+        self.assertEqual(self.check('# Example')[0], [])
+
     def test_changelog_keeps_historical_code_but_links_are_checked(self):
         self.write('CHANGELOG.md', '```rust\nold_api();\n```\n[missing](missing.md)')
         errors, snippets = self.check('# Example')
@@ -309,7 +363,7 @@ class Documentation(unittest.TestCase):
         self.write('src/receiver.rs', receiver)
         self.write('src/advanced/controls.rs', advanced)
         self.write('src/advanced/kvm_receiver.rs', kvm)
-        return docs.kvm_forward_violations(self.root)
+        return docs.method_twin_violations(self.root)
 
     def test_shared_receiver_controls_require_kvm_forwards(self):
         receiver = 'impl<M: ReceiverMode> Receiver<M> { pub fn control(&self) {} }'
@@ -390,6 +444,23 @@ class Documentation(unittest.TestCase):
         self.assertEqual(len(errors), 2)
         self.assertTrue(any('Receiver::control' in error for error in errors))
         self.assertTrue(any('Receiver::other' in error for error in errors))
+
+    def test_sync_and_async_twins_keep_all_aliases_in_both_directions(self):
+        alias = '#[doc(alias = "NDIlib_find_get_current_sources")]'
+        sync = f"impl<'a> SourceWatch<'a> {{ {alias} pub fn current_sources(&mut self) {{}} }}"
+        asynchronous = f"impl<D> AsyncSourceWatch<D> {{ {alias} pub async fn current_sources(&self) {{}} }}"
+        sync_file = 'src/finder.rs'
+        async_file = 'src/asynchronous/discovery.rs'
+        self.write(sync_file, sync)
+        self.write(async_file, asynchronous)
+        self.assertEqual(docs.method_twin_violations(self.root), [])
+        for file, text in ((sync_file, sync), (async_file, asynchronous)):
+            with self.subTest(missing_alias=file):
+                self.write(file, text.replace(alias, ''))
+                error, = docs.method_twin_violations(self.root)
+                self.assertIn('AsyncSourceWatch::current_sources doc(alias)', error)
+                self.assertIn('SourceWatch::current_sources', error)
+                self.write(file, text)
 
     def test_native_alias_coverage_follows_every_registry_and_new_files(self):
         forms = ['native_table', 'optional_tables', 'advanced_tables', 'file_families']

@@ -1,13 +1,24 @@
 //! Connection targets and native requests stay in agreement, without an SDK.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
-#[path = "support/fixture.rs"]
-mod fixture;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child, fixture);
+use common::TestChild;
+
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
+use runtime_fixture::{read_fake_log, NativeGate};
 
-use grafton_ndi::{Error, Ndi, Receiver, ReceiverOptions, RuntimeOptions, Source};
-use std::{fs, process::Command, sync::Barrier};
+use grafton_ndi::{
+    Error, Ndi, Receiver, ReceiverEvent, ReceiverItemRef, ReceiverOptions, RuntimeOptions, Source,
+};
+use std::{
+    path::PathBuf,
+    sync::{mpsc, Barrier},
+    time::{Duration, Instant},
+};
 
 #[test]
 fn connection_target_tracks_native_requests() {
@@ -15,32 +26,20 @@ fn connection_target_tracks_native_requests() {
         exercise_target();
         return;
     }
-    let directory = fixture::FixtureDir::create("connection-target");
+    let directory = common::FixtureDir::create("connection-target");
     let library = directory.path().join("libndi_target.so");
     runtime_fixture::FakeRuntime {
         cfgs: vec!["fake_objects"],
         ..Default::default()
     }
     .build(&library);
-    let result = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "connection_target_tracks_native_requests",
-            "--nocapture",
-        ])
+    TestChild::new("connection_target_tracks_native_requests")
         .env("GRAFTON_TARGET_CHILD", &library)
         .env(
             "GRAFTON_FAKE_NDI_LOG",
             directory.path().join("requests.log"),
         )
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+        .run();
 }
 
 #[test]
@@ -52,63 +51,117 @@ fn connection_target_snapshot_does_not_wait_for_a_native_connection_request() {
         .unwrap();
         let initial = Source::new("Initial").unwrap();
         let receiver = Receiver::new(&ndi, &ReceiverOptions::new(initial.clone())).unwrap();
-        let gate = std::path::PathBuf::from(std::env::var_os("GRAFTON_FAKE_CONNECT_GATE").unwrap());
-        struct Release(std::path::PathBuf);
-        impl Drop for Release {
-            fn drop(&mut self) {
-                fs::write(self.0.join("release"), b"").unwrap();
-            }
-        }
+        let gate = PathBuf::from(std::env::var_os("GRAFTON_FAKE_CONNECT_GATE").unwrap());
         let blocked = Source::new("Blocked").unwrap();
+        std::env::set_var("GRAFTON_FAKE_CAPTURE_SCRIPT", "native-gate:source");
+        assert!(receiver
+            .capture_audio_ref(Duration::ZERO)
+            .unwrap()
+            .is_none());
         std::thread::scope(|scope| {
             let receiver = &receiver;
-            let release = Release(gate.clone());
+            let release = NativeGate(&gate);
             scope.spawn(|| receiver.connect_to(&blocked));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while !gate.join("entered").exists() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "native request did not start"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            let (send, receive) = std::sync::mpsc::channel();
-            scope.spawn(move || send.send(receiver.connection_target()).unwrap());
-            let snapshot = receive.recv_timeout(std::time::Duration::from_secs(1));
-            // Release native work before asserting so a lock regression fails
-            // cleanly rather than hanging either scoped worker.
+            release.wait_for_entry();
+            let (send, receive) = mpsc::channel();
+            let (finished, capture_result) = mpsc::channel();
+            scope.spawn(move || {
+                send.send(receiver.connection_target()).unwrap();
+                capture_during_native_connect(receiver);
+                finished.send(()).unwrap();
+            });
+            let snapshot = receive.recv_timeout(Duration::from_secs(2));
+            // The capture must complete while connect is still blocked.
+            let captured = capture_result.recv_timeout(Duration::from_secs(3));
             drop(release);
             assert_eq!(
                 snapshot.expect("snapshot waited for native connect"),
                 initial
             );
+            captured.expect("capture did not finish while native connect was gated");
         });
         assert_eq!(receiver.connection_target(), blocked);
+
+        let capture_gate = PathBuf::from(std::env::var_os("GRAFTON_FAKE_CAPTURE_GATE").unwrap());
+        std::env::set_var("GRAFTON_FAKE_CAPTURE_SCRIPT", "wait-gate:hold,status");
+        std::thread::scope(|scope| {
+            let release = NativeGate(&capture_gate);
+            let waiting = scope.spawn(|| receiver.next_event(Duration::from_secs(8)).unwrap());
+            release.wait_for_entry();
+            let (send, completed) = mpsc::channel();
+            let receiver = &receiver;
+            scope.spawn(move || {
+                receiver.reconnect();
+                assert!(receiver
+                    .capture_audio_ref(Duration::ZERO)
+                    .unwrap()
+                    .is_none());
+                send.send(()).unwrap();
+            });
+            let changed = completed.recv_timeout(Duration::from_secs(2));
+            drop(release);
+            changed.expect("reconnect and typed capture must run during an event wait");
+            assert!(matches!(
+                waiting.join().unwrap(),
+                Some(ReceiverEvent::StatusChanged(_))
+            ));
+        });
         return;
     }
-    let directory = fixture::FixtureDir::create("connection-target-blocked");
+    let directory = common::FixtureDir::create("connection-target-blocked");
     let library = directory.path().join("libndi_blocked.so");
     runtime_fixture::FakeRuntime {
-        cfgs: vec!["fake_objects", "fake_blocking_connect"],
+        cfgs: vec!["fake_objects", "fake_blocking_connect", "fake_capture"],
         ..Default::default()
     }
     .build(&library);
-    let result = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "connection_target_snapshot_does_not_wait_for_a_native_connection_request",
-            "--nocapture",
-        ])
+    let capture_gate = common::FixtureDir::create("capture-blocked");
+    TestChild::new("connection_target_snapshot_does_not_wait_for_a_native_connection_request")
         .env("GRAFTON_TARGET_BLOCKED_CHILD", &library)
         .env("GRAFTON_FAKE_CONNECT_GATE", directory.path())
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
+        .env("GRAFTON_FAKE_CAPTURE_GATE", capture_gate.path())
+        .env("GRAFTON_FAKE_NDI_LOG", directory.join("captures.log"))
+        .run();
+}
+
+fn capture_during_native_connect(receiver: &Receiver) {
+    let before = read_fake_log();
+    assert!(matches!(
+        receiver.capture_any_ref(Duration::ZERO).unwrap(),
+        Some(ReceiverItemRef::Event(ReceiverEvent::SourceChanged))
+    ));
+    assert_eq!(
+        read_fake_log(),
+        before,
+        "consuming a retained event called the SDK"
     );
+    assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
+    assert!(receiver.capture_video(Duration::ZERO).unwrap().is_none());
+    assert!(receiver.capture_audio(Duration::ZERO).unwrap().is_none());
+    assert!(receiver
+        .capture_metadata_ref(Duration::ZERO)
+        .unwrap()
+        .is_none());
+    assert!(receiver.capture_any(Duration::ZERO).unwrap().is_none());
+    let log = read_fake_log();
+    let attempts: Vec<_> = log[before.len()..]
+        .lines()
+        .filter_map(|line| line.strip_prefix("capture:none:"))
+        .collect();
+    assert_eq!(attempts, ["000:0", "100:0", "010:0", "001:0", "111:0"]);
+
+    let budget = Duration::from_millis(230);
+    let began = Instant::now();
+    assert!(receiver.next_event(budget).unwrap().is_none());
+    assert!(began.elapsed() >= budget);
+    let bounded = read_fake_log();
+    let waits: Vec<_> = bounded[log.len()..]
+        .lines()
+        .filter_map(|line| line.strip_prefix("capture:none:000:"))
+        .map(|wait| wait.parse::<u32>().unwrap())
+        .collect();
+    assert!(!waits.is_empty());
+    assert!(waits.into_iter().all(|wait| wait <= 100));
 }
 
 fn exercise_target() {
@@ -133,10 +186,8 @@ fn exercise_target() {
         Err(Error::InvalidCString(_))
     ));
     assert_eq!(receiver.connection_target(), b);
-    let log = std::path::PathBuf::from(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap());
     let requests = || {
-        fs::read_to_string(&log)
-            .unwrap()
+        read_fake_log()
             .lines()
             .filter_map(|line| line.strip_prefix("receiver-connect:").map(str::to_owned))
             .collect::<Vec<_>>()

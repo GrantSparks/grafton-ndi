@@ -5,5 +5,8 @@ edition = "2021"
 publish = false
 description = "Maintenance tasks for grafton-ndi: regenerate and verify the vendored NDI bindings."
 
+[lints]
+workspace = true
+
 [dependencies]
 bindgen = "0.72.1"

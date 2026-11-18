@@ -8,24 +8,32 @@ use crate as api;
 
 #[cfg(feature = "advanced")]
 mod advanced_runtime;
+mod child;
 mod feature;
 #[cfg(feature = "file-io")]
 mod file_api;
+mod fixture;
 mod hx_placeholder;
 mod identity;
 mod policy;
 mod runtime;
+#[cfg(feature = "advanced")]
+mod stop;
 mod unique_name;
 mod unsupported;
 
 #[cfg(feature = "advanced")]
 pub use advanced_runtime::advanced_ndi;
+pub use child::TestChild;
 pub use feature::require_feature;
 #[cfg(feature = "file-io")]
 pub use file_api::file_api;
+pub use fixture::FixtureDir;
 pub use hx_placeholder::is_hx_placeholder;
 use policy::Requirement;
 pub use runtime::ndi;
+#[cfg(feature = "advanced")]
+pub use stop::StopOnDrop;
 pub use unique_name::unique_name;
 pub use unsupported::unsupported;
 
@@ -58,6 +66,10 @@ fn missing_requirement(requirement: Requirement) -> Option<&'static str> {
         Requirement::Runtime => None,
         Requirement::Advanced => missing(cfg!(feature = "advanced"), "the `advanced` feature"),
         Requirement::File => missing(cfg!(feature = "file-io"), "the `file-io` feature"),
+        Requirement::Peer => missing(
+            cfg!(not(ndi_link_static)),
+            "a target that loads the runtime dynamically",
+        ),
         Requirement::DiscoveryServer => missing(
             cfg!(all(target_os = "linux", not(ndi_link_static))),
             "a Linux target that loads the runtime dynamically",
@@ -105,15 +117,6 @@ mod tests {
     use crate::{Capability, CapabilityRefusal, Error, RuntimeFeature, SdkVersion};
     use std::sync::LazyLock;
 
-    const REQUIREMENTS: [Requirement; 6] = [
-        Requirement::Runtime,
-        Requirement::Advanced,
-        Requirement::File,
-        Requirement::DiscoveryServer,
-        Requirement::H264Decoder,
-        Requirement::Hevc444Decoder,
-    ];
-
     #[test]
     fn requirement_implications_include_decoder_prerequisites_without_cycles() {
         fn visit(requirement: Requirement, path: &mut Vec<Requirement>) {
@@ -124,7 +127,7 @@ mod tests {
             }
             path.pop();
         }
-        for requirement in REQUIREMENTS {
+        for requirement in Requirement::ALL {
             visit(requirement, &mut Vec::new());
             if requirement != Requirement::Runtime {
                 assert!(requirement.implied().contains(&Requirement::Runtime));
@@ -133,6 +136,94 @@ mod tests {
         for decoder in [Requirement::H264Decoder, Requirement::Hevc444Decoder] {
             assert!(decoder.implied().contains(&Requirement::Advanced));
         }
+    }
+
+    #[test]
+    fn concurrent_fixtures_with_the_same_purpose_own_distinct_paths() {
+        let fixtures: Vec<_> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| FixtureDir::create("concurrent-test")))
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect()
+        });
+        let paths: std::collections::HashSet<_> = fixtures.iter().map(FixtureDir::path).collect();
+        assert_eq!(paths.len(), fixtures.len());
+        assert!(paths.iter().all(|path| path.is_dir()));
+    }
+
+    #[test]
+    fn fixture_cleans_up_after_unwinding() {
+        let mut path = None;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let fixture = FixtureDir::create("unwinding-test");
+            path = Some(fixture.path().to_owned());
+            std::fs::write(fixture.join("sentinel"), b"test").unwrap();
+            panic!("test fixture scope unwound");
+        }));
+        assert!(outcome.is_err());
+        assert!(!path.unwrap().exists());
+    }
+
+    #[test]
+    fn child_skips_are_forwarded_to_the_diagnostic_writer() {
+        const CHILD: &str = "GRAFTON_CHILD_SKIP_FIXTURE";
+        const REASON: &str = "the skip fixture has no Discovery Server";
+        if std::env::var_os(CHILD).is_some() {
+            policy::skip(Requirement::DiscoveryServer, REASON);
+            return;
+        }
+
+        let output = TestChild::new(
+            "test_support::tests::child_skips_are_forwarded_to_the_diagnostic_writer",
+        )
+        .env(CHILD, "1")
+        .env_remove("GRAFTON_NDI_REQUIRE_RUNTIME")
+        .output(true);
+        let mut diagnostics = Vec::new();
+        child::forward_skips(&output, &mut diagnostics);
+        let diagnostics = String::from_utf8(diagnostics).unwrap();
+        let mut lines = diagnostics.lines();
+        assert_eq!(lines.next(), Some(REASON));
+        assert!(lines.next().unwrap().starts_with(
+            "skipped: test_support::tests::child_skips_are_forwarded_to_the_diagnostic_writer"
+        ));
+        assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn peer_promises_require_a_dynamic_build_and_a_second_runtime() {
+        const CHILD: &str = "GRAFTON_PEER_PROMISE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(Requirement::Peer.is_promised());
+            assert!(Requirement::Runtime.is_promised());
+            assert_eq!(
+                unverifiable_promises().is_empty(),
+                cfg!(not(ndi_link_static))
+            );
+            policy::skip(Requirement::Peer, "the peer fixture has no second runtime");
+            return;
+        }
+
+        let mut child = TestChild::new(
+            "test_support::tests::peer_promises_require_a_dynamic_build_and_a_second_runtime",
+        );
+        child
+            .env(CHILD, "1")
+            .env("GRAFTON_NDI_REQUIRE_RUNTIME", "peer");
+        let output = child.output(false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("promises peer but the peer fixture has no second runtime"),
+            "{stderr}"
+        );
+
+        child.env("GRAFTON_NDI_REQUIRE_RUNTIME", "peer,unknown");
+        let output = child.output(false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("lists \"unknown\""), "{stderr}");
     }
 
     #[test]
@@ -168,22 +259,12 @@ mod tests {
             } else {
                 "h264-decoder,hevc-444-decoder"
             };
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "test_support::tests::decoder_promises_enforce_their_implied_requirements",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .env("GRAFTON_NDI_REQUIRE_RUNTIME", tokens)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{tokens}: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            TestChild::new(
+                "test_support::tests::decoder_promises_enforce_their_implied_requirements",
+            )
+            .env(CHILD, "1")
+            .env("GRAFTON_NDI_REQUIRE_RUNTIME", tokens)
+            .run();
         }
     }
 
@@ -219,20 +300,15 @@ mod tests {
             return;
         }
         for promise in [None, Some("advanced")] {
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command.args([
-                "--exact",
-                "test_support::tests::feature_refusals_distinguish_prerequisites_from_runtime_limits",
-                "--nocapture",
-            ]).env(CHILD, "1");
+            let mut command = TestChild::new("test_support::tests::feature_refusals_distinguish_prerequisites_from_runtime_limits");
+            command.env(CHILD, "1");
             if let Some(promise) = promise {
                 command.env("GRAFTON_NDI_REQUIRE_RUNTIME", promise);
             } else {
                 command.env_remove("GRAFTON_NDI_REQUIRE_RUNTIME");
             }
-            let output = command.output().unwrap();
+            let output = command.run();
             let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(output.status.success(), "{stderr}");
             assert!(
                 stderr.contains("skipped:") && stderr.contains("video-only receiver bandwidth"),
                 "{stderr}"

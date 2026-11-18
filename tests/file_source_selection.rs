@@ -4,15 +4,12 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, file);
-#[path = "support/fixture.rs"]
-mod fixture;
+common_helpers!(runtime, file, fixture);
 
-use fixture::FixtureDir;
 use grafton_ndi::{
     file::{
         FileNaming, FileRecorderOptions, FinishStatus, RecorderEventKind, RecordingTarget,
-        RecordingTimecode, SourceSpec,
+        RecordingTimecode, SessionEnd, SourceSpec,
     },
     MediaTypes,
 };
@@ -32,7 +29,7 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
     // This executable has one test and loads no SDK before installing its own
     // process configuration. IP queries provide loopback discovery without
     // changing system or concurrent test-process configuration.
-    let fixture = FixtureDir::create("file-source-selection");
+    let fixture = common::FixtureDir::create("file-source-selection");
     let configuration = fixture.path().join("config");
     let temporary = fixture.path().join("tmp");
     std::fs::create_dir(&configuration).unwrap();
@@ -166,7 +163,9 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
             assert_eq!((track.width(), track.height()), expected);
             thread::sleep(Duration::from_millis(150));
             assert!(recorder.stats().unwrap().unwrap().video_frames_written() > 0);
-            let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+            let FinishStatus::Ended(SessionEnd::Closed(report)) =
+                recorder.finish(PATIENCE).unwrap()
+            else {
                 panic!("the selected recording was not finalized");
             };
             assert_eq!(report.error_events(), 0);
@@ -208,7 +207,8 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
             .stats()
             .unwrap()
             .is_none_or(|stats| stats.video_frames_written() == 0));
-        let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+        let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap()
+        else {
             panic!("the unavailable endpoint recording was not finalized");
         };
         assert_eq!(report.empty_files(), 1);

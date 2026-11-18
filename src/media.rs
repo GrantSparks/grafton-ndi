@@ -8,14 +8,39 @@ use std::{
 
 use crate::{AudioFormat, Error, PixelFormat, Result};
 
+/// Maximum compressed frame size, in bytes, that the crate sends or accepts.
+pub const MAX_PACKET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Maximum capacity, in bytes, for a single custom receive allocation.
+///
+/// This ceiling covers uncompressed [video](crate::frames::MAX_VIDEO_BYTES),
+/// uncompressed audio and [compressed packets](MAX_PACKET_BYTES).
+pub const MAX_ALLOCATION_BYTES: usize = {
+    let video = crate::frames::MAX_VIDEO_BYTES;
+    let audio = crate::frames::MAX_AUDIO_BYTES;
+    let uncompressed = if video > audio { video } else { audio };
+    if uncompressed > MAX_PACKET_BYTES {
+        uncompressed
+    } else {
+        MAX_PACKET_BYTES
+    }
+};
+
 // An omitted variant makes index() non-exhaustive; a duplicate cannot define
 // its index twice. Keep decoding and iteration tied to the same checked list.
 macro_rules! decoded_variants {
     ($name:ident: $($variant:ident),+ $(,)?) => {
         impl $name {
             /// Every variant, in declaration order.
-            pub(crate) const ALL: [Self; [$(stringify!($variant)),+].len()] =
-                [$(Self::$variant),+];
+            pub(crate) const ALL: [Self; [$(stringify!($variant)),+].len()] = const_assert!(@value {
+                let variants = [$(Self::$variant),+];
+                let mut index = 0;
+                while index < variants.len() {
+                    assert!(variants[index].index() == index);
+                    index += 1;
+                }
+                variants
+            });
 
             const fn index(self) -> usize {
                 enum Index { $($variant),+ }
@@ -23,13 +48,6 @@ macro_rules! decoded_variants {
             }
         }
 
-        const _: () = {
-            let mut index = 0;
-            while index < $name::ALL.len() {
-                assert!($name::ALL[index].index() == index);
-                index += 1;
-            }
-        };
     };
 }
 pub(crate) use decoded_variants;
@@ -73,7 +91,7 @@ impl SdkQuantity {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<Option<SdkQuantity>>() == 4);
+const_assert!(std::mem::size_of::<Option<SdkQuantity>>() == 4);
 
 /// A frame rate in frames per second, as the fraction
 /// `numerator / denominator`.
@@ -450,9 +468,7 @@ mod tests {
              struct SdkQuantity(NonZeroU32);\n{quantity}\n{rate}\n\
              impl FrameRate {{ {per_second} }}\n"
         );
-        let directory =
-            std::env::temp_dir().join(format!("grafton-const-frame-rate-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = crate::test_support::FixtureDir::create("const-frame-rate");
         for (name, fixture, succeeds) in [
             (
                 "positive",
@@ -465,7 +481,7 @@ mod tests {
             std::fs::write(&path, format!("{definitions}\n{fixture}")).unwrap();
             let output = std::process::Command::new("rustc")
                 .args(["--edition=2021", "--emit=metadata", "--out-dir"])
-                .arg(&directory)
+                .arg(directory.path())
                 .arg(path)
                 .output()
                 .unwrap();
@@ -475,7 +491,6 @@ mod tests {
                 assert!(error.contains("E0080"), "{error}");
             }
         }
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

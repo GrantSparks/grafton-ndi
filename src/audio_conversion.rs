@@ -86,7 +86,7 @@ impl AudioShape {
     /// within the shared payload limit, and exactly `channels * samples`
     /// samples. Nothing is checked again.
     fn from_planar(frame: &(impl AudioSource + ?Sized)) -> Self {
-        Self(frame.layout().packed())
+        Self(*frame.layout().packed().as_layout())
     }
 
     fn check_output(self, length: usize) -> Result<()> {
@@ -370,7 +370,7 @@ macro_rules! send_interleaved {
             let raw = frame.raw();
             // SAFETY: the sender instance is live for this borrow and the
             // validated source slice outlives the synchronous call.
-            unsafe { send.$send(self.native_instance(), &raw) };
+            unsafe { send.$send(self.handle().instance(), &raw) };
             Ok(())
         }
     };

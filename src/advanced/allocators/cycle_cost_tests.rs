@@ -14,7 +14,7 @@ fn custom_allocation_cycle_cost() {
         ..Default::default()
     };
     descriptor.__bindgen_anon_1.line_stride_in_bytes = 3840;
-    let request = video_request(&descriptor).unwrap();
+    let request = descriptor.request().unwrap();
     for path in [Path::External, Path::Pool, Path::Preboxed] {
         for producers in [0, 1, 4] {
             let pool = TestPool::new(16, request.bytes);

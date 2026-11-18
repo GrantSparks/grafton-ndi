@@ -12,7 +12,7 @@
 
 use grafton_ndi::{
     audio_conversion::{AudioConverter, AudioReferenceLevel},
-    Error, Ndi, Receiver, ReceiverBandwidth, ReceiverOptions,
+    Ndi, Receiver, ReceiverBandwidth, ReceiverOptions,
 };
 
 use std::{
@@ -32,7 +32,7 @@ mod source_wait;
 use finder::finder_with_extra_ips;
 use source_wait::wait_for_first_source;
 
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments for extra IPs
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();

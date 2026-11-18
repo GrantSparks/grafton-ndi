@@ -412,23 +412,25 @@ fn check_against_reference(
     } else {
         65535.0
     };
+    let channels = if codes.sampling().alpha { 4 } else { 3 };
     assert_eq!(
         (
             decoded.width as usize,
             decoded.height as usize,
             decoded.channels
         ),
-        (codes.width, codes.height, 4)
+        (codes.width, codes.height, channels)
     );
     let bits = codes.sampling().bits;
     for y in 0..codes.height {
         for x in 0..codes.width {
             let [luma, cb, cr, alpha] = codes.pixel(x, y);
             let rgb = reference_rgb(matrix, range, bits, max, [luma, cb, cr]);
-            let at = (y * codes.width + x) * 4;
+            let at = (y * codes.width + x) * channels;
             for (c, want) in rgb
                 .into_iter()
                 .chain([reference_alpha(alpha, bits, max)])
+                .take(channels)
                 .enumerate()
             {
                 let got = f64::from(decoded.samples[at + c]);
@@ -641,10 +643,11 @@ fn a_chroma_impulse_covers_exactly_the_pixels_it_is_sited_on() {
                 ))
                 .unwrap(),
         );
-        let gray = &decoded.samples[..4];
+        let channels = decoded.channels;
+        let gray = &decoded.samples[..channels];
         let changed: Vec<(usize, usize)> = (0..height)
             .flat_map(|y| (0..width).map(move |x| (x, y)))
-            .filter(|&(x, y)| &decoded.samples[(y * width + x) * 4..][..4] != gray)
+            .filter(|&(x, y)| &decoded.samples[(y * width + x) * channels..][..channels] != gray)
             .collect();
         let (cx, cy) = (impulse % cw, impulse / cw);
         let expected: Vec<(usize, usize)> = (cy << s.v_shift..(cy + 1) << s.v_shift)
@@ -692,6 +695,40 @@ fn any_frame_bytes(format: PixelFormat, width: usize, height: usize, seed: u64) 
     }
 }
 
+struct ImagePixels {
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    stride: usize,
+    bytes: Vec<u8>,
+}
+
+impl ImagePixels {
+    fn builder(&self) -> crate::BorrowedVideoFrameBuilder<'_> {
+        BorrowedVideoFrame::builder(&self.bytes, self.width, self.height, self.format)
+            .line_stride_bytes(self.stride)
+    }
+
+    fn frame(&self) -> BorrowedVideoFrame<'_> {
+        self.builder().build().unwrap()
+    }
+}
+
+// SAFETY: the synthetic guard points into the borrowed frame and releases
+// nothing when dropped. The borrow keeps the descriptor's pixels and metadata alive.
+fn as_test_capture(frame: &impl crate::frames::VideoParts) -> crate::FrameSyncVideoRef<'_> {
+    use crate::capture::{FrameSyncVideoFree, Guard};
+    use crate::frames::VideoPartsExt;
+    unsafe {
+        crate::FrameSyncVideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+            std::ptr::null_mut(),
+            frame.video_descriptor(),
+            |_, _| {},
+        ))
+    }
+    .unwrap()
+}
+
 /// `packed` laid out with `padding` bytes after each row of the first
 /// plane, and the matching padding in the others, as the SDK pads. The
 /// padding bytes are 0xEE.
@@ -701,7 +738,7 @@ fn padded(
     height: u32,
     packed: &[u8],
     padding: usize,
-) -> VideoFrame {
+) -> ImagePixels {
     let packed = VideoFrame::builder()
         .resolution(width, height)
         .pixel_format(format)
@@ -710,10 +747,16 @@ fn padded(
         .unwrap();
     let stride = packed.line_stride_bytes() + padding;
     let len = format.buffer_len(width, height, Some(stride)).unwrap();
-    let mut frame =
-        VideoFrame::with_line_stride(format, width, height, stride, vec![0xEE; len], None);
-    let base = frame.data().as_ptr() as usize;
+    let mut frame = ImagePixels {
+        format,
+        width,
+        height,
+        stride,
+        bytes: vec![0xEE; len],
+    };
+    let base = frame.bytes.as_ptr() as usize;
     let starts: Vec<usize> = frame
+        .frame()
         .planes()
         .flat_map(|plane| plane.rows())
         .map(|row| row.as_ptr() as usize - base)
@@ -722,7 +765,7 @@ fn padded(
         .into_iter()
         .zip(packed.planes().flat_map(|plane| plane.rows()))
     {
-        frame.data_mut()[start..start + row.len()].copy_from_slice(row);
+        frame.bytes[start..start + row.len()].copy_from_slice(row);
     }
     frame
 }
@@ -748,7 +791,8 @@ fn padded_rows_odd_heights_and_the_smallest_frames_encode_like_packed_ones() {
                 .build()
                 .unwrap();
             for padding in [4, 64] {
-                let padded = padded(format, width, height, &packed, padding);
+                let pixels = padded(format, width, height, &packed, padding);
+                let padded = pixels.frame();
                 assert!(padded.line_stride_bytes() > frame.line_stride_bytes());
                 for options in every_output() {
                     assert_eq!(
@@ -775,7 +819,7 @@ fn every_frame_type_encodes_the_same_bytes() {
             .build()
             .unwrap();
         let padded = padded(format, width, height, &packed, 8);
-        let captured = owned.as_test_capture();
+        let captured = as_test_capture(&owned);
         let borrowed = BorrowedVideoFrame::builder(&packed, width, height, format)
             .metadata(c"<ndi_color_info matrix=\"bt_601\"/>")
             .build()
@@ -800,7 +844,9 @@ fn every_frame_type_encodes_the_same_bytes() {
             // the matrix does not touch, agree with it.
             if RGB_FORMATS.contains(&format) {
                 assert_eq!(
-                    padded.as_test_capture().encode_image(&options).unwrap(),
+                    as_test_capture(&padded.frame())
+                        .encode_image(&options)
+                        .unwrap(),
                     expected
                 );
             }
@@ -809,12 +855,13 @@ fn every_frame_type_encodes_the_same_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// PNG and the scalar JPEG backend keep 2.0's bytes
+// PNG and scalar JPEG output identity
 // ---------------------------------------------------------------------------
 
-/// SHA-256 of grafton-ndi 2.0's output for the RGB formats, recorded from the
-/// 2.0 encoder before it was replaced: each covers sizes 2×1, 2×2, 18×19,
-/// 64×33 and 130×67, packed and padded rows, noise and gradient content.
+/// SHA-256 of the encoded output for the RGB formats. PNG with alpha and
+/// scalar JPEG keep 2.0's bytes. Opaque PNG records the three-channel output.
+/// Each hash covers sizes 2×1, 2×2, 18×19, 64×33 and 130×67, packed and
+/// padded rows, noise and gradient content.
 const IDENTITY_HASHES: [(PixelFormat, Option<u8>, &str); 28] = [
     (
         PixelFormat::Rgba,
@@ -889,7 +936,7 @@ const IDENTITY_HASHES: [(PixelFormat, Option<u8>, &str); 28] = [
     (
         PixelFormat::Rgbx,
         None,
-        "eb701500fdaaafbd0b77f6bd736a3c6a78c5fa7188234a6fb9bb2f6b8595add4",
+        "4007f5d8854053e2721a50d9603988c64a5d695ae05975676f3235c8b63cf90b",
     ),
     (
         PixelFormat::Rgbx,
@@ -924,7 +971,7 @@ const IDENTITY_HASHES: [(PixelFormat, Option<u8>, &str); 28] = [
     (
         PixelFormat::Bgrx,
         None,
-        "ba2edbd6b06426db017932c336c0a34eef4f85ee35b6690cfa42d7061de7f91a",
+        "a8bc14eb1d951622f2b3d9693682b95fecdc8572247d4eb8a595168a626e3493",
     ),
     (
         PixelFormat::Bgrx,
@@ -959,7 +1006,7 @@ const IDENTITY_HASHES: [(PixelFormat, Option<u8>, &str); 28] = [
 ];
 
 /// The inputs the hashes were recorded from, in recording order.
-fn identity_frames(format: PixelFormat) -> Vec<VideoFrame> {
+fn identity_frames(format: PixelFormat) -> Vec<ImagePixels> {
     let mut frames = Vec::new();
     for (width, height) in [(2u32, 1u32), (2, 2), (18, 19), (64, 33), (130, 67)] {
         for padding in [0usize, 12] {
@@ -988,9 +1035,13 @@ fn identity_frames(format: PixelFormat) -> Vec<VideoFrame> {
                         }
                     }
                 }
-                frames.push(VideoFrame::with_line_stride(
-                    format, width, height, stride, data, None,
-                ));
+                frames.push(ImagePixels {
+                    format,
+                    width,
+                    height,
+                    stride,
+                    bytes: data,
+                });
             }
         }
     }
@@ -1010,7 +1061,7 @@ fn identity_hash(images: impl Iterator<Item = Vec<u8>>) -> String {
 }
 
 #[test]
-fn rgb_png_and_scalar_jpeg_keep_the_bytes_of_grafton_ndi_2() {
+fn png_and_scalar_jpeg_pin_encoded_bytes() {
     // JPEG's runtime SIMD dispatch can change encoded bytes. Its contract is
     // covered by independent decoded-quality checks rather than scalar hashes.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1022,7 +1073,7 @@ fn rgb_png_and_scalar_jpeg_keep_the_bytes_of_grafton_ndi_2() {
         .filter(|(_, quality, _)| quality.is_none() || !accelerated)
     {
         let frames = identity_frames(format);
-        let shortcut = identity_hash(frames.iter().map(|frame| {
+        let shortcut = identity_hash(frames.iter().map(ImagePixels::frame).map(|frame| {
             match quality {
                 None => frame
                     .encode_image(&crate::image_encoding::ImageOptions::new(
@@ -1041,8 +1092,7 @@ fn rgb_png_and_scalar_jpeg_keep_the_bytes_of_grafton_ndi_2() {
         let mut buffer = Vec::new();
         let streamed = identity_hash(frames.iter().map(|frame| {
             buffer.clear();
-            frame
-                .as_test_capture()
+            as_test_capture(&frame.frame())
                 .encode_image_to(&options, &mut buffer)
                 .unwrap();
             buffer.clone()
@@ -1053,16 +1103,13 @@ fn rgb_png_and_scalar_jpeg_keep_the_bytes_of_grafton_ndi_2() {
         );
         // An SDR tag changes nothing.
         let tagged = identity_hash(frames.iter().map(|frame| {
-            let tagged = VideoFrame::with_line_stride(
-                format,
-                frame.width(),
-                frame.height(),
-                frame.line_stride_bytes(),
-                frame.data().to_vec(),
-                Some(
-                    "<ndi_color_info transfer=\"bt_709\" matrix=\"bt_709\" primaries=\"bt_709\"/>",
-                ),
-            );
+            let tagged = frame
+                .builder()
+                .metadata(
+                    c"<ndi_color_info transfer=\"bt_709\" matrix=\"bt_709\" primaries=\"bt_709\"/>",
+                )
+                .build()
+                .unwrap();
             tagged.encode_image(&options).unwrap()
         }));
         assert_eq!(tagged, expected, "{format:?} {quality:?} SDR-tagged");
@@ -1160,15 +1207,11 @@ fn every_png_level_and_lossless_webp_decode_to_the_converted_pixels() {
     for format in PixelFormat::ALL {
         let (width, height) = (34u32, 10u32);
         let packed = any_frame_bytes(format, width as usize, height as usize, 21);
-        for frame in [
-            VideoFrame::builder()
-                .resolution(width, height)
-                .pixel_format(format)
-                .data(packed.clone())
-                .build()
-                .unwrap(),
-            padded(format, width, height, &packed, 8),
-        ] {
+        let padded = padded(format, width, height, &packed, 8);
+        let packed = BorrowedVideoFrame::builder(&packed, width, height, format)
+            .build()
+            .unwrap();
+        for frame in [packed, padded.frame()] {
             for alpha in [AlphaMode::Keep, AlphaMode::Discard] {
                 let reference = decode_png(
                     &frame
@@ -1177,7 +1220,11 @@ fn every_png_level_and_lossless_webp_decode_to_the_converted_pixels() {
                 );
                 assert_eq!(
                     reference.channels,
-                    if alpha == AlphaMode::Keep { 4 } else { 3 }
+                    if alpha.keeps_alpha() && format.info().has_alpha() {
+                        4
+                    } else {
+                        3
+                    }
                 );
                 for level in [
                     PngCompression::Fast,
@@ -1297,6 +1344,48 @@ fn lossy_webp_reduces_every_pixel_format_and_preserves_alpha() {
                         .map(|p| u16::from(p[3]))
                         .collect();
                     assert_eq!(actual, expected, "{format:?} {downscale:?} alpha");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn keep_writes_rgb_for_opaque_sources_and_preserves_source_alpha() {
+    for format in PixelFormat::ALL {
+        let frame = VideoFrame::builder()
+            .resolution(18, 10)
+            .pixel_format(format)
+            .data(any_frame_bytes(format, 18, 10, 21))
+            .build()
+            .unwrap();
+        let source = Source::new(&frame);
+        let has_alpha = format.info().has_alpha();
+        let source_channels = if has_alpha { 4 } else { 3 };
+        for downscale in [Downscale::Off, Downscale::Half] {
+            for (codec, depth, channels) in [
+                (ImageFormat::Png, SampleDepth::Eight, source_channels),
+                (ImageFormat::Png, SampleDepth::Sixteen, source_channels),
+                (
+                    ImageFormat::WebpLossless,
+                    SampleDepth::Eight,
+                    source_channels,
+                ),
+                (ImageFormat::WebpLossy(75), SampleDepth::Eight, 4),
+            ] {
+                let keep = options(codec).depth(depth).downscale(downscale);
+                let plan = Plan::new(&source, &keep).unwrap();
+                assert_eq!(plan.alpha, has_alpha, "{format:?} {keep:?}");
+                assert_eq!(plan.channels().count(), channels, "{format:?} {keep:?}");
+                let image = frame.encode_image(&keep).unwrap();
+                if codec == ImageFormat::Png {
+                    assert_eq!(decode_png(&image).channels, channels, "{format:?} {keep:?}");
+                } else if !has_alpha {
+                    assert_eq!(decode_webp(&image).channels, 3, "{format:?} {keep:?}");
+                }
+                if !has_alpha {
+                    let discarded = frame.encode_image(&keep.alpha(AlphaMode::Discard)).unwrap();
+                    assert_eq!(image, discarded, "{format:?} {codec:?} {downscale:?}");
                 }
             }
         }
@@ -1454,9 +1543,10 @@ fn sixteen_bit_png_keeps_high_bit_depth_precision() {
             .unwrap(),
     );
     assert_eq!(decoded.bits, 16);
+    assert_eq!(decoded.channels, 3);
     let greens: Vec<u16> = decoded
         .samples
-        .as_chunks::<4>()
+        .as_chunks::<3>()
         .0
         .iter()
         .map(|p| p[1])
@@ -1514,20 +1604,7 @@ fn every_transfer_agrees_on_hdr_refusal_and_png_color_code() {
             .unwrap();
         let color = frame.color_info().unwrap().unwrap();
         assert_eq!(color.is_hdr(), transfer.is_hdr());
-        assert_eq!(super::hdr_transfer(&color).is_some(), transfer.is_hdr());
         assert_eq!(matches!(transfer.h273_code(), 16 | 18), transfer.is_hdr());
-        for format in [
-            ImageFormat::Png,
-            ImageFormat::Jpeg(85),
-            ImageFormat::WebpLossless,
-            ImageFormat::WebpLossy(75),
-        ] {
-            assert_eq!(
-                Plan::new(&Source::new(&frame), &options(format)).is_err(),
-                transfer.is_hdr(),
-                "{transfer:?} {format:?}"
-            );
-        }
         let png = frame
             .encode_image(&options(ImageFormat::Png).hdr(HdrPolicy::CodeValues))
             .unwrap();
@@ -1538,14 +1615,89 @@ fn every_transfer_agrees_on_hdr_refusal_and_png_color_code() {
 }
 
 #[test]
+fn codecs_admit_colors_only_when_they_can_write_the_required_tag() {
+    use crate::{ColorPrimaries, FrameDefect, InputDefect, TransferFunction};
+
+    for (metadata, primaries, transfer, tag) in [
+        ("", None, None, None),
+        (
+            r#"<ndi_color_info primaries="bt_709" transfer="bt_709"/>"#,
+            Some(ColorPrimaries::Bt709),
+            Some(TransferFunction::Bt709),
+            None,
+        ),
+        (
+            r#"<ndi_color_info primaries="bt_2020" transfer="bt_2020"/>"#,
+            Some(ColorPrimaries::Bt2020),
+            Some(TransferFunction::Bt2020),
+            Some([9, 1, 0, 1]),
+        ),
+        (
+            r#"<ndi_color_info primaries="bt_2020"/>"#,
+            Some(ColorPrimaries::Bt2020),
+            None,
+            Some([9, 1, 0, 1]),
+        ),
+        (
+            r#"<ndi_color_info primaries="bt_2020" transfer="bt_2100_pq"/>"#,
+            Some(ColorPrimaries::Bt2020),
+            Some(TransferFunction::Pq),
+            Some([9, 16, 0, 1]),
+        ),
+        (
+            r#"<ndi_color_info transfer="bt_2100_hlg"/>"#,
+            None,
+            Some(TransferFunction::Hlg),
+            Some([2, 18, 0, 1]),
+        ),
+    ] {
+        let frame = VideoFrame::builder()
+            .resolution(4, 2)
+            .pixel_format(PixelFormat::Uyvy)
+            .metadata(metadata)
+            .build()
+            .unwrap();
+        let hdr = transfer.filter(|transfer| transfer.is_hdr());
+        for policy in [HdrPolicy::Refuse, HdrPolicy::CodeValues] {
+            for format in ImageFormat::ALL {
+                let image = frame.encode_image(&options(format).hdr(policy));
+                if let Some(expected) = hdr.filter(|_| policy == HdrPolicy::Refuse) {
+                    assert!(matches!(
+                        image,
+                        Err(Error::InvalidFrame(FrameDefect::HdrRefused { transfer }))
+                            if transfer == expected
+                    ));
+                } else if format == ImageFormat::Png {
+                    let image = image.unwrap();
+                    let actual = png_chunks(&image)
+                        .into_iter()
+                        .find_map(|(kind, payload)| (kind == *b"cICP").then_some(payload));
+                    assert_eq!(actual.as_deref(), tag.as_ref().map(<[_; 4]>::as_slice));
+                } else if tag.is_some() {
+                    assert!(matches!(
+                        image,
+                        Err(Error::InvalidInput(InputDefect::ColorTagNeedsPng {
+                            codec, primaries: actual_primaries, transfer: actual_transfer,
+                        })) if codec == format.info().codec
+                            && actual_primaries == primaries && actual_transfer == transfer
+                    ));
+                } else {
+                    assert!(image.is_ok(), "{format:?} {policy:?} {metadata}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn every_image_format_has_its_documented_quality_bounds() {
     for (format, expected) in [
         (ImageFormat::Png, None),
-        (ImageFormat::Jpeg(85), Some(1..=100)),
+        (ImageFormat::Jpeg(85), Some((85, 1..=100))),
         (ImageFormat::WebpLossless, None),
-        (ImageFormat::WebpLossy(75), Some(0..=100)),
+        (ImageFormat::WebpLossy(75), Some((75, 0..=100))),
     ] {
-        assert_eq!(format.info().quality, expected);
+        assert_eq!(format.quality(), expected);
     }
 }
 
@@ -1584,7 +1736,7 @@ fn hdr_frames_are_refused_by_default_in_every_format() {
             ] {
                 let message = invalid_input(frame.encode_image(&hdr(refused)));
                 assert!(
-                    matches!(message, crate::InputDefect::HdrNeedsPng {codec, transfer} if codec == refused.info().codec && transfer == if name=="PQ" {crate::TransferFunction::Pq} else {crate::TransferFunction::Hlg}),
+                    matches!(message, crate::InputDefect::ColorTagNeedsPng {codec, primaries: Some(crate::ColorPrimaries::Bt2020), transfer: Some(transfer)} if codec == refused.info().codec && transfer == if name=="PQ" {crate::TransferFunction::Pq} else {crate::TransferFunction::Hlg}),
                     "{message}"
                 );
             }
@@ -1931,51 +2083,69 @@ fn every_writer_encode_reports_final_flush_and_buffered_write_failures() {
 
 #[test]
 fn conflicting_options_are_refused_before_anything_is_written() {
+    use crate::{ImageCodecKind, ImageSettingKind, InputDefect};
+
     let frame = random_codes(PixelFormat::P216, 4, 2, 1).frame(None);
     let cases = [
-        (options(ImageFormat::Jpeg(0)), "quality"),
-        (options(ImageFormat::Jpeg(101)), "quality"),
-        (options(ImageFormat::Jpeg(255)), "quality"),
-        (options(ImageFormat::WebpLossy(101)), "WebP quality"),
-        (options(ImageFormat::WebpLossy(255)), "WebP quality"),
+        (
+            options(ImageFormat::Jpeg(0)),
+            Some((ImageSettingKind::Quality, 0, 1, 100)),
+        ),
+        (
+            options(ImageFormat::Jpeg(101)),
+            Some((ImageSettingKind::Quality, 101, 1, 100)),
+        ),
+        (
+            options(ImageFormat::Jpeg(255)),
+            Some((ImageSettingKind::Quality, 255, 1, 100)),
+        ),
+        (
+            options(ImageFormat::WebpLossy(101)),
+            Some((ImageSettingKind::Quality, 101, 0, 100)),
+        ),
+        (
+            options(ImageFormat::WebpLossy(255)),
+            Some((ImageSettingKind::Quality, 255, 0, 100)),
+        ),
         (
             options(ImageFormat::WebpLossy(75)).webp_effort(7),
-            "WebP effort",
+            Some((ImageSettingKind::Effort, 7, 0, 6)),
         ),
         (
             options(ImageFormat::WebpLossy(75)).webp_effort(255),
-            "WebP effort",
+            Some((ImageSettingKind::Effort, 255, 0, 6)),
         ),
         (
             options(ImageFormat::Jpeg(85)).depth(SampleDepth::Sixteen),
-            "SampleDepth::Sixteen",
+            None,
         ),
         (
             options(ImageFormat::WebpLossless).depth(SampleDepth::Sixteen),
-            "SampleDepth::Sixteen",
+            None,
         ),
         (
             options(ImageFormat::WebpLossy(75)).depth(SampleDepth::Sixteen),
-            "SampleDepth::Sixteen",
+            None,
         ),
     ];
-    for (options, needle) in cases {
+    for (options, bad_setting) in cases {
         let mut out = Recorder {
             written: 0,
             fail_after: None,
         };
         let message = invalid_input(frame.encode_image_to(&options, &mut out));
-        assert!(
-            match needle {
-                "quality" | "WebP quality" =>
-                    matches!(message, crate::InputDefect::ImageQuality { codec, .. } if codec == options.format.info().codec),
-                "WebP effort" => matches!(message, crate::InputDefect::WebpEffort { .. }),
-                "SampleDepth::Sixteen" =>
-                    matches!(message, crate::InputDefect::SixteenBitNeedsPng { codec } if codec == options.format.info().codec),
-                other => panic!("unexpected case {other}"),
+        let codec = options.format.info().codec;
+        let expected = match bad_setting {
+            Some((setting, value, minimum, maximum)) => InputDefect::ImageSetting {
+                codec,
+                setting,
+                value,
+                minimum,
+                maximum,
             },
-            "{message}"
-        );
+            None => InputDefect::SixteenBitNeedsPng { codec },
+        };
+        assert_eq!(message, expected);
         assert_eq!(out.written, 0, "{options:?}");
     }
     for quality in [0, 101] {
@@ -1985,7 +2155,7 @@ fn conflicting_options_are_refused_before_anything_is_written() {
                     crate::image_encoding::ImageFormat::Jpeg(quality)
                 ))
             ),
-            crate::InputDefect::ImageQuality { codec: crate::ImageCodecKind::Jpeg, quality: actual, .. } if actual == quality
+            InputDefect::ImageSetting { codec: ImageCodecKind::Jpeg, setting: ImageSettingKind::Quality, value, .. } if value == quality
         ));
         assert!(matches!(
             invalid_input(
@@ -1993,7 +2163,7 @@ fn conflicting_options_are_refused_before_anything_is_written() {
                     ImageFormat::Jpeg(quality)
                 ))
             ),
-            crate::InputDefect::ImageQuality { codec: crate::ImageCodecKind::Jpeg, quality: actual, .. } if actual == quality
+            InputDefect::ImageSetting { codec: ImageCodecKind::Jpeg, setting: ImageSettingKind::Quality, value, .. } if value == quality
         ));
     }
     // Quality is checked before the frame: even an HDR frame reports it.
@@ -2179,26 +2349,28 @@ fn reduced_images_are_the_block_averages_of_the_full_image() {
             );
             let (rw, rh) = (width.div_ceil(size), height.div_ceil(size));
             assert_eq!((reduced.width as usize, reduced.height as usize), (rw, rh));
+            let channels = full.channels;
+            assert_eq!(reduced.channels, channels);
             for by in 0..rh {
                 for bx in 0..rw {
                     let pixels: Vec<&[u16]> = (by * size..((by + 1) * size).min(height))
                         .flat_map(|y| {
                             (bx * size..((bx + 1) * size).min(width)).map(move |x| (x, y))
                         })
-                        .map(|(x, y)| &full.samples[(y * width + x) * 4..][..4])
+                        .map(|(x, y)| &full.samples[(y * width + x) * channels..][..channels])
                         .collect();
                     let count = pixels.len() as u64;
-                    let alpha: u64 = pixels.iter().map(|p| u64::from(p[3])).sum();
-                    let has_alpha = matches!(
-                        format,
-                        PixelFormat::Uyva | PixelFormat::Bgra | PixelFormat::Nb4g
-                    );
-                    let expected: Vec<u16> = (0..4)
+                    let alpha: u64 = pixels
+                        .iter()
+                        .filter_map(|p| p.get(3))
+                        .map(|&alpha| u64::from(alpha))
+                        .sum();
+                    let expected: Vec<u16> = (0..channels)
                         .map(|c| {
                             let mean = |sum: u64, n: u64| ((sum + n / 2) / n) as u16;
                             if c == 3 {
                                 mean(alpha, count)
-                            } else if has_alpha && alpha > 0 {
+                            } else if alpha > 0 {
                                 mean(
                                     pixels
                                         .iter()
@@ -2212,7 +2384,7 @@ fn reduced_images_are_the_block_averages_of_the_full_image() {
                         })
                         .collect();
                     assert_eq!(
-                        &reduced.samples[(by * rw + bx) * 4..][..4],
+                        &reduced.samples[(by * rw + bx) * channels..][..channels],
                         expected,
                         "{format:?} {downscale:?} {bx},{by}"
                     );
@@ -2319,7 +2491,8 @@ fn workspace_reuses_conversion_capacity_across_formats_sizes_and_failures() {
     for (width, height, seed) in [(34, 18, 7), (18, 6, 89), (2, 2, 42)] {
         for format in PixelFormat::ALL {
             let bytes = any_frame_bytes(format, width, height, seed);
-            let frame = padded(format, width as u32, height as u32, &bytes, 16);
+            let input = padded(format, width as u32, height as u32, &bytes, 16);
+            let frame = input.frame();
             for options in every_output() {
                 let expected = frame.encode_image(&options).unwrap();
                 assert_eq!(workspace.encode(&frame, &options).unwrap(), expected);
@@ -2373,7 +2546,8 @@ fn warm_workspace_conversion_does_not_allocate() {
     for format in PixelFormat::ALL {
         for (width, height) in [(34, 18), (18, 6), (2, 2)] {
             let bytes = any_frame_bytes(format, width, height, 23);
-            let frame = padded(format, width as u32, height as u32, &bytes, 16);
+            let input = padded(format, width as u32, height as u32, &bytes, 16);
+            let frame = input.frame();
             let source = Source::new(&frame);
             for reduction in [
                 Downscale::Off,
@@ -2488,7 +2662,12 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
             ] {
                 let shift = downscale.shift();
                 let reduced = (width.div_ceil(1 << shift), height.div_ceil(1 << shift));
-                for (alpha, channels) in [(AlphaMode::Keep, 4), (AlphaMode::Discard, 3)] {
+                for alpha in [AlphaMode::Keep, AlphaMode::Discard] {
+                    let channels = if alpha.keeps_alpha() && format.info().has_alpha() {
+                        4
+                    } else {
+                        3
+                    };
                     // PNG at both depths: the pipeline allocates only the
                     // downscale sums, then one row of scratch serves every row.
                     for depth in [SampleDepth::Eight, SampleDepth::Sixteen] {
@@ -2517,7 +2696,7 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                             let ((mut pixels, allocations), peak) =
                                 peak_bytes(|| allocation_count(|| plan.pixels::<u8>()));
                             check(allocations, peak);
-                            let borrowed = pixels.rgba_rows().is_some();
+                            let borrowed = pixels.direct_rgba().is_some();
                             assert_eq!(
                                 borrowed,
                                 format == PixelFormat::Rgba
@@ -2540,7 +2719,7 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                             let ((mut pixels, allocations), peak) =
                                 peak_bytes(|| allocation_count(|| plan.pixels::<u16>()));
                             check(allocations, peak);
-                            assert!(pixels.rgba_rows().is_none());
+                            assert!(pixels.direct_rgba().is_none());
                             let mut row = row_buffer::<u16>(reduced.0, channels);
                             assert_eq!(row.len(), row_len);
                             let (_, allocations) = allocation_count(|| {
@@ -2634,7 +2813,8 @@ fn workspace_resources() {
     };
     for (width, height) in [(1920, 1080), (3840, 2160)] {
         let rgba = content_rgba("photographic", width, height, None);
-        let frame = padded(PixelFormat::Bgra, width as u32, height as u32, &rgba, 16);
+        let input = padded(PixelFormat::Bgra, width as u32, height as u32, &rgba, 16);
+        let frame = input.frame();
         for (name, options) in [
             (
                 "png",
@@ -2666,7 +2846,7 @@ fn workspace_resources() {
                         allocation_count(|| workspace.encode(&frame, &options).unwrap())
                     });
                     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("workspace,{width},{height},{name},{warm},{sample},{elapsed:.6},{allocations},{peak},{retained_before},{},{},{},{rss_before},{}", workspace.retained_bytes(), frame.data().len(), image.len(), rss());
+                    eprintln!("workspace,{width},{height},{name},{warm},{sample},{elapsed:.6},{allocations},{peak},{retained_before},{},{},{},{rss_before},{}", workspace.retained_bytes(), input.bytes.len(), image.len(), rss());
                     black_box(image);
                 }
             }
@@ -2699,7 +2879,8 @@ fn workspace_output_growth_resources() {
     }
     for (width, height) in [(1920, 1080), (3840, 2160)] {
         let rgba = content_rgba("photographic", width, height, None);
-        let frame = padded(PixelFormat::Bgra, width as u32, height as u32, &rgba, 16);
+        let input = padded(PixelFormat::Bgra, width as u32, height as u32, &rgba, 16);
+        let frame = input.frame();
         for format in [
             ImageFormat::Png,
             ImageFormat::Jpeg(85),
@@ -3428,11 +3609,58 @@ fn reader_format_facts_match_the_frame_layout_for_every_format() {
         };
         assert_eq!(info.sample_width().bits(), expected_bits, "{format:?}");
         assert_eq!(info.has_alpha(), expected_alpha, "{format:?}");
-        for keep in [false, true] {
+        for alpha in [AlphaMode::Keep, AlphaMode::Discard] {
             let source = Source::new(&frame);
-            let reader =
-                super::Reader::<u8>::new(&source, YuvMatrix::Bt709, YuvRange::Limited, keep);
-            assert_eq!(reader.has_alpha(), keep && info.has_alpha(), "{format:?}");
+            let plan = Plan::new(&source, &options(ImageFormat::Png).alpha(alpha)).unwrap();
+            assert_eq!(
+                plan.pixels::<u8>().reader.has_alpha(),
+                alpha.keeps_alpha() && info.has_alpha(),
+                "{format:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn direct_rows_require_contiguous_full_size_eight_bit_packed_rgb() {
+    use crate::frames::RgbOrder;
+
+    for format in PixelFormat::ALL {
+        let order = match format {
+            PixelFormat::Rgba | PixelFormat::Rgbx => Some(RgbOrder::Rgb),
+            PixelFormat::Bgra | PixelFormat::Bgrx => Some(RgbOrder::Bgr),
+            _ => None,
+        };
+        for padding in [0, 8] {
+            let (width, height) = (18, 10);
+            let stride = format.line_stride_bytes(width).unwrap() + padding;
+            let data = vec![42; format.buffer_len(width, height, Some(stride)).unwrap()];
+            let frame = BorrowedVideoFrame::builder(&data, width, height, format)
+                .line_stride_bytes(stride)
+                .build()
+                .unwrap();
+            let source = Source::new(&frame);
+            for downscale in Downscale::ALL {
+                for alpha in [AlphaMode::Keep, AlphaMode::Discard] {
+                    let options = options(ImageFormat::Png).downscale(downscale).alpha(alpha);
+                    let plan = Plan::new(&source, &options).unwrap();
+                    let pixels = plan.pixels::<u8>();
+                    let eligible = order.filter(|_| padding == 0 && downscale == Downscale::Off);
+                    assert_eq!(
+                        pixels.direct_rows(false),
+                        eligible.map(|order| (data.as_slice(), order)),
+                        "{format:?} {padding} {options:?}",
+                    );
+                    assert_eq!(
+                        pixels.direct_rows(true),
+                        eligible
+                            .filter(|_| alpha.keeps_alpha() && format.info().has_alpha())
+                            .map(|order| (data.as_slice(), order)),
+                        "{format:?} {padding} {options:?}",
+                    );
+                    assert!(plan.pixels::<u16>().direct_rows(false).is_none());
+                }
+            }
         }
     }
 }
@@ -3568,7 +3796,6 @@ fn every_image_format_states_its_capabilities_once() {
             ImageFormat::Png => (
                 crate::ImageCodecKind::Png,
                 "image/png",
-                None,
                 AlphaChannel::Optional,
                 true,
                 true,
@@ -3577,7 +3804,6 @@ fn every_image_format_states_its_capabilities_once() {
             ImageFormat::Jpeg(_) => (
                 crate::ImageCodecKind::Jpeg,
                 "image/jpeg",
-                Some(1..=100),
                 AlphaChannel::None,
                 false,
                 false,
@@ -3586,7 +3812,6 @@ fn every_image_format_states_its_capabilities_once() {
             ImageFormat::WebpLossless => (
                 crate::ImageCodecKind::Webp,
                 "image/webp",
-                None,
                 AlphaChannel::Optional,
                 false,
                 false,
@@ -3595,7 +3820,6 @@ fn every_image_format_states_its_capabilities_once() {
             ImageFormat::WebpLossy(_) => (
                 crate::ImageCodecKind::Webp,
                 "image/webp",
-                Some(0..=100),
                 AlphaChannel::AlwaysRgba,
                 false,
                 false,
@@ -3606,10 +3830,9 @@ fn every_image_format_states_its_capabilities_once() {
             (
                 info.codec,
                 info.media_type,
-                info.quality.clone(),
                 info.alpha,
                 info.sixteen_bit,
-                info.hdr_code_values,
+                info.carries_color_tag,
                 info.aspect_tag
             ),
             expected
@@ -3673,12 +3896,12 @@ fn every_image_format_states_its_capabilities_once() {
             Err(Error::InvalidFrame(crate::FrameDefect::HdrRefused { .. }))
         ));
         let options = options(format).hdr(HdrPolicy::CodeValues);
-        if info.hdr_code_values {
+        if info.carries_color_tag {
             let image = hdr.encode_image(&options).unwrap();
             assert!(png_chunks(&image).iter().any(|(kind, _)| kind == b"cICP"));
         } else {
             assert!(
-                matches!(Plan::new(&source, &options), Err(Error::InvalidInput(crate::InputDefect::HdrNeedsPng { codec, .. })) if codec == info.codec)
+                matches!(Plan::new(&source, &options), Err(Error::InvalidInput(crate::InputDefect::ColorTagNeedsPng { codec, .. })) if codec == info.codec)
             );
         }
     }

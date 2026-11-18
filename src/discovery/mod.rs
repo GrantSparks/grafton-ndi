@@ -81,6 +81,9 @@
 //! # }
 //! ```
 //!
+//! See [discovery_server.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/discovery_server.rs)
+//! for runnable registration and listener workflows.
+//!
 //! # Connecting
 //!
 //! Each object is created for a Discovery Server address: the one given in its
@@ -153,6 +156,9 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! See [discovery_server.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/discovery_server.rs)
+//! for a complete listener loop.
 
 #![warn(missing_docs)]
 
@@ -216,7 +222,7 @@ impl ServerOptions for AdvertiserOptions {
         let Some(values) = self.configured_servers() else {
             return Ok(None);
         };
-        crate::finder::list_cstring(Some(values), "servers").map(|url| {
+        crate::list_setting::list_cstring(Some(values), "servers").map(|url| {
             url.map(|url| ServerEndpoint {
                 url,
                 input: EndpointInput::List(values),
@@ -233,15 +239,8 @@ impl ServerOptions for ListenerOptions {
     fn server(&self) -> crate::Result<Option<ServerEndpoint<'_>>> {
         self.configured_server()
             .map(|text| {
-                // Preserve the public refusal order: NUL before a server list.
-                let url = std::ffi::CString::new(text)?;
-                if text.contains(',') {
-                    return Err(crate::Error::InvalidInput(
-                        crate::InputDefect::MultipleDiscoveryServers,
-                    ));
-                }
                 Ok(ServerEndpoint {
-                    url,
+                    url: crate::list_setting::endpoint_cstring(text)?,
                     input: EndpointInput::Single(text),
                 })
             })
@@ -404,36 +403,27 @@ struct ServerObject<A: ServerApi, R: Retained<A> = ()> {
     api: crate::runtime::Bound<A>,
     _url: Option<std::ffi::CString>,
     #[cfg(feature = "advanced")]
-    _config: Option<crate::advanced::AdvancedConfig>,
+    _config: crate::advanced::RetainedConfig,
 }
 
 impl<A: ServerApi, R: Retained<A>> ServerObject<A, R> {
     fn new(ndi: &crate::Ndi, options: &A::Options) -> crate::Result<Self> {
         #[cfg(feature = "advanced")]
-        if let Some(config) = options.config() {
-            use crate::advanced::Configurable;
-            // SAFETY: the configured entry point obeys the shared lifecycle.
-            return unsafe {
-                Self::configured(
-                    ndi,
-                    options,
-                    config,
-                    |table: &A::Configured, settings, text| {
-                        A::create_configured(table, settings, text)
-                    },
-                )
-            };
+        {
+            <Self as crate::advanced::Configurable>::create_from_options(ndi, options)
         }
+        #[cfg(not(feature = "advanced"))]
+        {
+            Self::create_plain(ndi, options)
+        }
+    }
+
+    fn create_plain(ndi: &crate::Ndi, options: &A::Options) -> crate::Result<Self> {
         // SAFETY: the plain entry point obeys the shared lifecycle.
         unsafe {
-            Self::create(
-                ndi,
-                options,
-                R::default(),
-                #[cfg(feature = "advanced")]
-                None,
-                |api, settings| api.create(settings),
-            )
+            Self::create(ndi, options, R::default(), |api, settings| {
+                crate::runtime::NativeCreation::plain(api.create(settings))
+            })
         }
     }
 
@@ -445,8 +435,7 @@ impl<A: ServerApi, R: Retained<A>> ServerObject<A, R> {
         ndi: &crate::Ndi,
         options: &A::Options,
         retained: R,
-        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
-        create: impl FnOnce(&A, &A::Settings) -> sys::table::Called<A::Instance>,
+        create: impl FnOnce(&A, &A::Settings) -> crate::runtime::NativeCreation<A::Instance>,
     ) -> crate::Result<Self> {
         // Configured gates run first and include this table's own capability.
         let api = ndi.bind::<A>()?;
@@ -456,7 +445,8 @@ impl<A: ServerApi, R: Retained<A>> ServerObject<A, R> {
                 .as_ref()
                 .map_or(std::ptr::null(), |endpoint| endpoint.url.as_ptr()),
         );
-        let instance = create(&api, &settings).into_value();
+        let created = create(&api, &settings);
+        let instance = created.call.into_value();
         if instance.is_null() {
             return Err(not_created(A::OBJECT, endpoint.as_ref()));
         }
@@ -466,7 +456,7 @@ impl<A: ServerApi, R: Retained<A>> ServerObject<A, R> {
             api,
             _url: endpoint.map(|endpoint| endpoint.url),
             #[cfg(feature = "advanced")]
-            _config: config,
+            _config: created.config,
         })
     }
 }
@@ -490,18 +480,37 @@ impl<A: ServerApi, R: Retained<A>> crate::advanced::Configurable for ServerObjec
     type Options = A::Options;
     type Settings = A::Settings;
     type Instance = A::Instance;
+    fn config(options: &Self::Options) -> Option<&crate::advanced::AdvancedConfig> {
+        options.config()
+    }
+
+    fn create_plain(ndi: &crate::Ndi, options: &Self::Options) -> crate::Result<Self> {
+        Self::create_plain(ndi, options)
+    }
+
+    fn create_configured(
+        ndi: &crate::Ndi,
+        options: &Self::Options,
+        config: Option<&crate::advanced::AdvancedConfig>,
+    ) -> crate::Result<Self> {
+        // SAFETY: the configured entry point obeys the shared lifecycle.
+        unsafe {
+            Self::configured(
+                ndi,
+                options,
+                config,
+                |table: &A::Configured, settings, text| A::create_configured(table, settings, text),
+            )
+        }
+    }
+
     unsafe fn create_with(
         ndi: &crate::Ndi,
         options: &Self::Options,
-        config: crate::advanced::AdvancedConfig,
-        create: impl FnOnce(&Self::Settings) -> sys::table::Called<Self::Instance>,
+        create: impl FnOnce(&Self::Settings) -> crate::runtime::NativeCreation<Self::Instance>,
     ) -> crate::Result<Self> {
         // SAFETY: forwarded to the caller's fresh-instance obligation.
-        unsafe {
-            Self::create(ndi, options, R::default(), Some(config), |_, settings| {
-                create(settings)
-            })
-        }
+        unsafe { Self::create(ndi, options, R::default(), |_, settings| create(settings)) }
     }
 }
 
@@ -529,7 +538,13 @@ mod endpoint_tests {
         assert!(ServerOptions::server(&ListenerOptions::new())
             .unwrap()
             .is_none());
-        for text in ["", "café.local:5959", "127.0.0.1"] {
+        assert!(matches!(
+            ServerOptions::server(&ListenerOptions::new().server("")),
+            Err(crate::Error::InvalidInput(crate::InputDefect::Empty {
+                what: "server"
+            }))
+        ));
+        for text in ["café.local:5959", "127.0.0.1"] {
             let options = ListenerOptions::new().server(text);
             let endpoint = ServerOptions::server(&options).unwrap().unwrap();
             assert_eq!(endpoint.url.to_bytes(), text.as_bytes());

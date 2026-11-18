@@ -42,3 +42,41 @@ fn a_timeout_requires_the_settlement_kernels_late_drain_proof() {
         "a privacy error does not establish the proof parameter:\n{stderr}"
     );
 }
+
+#[test]
+fn native_stop_and_late_drain_proofs_cannot_be_forged_or_discarded() {
+    let compile = |cfg| {
+        nested_cargo::command("features-file-io", "rustc", None, None)
+            .args([
+                "--lib",
+                "--no-default-features",
+                "--features",
+                "file-io",
+                "--",
+                "--cfg",
+                cfg,
+                "-D",
+                "warnings",
+            ])
+            .output()
+            .expect("compile the recorder proof fixture")
+    };
+    let forged = compile("ndi_test_file_proofs");
+    let stderr = String::from_utf8_lossy(&forged.stderr);
+    assert!(
+        !forged.status.success()
+            && stderr.matches("E0451").count() >= 2
+            && stderr.contains("StopOwed")
+            && stderr.contains("LateDrain"),
+        "{stderr}"
+    );
+
+    let discarded = compile("ndi_test_file_proofs_discarded");
+    let stderr = String::from_utf8_lossy(&discarded.stderr);
+    assert!(
+        !discarded.status.success()
+            && stderr.contains("unused_must_use")
+            && stderr.contains("a session transition may owe a native stop"),
+        "{stderr}"
+    );
+}

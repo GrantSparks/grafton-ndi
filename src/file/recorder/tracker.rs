@@ -29,6 +29,13 @@ pub(super) struct Files {
     next_order: u64,
 }
 
+impl Files {
+    fn position(&self, path: &EventText) -> Result<usize, usize> {
+        self.entries
+            .binary_search_by(|open| open.path.as_bytes().cmp(path.as_bytes()))
+    }
+}
+
 impl FileTracker {
     pub(super) fn new() -> Self {
         Self::Complete(Files::default())
@@ -98,10 +105,7 @@ impl FileTracker {
             return;
         }
         let files = self.data_mut();
-        let index = match files
-            .entries
-            .binary_search_by(|open| open.path.as_bytes().cmp(path.as_bytes()))
-        {
+        let index = match files.position(&path) {
             Ok(_) => {
                 self.mark_incomplete();
                 return;
@@ -157,10 +161,7 @@ impl FileTracker {
     pub(super) fn first_frame(&mut self, path: &EventText) {
         if Self::exact(path) {
             let files = self.data_mut();
-            if let Ok(index) = files
-                .entries
-                .binary_search_by(|open| open.path.as_bytes().cmp(path.as_bytes()))
-            {
+            if let Ok(index) = files.position(path) {
                 files.entries[index].has_media = true;
                 return;
             }
@@ -174,10 +175,7 @@ impl FileTracker {
         let complete = self.is_complete();
         if Self::exact(path) {
             let files = self.data_mut();
-            if let Ok(index) = files
-                .entries
-                .binary_search_by(|open| open.path.as_bytes().cmp(path.as_bytes()))
-            {
+            if let Ok(index) = files.position(path) {
                 let closed = files.entries.remove(index);
                 files.path_bytes -= closed.path.retained_bytes();
                 return if closed.has_media {

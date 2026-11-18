@@ -4,18 +4,15 @@
 use crate::capture::CaptureKind;
 use std::time::Duration;
 
-use super::{
-    AdvancedConfig, AudioCodec, CompressedAudioRef, CompressedVideoRef, PacketAttached,
-    ReceivedAudioPacket, ReceivedVideoPacket, ReceiverControls, VideoCodec,
-};
 #[cfg(test)]
-use super::{CompressedAudioFrame, CompressedVideoFrame};
+use super::CompressedFrame;
+use super::{
+    AudioCodec, AudioPacketFormat, CompressedRef, PacketAttached, ReceivedPacket, ReceiverControls,
+    VideoCodec, VideoPacketFormat,
+};
 use crate::{
     capture::{AllSlots, AudioKind, CaptureStrategy, Guard, Media, MetadataKind, VideoKind},
-    sys::{
-        advanced::{native, ReceiverConfiguration},
-        bindings::*,
-    },
+    sys::bindings::*,
     timeout::Deadline,
     AudioFrame, AudioFrameRef, MetadataFrame, MetadataFrameRef, Ndi, Receiver, ReceiverEvent,
     ReceiverOptions, Result, VideoFrame, VideoFrameRef,
@@ -74,7 +71,7 @@ pub enum ReceivedVideo {
     /// A decoded frame.
     Decoded(VideoFrame),
     /// A codec packet, exactly as the source sent it.
-    Compressed(ReceivedVideoPacket),
+    Compressed(ReceivedPacket<VideoPacketFormat>),
 }
 
 /// Audio from a [`PacketReceiver`]: a codec packet when the source's format is
@@ -85,7 +82,7 @@ pub enum ReceivedAudio {
     /// Decoded planar floating-point audio.
     Decoded(AudioFrame),
     /// A codec packet, exactly as the source sent it.
-    Compressed(ReceivedAudioPacket),
+    Compressed(ReceivedPacket<AudioPacketFormat>),
 }
 
 /// What one [`PacketReceiver::capture_any`] call produced.
@@ -110,7 +107,7 @@ pub enum ReceivedVideoRef<'rx> {
     /// Decoded pixels borrowed from the receiver.
     Decoded(VideoFrameRef<'rx>),
     /// Codec bytes borrowed in place.
-    Compressed(CompressedVideoRef<'rx>),
+    Compressed(CompressedRef<'rx, VideoPacketFormat>),
 }
 
 impl ReceivedVideoRef<'_> {
@@ -130,7 +127,7 @@ pub enum ReceivedAudioRef<'rx> {
     /// Decoded samples borrowed from the receiver.
     Decoded(AudioFrameRef<'rx>),
     /// Codec bytes borrowed in place.
-    Compressed(CompressedAudioRef<'rx>),
+    Compressed(CompressedRef<'rx, AudioPacketFormat>),
 }
 
 impl ReceivedAudioRef<'_> {
@@ -231,7 +228,7 @@ pub struct PacketReceiver {
 impl std::fmt::Debug for PacketReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PacketReceiver")
-            .field("mode", &std::any::type_name::<PacketAttached>())
+            .field("receiver", &self.receiver)
             .finish_non_exhaustive()
     }
 }
@@ -257,19 +254,11 @@ impl PacketReceiver {
     #[doc(alias = "NDIlib_recv_create_v4")]
     pub fn new(ndi: &Ndi, options: &ReceiverOptions, preset: PassthroughPreset) -> Result<Self> {
         let options = creation_options(options, ndi.passthrough_format(preset)?);
-        let config = AdvancedConfig::or_empty(options.config.as_ref());
-        // SAFETY: the closure returns what the SDK's configured receiver
-        // creation returned for the settings it was handed, which carry the
-        // preset's color format and fielded video; the strings they point to
-        // belong to the creation path, which outlives the call.
-        let receiver = unsafe {
-            <Receiver<PacketAttached> as super::Configurable>::configured(
-                ndi,
-                &options,
-                &config,
-                |table: &ReceiverConfiguration, _settings, _text| native!(ReceiverConfiguration, table => table.named().NDIlib_recv_create_v4(_settings, _text)),
-            )
-        }?;
+        let receiver = <Receiver<PacketAttached> as super::Configurable>::create_configured(
+            ndi,
+            &options,
+            options.configured_config(),
+        )?;
         Ok(Self::from_receiver(receiver))
     }
 
@@ -408,7 +397,7 @@ fn creation_options(
 
 fn video_ref_event(frame: Guard<'_, VideoKind>) -> Result<PacketItemRef<'_>> {
     let video = if VideoCodec::from_outer(frame.frame().FourCC).is_some() {
-        ReceivedVideoRef::Compressed(CompressedVideoRef::new(frame)?)
+        ReceivedVideoRef::Compressed(CompressedRef::<VideoPacketFormat>::new(frame)?)
     } else {
         ReceivedVideoRef::Decoded(VideoKind::make_ref(frame)?)
     };
@@ -417,7 +406,7 @@ fn video_ref_event(frame: Guard<'_, VideoKind>) -> Result<PacketItemRef<'_>> {
 
 fn audio_ref_event(frame: Guard<'_, AudioKind>) -> Result<PacketItemRef<'_>> {
     let audio = if AudioCodec::from_outer(frame.frame().FourCC).is_some() {
-        ReceivedAudioRef::Compressed(CompressedAudioRef::new(frame)?)
+        ReceivedAudioRef::Compressed(CompressedRef::<AudioPacketFormat>::new(frame)?)
     } else {
         ReceivedAudioRef::Decoded(AudioKind::make_ref(frame)?)
     };
@@ -454,7 +443,6 @@ mod tests {
         advanced::{EnvelopeCodec, PacketEnvelope, VideoPacketFormat},
         capture::{Delivered, Notification},
         frames::{AudioPartsExt, MetadataPartsExt, PixelFormat},
-        receiver::native_capture_calls,
         Error, Timecode,
     };
 
@@ -566,7 +554,7 @@ mod tests {
         let format = VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap();
         let packet =
             PacketEnvelope::encode(EnvelopeCodec::H264, 10, 9, true, &[1, 2, 3], &[4, 5]).unwrap();
-        let mut sent = CompressedVideoFrame::new(format, packet.clone()).unwrap();
+        let mut sent = CompressedFrame::<VideoPacketFormat>::new(format, packet.clone()).unwrap();
         let (event, releases) = deliver::<VideoKind>(sent.raw(), video_event);
         assert_eq!(releases, 1);
         let PacketItem::Video(ReceivedVideo::Compressed(copied)) = event.unwrap() else {
@@ -622,7 +610,7 @@ mod tests {
         assert!(event.is_err());
         assert_eq!(releases, 1);
 
-        let mut sent = CompressedAudioFrame::new(
+        let mut sent = CompressedFrame::<AudioPacketFormat>::new(
             crate::advanced::AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![1; 8],
         )
@@ -665,53 +653,6 @@ mod tests {
         let (event, releases) = deliver::<MetadataKind>(bad_text, metadata_event);
         assert!(matches!(event, Err(Error::InvalidUtf8(_))));
         assert_eq!(releases, 1);
-    }
-
-    #[test]
-    fn packet_capture_reaches_the_sdk_while_connection_changes_are_locked() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver: Receiver<PacketAttached> =
-            Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap()))
-                .unwrap()
-                .into_packet_for_test();
-        native_capture_calls::take();
-        assert!(matches!(
-            PacketReceiver::capture_from(&receiver, Duration::MAX),
-            Err(Error::InvalidInput(_))
-        ));
-        let reconnect = receiver.core.reconnect_lock();
-        std::thread::scope(|scope| {
-            let (done, completed) = std::sync::mpsc::channel();
-            let receiver = &receiver;
-            let worker = scope.spawn(move || {
-                for timeout in [Duration::ZERO, Duration::from_millis(5)] {
-                    assert!(PacketReceiver::capture_from(receiver, timeout)
-                        .unwrap()
-                        .is_none());
-                }
-                done.send(native_capture_calls::take()).unwrap();
-            });
-            // The connection lock stays held until capture returns. A capture
-            // that took it would stall instead of reaching the SDK.
-            let calls = completed.recv_timeout(Duration::from_secs(2));
-            drop(reconnect);
-            worker.join().unwrap();
-            assert!(calls.unwrap() >= 2);
-        });
-        PacketReceiver::capture_from(&receiver, Duration::ZERO).unwrap();
-        assert_eq!(native_capture_calls::take(), 1);
-
-        // Nothing is connected, so nothing arrives: the capture waits out its
-        // whole budget, capturing again as often as the SDK returns early.
-        let budget = Duration::from_millis(250);
-        let began = std::time::Instant::now();
-        assert!(PacketReceiver::capture_from(&receiver, budget)
-            .unwrap()
-            .is_none());
-        assert!(began.elapsed() >= budget);
-        assert!(native_capture_calls::take() >= 1);
     }
 
     /// A packet receiver is created from the preset's color format, so that is

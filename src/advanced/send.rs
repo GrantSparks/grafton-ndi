@@ -3,33 +3,27 @@
 #[cfg(any(test, ndi_has_advanced_scatter_send))]
 use std::ptr;
 
-#[cfg(doc)]
-use super::{AudioCodec, MAX_PACKET_BYTES};
-
 use super::{
     aliasable::AliasableVec,
     invalid_frame,
-    packets::{
-        frame_extras_accessors, packet_debug, AudioPacketFormat, FrameExtras, PacketBytes,
-        PacketLen,
-    },
-    AdvancedConfig, CompressedAttached, CompressedAudioFrame, CompressedAudioSendMode,
-    CompressedVideoFrame, VideoPacketFormat,
+    packets::{EnvelopeExtents, PacketBytes, PacketLen},
+    AudioPacketFormat, CompressedAttached, CompressedAudioSendMode, CompressedFrame, ScatterFrame,
+    VideoPacketFormat,
 };
 use crate::{
     marker::NotSync,
-    sender::in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans},
-    sys::{
-        advanced::{native, ScatterSend},
-        bindings::*,
+    sender::{
+        in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans},
+        SendHandle,
     },
+    sys::advanced::{native, ScatterSend},
     Ndi, Rejected, Result, Sender, SenderOptions, StreamTier,
 };
 
 #[cfg(any(test, ndi_has_advanced_scatter_send))]
 use super::aliasable::AliasableBox;
 #[cfg(ndi_has_advanced_scatter_send)]
-use crate::sys::advanced::FrameScatter;
+use crate::sys::{advanced::FrameScatter, bindings::*};
 
 /// Maximum number of blocks in one scatter frame.
 pub const MAX_SCATTER_BLOCKS: usize = 65_536;
@@ -44,8 +38,9 @@ mod scatter_completion_tests;
 /// The SDK writes to the blocks it sends, as it does to a contiguous frame,
 /// and keeps the addresses of the blocks and of both arrays while an
 /// asynchronous send is pending.
-struct ScatterStorage {
-    blocks: Box<[AliasableVec<u8>]>,
+pub(super) struct ScatterStorage {
+    first: AliasableVec<u8>,
+    rest: Box<[AliasableVec<u8>]>,
     #[cfg(any(test, ndi_has_advanced_scatter_send))]
     pointers: BlockPointers,
     #[cfg(any(test, ndi_has_advanced_scatter_send))]
@@ -54,18 +49,57 @@ struct ScatterStorage {
     // reads this array; it writes only the packet blocks.
     sizes: AliasableBox<[Option<PacketLen>]>,
     total: PacketLen,
-    #[cfg(ndi_has_advanced_scatter_send)]
-    first: PacketLen,
 }
 
-/// One validation pass supplies every extent the scatter descriptors need.
-struct ScatterSizes {
-    total: PacketLen,
+/// The exact blocks and extents established together by the shape check.
+pub(super) struct CheckedScatter<'a> {
+    pub(super) first: &'a mut Vec<u8>,
+    pub(super) rest: &'a mut [Vec<u8>],
+    pub(super) total: PacketLen,
     #[cfg(any(test, ndi_has_advanced_scatter_send))]
     sizes: Box<[Option<PacketLen>]>,
-    #[cfg(ndi_has_advanced_scatter_send)]
-    first: PacketLen,
 }
+
+impl CheckedScatter<'_> {
+    /// Move the accepted blocks without copying their contents.
+    pub(super) fn into_storage(self) -> ScatterStorage {
+        ScatterStorage::new(
+            AliasableVec::new(std::mem::take(self.first)),
+            self.rest
+                .iter_mut()
+                .map(std::mem::take)
+                .map(AliasableVec::new)
+                .collect(),
+            self.total,
+            #[cfg(any(test, ndi_has_advanced_scatter_send))]
+            self.sizes,
+        )
+    }
+}
+
+/// A scatter frame always starts with one block followed by at most
+/// `MAX_SCATTER_BLOCKS - 1` more, so the combined iterator has an exact size.
+struct ScatterBlocks<'a> {
+    first: Option<&'a [u8]>,
+    rest: std::slice::Iter<'a, AliasableVec<u8>>,
+}
+
+impl<'a> Iterator for ScatterBlocks<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.first
+            .take()
+            .or_else(|| self.rest.next().map(|block| &**block))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = usize::from(self.first.is_some()) + self.rest.len();
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for ScatterBlocks<'_> {}
 
 /// Addresses lent to the SDK, never dereferenced by Rust.
 #[cfg(any(test, ndi_has_advanced_scatter_send))]
@@ -87,33 +121,31 @@ unsafe impl Send for BlockPointers {}
 #[cfg(any(test, ndi_has_advanced_scatter_send))]
 unsafe impl Sync for BlockPointers {}
 
-const _: () = {
+const_assert!({
     assert!(size_of::<Option<PacketLen>>() == size_of::<i32>());
     assert!(std::mem::align_of::<Option<PacketLen>>() == std::mem::align_of::<i32>());
     const fn send_and_sync<T: Send + Sync>() {}
     send_and_sync::<ScatterStorage>();
-};
+});
 
 impl Clone for ScatterStorage {
     /// Copies of the blocks, with arrays that describe the copies.
     fn clone(&self) -> Self {
         Self::new(
-            self.blocks().map(<[u8]>::to_vec).collect(),
-            ScatterSizes {
-                total: self.total,
-                #[cfg(any(test, ndi_has_advanced_scatter_send))]
-                sizes: Box::from(&*self.sizes),
-                #[cfg(ndi_has_advanced_scatter_send)]
-                first: self.first,
-            },
+            self.first.clone(),
+            self.rest.clone(),
+            self.total,
+            #[cfg(any(test, ndi_has_advanced_scatter_send))]
+            Box::from(&*self.sizes),
         )
     }
 }
 
 impl ScatterStorage {
-    fn retained_bytes(&self) -> usize {
-        let bytes = self.blocks.iter().fold(
-            self.blocks.len() * size_of::<AliasableVec<u8>>(),
+    pub(super) fn retained_bytes(&self) -> usize {
+        let block_headers = (self.rest.len() + 1) * size_of::<AliasableVec<u8>>();
+        let bytes = self.rest.iter().fold(
+            block_headers.saturating_add(self.first.capacity()),
             |total, block| total.saturating_add(block.capacity()),
         );
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
@@ -126,10 +158,11 @@ impl ScatterStorage {
     }
 
     /// Check each block and the sum once, retaining every checked extent.
-    fn check(blocks: &[Vec<u8>]) -> Result<ScatterSizes> {
+    pub(super) fn check(blocks: &mut [Vec<u8>], header_bytes: usize) -> Result<CheckedScatter<'_>> {
+        let count = blocks.len();
         let (first, rest) = blocks
-            .split_first()
-            .filter(|_| blocks.len() <= MAX_SCATTER_BLOCKS)
+            .split_first_mut()
+            .filter(|_| count <= MAX_SCATTER_BLOCKS)
             .ok_or_else(|| invalid_frame(crate::FrameDefect::ScatterBlockCount))?;
         let checked = |block: &Vec<u8>| {
             PacketLen::new(block.len()).ok_or_else(|| {
@@ -140,13 +173,13 @@ impl ScatterStorage {
                 })
             })
         };
-        let first = checked(first)?;
-        let mut total = first;
+        let first_size = checked(first)?;
+        let mut total = first_size;
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
-        let mut sizes = Vec::with_capacity(blocks.len() + 1);
+        let mut sizes = Vec::with_capacity(count + 1);
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
-        sizes.push(Some(first));
-        for block in rest {
+        sizes.push(Some(first_size));
+        for block in rest.iter() {
             let size = checked(block)?;
             total = total
                 .checked_add(size)
@@ -154,40 +187,48 @@ impl ScatterStorage {
             #[cfg(any(test, ndi_has_advanced_scatter_send))]
             sizes.push(Some(size));
         }
+        if first.len() < header_bytes {
+            return Err(invalid_frame(crate::FrameDefect::ScatterHeader));
+        }
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
         sizes.push(None);
-        Ok(ScatterSizes {
+        Ok(CheckedScatter {
+            first,
+            rest,
             total,
             #[cfg(any(test, ndi_has_advanced_scatter_send))]
             sizes: sizes.into_boxed_slice(),
-            #[cfg(ndi_has_advanced_scatter_send)]
-            first,
         })
     }
 
-    /// Take ownership of the blocks and the extents that `check` accepted.
-    fn new(blocks: Vec<Vec<u8>>, checked: ScatterSizes) -> Self {
-        let blocks: Box<[_]> = blocks.into_iter().map(AliasableVec::new).collect();
+    /// Take ownership of exactly the blocks and extents admitted together.
+    fn new(
+        first: AliasableVec<u8>,
+        rest: Box<[AliasableVec<u8>]>,
+        total: PacketLen,
+        #[cfg(any(test, ndi_has_advanced_scatter_send))] sizes: Box<[Option<PacketLen>]>,
+    ) -> Self {
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
-        let mut blocks = blocks;
+        let (mut first, mut rest) = (first, rest);
         // The SDK writes through these, whatever its declaration says.
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
         let pointers = AliasableBox::new(
-            blocks
-                .iter_mut()
-                .map(|block| block.as_mut_ptr().cast::<u8>().cast_const())
+            std::iter::once(&mut first)
+                .chain(rest.iter_mut())
+                .map(|block| block.as_mut_ptr().cast_const())
                 .chain(std::iter::once(ptr::null()))
                 .collect(),
         );
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
-        let sizes = AliasableBox::new(checked.sizes);
+        let sizes = AliasableBox::new(sizes);
         #[cfg(ndi_has_advanced_scatter_send)]
         let list = AliasableBox::new(Box::new(FrameScatter {
             p_data_blocks: pointers.as_ptr().cast(),
             p_data_blocks_size: sizes.as_ptr().cast(),
         }));
         Self {
-            blocks,
+            first,
+            rest,
             #[cfg(any(test, ndi_has_advanced_scatter_send))]
             pointers: BlockPointers {
                 array: pointers,
@@ -196,9 +237,7 @@ impl ScatterStorage {
             },
             #[cfg(any(test, ndi_has_advanced_scatter_send))]
             sizes,
-            total: checked.total,
-            #[cfg(ndi_has_advanced_scatter_send)]
-            first: checked.first,
+            total,
         }
     }
 
@@ -206,24 +245,39 @@ impl ScatterStorage {
     /// The SDK may write to the blocks for as long as it holds the
     /// description, so the caller keeps the storage exclusively for that long.
     #[cfg(ndi_has_advanced_scatter_send)]
-    fn descriptor(&mut self) -> *const FrameScatter {
+    pub(super) fn descriptor(&mut self) -> *const FrameScatter {
         self.pointers.list.as_ptr()
     }
 
-    fn blocks(&self) -> impl ExactSizeIterator<Item = &[u8]> {
-        self.blocks.iter().map(|block| &**block)
+    pub(super) fn total_bytes(&self) -> usize {
+        self.total.to_usize()
     }
 
-    fn into_blocks(self) -> Vec<Vec<u8>> {
-        self.blocks
-            .into_vec()
-            .into_iter()
-            .map(AliasableVec::into_vec)
-            .collect()
+    #[cfg(ndi_has_advanced_scatter_send)]
+    pub(super) fn lend_first_block(&mut self) -> (*mut u8, i32) {
+        // SAFETY: construction always supplies one positive size for the
+        // first block and the allocated, aligned array containing that size
+        // stays live. The SDK only reads this array, in the native i32 layout.
+        let size = unsafe { self.sizes.as_ptr().cast::<i32>().read() };
+        (self.first.as_mut_ptr(), size)
     }
 
-    fn copy_contiguous(&self) -> PacketBytes {
-        PacketBytes::with_len(self.total, |bytes| {
+    pub(super) fn blocks(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        ScatterBlocks {
+            first: Some(&self.first),
+            rest: self.rest.iter(),
+        }
+    }
+
+    pub(super) fn into_blocks(self) -> Vec<Vec<u8>> {
+        let mut blocks = Vec::with_capacity(self.rest.len() + 1);
+        blocks.push(self.first.into_vec());
+        blocks.extend(self.rest.into_vec().into_iter().map(AliasableVec::into_vec));
+        blocks
+    }
+
+    pub(super) fn copy_contiguous(&self, extents: Option<EnvelopeExtents>) -> PacketBytes {
+        PacketBytes::with_len(self.total, extents, |bytes| {
             for block in self.blocks() {
                 bytes.extend_from_slice(block);
             }
@@ -231,228 +285,22 @@ impl ScatterStorage {
     }
 }
 
-/// The first block of a scatter frame, which must hold the whole of the
-/// frame's header of `header_bytes` bytes.
-fn first_block(blocks: &[Vec<u8>], header_bytes: usize) -> Result<&[u8]> {
-    let first = &blocks[0];
-    if first.len() < header_bytes {
-        return Err(invalid_frame(crate::FrameDefect::ScatterHeader));
-    }
-    Ok(first)
-}
-
-/// The `N` bytes at `offset` of a frame held in `blocks`, if it has them.
-fn bytes_at<const N: usize>(blocks: &[Vec<u8>], offset: usize) -> Option<[u8; N]> {
-    let mut bytes = blocks.iter().flatten().skip(offset).copied();
+/// The `N` bytes at `offset` of a frame held in several blocks.
+pub(super) fn bytes_at<const N: usize>(
+    first: &[u8],
+    rest: &[Vec<u8>],
+    offset: usize,
+) -> Option<[u8; N]> {
+    let mut bytes = first
+        .iter()
+        .chain(rest.iter().flatten())
+        .skip(offset)
+        .copied();
     let mut value = [0; N];
     for byte in &mut value {
         *byte = bytes.next()?;
     }
     Some(value)
-}
-
-/// One compressed video frame held in several owned blocks.
-///
-/// The blocks are sent as they are, without being joined: an encoder can hand
-/// over its header, payload and parameter sets separately. The first block
-/// must hold the frame's complete header: for H.264 and HEVC the 44-byte
-/// packet envelope header (see [`PacketEnvelope`](super::PacketEnvelope)),
-/// for SpeedHQ its first four bytes.
-///
-/// # Examples
-///
-/// ```
-/// use grafton_ndi::advanced::{
-///     EnvelopeCodec, PacketEnvelope, ScatterVideoFrame, VideoCodec, VideoPacketFormat,
-/// };
-///
-/// let packet =
-///     PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, &[0x65; 64], &[0x67; 8])?;
-/// let (header, rest) = packet.split_at(44);
-/// let frame = ScatterVideoFrame::new(
-///     VideoPacketFormat::new(VideoCodec::H264, 1280, 720)?,
-///     vec![header.to_vec(), rest.to_vec()],
-/// )?;
-/// assert_eq!(frame.total_bytes(), packet.len());
-/// # Ok::<(), grafton_ndi::Error>(())
-/// ```
-#[derive(Clone)]
-pub struct ScatterVideoFrame {
-    format: VideoPacketFormat,
-    storage: ScatterStorage,
-    extras: FrameExtras,
-}
-
-packet_debug!(ScatterVideoFrame, "ScatterVideoFrame", frame, video, frame.extras.timestamp();
-    "blocks" = frame.blocks().len(), "bytes" = frame.total_bytes());
-
-impl ScatterVideoFrame {
-    frame_extras_accessors!();
-
-    /// Take ownership of one frame's blocks, in order.
-    ///
-    /// # Errors
-    ///
-    /// Returns the blocks with [`Error::InvalidFrame`](crate::Error::InvalidFrame)
-    /// when there are none or more than [`MAX_SCATTER_BLOCKS`], a block is
-    /// empty, the frame exceeds [`MAX_PACKET_BYTES`], or the first block does
-    /// not begin a frame of the format's codec that can be sent and is
-    /// delivered (see [`VideoCodec`](super::VideoCodec)).
-    pub fn new(
-        format: VideoPacketFormat,
-        blocks: Vec<Vec<u8>>,
-    ) -> std::result::Result<Self, Rejected<Vec<Vec<u8>>>> {
-        let check = || {
-            let sizes = ScatterStorage::check(&blocks)?;
-            format.validate_for_send(
-                first_block(&blocks, format.header_bytes())?,
-                sizes.total.to_usize(),
-            )?;
-            Ok(sizes)
-        };
-        match check() {
-            Ok(sizes) => Ok(Self {
-                format,
-                storage: ScatterStorage::new(blocks, sizes),
-                extras: FrameExtras::default(),
-            }),
-            Err(error) => Err(Rejected::new(error, blocks)),
-        }
-    }
-
-    /// The format.
-    pub fn format(&self) -> VideoPacketFormat {
-        self.format
-    }
-
-    /// The blocks, in order.
-    pub fn blocks(&self) -> impl ExactSizeIterator<Item = &[u8]> {
-        self.storage.blocks()
-    }
-
-    /// Recover each original block, preserving order, allocation and capacity.
-    ///
-    /// The outer vector may be newly allocated; block payloads are not copied.
-    /// Any SDK envelope stamping performed during sending is retained.
-    pub fn into_blocks(self) -> Vec<Vec<u8>> {
-        self.storage.into_blocks()
-    }
-
-    /// The size of the whole frame in bytes.
-    pub fn total_bytes(&self) -> usize {
-        self.storage.total.to_usize()
-    }
-
-    pub(super) fn retained_bytes(&self) -> usize {
-        self.storage
-            .retained_bytes()
-            .saturating_add(self.extras.retained_bytes())
-    }
-
-    /// Join the blocks into one newly allocated contiguous frame.
-    pub fn into_contiguous_copy(self) -> CompressedVideoFrame {
-        CompressedVideoFrame {
-            format: self.format,
-            payload: self.storage.copy_contiguous(),
-            extras: self.extras,
-        }
-    }
-
-    /// A native descriptor without data: a scatter send takes the payload
-    /// from the block arrays and ignores the frame's own data fields.
-    #[cfg(ndi_has_advanced_scatter_send)]
-    fn descriptor(&self) -> NDIlib_video_frame_v2_t {
-        self.format.descriptor(&self.extras)
-    }
-}
-
-/// One compressed audio frame held in several owned blocks.
-///
-/// For AAC the first block must hold the complete 44-byte packet envelope
-/// header; Opus has no envelope.
-#[derive(Clone)]
-pub struct ScatterAudioFrame {
-    format: AudioPacketFormat,
-    storage: ScatterStorage,
-    extras: FrameExtras,
-}
-
-packet_debug!(ScatterAudioFrame, "ScatterAudioFrame", frame, audio, frame.extras.timestamp();
-    "blocks" = frame.blocks().len(), "bytes" = frame.total_bytes());
-
-impl ScatterAudioFrame {
-    frame_extras_accessors!();
-
-    /// Take ownership of one frame's blocks, in order, with the given format.
-    ///
-    /// # Errors
-    ///
-    /// Returns the blocks with [`Error::InvalidFrame`](crate::Error::InvalidFrame)
-    /// when the format parameters are not ones the codec is delivered with
-    /// (see [`AudioCodec`]), the block list is invalid (as for
-    /// [`ScatterVideoFrame::new`]), or the blocks do not hold
-    /// a sendable AAC packet that agrees with the parameters.
-    pub fn new(
-        format: AudioPacketFormat,
-        blocks: Vec<Vec<u8>>,
-    ) -> std::result::Result<Self, Rejected<Vec<Vec<u8>>>> {
-        let check = || {
-            let sizes = ScatterStorage::check(&blocks)?;
-            let header = first_block(&blocks, format.codec().header_bytes())?;
-            format
-                .codec()
-                .validate_for_send(format, header, sizes.total.to_usize(), |offset| {
-                    bytes_at(&blocks, offset)
-                })?;
-            Ok(sizes)
-        };
-        match check() {
-            Ok(sizes) => Ok(Self {
-                format,
-                storage: ScatterStorage::new(blocks, sizes),
-                extras: FrameExtras::default(),
-            }),
-            Err(error) => Err(Rejected::new(error, blocks)),
-        }
-    }
-
-    /// The codec and audio format.
-    pub fn format(&self) -> AudioPacketFormat {
-        self.format
-    }
-
-    /// The blocks, in order.
-    pub fn blocks(&self) -> impl ExactSizeIterator<Item = &[u8]> {
-        self.storage.blocks()
-    }
-
-    /// Recover each original block, preserving order, allocation and capacity.
-    ///
-    /// The outer vector may be newly allocated; block payloads are not copied.
-    /// Any SDK envelope stamping performed during sending is retained.
-    pub fn into_blocks(self) -> Vec<Vec<u8>> {
-        self.storage.into_blocks()
-    }
-
-    /// The size of the whole frame in bytes.
-    pub fn total_bytes(&self) -> usize {
-        self.storage.total.to_usize()
-    }
-
-    /// Join the blocks into one newly allocated contiguous frame.
-    pub fn into_contiguous_copy(self) -> CompressedAudioFrame {
-        CompressedAudioFrame {
-            format: self.format,
-            payload: self.storage.copy_contiguous(),
-            extras: self.extras,
-        }
-    }
-
-    /// A native descriptor without data; see [`ScatterVideoFrame::descriptor`].
-    #[cfg(ndi_has_advanced_scatter_send)]
-    fn descriptor(&self) -> NDIlib_audio_frame_v3_t {
-        self.format.descriptor(&self.extras)
-    }
 }
 
 /// A video frame that was submitted asynchronously and that the SDK has
@@ -461,9 +309,9 @@ impl ScatterAudioFrame {
 #[non_exhaustive]
 pub enum SubmittedVideo {
     /// A frame submitted with [`CompressedSender::submit_video`].
-    Contiguous(CompressedVideoFrame),
+    Contiguous(CompressedFrame<VideoPacketFormat>),
     /// A frame submitted with [`CompressedSender::submit_scatter_video`].
-    Scatter(ScatterVideoFrame),
+    Scatter(ScatterFrame<VideoPacketFormat>),
 }
 
 impl SubmittedVideo {
@@ -510,7 +358,7 @@ pub(crate) struct ScatterDispatch {
 }
 
 #[cfg(ndi_has_advanced_scatter_send)]
-const _: () = assert!(size_of::<ScatterDispatch>() == size_of::<&ScatterSend>());
+const_assert!(size_of::<ScatterDispatch>() == size_of::<&ScatterSend>());
 
 impl ScatterDispatch {
     #[cfg(ndi_has_advanced_scatter_send)]
@@ -571,7 +419,7 @@ impl<F> ScatterSendable<F> {
 }
 
 impl<'a, F> ScatterSendable<&'a mut F, &'a ScatterSend> {
-    fn borrowed(frame: &'a mut F, ndi: &'a Ndi) -> Result<Self> {
+    pub(crate) fn borrowed(frame: &'a mut F, ndi: &'a Ndi) -> Result<Self> {
         Ok(Self {
             frame,
             table: ndi.table::<ScatterSend>()?,
@@ -579,26 +427,24 @@ impl<'a, F> ScatterSendable<&'a mut F, &'a ScatterSend> {
     }
 }
 
-impl ScatterSendable<&mut ScatterVideoFrame, &ScatterSend> {
-    fn send_video(self, sender: NDIlib_send_instance_t) {
+impl ScatterSendable<&mut ScatterFrame<VideoPacketFormat>, &ScatterSend> {
+    pub(crate) fn send_video(self, sender: SendHandle<'_>) {
         native!(ScatterSend, self.table, uses(self, sender) => {
-            let descriptor = self.frame.descriptor();
-            let scatter = self.frame.storage.descriptor();
+            let (descriptor, scatter) = self.frame.lend_scatter();
             // SAFETY: the caller's live sender borrows this frame exclusively
             // through the synchronous call, including its stable scatter list.
-            unsafe { self.table.NDIlib_send_send_video_scatter(sender, &descriptor, scatter) };
+            unsafe { self.table.NDIlib_send_send_video_scatter(sender.instance(), &descriptor, scatter) };
         })
     }
 }
 
-impl ScatterSendable<&mut ScatterAudioFrame, &ScatterSend> {
-    fn send_audio(self, sender: NDIlib_send_instance_t) {
+impl ScatterSendable<&mut ScatterFrame<AudioPacketFormat>, &ScatterSend> {
+    fn send_audio(self, sender: SendHandle<'_>) {
         native!(ScatterSend, self.table, uses(self, sender) => {
-            let descriptor = self.frame.descriptor();
-            let scatter = self.frame.storage.descriptor();
+            let (descriptor, scatter) = self.frame.lend_scatter();
             // SAFETY: the caller retains its live sender and this exclusive
             // frame borrow, including every block and list, until return.
-            unsafe { self.table.NDIlib_send_send_audio_scatter(sender, &descriptor, scatter) };
+            unsafe { self.table.NDIlib_send_send_audio_scatter(sender.instance(), &descriptor, scatter) };
         })
     }
 }
@@ -616,12 +462,11 @@ pub(crate) struct ScatterVideoLoan {
     ),
 }
 
-impl ScatterSendable<ScatterVideoFrame> {
+impl ScatterSendable<ScatterFrame<VideoPacketFormat>> {
     fn lend(&mut self) -> Lent {
         #[cfg(ndi_has_advanced_scatter_send)]
         {
-            let descriptor = self.frame.descriptor();
-            let scatter = self.frame.storage.descriptor();
+            let (descriptor, scatter) = self.frame.lend_scatter();
             Lent::Scatter(ScatterVideoLoan {
                 descriptor,
                 scatter,
@@ -636,8 +481,7 @@ impl ScatterSendable<ScatterVideoFrame> {
 
     #[cfg(ndi_has_advanced_scatter_send)]
     pub(super) fn completion_key(&mut self) -> (*mut u8, i32) {
-        let first = &mut self.frame.storage.blocks[0];
-        (first.as_mut_ptr(), self.frame.storage.first.to_sdk())
+        self.frame.lend_first_block()
     }
 }
 
@@ -682,15 +526,15 @@ impl ScatterVideoLoan {
 /// the SDK may still write to them.
 pub(crate) enum PendingVideo {
     /// A frame submitted with [`CompressedSender::submit_video`].
-    Contiguous(CompressedVideoFrame),
+    Contiguous(CompressedFrame<VideoPacketFormat>),
     /// A frame submitted with [`CompressedSender::submit_scatter_video`].
-    Scatter(ScatterSendable<ScatterVideoFrame>),
+    Scatter(ScatterSendable<ScatterFrame<VideoPacketFormat>>),
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<PendingVideo>();
-};
+});
 
 impl PendingVideo {
     /// The stream the frame is sent on.
@@ -722,15 +566,12 @@ unsafe impl Lend for PendingVideo {
     }
 }
 
-#[derive(Default)]
 /// The frame most recently submitted asynchronously on each stream.
 ///
-/// `Processing.NDI.Send.h` makes subsequent video sends synchronizing calls
-/// for the sender, across streams. The crate conservatively retains one frame
-/// per stream until the replacement on that same stream returns, an explicit
-/// reclaim releases it, or the native sender is destroyed. A synchronizing send on
-/// another stream can end the native loan earlier without releasing this
-/// retained storage to the caller.
+/// The loan kernel marks both slots released after synchronous video
+/// dispatch. Each frame remains in its own slot until that stream replaces it
+/// or the owner reclaims it. Sender destruction releases any outstanding loan.
+#[derive(Default)]
 pub(crate) struct PendingStreams {
     program: InFlight<PendingVideo>,
     preview: InFlight<PendingVideo>,
@@ -822,9 +663,9 @@ impl Loans for PendingStreams {
 /// and returns both streams' frames while keeping the source available.
 ///
 /// ```compile_fail,E0502
-/// use grafton_ndi::advanced::{CompressedSender, CompressedVideoFrame};
+/// use grafton_ndi::advanced::{CompressedSender, CompressedFrame, VideoPacketFormat};
 ///
-/// fn send(sender: &mut CompressedSender, frame: &mut CompressedVideoFrame) {
+/// fn send(sender: &mut CompressedSender, frame: &mut CompressedFrame<VideoPacketFormat>) {
 ///     let bytes = frame.data();
 ///     let _ = sender.send_video(frame);
 ///     // The SDK may have written to what `bytes` refers to.
@@ -836,7 +677,7 @@ impl Loans for PendingStreams {
 ///
 /// The SDK reports nothing about a frame it does not deliver. The frames it
 /// would discard for what they are (see [`VideoCodec`](super::VideoCodec) and
-/// [`AudioCodec`]) are refused when they are built or converted. Contiguous
+/// [`AudioCodec`](super::AudioCodec)) are refused when they are built or converted. Contiguous
 /// sends are infallible; scatter sends can fail only when scatter sending is
 /// unavailable.
 /// Every other frame is delivered, subject to two rules about the stream it
@@ -855,7 +696,7 @@ impl Loans for PendingStreams {
 /// ```no_run
 /// use grafton_ndi::{
 ///     advanced::{
-///         CompressedSender, CompressedVideoFrame, EnvelopeCodec, PacketEnvelope, VideoCodec,
+///         CompressedFrame, CompressedSender, EnvelopeCodec, PacketEnvelope, VideoCodec,
 ///         VideoPacketFormat,
 ///     },
 ///     FrameRate, Ndi, SenderOptions,
@@ -871,7 +712,7 @@ impl Loans for PendingStreams {
 /// let (payload, parameter_sets) = encoded_access_unit();
 /// let packet =
 ///     PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, &payload, &parameter_sets)?;
-/// let mut frame = CompressedVideoFrame::new(format, packet)?;
+/// let mut frame = CompressedFrame::<VideoPacketFormat>::new(format, packet)?;
 /// sender.send_video(&mut frame);
 /// # Ok(())
 /// # }
@@ -892,9 +733,12 @@ impl CompressedSender {
     /// without an Advanced runtime (or in a build without the Advanced SDK).
     #[doc(alias = "NDIlib_send_create_v2")]
     pub fn new(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
-        let config = AdvancedConfig::or_empty(options.config.as_ref());
         let pending = PendingStreams::default();
-        let sender = Sender::new_configured(ndi, options, &config)?;
+        let sender = <Sender<CompressedAttached> as super::Configurable>::create_configured(
+            ndi,
+            options,
+            options.configured_config(),
+        )?;
         Ok(Self {
             lending: Lending::new(sender, pending),
         })
@@ -940,7 +784,7 @@ impl CompressedSender {
     ///
     /// The frame is borrowed exclusively because the SDK writes to its bytes.
     #[doc(alias = "NDIlib_send_send_video_v2")]
-    pub fn send_video(&mut self, frame: &mut CompressedVideoFrame) {
+    pub fn send_video(&mut self, frame: &mut CompressedFrame<VideoPacketFormat>) {
         self.split().0.send_video(frame)
     }
 
@@ -954,16 +798,19 @@ impl CompressedSender {
     /// and pace sends in the application, or use [`super::Genlock`], to avoid
     /// this frame-rate wait. SDK back-pressure can also block a call.
     #[doc(alias = "NDIlib_send_send_video_async_v2")]
-    pub fn submit_video(&mut self, frame: CompressedVideoFrame) -> Option<SubmittedVideo> {
+    pub fn submit_video(
+        &mut self,
+        frame: CompressedFrame<VideoPacketFormat>,
+    ) -> Option<SubmittedVideo> {
         self.split().0.submit_video(frame)
     }
 
     /// Drain asynchronous video and return both streams' final frames.
     ///
-    /// One null asynchronous flush waits for the SDK to finish with all
-    /// pending video, without a timeout. The source stays available and can
-    /// send again; the next asynchronous send on either drained stream
-    /// returns `None`. Reclaiming from an empty sender makes no native call.
+    /// If the SDK still owns a loan, one null asynchronous flush waits for
+    /// it without a timeout. A preceding synchronous video send already
+    /// ends both loans and needs no flush. The source stays available and
+    /// the next asynchronous send on either drained stream returns `None`.
     /// Reclamation does not report whether receivers received the frames.
     #[doc(alias = "NDIlib_send_send_video_async_v2")]
     pub fn reclaim_video(&mut self) -> ReclaimedVideo {
@@ -980,7 +827,10 @@ impl CompressedSender {
     /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
     /// when the runtime has no scatter sending.
     #[doc(alias = "NDIlib_send_send_video_scatter")]
-    pub fn send_scatter_video(&mut self, frame: &mut ScatterVideoFrame) -> Result<()> {
+    pub fn send_scatter_video(
+        &mut self,
+        frame: &mut ScatterFrame<VideoPacketFormat>,
+    ) -> Result<()> {
         self.split().0.send_scatter_video(frame)
     }
 
@@ -993,8 +843,9 @@ impl CompressedSender {
     #[doc(alias = "NDIlib_send_send_video_scatter_async")]
     pub fn submit_scatter_video(
         &mut self,
-        frame: ScatterVideoFrame,
-    ) -> std::result::Result<Option<SubmittedVideo>, Rejected<ScatterVideoFrame>> {
+        frame: ScatterFrame<VideoPacketFormat>,
+    ) -> std::result::Result<Option<SubmittedVideo>, Rejected<ScatterFrame<VideoPacketFormat>>>
+    {
         self.split().0.submit_scatter_video(frame)
     }
 
@@ -1018,27 +869,18 @@ pub struct CompressedVideo<'a> {
 }
 
 impl CompressedVideo<'_> {
-    fn instance(&self) -> NDIlib_send_instance_t {
-        self.pair.sender().native_instance()
-    }
-
     /// See [`CompressedSender::send_video`].
     #[doc(alias = "NDIlib_send_send_video_v2")]
-    pub fn send_video(&mut self, frame: &mut CompressedVideoFrame) {
-        let descriptor = frame.raw();
-        // SAFETY: the sender is live, and the descriptor lends `frame`, which
-        // is borrowed exclusively for longer than this synchronous call.
-        unsafe {
-            self.pair
-                .sender()
-                .core()
-                .NDIlib_send_send_video_v2(self.instance(), &descriptor)
-        };
+    pub fn send_video(&mut self, frame: &mut CompressedFrame<VideoPacketFormat>) {
+        self.pair.send_video(frame);
     }
 
     /// See [`CompressedSender::submit_video`].
     #[doc(alias = "NDIlib_send_send_video_async_v2")]
-    pub fn submit_video(&mut self, frame: CompressedVideoFrame) -> Option<SubmittedVideo> {
+    pub fn submit_video(
+        &mut self,
+        frame: CompressedFrame<VideoPacketFormat>,
+    ) -> Option<SubmittedVideo> {
         self.pair.submit_pending(frame)
     }
 
@@ -1054,9 +896,11 @@ impl CompressedVideo<'_> {
     ///
     /// As for [`CompressedSender::send_scatter_video`].
     #[doc(alias = "NDIlib_send_send_video_scatter")]
-    pub fn send_scatter_video(&mut self, frame: &mut ScatterVideoFrame) -> Result<()> {
-        ScatterSendable::borrowed(frame, self.pair.sender().runtime())?.send_video(self.instance());
-        Ok(())
+    pub fn send_scatter_video(
+        &mut self,
+        frame: &mut ScatterFrame<VideoPacketFormat>,
+    ) -> Result<()> {
+        self.pair.send_scatter_video(frame)
     }
 
     /// See [`CompressedSender::submit_scatter_video`].
@@ -1067,8 +911,9 @@ impl CompressedVideo<'_> {
     #[doc(alias = "NDIlib_send_send_video_scatter_async")]
     pub fn submit_scatter_video(
         &mut self,
-        frame: ScatterVideoFrame,
-    ) -> std::result::Result<Option<SubmittedVideo>, Rejected<ScatterVideoFrame>> {
+        frame: ScatterFrame<VideoPacketFormat>,
+    ) -> std::result::Result<Option<SubmittedVideo>, Rejected<ScatterFrame<VideoPacketFormat>>>
+    {
         self.pair.submit_scatter(frame)
     }
 }
@@ -1079,13 +924,15 @@ impl<M: CompressedAudioSendMode> Sender<M> {
     /// envelope. The compressed or queued mode proves runtime availability;
     /// the frame's type proves send admission.
     #[doc(alias = "NDIlib_send_send_audio_v3")]
-    pub fn send_compressed_audio(&self, frame: &mut CompressedAudioFrame) {
+    pub fn send_compressed_audio(&self, frame: &mut CompressedFrame<AudioPacketFormat>) {
         let descriptor = frame.raw();
+        let handle = self.handle();
         // SAFETY: this live Advanced sender lends the exclusively borrowed
         // frame for the whole synchronous call, after which the SDK releases it.
         unsafe {
-            self.core()
-                .NDIlib_send_send_audio_v3(self.native_instance(), &descriptor)
+            handle
+                .core()
+                .NDIlib_send_send_audio_v3(handle.instance(), &descriptor)
         };
     }
 
@@ -1097,8 +944,8 @@ impl<M: CompressedAudioSendMode> Sender<M> {
     /// [`crate::Error::UnsupportedCapability`] when scatter sending is
     /// unavailable in the selected runtime or build headers.
     #[doc(alias = "NDIlib_send_send_audio_scatter")]
-    pub fn send_scatter_audio(&self, frame: &mut ScatterAudioFrame) -> Result<()> {
-        ScatterSendable::borrowed(frame, self.runtime())?.send_audio(self.native_instance());
+    pub fn send_scatter_audio(&self, frame: &mut ScatterFrame<AudioPacketFormat>) -> Result<()> {
+        ScatterSendable::borrowed(frame, self.runtime())?.send_audio(self.handle());
         Ok(())
     }
 }
@@ -1140,7 +987,7 @@ mod tests {
                 .clock_audio(false),
         )
         .unwrap();
-        let mut frame = CompressedAudioFrame::new(
+        let mut frame = CompressedFrame::<AudioPacketFormat>::new(
             AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![1; 64],
         )
@@ -1164,7 +1011,7 @@ mod tests {
             &super::super::QueueLimits::default(),
         )
         .unwrap();
-        let mut frame = CompressedAudioFrame::new(
+        let mut frame = CompressedFrame::<AudioPacketFormat>::new(
             AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![1; 64],
         )
@@ -1199,8 +1046,8 @@ mod tests {
         channels: u32,
         samples: u32,
         blocks: Vec<Vec<u8>>,
-    ) -> Result<ScatterAudioFrame> {
-        ScatterAudioFrame::new(
+    ) -> Result<ScatterFrame<AudioPacketFormat>> {
+        ScatterFrame::<AudioPacketFormat>::new(
             AudioPacketFormat::new(codec, sample_rate, channels, samples)?,
             blocks,
         )
@@ -1209,8 +1056,9 @@ mod tests {
 
     #[test]
     fn a_scatter_check_retains_every_extent_and_the_terminator() {
-        let blocks = vec![vec![1; 44], vec![2; 3], vec![3; 2]];
-        let checked = ScatterStorage::check(&blocks).unwrap();
+        let mut blocks = vec![vec![1; 44], vec![2; 3], vec![3; 2]];
+        let first_pointer = blocks[0].as_ptr();
+        let checked = ScatterStorage::check(&mut blocks, 44).unwrap();
         assert_eq!(checked.total.to_usize(), 49);
         assert_eq!(
             checked
@@ -1220,15 +1068,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some(44), Some(3), Some(2), None]
         );
-        #[cfg(ndi_has_advanced_scatter_send)]
-        assert_eq!(checked.first.to_usize(), 44);
-        for (blocks, cause) in [
+        assert_eq!(checked.first.len(), 44);
+        assert_eq!(checked.first.as_ptr(), first_pointer);
+        for (mut blocks, cause) in [
             (vec![], crate::FrameDefect::ScatterBlockCount),
             (vec![vec![]], crate::FrameDefect::EmptyScatterBlock),
             (vec![vec![1], vec![]], crate::FrameDefect::EmptyScatterBlock),
+            (vec![vec![1], vec![2]], crate::FrameDefect::ScatterHeader),
         ] {
             assert!(
-                matches!(ScatterStorage::check(&blocks), Err(crate::Error::InvalidFrame(actual)) if actual == cause)
+                matches!(ScatterStorage::check(&mut blocks, 44), Err(crate::Error::InvalidFrame(actual)) if actual == cause)
             );
         }
         let max = PacketLen::new(super::super::MAX_PACKET_BYTES).unwrap();
@@ -1236,11 +1085,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "the 256 MiB extent is checked by the native test run")]
+    #[cfg_attr(
+        miri,
+        ignore = "the full packet extent is checked by the native test run"
+    )]
     fn a_scatter_check_refuses_an_oversized_sum() {
-        let blocks = vec![vec![0; super::super::MAX_PACKET_BYTES], vec![1]];
+        let mut blocks = vec![vec![0; super::super::MAX_PACKET_BYTES], vec![1]];
         assert!(matches!(
-            ScatterStorage::check(&blocks),
+            ScatterStorage::check(&mut blocks, 44),
             Err(crate::Error::InvalidFrame(crate::FrameDefect::ScatterSize))
         ));
     }
@@ -1248,7 +1100,7 @@ mod tests {
     #[test]
     fn joining_three_blocks_keeps_video_and_audio_extents_paired() {
         let (format, bytes) = h264();
-        let mut video = ScatterVideoFrame::new(format, split(&bytes, &[44, 47]))
+        let mut video = ScatterFrame::<VideoPacketFormat>::new(format, split(&bytes, &[44, 47]))
             .unwrap()
             .into_contiguous_copy();
         let raw = video.raw();
@@ -1277,63 +1129,71 @@ mod tests {
     #[test]
     fn validates_complete_first_header_and_segmented_total() {
         let (format, bytes) = h264();
-        assert!(ScatterVideoFrame::new(format, split(&bytes, &[43])).is_err());
+        assert!(ScatterFrame::<VideoPacketFormat>::new(format, split(&bytes, &[43])).is_err());
+        assert!(ScatterFrame::<VideoPacketFormat>::new(
+            format,
+            vec![bytes[..44].to_vec(), bytes[44..48].to_vec()]
+        )
+        .is_err());
         assert!(
-            ScatterVideoFrame::new(format, vec![bytes[..44].to_vec(), bytes[44..48].to_vec()])
-                .is_err()
+            ScatterFrame::<VideoPacketFormat>::new(format, vec![bytes.clone(), vec![0]]).is_err()
         );
-        assert!(ScatterVideoFrame::new(format, vec![bytes.clone(), vec![0]]).is_err());
-        assert!(ScatterVideoFrame::new(format, vec![bytes.clone(), vec![]]).is_err());
-        let frame = ScatterVideoFrame::new(format, split(&bytes, &[44, 47])).unwrap();
+        assert!(
+            ScatterFrame::<VideoPacketFormat>::new(format, vec![bytes.clone(), vec![]]).is_err()
+        );
+        let frame =
+            ScatterFrame::<VideoPacketFormat>::new(format, split(&bytes, &[44, 47])).unwrap();
         assert_eq!(frame.total_bytes(), bytes.len());
-        assert_eq!(frame.storage.pointers.array.len(), 4);
-        assert!(frame.storage.pointers.array[3].is_null());
+        assert_eq!(frame.storage_for_test().pointers.array.len(), 4);
+        assert!(frame.storage_for_test().pointers.array[3].is_null());
         // SAFETY: the transparent NonZeroU32 niche and the layout assertions
         // guarantee the SDK's int representation, including the zero terminator.
         // The frame retains this initialized array through the borrowed read.
         let sdk_sizes = unsafe {
             std::slice::from_raw_parts(
-                frame.storage.sizes.as_ptr().cast::<i32>(),
-                frame.storage.sizes.len(),
+                frame.storage_for_test().sizes.as_ptr().cast::<i32>(),
+                frame.storage_for_test().sizes.len(),
             )
         };
         assert_eq!(sdk_sizes, &[44, 3, 2, 0]);
         let moved = Box::new(frame);
         for (block, pointer) in moved
-            .storage
-            .blocks
-            .iter()
-            .zip(moved.storage.pointers.array.iter())
+            .storage_for_test()
+            .blocks()
+            .zip(moved.storage_for_test().pointers.array.iter())
         {
             assert_eq!(block.as_ptr().cast::<u8>(), *pointer);
         }
         assert_eq!(moved.into_contiguous_copy().data(), bytes);
         fn send_sync<T: Send + Sync>() {}
-        send_sync::<ScatterVideoFrame>();
-        send_sync::<ScatterAudioFrame>();
-        send_sync::<CompressedVideoFrame>();
-        send_sync::<CompressedAudioFrame>();
+        send_sync::<ScatterFrame<VideoPacketFormat>>();
+        send_sync::<ScatterFrame<AudioPacketFormat>>();
+        send_sync::<CompressedFrame<VideoPacketFormat>>();
+        send_sync::<CompressedFrame<AudioPacketFormat>>();
         // With and without the Advanced headers alike.
         send_sync::<CompressedSender>();
     }
 
     #[test]
     fn scatter_video_is_admitted_on_the_same_terms_as_contiguous_video() {
-        let reason =
-            |result: std::result::Result<ScatterVideoFrame, Rejected<Vec<Vec<u8>>>>| match result
-                .map_err(Rejected::into_error)
-            {
-                Err(crate::Error::InvalidFrame(reason)) => reason,
-                other => panic!("expected an invalid frame, got {other:?}"),
-            };
+        let reason = |result: std::result::Result<
+            ScatterFrame<VideoPacketFormat>,
+            Rejected<Vec<Vec<u8>>>,
+        >| match result.map_err(Rejected::into_error) {
+            Err(crate::Error::InvalidFrame(reason)) => reason,
+            other => panic!("expected an invalid frame, got {other:?}"),
+        };
         let speedhq = VideoPacketFormat::new(VideoCodec::SpeedHq422, 1920, 1080).unwrap();
-        ScatterVideoFrame::new(speedhq, vec![vec![99, 0, 0, 0], vec![1; 8]]).unwrap();
-        let refused = ScatterVideoFrame::new(speedhq, vec![vec![100, 0, 0, 0], vec![1; 8]]);
+        ScatterFrame::<VideoPacketFormat>::new(speedhq, vec![vec![99, 0, 0, 0], vec![1; 8]])
+            .unwrap();
+        let refused =
+            ScatterFrame::<VideoPacketFormat>::new(speedhq, vec![vec![100, 0, 0, 0], vec![1; 8]]);
         assert!(matches!(
             reason(refused),
             crate::FrameDefect::SpeedHqQuality
         ));
-        let refused = ScatterVideoFrame::new(speedhq, vec![vec![0, 0, 0], vec![1; 8]]);
+        let refused =
+            ScatterFrame::<VideoPacketFormat>::new(speedhq, vec![vec![0, 0, 0], vec![1; 8]]);
         assert!(matches!(reason(refused), crate::FrameDefect::ScatterHeader));
 
         let (format, bytes) = h264();
@@ -1341,7 +1201,7 @@ mod tests {
             let format = VideoPacketFormat::new(VideoCodec::H264, width, height)
                 .unwrap()
                 .with_tier(StreamTier::Preview);
-            ScatterVideoFrame::new(format, split(&bytes, &[44]))
+            ScatterFrame::<VideoPacketFormat>::new(format, split(&bytes, &[44]))
         };
         preview(640, 640).unwrap();
         assert!(matches!(
@@ -1353,14 +1213,17 @@ mod tests {
             crate::FrameDefect::PreviewVideoDimensions
         ));
         assert!(matches!(
-            reason(ScatterVideoFrame::new(format, split(&bytes, &[43]))),
+            reason(ScatterFrame::<VideoPacketFormat>::new(
+                format,
+                split(&bytes, &[43])
+            )),
             crate::FrameDefect::ScatterHeader
         ));
 
         // A keyframe needs its parameter sets here too.
         let bare =
             PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, &[1, 2, 3], &[]).unwrap();
-        let refused = ScatterVideoFrame::new(format, split(&bare, &[44]));
+        let refused = ScatterFrame::<VideoPacketFormat>::new(format, split(&bare, &[44]));
         assert!(matches!(
             reason(refused),
             crate::FrameDefect::KeyframeConfigurationMissing
@@ -1371,10 +1234,10 @@ mod tests {
     fn rejected_blocks_are_returned_in_order() {
         let (format, bytes) = h264();
         let blocks = split(&bytes, &[43]);
-        let rejected = ScatterVideoFrame::new(format, blocks.clone()).unwrap_err();
+        let rejected = ScatterFrame::<VideoPacketFormat>::new(format, blocks.clone()).unwrap_err();
         assert_eq!(rejected.into_inner(), blocks);
 
-        let rejected = ScatterAudioFrame::new(
+        let rejected = ScatterFrame::<AudioPacketFormat>::new(
             AudioPacketFormat::new(AudioCodec::Opus, 44_100, 2, 960).unwrap(),
             vec![vec![1], vec![2]],
         )
@@ -1386,7 +1249,8 @@ mod tests {
     #[test]
     fn a_cloned_scatter_frame_describes_its_own_blocks() {
         let (format, bytes) = h264();
-        let mut frame = ScatterVideoFrame::new(format, split(&bytes, &[44, 47])).unwrap();
+        let mut frame =
+            ScatterFrame::<VideoPacketFormat>::new(format, split(&bytes, &[44, 47])).unwrap();
         frame.set_timecode(Timecode::from_ticks(3));
         frame.set_metadata("<scatter/>").unwrap();
         let copy = frame.clone();
@@ -1395,37 +1259,47 @@ mod tests {
             (Timecode::from_ticks(3), Some("<scatter/>"))
         );
         let blocks = copy
-            .storage
-            .blocks
-            .iter()
-            .zip(copy.storage.pointers.array.iter());
-        for ((block, pointer), original) in blocks.zip(frame.storage.blocks.iter()) {
+            .storage_for_test()
+            .blocks()
+            .zip(copy.storage_for_test().pointers.array.iter());
+        for ((block, pointer), original) in blocks.zip(frame.storage_for_test().blocks()) {
             assert_eq!(block.as_ptr().cast::<u8>(), *pointer);
             assert_ne!(block.as_ptr(), original.as_ptr());
-            assert_eq!(**block, **original);
+            assert_eq!(block, original);
         }
-        assert_eq!(&*copy.storage.sizes, &*frame.storage.sizes);
-        assert!(copy.storage.pointers.array[3].is_null());
+        assert_eq!(
+            &*copy.storage_for_test().sizes,
+            &*frame.storage_for_test().sizes
+        );
+        assert!(copy.storage_for_test().pointers.array[3].is_null());
         #[cfg(ndi_has_advanced_scatter_send)]
         {
             assert_ne!(
-                copy.storage.pointers.list.as_ptr(),
-                frame.storage.pointers.list.as_ptr()
+                copy.storage_for_test().pointers.list.as_ptr(),
+                frame.storage_for_test().pointers.list.as_ptr()
             );
-            let list = &*copy.storage.pointers.list;
+            let list = &*copy.storage_for_test().pointers.list;
             assert_eq!(
                 list.p_data_blocks.cast::<*const u8>(),
-                copy.storage.pointers.array.as_ptr().cast::<*const u8>()
+                copy.storage_for_test()
+                    .pointers
+                    .array
+                    .as_ptr()
+                    .cast::<*const u8>()
             );
             assert_eq!(
                 list.p_data_blocks_size.cast::<i32>(),
-                copy.storage.sizes.as_ptr().cast::<i32>()
+                copy.storage_for_test().sizes.as_ptr().cast::<i32>()
             );
         }
 
-        let mut audio =
-            scatter_audio(AudioCodec::Opus, 48_000, 2, 960, vec![vec![1], vec![2]]).unwrap();
-        audio.format = audio.format.with_protected(true);
+        let audio = ScatterFrame::new(
+            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960)
+                .unwrap()
+                .with_protected(true),
+            vec![vec![1], vec![2]],
+        )
+        .unwrap();
         let copy = audio.clone();
         assert!(copy.format().is_protected());
         assert_eq!(
@@ -1445,8 +1319,8 @@ mod tests {
     #[test]
     fn a_scatter_frame_the_sdk_has_written_to_is_read_back_and_sendable() {
         let (format, bytes) = h264();
-        let frame = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
-        let first = frame.storage.pointers.array[0].cast_mut();
+        let frame = ScatterFrame::<VideoPacketFormat>::new(format, split(&bytes, &[44])).unwrap();
+        let first = frame.storage_for_test().pointers.array[0].cast_mut();
         let moved = Box::new(frame);
         // SAFETY: the pointer was created to be written through, the block
         // holds a complete header, and no reference to it exists.
@@ -1456,7 +1330,7 @@ mod tests {
         assert_eq!(stamped[..24], bytes[..24]);
 
         let joined = moved.into_contiguous_copy();
-        super::super::ReceivedVideoPacket::from(joined.clone())
+        super::super::ReceivedPacket::<super::super::VideoPacketFormat>::from(joined.clone())
             .validate_for_send()
             .unwrap();
         assert_eq!(joined.data()[24..32], 7u64.to_ne_bytes());
@@ -1477,12 +1351,12 @@ mod tests {
                 .unwrap()
                 .into_contiguous_copy();
             assert_eq!(aac.data(), packet);
-            super::super::ReceivedAudioPacket::from(aac.clone())
+            super::super::ReceivedPacket::<super::super::AudioPacketFormat>::from(aac.clone())
                 .validate_for_send()
                 .unwrap();
         }
 
-        let reason = |result: Result<ScatterAudioFrame>| match result {
+        let reason = |result: Result<ScatterFrame<AudioPacketFormat>>| match result {
             Err(crate::Error::InvalidFrame(reason)) => reason,
             other => panic!("expected an invalid frame, got {other:?}"),
         };
@@ -1537,7 +1411,7 @@ mod tests {
         };
         let frame = opus(48_000, 960).unwrap().into_contiguous_copy();
         assert_eq!(frame.data(), &[1, 2]);
-        super::super::ReceivedAudioPacket::from(frame.clone())
+        super::super::ReceivedPacket::<super::super::AudioPacketFormat>::from(frame.clone())
             .validate_for_send()
             .unwrap();
         assert!(matches!(
@@ -1558,18 +1432,19 @@ mod tests {
 
     #[test]
     fn bytes_are_found_wherever_the_blocks_put_them() {
-        let blocks = vec![vec![0, 1], vec![2], vec![3, 4, 5]];
-        assert_eq!(bytes_at(&blocks, 0), Some([0, 1]));
-        assert_eq!(bytes_at(&blocks, 1), Some([1, 2, 3]));
-        assert_eq!(bytes_at(&blocks, 4), Some([4, 5]));
-        assert_eq!(bytes_at::<2>(&blocks, 5), None);
-        assert_eq!(bytes_at::<1>(&blocks, 6), None);
+        let blocks = [vec![0, 1], vec![2], vec![3, 4, 5]];
+        let (first, rest) = blocks.split_first().unwrap();
+        assert_eq!(bytes_at(first, rest, 0), Some([0, 1]));
+        assert_eq!(bytes_at(first, rest, 1), Some([1, 2, 3]));
+        assert_eq!(bytes_at(first, rest, 4), Some([4, 5]));
+        assert_eq!(bytes_at::<2>(first, rest, 5), None);
+        assert_eq!(bytes_at::<1>(first, rest, 6), None);
     }
 
     #[test]
     fn refused_scatter_proofs_return_every_original_block() {
         let (format, bytes) = h264();
-        let video = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
+        let video = ScatterFrame::<VideoPacketFormat>::new(format, split(&bytes, &[44])).unwrap();
         let video_blocks: Vec<_> = video
             .blocks()
             .map(|block| (block.as_ptr(), block.len()))
@@ -1590,7 +1465,7 @@ mod tests {
             video_blocks
         );
 
-        let audio = ScatterAudioFrame::new(
+        let audio = ScatterFrame::<AudioPacketFormat>::new(
             AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![vec![1, 2], vec![3, 4]],
         )
@@ -1618,7 +1493,8 @@ mod tests {
             return;
         }
         let (format, bytes) = h264();
-        let mut video = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
+        let mut video =
+            ScatterFrame::<VideoPacketFormat>::new(format, split(&bytes, &[44])).unwrap();
         let pointers: Vec<_> = video.blocks().map(|block| block.as_ptr()).collect();
         let (result, allocations) =
             crate::test_alloc::allocation_count(|| ScatterSendable::borrowed(&mut video, &ndi));
@@ -1641,7 +1517,7 @@ mod tests {
             pointers
         );
 
-        let mut audio = ScatterAudioFrame::new(
+        let mut audio = ScatterFrame::<AudioPacketFormat>::new(
             AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![vec![1, 2], vec![3, 4]],
         )
@@ -1663,7 +1539,7 @@ mod tests {
     #[test]
     fn async_submission_lends_what_the_pending_entry_owns() {
         let (format, bytes) = h264();
-        let frame = CompressedVideoFrame::new(format, bytes.clone()).unwrap();
+        let frame = CompressedFrame::<VideoPacketFormat>::new(format, bytes.clone()).unwrap();
         let data = frame.data().as_ptr();
         let mut pending = PendingVideo::Contiguous(frame);
         let (lent, allocations) = crate::test_alloc::allocation_count(|| pending.lend());
@@ -1686,9 +1562,14 @@ mod tests {
             return;
         };
         let table = ndi.table::<ScatterSend>().unwrap();
-        let frame = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
-        let pointers = frame.storage.pointers.array.as_ptr().cast::<*const u8>();
-        let sizes = frame.storage.sizes.as_ptr().cast::<i32>();
+        let frame = ScatterFrame::<VideoPacketFormat>::new(format, split(&bytes, &[44])).unwrap();
+        let pointers = frame
+            .storage_for_test()
+            .pointers
+            .array
+            .as_ptr()
+            .cast::<*const u8>();
+        let sizes = frame.storage_for_test().sizes.as_ptr().cast::<i32>();
         let (mut pending, allocations) = crate::test_alloc::allocation_count(|| {
             PendingVideo::Scatter(ScatterSendable::for_test(frame, Some(table)).unwrap())
         });
@@ -1719,8 +1600,10 @@ mod tests {
             return;
         };
         let (format, bytes) = h264();
-        let make =
-            |tier| ScatterVideoFrame::new(format.with_tier(tier), split(&bytes, &[44])).unwrap();
+        let make = |tier| {
+            ScatterFrame::<VideoPacketFormat>::new(format.with_tier(tier), split(&bytes, &[44]))
+                .unwrap()
+        };
         let mut sender = CompressedSender::new(
             &ndi,
             &SenderOptions::new(crate::test_support::unique_name("scatter-double-buffer"))
@@ -1728,14 +1611,14 @@ mod tests {
         )
         .unwrap();
         let list = |stream: &InFlight<PendingVideo>| match stream.frame().unwrap() {
-            PendingVideo::Scatter(proof) => proof.frame.storage.pointers.list.as_ptr(),
+            PendingVideo::Scatter(proof) => proof.frame.storage_for_test().pointers.list.as_ptr(),
             _ => panic!("scatter stream"),
         };
         let mut first = make(StreamTier::Program);
         let original = first.blocks().next().unwrap().as_ptr();
-        let original_list = first.storage.descriptor();
+        let original_list = first.lend_scatter().1;
         sender.send_scatter_video(&mut first).unwrap();
-        assert_eq!(first.storage.descriptor(), original_list);
+        assert_eq!(first.lend_scatter().1, original_list);
         sender.submit_scatter_video(first).unwrap();
         let program = list(&sender.lending.loans().program);
         assert_eq!(program, original_list);
@@ -1773,8 +1656,11 @@ mod tests {
         // contiguous replacement and a later asynchronous submission.
         sender
             .submit_video(
-                CompressedVideoFrame::new(format.with_tier(StreamTier::Preview), bytes.clone())
-                    .unwrap(),
+                CompressedFrame::<VideoPacketFormat>::new(
+                    format.with_tier(StreamTier::Preview),
+                    bytes.clone(),
+                )
+                .unwrap(),
             )
             .unwrap();
         sender.submit_scatter_video(returned_preview).unwrap();
@@ -1786,15 +1672,20 @@ mod tests {
 
     #[cfg(ndi_has_advanced_scatter_send)]
     #[test]
-    fn scatter_construction_allocates_arrays_and_one_frame_owned_list() {
+    fn scatter_construction_allocates_only_block_headers_and_native_descriptors() {
         let (format, bytes) = h264();
-        // Exclude shrinking the caller's spare outer-vector capacity from the
-        // frame's two arrays and one stable-list allocation.
-        let blocks = split(&bytes, &[44]).into_boxed_slice().into_vec();
-        let (frame, allocations) =
-            crate::test_alloc::allocation_count(|| ScatterVideoFrame::new(format, blocks).unwrap());
-        assert_eq!(allocations, 3, "pointer array, size array and stable list");
-        assert_eq!(frame.total_bytes(), bytes.len());
+        for (cuts, allocations) in [(&[][..], 3), (&[44][..], 4)] {
+            let blocks = split(&bytes, cuts);
+            let pointers: Vec<_> = blocks.iter().map(Vec::as_ptr).collect();
+            let (frame, called) =
+                crate::test_alloc::allocation_count(|| ScatterFrame::new(format, blocks).unwrap());
+            assert_eq!(
+                called, allocations,
+                "two arrays, one stable list, and the remaining block headers"
+            );
+            assert_eq!(frame.total_bytes(), bytes.len());
+            assert!(frame.blocks().map(<[u8]>::as_ptr).eq(pointers));
+        }
     }
 
     #[test]
@@ -1825,13 +1716,17 @@ mod tests {
                         .unwrap()
                         .with_tier(tier);
                     expected[index] = Some(if scatter {
-                        let frame =
-                            ScatterVideoFrame::new(format, vec![vec![1; 16], vec![2; 8]]).unwrap();
+                        let frame = ScatterFrame::<VideoPacketFormat>::new(
+                            format,
+                            vec![vec![1; 16], vec![2; 8]],
+                        )
+                        .unwrap();
                         let pointer = frame.blocks().next().unwrap().as_ptr();
                         assert!(sender.submit_scatter_video(frame).unwrap().is_none());
                         pointer
                     } else {
-                        let frame = CompressedVideoFrame::new(format, vec![1; 16]).unwrap();
+                        let frame =
+                            CompressedFrame::<VideoPacketFormat>::new(format, vec![1; 16]).unwrap();
                         let pointer = frame.data().as_ptr();
                         assert!(sender.submit_video(frame).is_none());
                         pointer
@@ -1873,7 +1768,10 @@ mod tests {
             return;
         };
         let (format, bytes) = h264();
-        let make = |tier| CompressedVideoFrame::new(format.with_tier(tier), bytes.clone()).unwrap();
+        let make = |tier| {
+            CompressedFrame::<VideoPacketFormat>::new(format.with_tier(tier), bytes.clone())
+                .unwrap()
+        };
         let options = SenderOptions::new(crate::test_support::unique_name("Per-stream retention"))
             .clock_video(false);
         let mut sender = CompressedSender::new(&ndi, &options).unwrap();
@@ -1893,7 +1791,7 @@ mod tests {
         // The SDK may have stamped the reserved field, and nothing else.
         assert_eq!(returned.data()[..24], bytes[..24]);
         assert_eq!(returned.data()[32..], bytes[32..]);
-        super::super::ReceivedVideoPacket::from(returned.clone())
+        super::super::ReceivedPacket::<super::super::VideoPacketFormat>::from(returned.clone())
             .validate_for_send()
             .unwrap();
         let reclaimed = sender.close();

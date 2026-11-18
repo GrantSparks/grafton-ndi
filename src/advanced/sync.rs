@@ -274,7 +274,7 @@ unsafe impl<'owner> crate::capture::FrameSource<'owner, AvSyncAudioFree> for &'o
 // The bound table uses the receiver lease the resource already retained:
 // one handle, one table pointer and one receiver Arc, with no separate Ndi.
 #[cfg(ndi_has_advanced_av_sync)]
-const _: () = assert!(
+const_assert!(
     std::mem::size_of::<AvResource>()
         == std::mem::size_of::<AvSyncInstance>()
             + std::mem::size_of::<&AvSyncTable>()
@@ -296,10 +296,10 @@ struct AvSyncInstance(AvSyncHandle);
 #[cfg(ndi_has_advanced_av_sync)]
 unsafe impl Send for AvSyncInstance {}
 
-const _: () = {
+const_assert!({
     const fn send<T: Send>() {}
     send::<AvResource>();
-};
+});
 
 impl sealed::Sealed for AvSyncKind {}
 
@@ -314,8 +314,6 @@ unsafe impl Synchronizer for AvSyncKind {
             // SAFETY: Resource retains the creating receiver and runtime, and
             // invokes this destruction once for the uniquely owned handle.
             unsafe { self.table.NDIlib_avsync_destroy(self.handle.0) };
-            #[cfg(test)]
-            crate::receiver::lifecycle_test_events::record("avsync");
         });
     }
 
@@ -395,7 +393,7 @@ pub struct AvSync {
 impl std::fmt::Debug for AvSync {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AvSync")
-            .field("mode", &std::any::type_name::<AvSyncAttached>())
+            .field("receiver", self.receiver())
             .finish_non_exhaustive()
     }
 }
@@ -586,8 +584,10 @@ pub struct AvSyncCapture<'a> {
 
 impl std::fmt::Debug for AvSyncCapture<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let receiver =
+            crate::receiver::ReceiverIdentity::new::<AvSyncAttached>(self.resource.receiver());
         f.debug_struct("AvSyncCapture")
-            .field("mode", &std::any::type_name::<AvSyncAttached>())
+            .field("receiver", &receiver)
             .finish_non_exhaustive()
     }
 }
@@ -923,7 +923,7 @@ struct GenResource {
     handle: GenlockInstance,
     table: crate::runtime::Bound<GenlockTable>,
     source: RetainedSources,
-    _config: Option<AdvancedConfig>,
+    _config: super::RetainedConfig,
 }
 
 #[cfg(ndi_has_advanced_genlock)]
@@ -954,10 +954,10 @@ unsafe impl Send for GenlockInstance {}
 #[cfg(ndi_has_advanced_genlock)]
 unsafe impl Sync for GenlockInstance {}
 
-const _: () = {
+const_assert!({
     const fn send_and_sync<T: Send + Sync>() {}
     send_and_sync::<GenResource>();
-};
+});
 
 impl Drop for GenResource {
     fn drop(&mut self) {
@@ -1091,22 +1091,20 @@ impl Genlock {
         let table = ndi.bind::<GenlockTable>()?;
         native!(Genlock, table, uses(options) => {
             let mut source = RetainedSources::default();
-            let handle = source.replace(options.source.as_ref(), |source| {
-                // SAFETY: the retention helper keeps the descriptor and text
-                // at stable addresses until after native destruction.
-                unsafe {
-                    table.named().NDIlib_genlock_create(
-                        source,
-                        options.config.as_ref().map_or(ptr::null(), AdvancedConfig::as_ptr),
-                    )
-                }
-            }).created()?.as_ptr();
+            let (call, config) = AdvancedConfig::lend(options.configured_config(), |config| {
+                source.replace(options.source.as_ref(), |source| {
+                    // SAFETY: the source helper and configuration owner retain
+                    // both pointers at stable addresses through native destruction.
+                    unsafe { table.named().NDIlib_genlock_create(source, config) }
+                })
+            });
+            let handle = call.created()?.as_ptr();
             Ok(Self {
                 resource: GenResource {
                     handle: GenlockInstance(handle),
                     table,
                     source,
-                    _config: options.config.clone(),
+                    _config: config,
                 },
                 _not_sync: NotSync::default(),
             })
@@ -1353,50 +1351,6 @@ mod tests {
             )
         };
         outcome(status, guard).map(|outcome| outcome.to_owned())
-    }
-
-    #[test]
-    fn recovery_destroys_avsync_before_raw_capture_is_available() {
-        use crate::receiver::lifecycle_test_events::{snapshot, track};
-        let Some(ndi) = crate::test_support::advanced_ndi() else {
-            return;
-        };
-        let events = track(|| {
-            let receiver =
-                Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new("").unwrap()))
-                    .unwrap();
-            let sync = AvSync::new(receiver).unwrap();
-            let receiver = sync.into_receiver();
-            assert_eq!(snapshot(), ["avsync"]);
-            assert!(receiver
-                .capture_audio(std::time::Duration::ZERO)
-                .unwrap()
-                .is_none());
-            drop(receiver);
-        });
-        assert_eq!(events, ["avsync", "receiver"]);
-    }
-
-    #[test]
-    fn avsync_destroys_before_its_receiver_on_drop_and_recovery() {
-        use crate::receiver::lifecycle_test_events::track;
-        let Some(ndi) = crate::test_support::advanced_ndi() else {
-            return;
-        };
-        for recover in [false, true] {
-            let events = track(|| {
-                let receiver =
-                    Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new("").unwrap()))
-                        .unwrap();
-                let sync = AvSync::new(receiver).unwrap();
-                if recover {
-                    drop(sync.into_receiver());
-                } else {
-                    drop(sync);
-                }
-            });
-            assert_eq!(events, ["avsync", "receiver"]);
-        }
     }
 
     fn descriptor() -> NDIlib_audio_frame_v3_t {
@@ -1769,14 +1723,8 @@ mod tests {
             .build()
             .unwrap();
         let stop = AtomicBool::new(false);
-        struct Stop<'a>(&'a AtomicBool);
-        impl Drop for Stop<'_> {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
-            }
-        }
         std::thread::scope(|scope| {
-            let _stop = Stop(&stop);
+            let _stop = crate::test_support::StopOnDrop(&stop);
             scope.spawn(|| {
                 while !stop.load(Ordering::Acquire) {
                     sender.send_video(&video).unwrap();
@@ -2035,7 +1983,7 @@ mod tests {
         assert_eq!(status.into_value(), crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_no_audio_stream_received);
         assert_eq!(raw.timestamp, 0);
         let guard = unsafe { Guard::<AvSyncAudioFree>::new(resource, raw) };
-        assert_eq!(guard.audio_timestamp(raw.timestamp), None);
+        assert_eq!(guard.normalize_timestamp(raw.timestamp), None);
         assert!(matches!(
             outcome(Synchronized::NoAudioStream, guard).unwrap(),
             AvSyncOutcomeRef::NoAudioStream

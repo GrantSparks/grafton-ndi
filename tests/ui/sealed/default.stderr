@@ -54,10 +54,10 @@ help: the following other types implement trait `frames::AudioParts`
   |         `AudioFrameRef<'_>`
   |         `FrameSyncAudioRef<'_>`
 ...
-  | borrowed_audio_accessors!(AudioFrameRef, AudioKind);
-  | --------------------------------------------------- in this macro invocation
-  | borrowed_audio_accessors!(FrameSyncAudioRef, FrameSyncAudioFree);
-  | ---------------------------------------------------------------- in this macro invocation
+  | borrowed_audio_accessors!(new AudioFrameRef, AudioKind);
+  | ------------------------------------------------------- in this macro invocation
+  | borrowed_audio_accessors!(new FrameSyncAudioRef, FrameSyncAudioFree);
+  | -------------------------------------------------------------------- in this macro invocation
   |
  ::: src/frames/borrowed.rs
   |

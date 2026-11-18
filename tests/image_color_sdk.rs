@@ -21,7 +21,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name, unsupported, loopback);
+common_helpers!(runtime, name, unsupported, loopback, stop);
 
 use grafton_ndi::{
     capabilities::SdkEdition,
@@ -91,17 +91,6 @@ fn frame(
         .unwrap()
 }
 
-/// Stops a sending loop when the scope that waits for it ends, by return or
-/// by panic: a scope joins its threads either way, so a loop that only a
-/// later statement stops would hang a failed test instead of reporting it.
-struct StopOnDrop<'a>(&'a AtomicBool);
-
-impl Drop for StopOnDrop<'_> {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-}
-
 /// Send `frames` in rotation from one new sender, and receive from it in
 /// each of `formats` until every receiver holds a copy of each frame, which
 /// its metadata identifies. Returns one list a receiver, in `frames`' order.
@@ -128,7 +117,7 @@ fn round_trip(
                 std::thread::sleep(Duration::from_millis(40));
             }
         });
-        let _stop = StopOnDrop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         let received: Vec<Vec<VideoFrame>> = formats
             .iter()
             .map(|&format| {
@@ -180,16 +169,18 @@ fn png_rgb(png: &[u8]) -> Vec<[u8; 3]> {
         .unwrap();
     let mut buffer = vec![0; reader.output_buffer_size().unwrap()];
     let info = reader.next_frame(&mut buffer).unwrap();
-    assert_eq!(
-        (info.color_type, info.bit_depth),
-        (png::ColorType::Rgba, png::BitDepth::Eight)
-    );
-    buffer
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&[r, g, b, _]| [r, g, b])
-        .collect()
+    assert_eq!(info.bit_depth, png::BitDepth::Eight);
+    let buffer = &buffer[..info.buffer_size()];
+    match info.color_type {
+        png::ColorType::Rgb => buffer.as_chunks::<3>().0.to_vec(),
+        png::ColorType::Rgba => buffer
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&[r, g, b, _]| [r, g, b])
+            .collect(),
+        other => panic!("unexpected PNG color type: {other:?}"),
+    }
 }
 
 /// The RGB of an RGBX or RGBA frame's active rows.
@@ -322,12 +313,15 @@ fn the_sdk_converts_with_bt709_at_every_size_whatever_the_tag_says() {
                  differs by {interior:.2}; the frame differs by up to {largest}, {mean:.3} on \
                  average"
             );
-            if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-                assert_eq!(
-                    (largest, mean),
-                    (0, 0.0),
-                    "{case}: the loopback transport was lossless for this frame on Linux x86-64"
-                );
+            // Linux x86-64 previously delivered byte-identical UYVY in
+            // this fixture. On other targets report an observed difference
+            // when only the patch-integrity check can be used.
+            if largest != 0 && !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                common::unsupported(&format!(
+                    "lossless UYVY loopback for {case}, maximum difference {largest}, mean {mean:.3}"
+                ));
+            } else {
+                assert_eq!((largest, mean), (0, 0.0), "{case}: lossless UYVY loopback");
             }
             // The tag reaches both receivers unchanged.
             assert_eq!(
@@ -683,7 +677,7 @@ fn framesync_frames_encode_like_the_frames_sent() {
                 std::thread::sleep(Duration::from_millis(40));
             }
         });
-        let _stop = StopOnDrop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         let receiver = Receiver::new(
             &ndi,
             &ReceiverOptions::new(source).color_format(ReceiverColorFormat::UyvyBgra),

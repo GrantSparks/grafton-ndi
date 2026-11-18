@@ -4,8 +4,8 @@ use std::mem::MaybeUninit;
 
 use crate::{
     frames::{
-        AudioChannels, AudioParts, FrameMetadataRef, Initialized, ValidatedAudioLayout,
-        ValidatedVideoLayout, VideoHeader, VideoParts, VideoPlanes,
+        AudioChannels, AudioParts, FrameMetadataRef, Initialized, PackedAudioLayout,
+        PackedVideoLayout, ValidatedVideoLayout, VideoHeader, VideoParts, VideoPlanes, VideoTiming,
     },
     Rejected, Result, ScanType, SdkTimestamp,
 };
@@ -22,32 +22,32 @@ pub(crate) trait PackedLayout: sealed::Layout + Copy + std::fmt::Debug {
     fn length_error(self, actual: usize) -> crate::Error;
 }
 
-impl sealed::Layout for ValidatedVideoLayout {}
-impl PackedLayout for ValidatedVideoLayout {
+impl sealed::Layout for PackedVideoLayout {}
+impl PackedLayout for PackedVideoLayout {
     type Element = u8;
     fn len(self) -> usize {
-        self.data_len_bytes()
+        self.as_layout().data_len_bytes()
     }
     fn length_error(self, actual: usize) -> crate::Error {
         crate::Error::InvalidFrame(crate::FrameDefect::VideoDataLength {
             actual,
-            expected: self.data_len_bytes(),
+            expected: self.as_layout().data_len_bytes(),
         })
     }
 }
-impl sealed::Layout for ValidatedAudioLayout {}
-impl PackedLayout for ValidatedAudioLayout {
+impl sealed::Layout for PackedAudioLayout {}
+impl PackedLayout for PackedAudioLayout {
     type Element = f32;
     fn len(self) -> usize {
-        self.sample_count()
+        self.as_layout().sample_count()
     }
     fn length_error(self, actual: usize) -> crate::Error {
         crate::Error::InvalidFrame(crate::FrameDefect::AudioDataLength {
             detail: crate::CompactDiagnostic::new(crate::AudioLengthDefect {
                 actual,
-                expected: self.sample_count(),
-                channels: self.num_channels(),
-                samples: self.num_samples(),
+                expected: self.as_layout().sample_count(),
+                channels: self.as_layout().num_channels(),
+                samples: self.as_layout().num_samples(),
             }),
         })
     }
@@ -57,7 +57,6 @@ impl PackedLayout for ValidatedAudioLayout {
 pub(crate) trait PackedSource: sealed::Source {
     type Layout: PackedLayout;
     fn layout(&self) -> Self::Layout;
-    fn tail(&self) -> usize;
     fn write(self, elements: &mut Vec<<Self::Layout as PackedLayout>::Element>);
 }
 
@@ -71,7 +70,7 @@ pub(crate) struct PackedStorage<L: PackedLayout> {
 }
 
 impl<L: PackedLayout> PackedStorage<L> {
-    pub(crate) fn check_len(layout: L, len: usize) -> Result<()> {
+    fn check_len(layout: L, len: usize) -> Result<()> {
         if len == layout.len() {
             Ok(())
         } else {
@@ -89,20 +88,28 @@ impl<L: PackedLayout> PackedStorage<L> {
         }
     }
 
-    pub(crate) fn adopt(
+    /// Check the element count and any remaining input before changing the
+    /// supplied allocation. On success, lend the remaining validation to the
+    /// caller alongside paired storage.
+    pub(crate) fn adopt<T>(
         layout: L,
         mut elements: Vec<L::Element>,
         tail: usize,
-    ) -> std::result::Result<Self, Rejected<Vec<L::Element>>> {
-        if let Err(error) = Self::check_len(layout, elements.len()) {
-            return Err(Rejected::new(error, elements));
-        }
+        validate: impl FnOnce() -> Result<T>,
+    ) -> std::result::Result<(Self, T), Rejected<Vec<L::Element>>> {
+        let checked = match Self::check_len(layout, elements.len()).and_then(|()| validate()) {
+            Ok(checked) => checked,
+            Err(error) => return Err(Rejected::new(error, elements)),
+        };
         seal(&mut elements, tail);
-        Ok(Self {
-            layout,
-            elements,
-            tail,
-        })
+        Ok((
+            Self {
+                layout,
+                elements,
+                tail,
+            },
+            checked,
+        ))
     }
 
     pub(crate) fn swap(
@@ -110,13 +117,12 @@ impl<L: PackedLayout> PackedStorage<L> {
         elements: Vec<L::Element>,
         tail: usize,
     ) -> std::result::Result<Vec<L::Element>, Rejected<Vec<L::Element>>> {
-        let replacement = Self::adopt(self.layout, elements, tail)?;
+        let (replacement, ()) = Self::adopt(self.layout, elements, tail, || Ok(()))?;
         Ok(std::mem::replace(self, replacement).into_vec())
     }
 
-    pub(crate) fn copied(source: impl PackedSource<Layout = L>) -> Self {
+    pub(crate) fn copied(source: impl PackedSource<Layout = L>, tail: usize) -> Self {
         let layout = source.layout();
-        let tail = source.tail();
         let mut elements = Vec::with_capacity(layout.len().saturating_add(tail));
         refill(
             &mut elements,
@@ -137,11 +143,10 @@ impl<L: PackedLayout> PackedStorage<L> {
     /// Otherwise fill a fresh allocation and install it after the checked fill.
     /// On unwind the previous layout still covers initialized elements; their
     /// contents are unspecified, and the previous SDK tail remains zero.
-    pub(crate) fn refill_from(&mut self, source: impl PackedSource<Layout = L>) {
+    pub(crate) fn refill_from(&mut self, source: impl PackedSource<Layout = L>, tail: usize) {
         let layout = source.layout();
-        let tail = source.tail();
         if self.elements.capacity() < layout.len().saturating_add(tail) {
-            *self = Self::copied(source);
+            *self = Self::copied(source, tail);
         } else {
             let previous_tail = self.tail;
             refill(
@@ -172,11 +177,11 @@ impl<L: PackedLayout> PackedStorage<L> {
     pub(crate) fn as_ptr(&self) -> *const L::Element {
         self.elements.as_ptr()
     }
-    pub(crate) fn reserve_tail(&mut self, tail: usize) {
+    fn set_tail(&mut self, tail: usize) {
         if tail > self.tail {
             seal(&mut self.elements, tail);
-            self.tail = tail;
         }
+        self.tail = tail;
     }
     pub(crate) fn room(&self) -> usize {
         self.tail
@@ -217,31 +222,23 @@ fn seal<T: Copy + Default>(elements: &mut Vec<T>, tail: usize) {
 
 /// Video views derived from exactly one call to the source layout accessor.
 pub(crate) struct VideoCopy<'a> {
-    layout: ValidatedVideoLayout,
+    layout: PackedVideoLayout,
     planes: VideoPlanes<'a>,
-    tail: usize,
 }
 impl<'a> VideoCopy<'a> {
-    pub(crate) fn new(source: &'a (impl VideoParts + ?Sized), scan: ScanType) -> Self {
+    pub(crate) fn new(source: &'a (impl VideoParts + ?Sized)) -> Self {
         let source_layout = source.layout();
         let layout = source_layout.packed();
         // SAFETY: VideoParts lends initialized active rows for the borrow.
         let planes = unsafe { source_layout.view_planes(source.pixels()) };
-        Self {
-            layout,
-            planes,
-            tail: send_room(&layout, scan),
-        }
+        Self { layout, planes }
     }
 }
 impl sealed::Source for VideoCopy<'_> {}
 impl PackedSource for VideoCopy<'_> {
-    type Layout = ValidatedVideoLayout;
+    type Layout = PackedVideoLayout;
     fn layout(&self) -> Self::Layout {
         self.layout
-    }
-    fn tail(&self) -> usize {
-        self.tail
     }
     fn write(self, elements: &mut Vec<u8>) {
         for plane in self.planes {
@@ -255,7 +252,7 @@ impl PackedSource for VideoCopy<'_> {
 
 /// Audio views derived from exactly one call to the source layout accessor.
 pub(crate) struct AudioCopy<'a> {
-    layout: ValidatedAudioLayout,
+    layout: PackedAudioLayout,
     channels: AudioChannels<'a>,
 }
 impl<'a> AudioCopy<'a> {
@@ -271,12 +268,9 @@ impl<'a> AudioCopy<'a> {
 }
 impl sealed::Source for AudioCopy<'_> {}
 impl PackedSource for AudioCopy<'_> {
-    type Layout = ValidatedAudioLayout;
+    type Layout = PackedAudioLayout;
     fn layout(&self) -> Self::Layout {
         self.layout
-    }
-    fn tail(&self) -> usize {
-        0
     }
     fn write(self, elements: &mut Vec<f32>) {
         for channel in self.channels {
@@ -285,21 +279,153 @@ impl PackedSource for AudioCopy<'_> {
     }
 }
 
+/// Packed pixels, their scan type, and the zeroed tail required to lend them
+/// to the SDK. Changing the layout or scan type establishes the new room before
+/// exposing either value.
+#[derive(Clone, Debug)]
+pub(crate) struct VideoStorage {
+    packed: PackedStorage<PackedVideoLayout>,
+    scan: ScanType,
+}
+
+impl VideoStorage {
+    pub(crate) fn zeroed(layout: PackedVideoLayout, scan: ScanType) -> Self {
+        Self {
+            packed: PackedStorage::zeroed(layout, send_room(layout.as_layout(), scan)),
+            scan,
+        }
+    }
+
+    pub(crate) fn adopt<T>(
+        layout: PackedVideoLayout,
+        elements: Vec<u8>,
+        scan: ScanType,
+        validate: impl FnOnce() -> Result<T>,
+    ) -> std::result::Result<(Self, T), Rejected<Vec<u8>>> {
+        let (packed, checked) = PackedStorage::adopt(
+            layout,
+            elements,
+            send_room(layout.as_layout(), scan),
+            validate,
+        )?;
+        Ok((Self { packed, scan }, checked))
+    }
+
+    pub(crate) fn copied(copy: VideoCopy<'_>, scan: ScanType) -> Self {
+        let tail = send_room(copy.layout.as_layout(), scan);
+        Self {
+            packed: PackedStorage::copied(copy, tail),
+            scan,
+        }
+    }
+
+    pub(crate) fn refill_from(&mut self, copy: VideoCopy<'_>, scan: ScanType) {
+        let tail = send_room(copy.layout.as_layout(), scan);
+        self.packed.refill_from(copy, tail);
+        self.scan = scan;
+    }
+
+    pub(crate) fn set_scan_type(&mut self, scan: ScanType) {
+        self.packed.set_tail(send_room(self.layout(), scan));
+        self.scan = scan;
+    }
+
+    pub(crate) fn swap(
+        &mut self,
+        elements: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, Rejected<Vec<u8>>> {
+        self.packed.swap(elements, self.packed.room())
+    }
+
+    pub(crate) fn layout(&self) -> &ValidatedVideoLayout {
+        self.packed.layout().as_layout()
+    }
+
+    pub(crate) const fn scan_type(&self) -> ScanType {
+        self.scan
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        self.packed.into_vec()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.packed.as_slice()
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.packed.as_mut_slice()
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.packed.as_ptr()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn room(&self) -> usize {
+        self.packed.room()
+    }
+
+    #[cfg(any(test, feature = "advanced"))]
+    pub(crate) fn capacity(&self) -> usize {
+        self.packed.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.packed.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn room_bytes(&self) -> &[u8] {
+        self.packed.room_bytes()
+    }
+
+    fn staged(
+        copy: impl PackedSource<Layout = PackedVideoLayout>,
+        scan: ScanType,
+        staging: &mut Option<Self>,
+    ) -> &Self {
+        let layout = copy.layout();
+        let tail = send_room(layout.as_layout(), scan);
+        let required = layout.len().saturating_add(tail);
+        if staging
+            .as_ref()
+            .is_some_and(|storage| storage.packed.elements.capacity() < required)
+        {
+            // A replacement frees old staging before allocating. Failed filling
+            // leaves None, so discarded storage has no surviving descriptor.
+            drop(staging.take());
+        }
+        match staging {
+            Some(storage) => {
+                storage.packed.refill_from(copy, tail);
+                storage.scan = scan;
+                storage
+            }
+            None => staging.insert(Self {
+                packed: PackedStorage::copied(copy, tail),
+                scan,
+            }),
+        }
+    }
+}
+
 /// Packed video whose fields are private to the checked copy kernel.
 pub(crate) struct PackedVideo<'a> {
-    storage: &'a PackedStorage<ValidatedVideoLayout>,
-    header: &'a VideoHeader,
+    storage: &'a VideoStorage,
+    timing: VideoTiming,
     metadata: FrameMetadataRef<'a>,
     timestamp: Option<SdkTimestamp>,
 }
 // SAFETY: private fields bind the pixels to their storage's own layout and
-// initialized zero tail. The source's header and metadata remain borrowed.
+// initialized zero tail. Its timing is copied and its metadata remains borrowed.
 unsafe impl VideoParts for PackedVideo<'_> {
     fn layout(&self) -> &ValidatedVideoLayout {
         self.storage.layout()
     }
-    fn header(&self) -> &VideoHeader {
-        self.header
+    fn header(&self) -> VideoHeader {
+        self.timing.with_scan_type(self.storage.scan_type())
     }
     fn pixels(&self) -> *const u8 {
         self.storage.as_ptr()
@@ -311,47 +437,24 @@ unsafe impl VideoParts for PackedVideo<'_> {
         self.timestamp
     }
     fn initialized(&self) -> Initialized {
-        Initialized::Storage {
-            room_after: self.storage.room(),
-        }
+        Initialized::PackedSendReady
     }
 }
 
 pub(crate) fn stage_video<'a>(
     source: &'a (impl VideoParts + ?Sized),
-    staging: &'a mut Option<PackedStorage<ValidatedVideoLayout>>,
+    staging: &'a mut Option<VideoStorage>,
 ) -> PackedVideo<'a> {
     let header = source.header();
     let metadata = source.frame_metadata();
     let timestamp = source.sdk_timestamp();
-    let copy = VideoCopy::new(source, header.scan_type());
-    let storage = staged(copy, staging);
+    let copy = VideoCopy::new(source);
+    let storage = VideoStorage::staged(copy, header.scan_type(), staging);
     PackedVideo {
         storage,
-        header,
+        timing: header.timing,
         metadata,
         timestamp,
-    }
-}
-fn staged<L: PackedLayout>(
-    copy: impl PackedSource<Layout = L>,
-    staging: &mut Option<PackedStorage<L>>,
-) -> &PackedStorage<L> {
-    let required = copy.layout().len().saturating_add(copy.tail());
-    if staging
-        .as_ref()
-        .is_some_and(|storage| storage.elements.capacity() < required)
-    {
-        // A replacement frees old staging before allocating. Failed filling
-        // leaves None, so discarded storage has no surviving descriptor.
-        drop(staging.take());
-    }
-    match staging {
-        Some(storage) => {
-            storage.refill_from(copy);
-            storage
-        }
-        None => staging.insert(PackedStorage::copied(copy)),
     }
 }
 
@@ -394,11 +497,13 @@ fn refill<T: Copy>(
     };
     restore.data.clear();
     write(restore.data);
-    assert_eq!(
-        restore.data.len(),
-        expected_len,
-        "packed copy must initialize its complete layout"
-    );
+    #[expect(
+        clippy::panic,
+        reason = "sealed PackedSource implementations write their exact packed layout, which PackedVideo's VideoParts rely on"
+    )]
+    if restore.data.len() != expected_len {
+        panic!("packed copy must initialize its complete layout");
+    }
     restore.complete = true;
 }
 
@@ -425,16 +530,22 @@ pub(crate) fn send_room(layout: &ValidatedVideoLayout, scan: ScanType) -> usize 
 mod tests {
     use super::*;
 
-    fn video(width: u32) -> ValidatedVideoLayout {
-        ValidatedVideoLayout::new_uncompressed(crate::PixelFormat::Uyvy, width, 2, None).unwrap()
+    fn video(width: u32) -> PackedVideoLayout {
+        PackedVideoLayout::new(crate::PixelFormat::Uyvy, width, 2).unwrap()
     }
-    fn audio() -> ValidatedAudioLayout {
-        ValidatedAudioLayout::new_uncompressed(crate::AudioFormat::Fltp, 48_000, 2, 4, None)
-            .unwrap()
+    fn audio() -> PackedAudioLayout {
+        crate::frames::ValidatedAudioLayout::new_uncompressed(
+            crate::AudioFormat::Fltp,
+            48_000,
+            2,
+            4,
+            None,
+        )
+        .unwrap()
+        .packed()
     }
     struct Fill<L, F> {
         layout: L,
-        tail: usize,
         write: F,
     }
     impl<L, F> sealed::Source for Fill<L, F> {}
@@ -442,9 +553,6 @@ mod tests {
         type Layout = L;
         fn layout(&self) -> L {
             self.layout
-        }
-        fn tail(&self) -> usize {
-            self.tail
         }
         fn write(self, elements: &mut Vec<L::Element>) {
             (self.write)(elements)
@@ -458,11 +566,13 @@ mod tests {
         let mut storage = PackedStorage::zeroed(layout, 64);
         let pointer = storage.as_ptr();
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            storage.refill_from(Fill {
-                layout: video(2),
-                tail: usize::MAX,
-                write: |bytes: &mut Vec<_>| bytes.resize(video(2).len(), 0),
-            });
+            storage.refill_from(
+                Fill {
+                    layout: video(2),
+                    write: |bytes: &mut Vec<_>| bytes.resize(video(2).len(), 0),
+                },
+                usize::MAX,
+            );
         }));
         assert!(failed.is_err());
         assert_eq!(storage.as_ptr(), pointer);
@@ -476,12 +586,14 @@ mod tests {
             let zeroed = PackedStorage::zeroed(layout, tail);
             assert_eq!(zeroed.as_slice().len(), zeroed.layout().len());
             assert_eq!(zeroed.room_bytes().len(), tail);
-            let adopted = PackedStorage::adopt(layout, zeroed.into_vec(), tail).unwrap();
+            let adopted = PackedStorage::adopt(layout, zeroed.into_vec(), tail, || Ok(()))
+                .unwrap()
+                .0;
             assert_eq!(adopted.as_slice().len(), adopted.layout().len());
             let cloned = adopted.clone();
             assert_eq!(cloned.as_slice().len(), cloned.layout().len());
             assert_eq!(cloned.room_bytes().len(), tail);
-            assert!(PackedStorage::adopt(layout, Vec::new(), tail).is_err());
+            assert!(PackedStorage::adopt(layout, Vec::new(), tail, || Ok(())).is_err());
         }
         check(video(4), 64);
         check(audio(), 0);
@@ -494,16 +606,20 @@ mod tests {
         elements.resize(layout.len(), 7);
         let pointer = elements.as_ptr();
         let (mut storage, allocations) = crate::test_alloc::allocation_count(|| {
-            PackedStorage::adopt(layout, elements, 64).unwrap()
+            PackedStorage::adopt(layout, elements, 64, || Ok(()))
+                .unwrap()
+                .0
         });
         assert_eq!(allocations, 0);
         assert_eq!(storage.as_ptr(), pointer);
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
-            storage.refill_from(Fill {
-                layout,
-                tail: 64,
-                write: |bytes: &mut Vec<_>| bytes.resize(layout.len(), 9),
-            });
+            storage.refill_from(
+                Fill {
+                    layout,
+                    write: |bytes: &mut Vec<_>| bytes.resize(layout.len(), 9),
+                },
+                64,
+            );
         });
         assert_eq!(allocations, 0);
         assert_eq!(storage.as_ptr(), pointer);
@@ -517,11 +633,13 @@ mod tests {
             let mut storage = PackedStorage::zeroed(layout, tail);
             let pointer = storage.as_ptr();
             let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                storage.refill_from(Fill {
-                    layout,
+                storage.refill_from(
+                    Fill {
+                        layout,
+                        write: |data: &mut Vec<_>| data.push(L::Element::default()),
+                    },
                     tail,
-                    write: |data: &mut Vec<_>| data.push(L::Element::default()),
-                });
+                );
             }));
             assert!(failed.is_err());
             assert_eq!(format!("{:?}", storage.layout()), format!("{layout:?}"));
@@ -539,11 +657,13 @@ mod tests {
         let mut storage = PackedStorage::zeroed(previous, 64);
         let pointer = storage.as_ptr();
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            storage.refill_from(Fill {
-                layout: larger,
-                tail: 64,
-                write: |bytes: &mut Vec<_>| bytes.push(7),
-            });
+            storage.refill_from(
+                Fill {
+                    layout: larger,
+                    write: |bytes: &mut Vec<_>| bytes.push(7),
+                },
+                64,
+            );
         }));
         assert!(failed.is_err());
         assert_eq!(format!("{:?}", storage.layout()), format!("{previous:?}"));
@@ -554,14 +674,14 @@ mod tests {
 
     #[test]
     fn a_failed_staging_replacement_leaves_no_stale_storage() {
-        let mut staging = Some(PackedStorage::zeroed(video(4), 64));
+        let mut staging = Some(VideoStorage::zeroed(video(4), ScanType::Progressive));
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = staged(
+            let _ = VideoStorage::staged(
                 Fill {
                     layout: video(64),
-                    tail: 64,
                     write: |bytes: &mut Vec<_>| bytes.push(7),
                 },
+                ScanType::Progressive,
                 &mut staging,
             );
         }));
@@ -575,14 +695,16 @@ mod tests {
         let larger = video(8);
         let mut storage = PackedStorage::zeroed(previous, 64);
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            storage.refill_from(Fill {
-                layout: larger,
-                tail: 32,
-                write: |bytes: &mut Vec<_>| {
-                    bytes.resize(30, 255);
-                    panic!("interrupted copy");
+            storage.refill_from(
+                Fill {
+                    layout: larger,
+                    write: |bytes: &mut Vec<_>| {
+                        bytes.resize(30, 255);
+                        panic!("interrupted copy");
+                    },
                 },
-            });
+                32,
+            );
         }));
         assert!(failed.is_err());
         assert_eq!(format!("{:?}", storage.layout()), format!("{previous:?}"));

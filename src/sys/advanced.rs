@@ -126,7 +126,7 @@ macro_rules! advanced_tables {
         // Every Advanced capability owns exactly one table, in every build.
         // Missing and duplicate registry entries are selection-time defects
         // rejected here, rather than panics while detecting capabilities.
-        const _: () = {
+        const_assert!({
             let mut index = 0;
             while index < RuntimeFeature::UNIT.len() {
                 let feature = RuntimeFeature::UNIT[index];
@@ -143,7 +143,7 @@ macro_rules! advanced_tables {
                 );
                 index += 1;
             }
-        };
+        });
 
         impl AdvancedApi {
             pub(in crate::sys) fn load(resolver: &dyn Resolver) -> std::result::Result<ResolvedAdvancedApi, LoadRefusal> {

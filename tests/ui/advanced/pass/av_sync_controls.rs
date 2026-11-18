@@ -4,7 +4,7 @@
 // known to carry its sender's timestamp.
 use grafton_ndi::{
     advanced::{AvSync, AvSyncAttached, AvSyncOutcome, AvSyncRequest, AvSyncVideo},
-    MediaTypes, MetadataFrame, MetadataMode, Receiver, ReceiverMode, Source, StreamTier, Tally,
+    MediaTypes, MetadataFrame, MetadataMode, ReceiveDelay, Receiver, ReceiverMode, Source, StreamTier, Tally,
     VideoMode,
 };
 use std::time::Duration;
@@ -25,7 +25,7 @@ fn controls(receiver: &Receiver<AvSyncAttached>) {
     let _ = receiver.ptz().is_supported();
     let _ = receiver.request_keyframe();
     let _ = receiver.send_metadata(&MetadataFrame::new("<sync/>").unwrap());
-    let _ = receiver.set_video_delay(Duration::ZERO);
+    let _ = receiver.set_video_delay(ReceiveDelay::ZERO);
     let _ = receiver.connect_to(&Source::new("OTHER (Program)").unwrap());
     receiver.reconnect();
 }

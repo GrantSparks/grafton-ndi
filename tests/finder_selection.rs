@@ -1,18 +1,20 @@
 //! Configured, staggered selection and set-valued scoped caching at the native boundary.
 #![cfg(target_os = "linux")]
-#[path = "support/fixture.rs"]
-mod fixture;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child, fixture);
+use common::TestChild;
+
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use fixture::FixtureDir;
 use grafton_ndi::{
     Error, Finder, FinderOptions, Ndi, RuntimeOptions, Source, SourceAddress, SourceCache,
 };
-use runtime_fixture::FakeRuntime;
+use runtime_fixture::{read_fake_log, FakeRuntime};
 use std::{
     path::PathBuf,
-    process::Command,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -69,8 +71,7 @@ fn owning_cache_retains_discovery_scope_and_runtime_across_server_workers() {
             !Ndi::is_running(),
             "the last cache owner releases its runtime"
         );
-        let calls =
-            std::fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap();
+        let calls = read_fake_log();
         for operation in ["initialize", "finder-create", "finder-destroy", "destroy"] {
             assert_eq!(
                 calls.lines().filter(|line| *line == operation).count(),
@@ -81,7 +82,7 @@ fn owning_cache_retains_discovery_scope_and_runtime_across_server_workers() {
         assert!(calls.find("finder-destroy").unwrap() < calls.rfind("destroy").unwrap());
         return;
     }
-    let directory = FixtureDir::create("owned-source-cache");
+    let directory = common::FixtureDir::create("owned-source-cache");
     let library = directory.path().join("finder.so");
     FakeRuntime {
         cfgs: vec!["fake_finder"],
@@ -89,24 +90,12 @@ fn owning_cache_retains_discovery_scope_and_runtime_across_server_workers() {
         ..Default::default()
     }
     .build(&library);
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "owning_cache_retains_discovery_scope_and_runtime_across_server_workers",
-            "--nocapture",
-        ])
+    TestChild::new("owning_cache_retains_discovery_scope_and_runtime_across_server_workers")
         .env("GRAFTON_OWNED_CACHE_CHILD", "1")
         .env("GRAFTON_FAKE_FINDER_CASE", "selection-forward")
         .env("GRAFTON_FAKE_FINDER_RUNTIME", &library)
         .env("GRAFTON_FAKE_NDI_LOG", directory.path().join("calls.log"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .run();
 }
 
 fn finder(ndi: &Ndi, group: &str) -> Finder {
@@ -256,7 +245,7 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
             .unwrap();
         return;
     }
-    let directory = FixtureDir::create("finder-selection");
+    let directory = common::FixtureDir::create("finder-selection");
     let library = directory.path().join("finder.so");
     FakeRuntime {
         cfgs: vec!["fake_finder"],
@@ -265,21 +254,9 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
     }
     .build(&library);
     for scenario in ["selection-forward", "selection-reverse"] {
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "exact_selection_preserves_scope_and_complete_host_sets",
-                "--nocapture",
-            ])
+        TestChild::new("exact_selection_preserves_scope_and_complete_host_sets")
             .env("GRAFTON_FAKE_FINDER_CASE", scenario)
             .env("GRAFTON_FAKE_FINDER_RUNTIME", &library)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{scenario}: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+            .run();
     }
 }
