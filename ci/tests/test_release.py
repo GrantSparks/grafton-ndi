@@ -72,6 +72,7 @@ class Release(unittest.TestCase):
         changes = (
             (ENVIRONMENT, ('protection_rules',), [], 'item 1', 'require reviewers'),
             (ENVIRONMENT, ('protection_rules', 0, 'reviewers'), [], 'item 1', 'require reviewers'),
+            (ENVIRONMENT, ('protection_rules', 0, 'reviewers'), 'user', 'item 1', 'invalid control data'),
             (ENVIRONMENT, ('deployment_branch_policy',), None, 'item 1', 'custom deployment'),
             (DEPLOYMENTS, ('branch_policies', 0, 'type'), 'branch', 'item 1', 'exactly the v* tag'),
             (DEPLOYMENTS, ('total_count',), 2, 'item 1', 'exactly the v* tag'),
@@ -79,6 +80,7 @@ class Release(unittest.TestCase):
             (TAG_RULES, ('enforcement',), 'evaluate', 'item 2', 'active ruleset'),
             (TAG_RULES, ('rules',), [{'type': 'creation'}, {'type': 'update'}], 'item 2', 'deletion'),
             (TAG_RULES, ('conditions', 'ref_name', 'exclude'), ['refs/tags/v3*'], 'item 2', 'active ruleset'),
+            (TAG_RULES, ('conditions', 'ref_name', 'include'), 'refs/tags/v*', 'item 2', 'invalid control data'),
             (MAIN_RULES, (0, 'parameters', 'require_code_owner_review'), False, 'item 3', 'Code Owner'),
             (MAIN_RULES, (1, 'parameters', 'required_status_checks'), [], 'item 3', 'required-ci'),
             (MAIN_RULES, (), {}, 'item 3', 'invalid control data'),

@@ -7,6 +7,7 @@
 The tag must be `v` followed by the `version` in Cargo.toml. The controls
 check reads the GitHub API and uses GITHUB_TOKEN when it is set.
 """
+from itertools import count
 import json
 import os
 from pathlib import Path
@@ -49,14 +50,22 @@ def repository_get(repository, token):
 def environment_refusal(get):
     environment = get('environments/crates-io')
     reviewer_rules = environment.get('protection_rules', [])
-    if not any(rule.get('type') == 'required_reviewers' and rule.get('reviewers')
-               for rule in reviewer_rules):
+    if not isinstance(reviewer_rules, list):
+        raise ValueError('expected a list of environment protection rules')
+    reviewers = [rule.get('reviewers') for rule in reviewer_rules
+                 if rule['type'] == 'required_reviewers']
+    if any(not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries)
+           for entries in reviewers):
+        raise ValueError('expected a list of environment reviewers')
+    if not any(reviewers):
         return 'crates-io must require reviewers'
     policy = environment.get('deployment_branch_policy')
     if not policy or policy.get('custom_branch_policies') is not True or policy.get('protected_branches') is not False:
         return 'crates-io must use custom deployment policies'
     policies = get('environments/crates-io/deployment-branch-policies?per_page=100')
     rules = policies['branch_policies']
+    if not isinstance(rules, list) or type(policies['total_count']) is not int:
+        raise ValueError('expected a list of counted deployment policies')
     if (policies['total_count'] != 1 or len(rules) != 1
             or rules[0].get('name') != 'v*' or rules[0].get('type') != 'tag'):
         return 'crates-io deployments must be restricted to exactly the v* tag pattern'
@@ -65,7 +74,7 @@ def environment_refusal(get):
 
 def tag_ruleset_refusal(get):
     endpoint = 'rulesets?targets=tag&per_page=100'
-    for page in range(1, sys.maxsize):
+    for page in count(1):
         summaries = get(f'{endpoint}&page={page}')
         if not isinstance(summaries, list):
             raise ValueError('expected a list of rulesets')
@@ -77,9 +86,12 @@ def tag_ruleset_refusal(get):
                 raise ValueError('invalid ruleset ID')
             ruleset = get(f'rulesets/{ruleset_id}')
             refs = ruleset.get('conditions', {}).get('ref_name', {})
+            includes = refs.get('include', [])
+            if not isinstance(includes, list) or not all(isinstance(pattern, str) for pattern in includes):
+                raise ValueError('expected a list of tag ref patterns')
             types = {rule['type'] for rule in ruleset.get('rules', [])}
             if (ruleset.get('target') == 'tag' and ruleset.get('enforcement') == 'active'
-                    and 'refs/tags/v*' in refs.get('include', []) and refs.get('exclude') == []
+                    and 'refs/tags/v*' in includes and refs.get('exclude') == []
                     and {'creation', 'update', 'deletion'} <= types):
                 return None
         if len(summaries) < 100:
