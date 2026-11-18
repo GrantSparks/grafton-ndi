@@ -169,7 +169,10 @@ The async recorder drains native events continuously. `next_event` supplies
 bounded application notifications; dropped notifications do not alter its
 recording report. For both async handles, the wait starts on first poll and
 can take an event queued by its deadline even if the executor polls again
-later. Each wait leaves events queued after its deadline for later waits.
+later. Each wait reserves the queue through shutdown until it completes or is
+dropped. It leaves events queued after its deadline for later waits. With an
+empty queue, shutdown reports `Closed` or `OwnerFailed` if published by the
+deadline. A shutdown published later leaves the expired wait's result as `None`.
 Configure queue limits with `AsyncFileOptions` and handle `QueueFull`
 when submitting commands.
 Pass `&AsyncFileOptions` to `create_with_options`. Statistics name their units:

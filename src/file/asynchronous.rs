@@ -739,11 +739,17 @@ struct QueuedEvent<E> {
     value: Result<E>,
 }
 
+#[derive(Clone, Copy)]
+struct EventQueueEnd {
+    published_at: Instant,
+    outcome: OwnerExit,
+}
+
 struct Events<E> {
     queue: VecDeque<QueuedEvent<E>>,
     capacity: usize,
     dropped: u64,
-    end: Option<OwnerExit>,
+    end: Option<EventQueueEnd>,
     waiter: Option<EventWaiter>,
 }
 
@@ -781,11 +787,15 @@ impl<E> EventQueue<E> {
     fn close(&self, end: OwnerExit) {
         let wake = {
             let mut events = lock(&self.0);
-            events.end = Some(match events.end {
-                Some(OwnerExit::Failed) => OwnerExit::Failed,
-                _ => end,
+            let terminal = events.end.get_or_insert_with(|| EventQueueEnd {
+                published_at: Instant::now(),
+                outcome: end,
             });
-            events.waiter.take().and_then(|mut w| w.waker.take())
+            if end == OwnerExit::Failed {
+                terminal.outcome = end;
+            }
+            // The pending future keeps its claim until completion or drop.
+            events.waiter.as_mut().and_then(|w| w.waker.take())
         };
         WakerSlot::wake(wake);
     }
@@ -829,11 +839,13 @@ impl<E: Send> Expire for EventQueue<E> {
 /// deadline. Events queued by the deadline remain eligible even if the
 /// executor polls later. A zero timeout can take an already queued event.
 /// Events queued after a wait's deadline are available to later waits.
-/// One future may wait on a handle at a time; a second fails with
-/// [`Error::InvalidState`] and [`StateConflict::WaiterPending`]. Once the
-/// handle is closed and every queued event has been taken, the future fails
-/// with [`StateConflict::Closed`], or with [`StateConflict::OwnerFailed`] when the
-/// thread failed. When recorder shutdown begins with no submitted
+/// One future may wait on a handle at a time. It keeps its claim to the queue
+/// through shutdown until it completes or is dropped. A second wait fails
+/// with [`Error::InvalidState`] and [`StateConflict::WaiterPending`]. With an
+/// empty queue, a shutdown published by the deadline reports
+/// [`StateConflict::Closed`], or [`StateConflict::OwnerFailed`] when the thread
+/// failed. A shutdown published after the deadline leaves the expired wait's
+/// result as `None`. When recorder shutdown begins with no submitted
 /// [`finish`](AsyncFileRecorder::finish) or
 /// [`wait_for_finish`](AsyncFileRecorder::wait_for_finish) pending, the queue
 /// closes immediately. Cleanup events, including the last file-closed event,
@@ -963,7 +975,10 @@ impl<E> Future for FileEventFuture<E> {
                 // entry ends this wait and remains queued for a later one.
                 (Some(event), _) if event.queued_at > deadline.end() => Some(Ok(None)),
                 (Some(_), _) => events.queue.pop_front().map(|event| event.value.map(Some)),
-                (None, Some(end)) => Some(Err(stopped(end == OwnerExit::Failed))),
+                (None, Some(end)) if end.published_at <= deadline.end() => {
+                    Some(Err(stopped(end.outcome == OwnerExit::Failed)))
+                }
+                (None, Some(_)) => Some(Ok(None)),
                 (None, None) if deadline.is_expired() => Some(Ok(None)),
                 (None, None) => None,
             };
@@ -6622,6 +6637,138 @@ mod tests {
         assert!(waited < Duration::from_secs(2), "the wait took {waited:?}");
     }
 
+    fn shutdown_mock_recorder(recorder: &AsyncFileRecorder, end: OwnerExit) {
+        match end {
+            OwnerExit::Closed => {
+                block_on(recorder.clone().close()).unwrap();
+            }
+            OwnerExit::Failed => {
+                owner_failed(block_on(
+                    recorder.worker.call::<()>(|_| panic!("mock owner failure")),
+                ));
+                owner_failed(block_on(recorder.clone().close()));
+            }
+        }
+    }
+
+    #[test]
+    fn a_pending_recorder_wait_keeps_its_queued_event_through_shutdown() {
+        for end in [OwnerExit::Closed, OwnerExit::Failed] {
+            let (device, recorder) = mock_recorder(Closing::AtStop);
+            let started = block_on(recorder.next_event(Duration::from_secs(1)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(started.kind(), RecorderEventKind::Started);
+
+            let mut waiting = recorder.next_event(Duration::from_secs(30));
+            let (waker, woken) = channel_waker();
+            let mut context = Context::from_waker(&waker);
+            assert!(Pin::new(&mut waiting).poll(&mut context).is_pending());
+            device.push(mock::FIRST_FRAME, mock::TAKE);
+            woken.recv_timeout(Duration::from_secs(2)).unwrap();
+            shutdown_mock_recorder(&recorder, end);
+
+            assert!(matches!(
+                block_on(recorder.clone().next_event(Duration::ZERO)),
+                Err(Error::InvalidState(StateConflict::WaiterPending))
+            ));
+            let first = block_on(waiting).unwrap().unwrap();
+            assert_eq!(first.kind(), RecorderEventKind::FirstFrame);
+            let next = block_on(recorder.next_event(Duration::ZERO));
+            match end {
+                OwnerExit::Closed => closed(next),
+                OwnerExit::Failed => owner_failed(next),
+            }
+        }
+    }
+
+    #[test]
+    fn an_expired_wait_on_an_empty_recorder_queue_survives_shutdown() {
+        for end in [OwnerExit::Closed, OwnerExit::Failed] {
+            let (_, recorder) = mock_recorder(Closing::AtStop);
+            let started = block_on(recorder.next_event(Duration::from_secs(1)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(started.kind(), RecorderEventKind::Started);
+
+            let mut waiting = recorder.next_event(Duration::from_millis(100));
+            let (waker, woken) = channel_waker();
+            let mut context = Context::from_waker(&waker);
+            assert!(Pin::new(&mut waiting).poll(&mut context).is_pending());
+            // Only the timer can wake the pending wait at this point.
+            woken.recv_timeout(Duration::from_secs(2)).unwrap();
+            shutdown_mock_recorder(&recorder, end);
+
+            assert!(matches!(
+                Pin::new(&mut waiting).poll(&mut context),
+                Poll::Ready(Ok(None))
+            ));
+            let next = block_on(recorder.next_event(Duration::ZERO));
+            match end {
+                OwnerExit::Closed => closed(next),
+                OwnerExit::Failed => owner_failed(next),
+            }
+        }
+    }
+
+    #[test]
+    fn cancelling_a_woken_player_wait_leaves_its_queued_error_after_close() {
+        let (_, player) = mock_player();
+        let mut waiting = player.next_event(Duration::from_secs(30));
+        let (waker, woken) = channel_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(Pin::new(&mut waiting).poll(&mut context).is_pending());
+        player.worker.events.push(Err(Error::UnexpectedSdkResult(
+            crate::SdkResultDefect::FileStructureTooLarge {
+                bytes: 100,
+                name: "test event",
+            },
+        )));
+        woken.recv_timeout(Duration::from_secs(2)).unwrap();
+        block_on(player.close()).unwrap();
+        assert!(matches!(
+            block_on(player.clone().next_event(Duration::ZERO)),
+            Err(Error::InvalidState(StateConflict::WaiterPending))
+        ));
+        drop(waiting);
+        assert!(matches!(
+            block_on(player.next_event(Duration::ZERO)),
+            Err(Error::UnexpectedSdkResult(
+                crate::SdkResultDefect::FileStructureTooLarge {
+                    bytes: 100,
+                    name: "test event",
+                }
+            ))
+        ));
+        closed(block_on(player.next_event(Duration::ZERO)));
+    }
+
+    #[test]
+    fn an_on_time_player_close_keeps_its_timestamp_if_later_upgraded_to_failure() {
+        let (_, player) = mock_player();
+        let mut waiting = player.next_event(Duration::from_secs(1));
+        let (waker, woken) = channel_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(Pin::new(&mut waiting).poll(&mut context).is_pending());
+        let EventWaitState::Registered { deadline, .. } = waiting.state else {
+            panic!("a pending wait is timed");
+        };
+        block_on(player.close()).unwrap();
+        woken.recv_timeout(Duration::from_secs(2)).unwrap();
+        let events = &player.worker.events;
+        let published_at = lock(&events.0).end.unwrap().published_at;
+        assert!(published_at <= deadline.end());
+        thread::sleep(deadline.remaining());
+        assert!(deadline.is_expired());
+
+        // Model the second publication used when native destruction fails.
+        events.close(OwnerExit::Failed);
+        events.close(OwnerExit::Closed);
+        assert_eq!(lock(&events.0).end.unwrap().published_at, published_at);
+        owner_failed(block_on(waiting));
+        owner_failed(block_on(player.next_event(Duration::ZERO)));
+    }
+
     #[test]
     fn a_recorder_event_published_after_expiry_is_retained_for_the_next_wait() {
         let (device, recorder) = mock_recorder(Closing::AtStop);
@@ -6706,6 +6853,10 @@ mod tests {
         events.close(OwnerExit::Failed);
         assert_eq!(lock(&events.0).dropped, 1);
 
+        assert!(matches!(
+            block_on(events.wait(Duration::ZERO)),
+            Err(Error::InvalidState(StateConflict::WaiterPending))
+        ));
         assert!(matches!(
             Pin::new(&mut waiting).poll(&mut context),
             Poll::Ready(Ok(None))
