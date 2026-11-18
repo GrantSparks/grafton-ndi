@@ -166,21 +166,20 @@ fn complete_send_size_includes_scan_rows_and_stride_and_enables_direct_sending()
 #[test]
 fn compressed_and_scatter_round_trips_preserve_payload_pools() {
     use grafton_ndi::advanced::{
-        AudioCodec, AudioPacketFormat, CompressedAudioFrame, CompressedVideoFrame,
-        ScatterAudioFrame, ScatterVideoFrame, VideoCodec, VideoPacketFormat,
+        AudioCodec, AudioPacketFormat, CompressedFrame, ScatterFrame, VideoCodec, VideoPacketFormat,
     };
     let format = VideoPacketFormat::new(VideoCodec::SpeedHq422, 1920, 1080).unwrap();
     let mut bytes = Vec::with_capacity(4096);
     bytes.extend_from_slice(&[0, 0, 0, 0, 1, 2, 3]);
     let (pointer, capacity) = (bytes.as_ptr(), bytes.capacity());
-    let bytes = CompressedVideoFrame::new(format, bytes)
+    let bytes = CompressedFrame::<VideoPacketFormat>::new(format, bytes)
         .unwrap()
         .into_data();
     assert_eq!((bytes.as_ptr(), bytes.capacity()), (pointer, capacity));
     let mut tail = Vec::with_capacity(2048);
     tail.extend_from_slice(&[4, 5]);
     let (tail_pointer, tail_capacity) = (tail.as_ptr(), tail.capacity());
-    let blocks = ScatterVideoFrame::new(format, vec![bytes, tail])
+    let blocks = ScatterFrame::<VideoPacketFormat>::new(format, vec![bytes, tail])
         .unwrap()
         .into_blocks();
     assert_eq!(
@@ -195,14 +194,14 @@ fn compressed_and_scatter_round_trips_preserve_payload_pools() {
     let mut bytes = Vec::with_capacity(1024);
     bytes.extend_from_slice(&[1, 2, 3]);
     let (pointer, capacity) = (bytes.as_ptr(), bytes.capacity());
-    let bytes = CompressedAudioFrame::new(
+    let bytes = CompressedFrame::<AudioPacketFormat>::new(
         AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
         bytes,
     )
     .unwrap()
     .into_data();
     assert_eq!((bytes.as_ptr(), bytes.capacity()), (pointer, capacity));
-    let blocks = ScatterAudioFrame::new(
+    let blocks = ScatterFrame::<AudioPacketFormat>::new(
         AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
         vec![bytes],
     )
@@ -213,7 +212,7 @@ fn compressed_and_scatter_round_trips_preserve_payload_pools() {
         (pointer, capacity)
     );
     let bytes = blocks.into_iter().next().unwrap();
-    let rejected = CompressedAudioFrame::new(
+    let rejected = CompressedFrame::<AudioPacketFormat>::new(
         AudioPacketFormat::new(AudioCodec::Opus, 44_100, 2, 960).unwrap(),
         bytes,
     )
@@ -224,7 +223,7 @@ fn compressed_and_scatter_round_trips_preserve_payload_pools() {
         (pointer, capacity)
     );
     // AAC metadata/envelope validation occurs after its storage owner is created.
-    let rejected = CompressedAudioFrame::new(
+    let rejected = CompressedFrame::<AudioPacketFormat>::new(
         AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
         rejected,
     )

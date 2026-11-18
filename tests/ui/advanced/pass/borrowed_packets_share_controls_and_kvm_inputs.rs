@@ -18,17 +18,17 @@ fn kvm(receiver: &mut PacketReceiver) {
     drop(packet);
 }
 // A packet view can always be shortened to the borrow that consumes it.
-fn shorter_video<'long: 'short, 'short>(frame: CompressedVideoRef<'long>) -> CompressedVideoRef<'short> {
+fn shorter_video<'long: 'short, 'short>(frame: CompressedRef<'long, VideoPacketFormat>) -> CompressedRef<'short, VideoPacketFormat> {
     frame
 }
-fn shorter_audio<'long: 'short, 'short>(frame: CompressedAudioRef<'long>) -> CompressedAudioRef<'short> {
+fn shorter_audio<'long: 'short, 'short>(frame: CompressedRef<'long, AudioPacketFormat>) -> CompressedRef<'short, AudioPacketFormat> {
     frame
 }
 fn main() {
     fn traits<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
     traits::<PacketItemRef<'static>>();
-    traits::<CompressedVideoRef<'static>>();
-    traits::<CompressedAudioRef<'static>>();
+    traits::<CompressedRef<'static, VideoPacketFormat>>();
+    traits::<CompressedRef<'static, AudioPacketFormat>>();
     traits::<ReceivedVideoRef<'static>>();
     traits::<ReceivedAudioRef<'static>>();
 }

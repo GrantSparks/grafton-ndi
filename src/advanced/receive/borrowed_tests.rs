@@ -11,7 +11,7 @@ use std::{
 #[test]
 fn borrowed_compressed_payloads_allocate_nothing_and_release_once() {
     let format = VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap();
-    let mut source = CompressedVideoFrame::new(
+    let mut source = CompressedFrame::<VideoPacketFormat>::new(
         format,
         PacketEnvelope::encode(EnvelopeCodec::H264, 1, 0, true, &[1, 2, 3], &[4]).unwrap(),
     )
@@ -46,7 +46,7 @@ fn borrowed_compressed_payloads_allocate_nothing_and_release_once() {
         p_metadata: ptr::null(),
         ..raw
     };
-    let bare = CompressedVideoRef::new(unsafe {
+    let bare = CompressedRef::<VideoPacketFormat>::new(unsafe {
         Guard::with_test_free(ptr::null_mut(), raw_bare, |_, _| {})
     })
     .unwrap();
@@ -99,8 +99,9 @@ fn borrowed_compressed_payloads_allocate_nothing_and_release_once() {
             ..raw
         };
         let guard = unsafe { Guard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let (frame, allocations) =
-            crate::test_alloc::allocation_count(|| CompressedVideoRef::new(guard).unwrap());
+        let (frame, allocations) = crate::test_alloc::allocation_count(|| {
+            CompressedRef::<VideoPacketFormat>::new(guard).unwrap()
+        });
         assert_eq!(allocations, 0);
         assert_eq!(frame.metadata_status(), status);
         assert_eq!(frame.metadata(), None);
@@ -123,7 +124,7 @@ fn borrowed_compressed_payloads_allocate_nothing_and_release_once() {
 
 #[test]
 fn borrowed_audio_uses_receive_validation_and_reuses_owned_storage() {
-    let mut source = CompressedAudioFrame::new(
+    let mut source = CompressedFrame::<AudioPacketFormat>::new(
         crate::advanced::AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
         vec![1, 2, 3, 4],
     )
@@ -205,7 +206,7 @@ fn borrowed_audio_uses_receive_validation_and_reuses_owned_storage() {
             p_metadata: pointer,
             ..raw
         };
-        let frame = CompressedAudioRef::new(unsafe {
+        let frame = CompressedRef::<AudioPacketFormat>::new(unsafe {
             Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})
         })
         .unwrap();
@@ -246,12 +247,12 @@ fn decoded_packet_fallback_borrows_the_original_pixels_without_allocating() {
 #[test]
 fn borrowed_packets_normalize_timestamps_through_their_held_capture() {
     let format = VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap();
-    let mut video = CompressedVideoFrame::new(
+    let mut video = CompressedFrame::<VideoPacketFormat>::new(
         format,
         PacketEnvelope::encode(EnvelopeCodec::H264, 1, 0, true, &[1, 2, 3], &[4]).unwrap(),
     )
     .unwrap();
-    let mut audio = CompressedAudioFrame::new(
+    let mut audio = CompressedFrame::<AudioPacketFormat>::new(
         crate::advanced::AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
         vec![1, 2, 3, 4],
     )
@@ -271,11 +272,11 @@ fn borrowed_packets_normalize_timestamps_through_their_held_capture() {
         };
         // SAFETY: both source frames retain their immutable packet allocations;
         // these synthetic guards only count the lifetime and free nothing.
-        let video_ref = CompressedVideoRef::new(unsafe {
+        let video_ref = CompressedRef::<VideoPacketFormat>::new(unsafe {
             Guard::with_test_free(ptr::null_mut(), raw_video, |_, _| {})
         })
         .unwrap();
-        let audio_ref = CompressedAudioRef::new(unsafe {
+        let audio_ref = CompressedRef::<AudioPacketFormat>::new(unsafe {
             Guard::with_test_free(ptr::null_mut(), raw_audio, |_, _| {})
         })
         .unwrap();

@@ -15,7 +15,7 @@ use super::{
     reserved_map::ReservedMap,
     send::PendingVideo,
     send_slots::{DescriptorLease, Released, SlotKey},
-    CompressedVideoFrame, QueueAttached, ScatterVideoFrame, SubmittedVideo,
+    CompressedFrame, QueueAttached, ScatterFrame, SubmittedVideo, VideoPacketFormat,
 };
 #[cfg(test)]
 use crate::sys::advanced::ScatterSend;
@@ -129,9 +129,9 @@ pub enum QueuedVideoFrame {
     /// An uncompressed frame.
     Pixels(VideoFrame),
     /// A compressed frame.
-    Compressed(CompressedVideoFrame),
+    Compressed(CompressedFrame<VideoPacketFormat>),
     /// A compressed frame held in separate owned blocks.
-    Scatter(ScatterVideoFrame),
+    Scatter(ScatterFrame<VideoPacketFormat>),
 }
 
 impl From<VideoFrame> for QueuedVideoFrame {
@@ -140,14 +140,14 @@ impl From<VideoFrame> for QueuedVideoFrame {
     }
 }
 
-impl From<CompressedVideoFrame> for QueuedVideoFrame {
-    fn from(v: CompressedVideoFrame) -> Self {
+impl From<CompressedFrame<VideoPacketFormat>> for QueuedVideoFrame {
+    fn from(v: CompressedFrame<VideoPacketFormat>) -> Self {
         Self::Compressed(v)
     }
 }
 
-impl From<ScatterVideoFrame> for QueuedVideoFrame {
-    fn from(frame: ScatterVideoFrame) -> Self {
+impl From<ScatterFrame<VideoPacketFormat>> for QueuedVideoFrame {
+    fn from(frame: ScatterFrame<VideoPacketFormat>) -> Self {
         Self::Scatter(frame)
     }
 }
@@ -178,10 +178,10 @@ impl QueuedVideoFrame {
             VideoFrame,
         ) -> std::result::Result<Sendable<VideoFrame>, Rejected<VideoFrame>>,
         scatter: impl FnOnce(
-            ScatterVideoFrame,
+            ScatterFrame<VideoPacketFormat>,
         ) -> std::result::Result<
-            ScatterSendable<ScatterVideoFrame>,
-            (Error, ScatterVideoFrame),
+            ScatterSendable<ScatterFrame<VideoPacketFormat>>,
+            (Error, ScatterFrame<VideoPacketFormat>),
         >,
     ) -> std::result::Result<QueuedStorage, Rejected<Self>> {
         match self {
@@ -1039,10 +1039,10 @@ mod tests {
             let format = VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap();
             [
                 QueuedVideoFrame::Compressed(
-                    CompressedVideoFrame::new(format, bytes.clone()).unwrap(),
+                    CompressedFrame::<VideoPacketFormat>::new(format, bytes.clone()).unwrap(),
                 ),
                 QueuedVideoFrame::Scatter(
-                    ScatterVideoFrame::new(
+                    ScatterFrame::<VideoPacketFormat>::new(
                         format,
                         vec![bytes[..44].to_vec(), bytes[44..].to_vec()],
                     )
@@ -1067,7 +1067,9 @@ mod tests {
         let format =
             super::super::VideoPacketFormat::new(super::super::VideoCodec::SpeedHq422, 16, 16)
                 .unwrap();
-        let frame = ScatterVideoFrame::new(format, vec![vec![1, 2, 3, 4], vec![5, 6]]).unwrap();
+        let frame =
+            ScatterFrame::<VideoPacketFormat>::new(format, vec![vec![1, 2, 3, 4], vec![5, 6]])
+                .unwrap();
         let blocks: Vec<_> = frame.blocks().map(|block| block.as_ptr()).collect();
         let rejected = QueuedVideoFrame::Scatter(frame)
             .authorize_with(
@@ -1273,10 +1275,14 @@ mod tests {
                     VideoFrame::builder().resolution(16, 16).build().unwrap(),
                 ),
                 1 => QueuedVideoFrame::Compressed(
-                    CompressedVideoFrame::new(packet, vec![1, 2, 3, 4]).unwrap(),
+                    CompressedFrame::<VideoPacketFormat>::new(packet, vec![1, 2, 3, 4]).unwrap(),
                 ),
                 _ => QueuedVideoFrame::Scatter(
-                    ScatterVideoFrame::new(packet, vec![vec![1, 2, 3, 4], vec![5, 6]]).unwrap(),
+                    ScatterFrame::<VideoPacketFormat>::new(
+                        packet,
+                        vec![vec![1, 2, 3, 4], vec![5, 6]],
+                    )
+                    .unwrap(),
                 ),
             };
             for limit in [QueueLimit::Frames, QueueLimit::Bytes] {
@@ -1440,10 +1446,11 @@ mod tests {
         for frame in [
             QueuedVideoFrame::Pixels(VideoFrame::builder().resolution(16, 16).build().unwrap()),
             QueuedVideoFrame::Compressed(
-                CompressedVideoFrame::new(format, vec![1, 2, 3, 4]).unwrap(),
+                CompressedFrame::<VideoPacketFormat>::new(format, vec![1, 2, 3, 4]).unwrap(),
             ),
             QueuedVideoFrame::Scatter(
-                ScatterVideoFrame::new(format, vec![vec![1, 2, 3, 4], vec![5, 6]]).unwrap(),
+                ScatterFrame::<VideoPacketFormat>::new(format, vec![vec![1, 2, 3, 4], vec![5, 6]])
+                    .unwrap(),
             ),
         ] {
             let expected = match &frame {

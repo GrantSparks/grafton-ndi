@@ -20,3 +20,16 @@ fn alter_extent(packet: &mut PacketBytes, len: PacketLen) {
 fn construct_slice(bytes: &[u8], len: PacketLen) -> PacketSlice<'_> {
     PacketSlice { bytes, len }
 }
+
+#[cfg(ndi_test_packet_payload)]
+fn construct_frame(
+    format: VideoPacketFormat,
+    payload: PacketBytes,
+    extras: FrameExtras,
+) -> CompressedFrame<VideoPacketFormat> {
+    CompressedFrame {
+        format,
+        payload,
+        extras,
+    }
+}

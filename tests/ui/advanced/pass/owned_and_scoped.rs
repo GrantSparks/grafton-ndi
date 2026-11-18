@@ -1,5 +1,5 @@
 use grafton_ndi::{
-    advanced::{AvSync, CompressedSender, Genlock, ScatterVideoFrame},
+    advanced::{AvSync, CompressedSender, Genlock, ScatterFrame, VideoPacketFormat},
     FrameRate, Receiver, ScanType,
 };
 
@@ -13,7 +13,7 @@ fn independent_scoped_clocks(genlock: &mut Genlock, frame_rate: FrameRate) {
 fn owned_receiver(receiver: Receiver) {
     let _ = AvSync::new(receiver);
 }
-fn owned_submission(sender: &mut CompressedSender, frame: ScatterVideoFrame) {
+fn owned_submission(sender: &mut CompressedSender, frame: ScatterFrame<VideoPacketFormat>) {
     let _ = sender.submit_scatter_video(frame);
 }
 fn main() {

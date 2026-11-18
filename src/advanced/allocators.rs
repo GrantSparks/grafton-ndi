@@ -1815,7 +1815,8 @@ mod tests {
         // frame's lifetime; the synthetic guard releases no native storage.
         let guard =
             unsafe { crate::capture::Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
-        let frame = super::super::CompressedVideoRef::new(guard).unwrap();
+        let frame =
+            super::super::CompressedRef::<super::super::VideoPacketFormat>::new(guard).unwrap();
         assert_eq!(frame.data().len(), request.bytes);
     }
 

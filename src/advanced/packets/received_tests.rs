@@ -1,202 +1,20 @@
-//! Lossless owned receive packets, distinct from packets admitted for sending.
-use super::*;
-
-/// An owned compressed video packet copied from a receiver without loss.
-///
-/// Later envelope versions, flags and trailing bytes remain intact. Convert
-/// with [`CompressedVideoFrame::try_from`] before sending; a refusal returns
-/// this packet and its storage in [`Rejected`].
-#[derive(Clone)]
-pub struct ReceivedVideoPacket {
-    pub(crate) format: VideoPacketFormat,
-    pub(crate) payload: PacketBytes,
-    pub(crate) extras: FrameExtras,
-}
-
-packet_debug!(ReceivedVideoPacket, "ReceivedVideoPacket", frame, video, frame.timestamp();
-    "bytes" = frame.data().len());
-
-impl ReceivedVideoPacket {
-    frame_extras_accessors!();
-    envelope_accessor!(payload.extents());
-
-    /// The complete codec bytes, including retained envelope extensions.
-    pub fn data(&self) -> &[u8] {
-        self.payload.as_slice()
-    }
-
-    /// The codec and video format delivered by the receiver.
-    pub fn format(&self) -> VideoPacketFormat {
-        self.format
-    }
-
-    /// The sender's submission time, when supplied by the SDK.
-    pub fn timestamp(&self) -> Option<SdkTimestamp> {
-        self.extras.timestamp()
-    }
-
-    /// Take the original byte allocation and its capacity.
-    pub fn into_data(self) -> Vec<u8> {
-        self.payload.into_vec()
-    }
-
-    /// Check whether this lossless packet can be admitted for sending.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidFrame`] when the envelope or codec parameters are not
-    /// supported for sending. The packet remains unchanged.
-    pub fn validate_for_send(&self) -> Result<()> {
-        self.send_extents().map(drop)
-    }
-
-    fn send_extents(&self) -> Result<Option<EnvelopeExtents>> {
-        validate_video_content(self.format, self.payload.view(), Use::Send)
-    }
-}
-
-impl TryFrom<ReceivedVideoPacket> for CompressedVideoFrame {
-    type Error = Rejected<ReceivedVideoPacket>;
-
-    fn try_from(packet: ReceivedVideoPacket) -> std::result::Result<Self, Self::Error> {
-        let extents = match packet.send_extents() {
-            Ok(extents) => extents,
-            Err(error) => return Err(Rejected::new(error, packet)),
-        };
-        let ReceivedVideoPacket {
-            format,
-            payload,
-            extras,
-        } = packet;
-        Ok(Self {
-            format,
-            payload: payload.with_envelope(extents),
-            extras,
-        })
-    }
-}
-
-impl From<CompressedVideoFrame> for ReceivedVideoPacket {
-    fn from(frame: CompressedVideoFrame) -> Self {
-        let CompressedVideoFrame {
-            format,
-            payload,
-            extras,
-        } = frame;
-        Self {
-            format,
-            payload,
-            extras,
-        }
-    }
-}
-
-/// An owned compressed audio packet copied from a receiver without loss.
-///
-/// Convert with [`CompressedAudioFrame::try_from`] before sending. Unknown
-/// envelope details remain available for inspection and storage even when
-/// send admission refuses the packet.
-#[derive(Clone)]
-pub struct ReceivedAudioPacket {
-    pub(crate) format: AudioPacketFormat,
-    pub(crate) payload: PacketBytes,
-    pub(crate) extras: FrameExtras,
-}
-
-packet_debug!(ReceivedAudioPacket, "ReceivedAudioPacket", frame, audio, frame.timestamp();
-    "bytes" = frame.data().len());
-
-impl ReceivedAudioPacket {
-    frame_extras_accessors!();
-    envelope_accessor!(payload.extents());
-
-    /// The complete codec bytes, including retained envelope extensions.
-    pub fn data(&self) -> &[u8] {
-        self.payload.as_slice()
-    }
-
-    /// The codec and audio format delivered by the receiver.
-    pub fn format(&self) -> AudioPacketFormat {
-        self.format
-    }
-
-    /// The sender's submission time, when supplied by the SDK.
-    pub fn timestamp(&self) -> Option<SdkTimestamp> {
-        self.extras.timestamp()
-    }
-
-    /// Take the original byte allocation and its capacity.
-    pub fn into_data(self) -> Vec<u8> {
-        self.payload.into_vec()
-    }
-
-    /// Check whether this packet's codec parameters and envelope can be sent.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidFrame`] for unsupported delivery parameters or envelope
-    /// details. The packet remains unchanged.
-    pub fn validate_for_send(&self) -> Result<()> {
-        self.send_extents().map(drop)
-    }
-
-    fn send_extents(&self) -> Result<Option<EnvelopeExtents>> {
-        validate_audio_content_for_send(self.format, self.payload.view())
-    }
-}
-
-impl TryFrom<ReceivedAudioPacket> for CompressedAudioFrame {
-    type Error = Rejected<ReceivedAudioPacket>;
-
-    fn try_from(packet: ReceivedAudioPacket) -> std::result::Result<Self, Self::Error> {
-        let extents = match packet.send_extents() {
-            Ok(extents) => extents,
-            Err(error) => return Err(Rejected::new(error, packet)),
-        };
-        let ReceivedAudioPacket {
-            format,
-            payload,
-            extras,
-        } = packet;
-        Ok(Self {
-            format,
-            payload: payload.with_envelope(extents),
-            extras,
-        })
-    }
-}
-
-impl From<CompressedAudioFrame> for ReceivedAudioPacket {
-    fn from(frame: CompressedAudioFrame) -> Self {
-        let CompressedAudioFrame {
-            format,
-            payload,
-            extras,
-        } = frame;
-        Self {
-            format,
-            payload,
-            extras,
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::*;
     use crate::{capture::Guard, test_alloc::allocation_count};
 
-    fn video() -> CompressedVideoFrame {
-        CompressedVideoFrame::new(
+    fn video() -> CompressedFrame<VideoPacketFormat> {
+        CompressedFrame::<VideoPacketFormat>::new(
             VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap(),
             PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, false, &[1; 8], &[]).unwrap(),
         )
         .unwrap()
     }
 
-    fn audio() -> CompressedAudioFrame {
-        CompressedAudioFrame::new(
-            AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
+    fn audio() -> CompressedFrame<AudioPacketFormat> {
+        CompressedFrame::<AudioPacketFormat>::new(
+            AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024)
+                .unwrap()
+                .with_protected(true),
             testing::aac_packet(48_000, 2, &[1; 8]),
         )
         .unwrap()
@@ -208,30 +26,33 @@ mod tests {
         sent.set_metadata("<video/>").unwrap();
         let pointer = sent.data().as_ptr();
         let metadata = sent.metadata().unwrap().as_ptr();
-        let (received, allocations) = allocation_count(|| ReceivedVideoPacket::from(sent));
+        let (received, allocations) =
+            allocation_count(|| ReceivedPacket::<VideoPacketFormat>::from(sent));
         assert_eq!(allocations, 0);
         let (sent, allocations) =
-            allocation_count(|| CompressedVideoFrame::try_from(received).unwrap());
+            allocation_count(|| CompressedFrame::<VideoPacketFormat>::try_from(received).unwrap());
         assert_eq!(allocations, 0);
         assert_eq!(sent.data().as_ptr(), pointer);
         assert_eq!(sent.metadata().unwrap().as_ptr(), metadata);
-        let (received, allocations) = allocation_count(|| ReceivedVideoPacket::from(sent));
+        let (received, allocations) =
+            allocation_count(|| ReceivedPacket::<VideoPacketFormat>::from(sent));
         assert_eq!(allocations, 0);
         assert_eq!(received.data().as_ptr(), pointer);
 
         let mut sent = audio();
         sent.set_metadata("<audio/>").unwrap();
-        sent.format = sent.format.with_protected(true);
         let pointer = sent.data().as_ptr();
         let metadata = sent.metadata().unwrap().as_ptr();
-        let (received, allocations) = allocation_count(|| ReceivedAudioPacket::from(sent));
+        let (received, allocations) =
+            allocation_count(|| ReceivedPacket::<AudioPacketFormat>::from(sent));
         assert_eq!(allocations, 0);
         let (sent, allocations) =
-            allocation_count(|| CompressedAudioFrame::try_from(received).unwrap());
+            allocation_count(|| CompressedFrame::<AudioPacketFormat>::try_from(received).unwrap());
         assert_eq!(allocations, 0);
         assert!(sent.format().is_protected());
         assert_eq!(sent.metadata().unwrap().as_ptr(), metadata);
-        let (received, allocations) = allocation_count(|| ReceivedAudioPacket::from(sent));
+        let (received, allocations) =
+            allocation_count(|| ReceivedPacket::<AudioPacketFormat>::from(sent));
         assert_eq!(allocations, 0);
         assert_eq!(received.data().as_ptr(), pointer);
     }
@@ -252,13 +73,13 @@ mod tests {
             "bad\0metadata".to_owned(),
             "x".repeat(crate::frames::MAX_METADATA_BYTES),
         ] {
-            let mut video = ReceivedVideoPacket::from(video());
+            let mut video = ReceivedPacket::<VideoPacketFormat>::from(video());
             video.set_metadata("<old/>").unwrap();
             let pointer = video.metadata().unwrap().as_ptr();
             returned(text.clone(), |text| video.set_metadata(text).unwrap_err());
             assert_eq!(video.metadata(), Some("<old/>"));
             assert_eq!(video.metadata().unwrap().as_ptr(), pointer);
-            let mut audio = ReceivedAudioPacket::from(audio());
+            let mut audio = ReceivedPacket::<AudioPacketFormat>::from(audio());
             audio.set_metadata("<old/>").unwrap();
             let pointer = audio.metadata().unwrap().as_ptr();
             returned(text, |text| audio.set_metadata(text).unwrap_err());
@@ -285,7 +106,7 @@ mod tests {
         raw.p_metadata = c"<received/>".as_ptr();
         // SAFETY: bytes and the terminated metadata remain live until the guard drops.
         let guard = unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
-        let borrowed = CompressedVideoRef::new(guard).unwrap();
+        let borrowed = CompressedRef::<VideoPacketFormat>::new(guard).unwrap();
         let received = borrowed.to_owned();
         assert_eq!(received.data(), bytes);
         assert_eq!(
@@ -294,7 +115,7 @@ mod tests {
         );
         assert_eq!(received.envelope(), borrowed.envelope());
         let pointer = received.data().as_ptr();
-        let refused = CompressedVideoFrame::try_from(received)
+        let refused = CompressedFrame::<VideoPacketFormat>::try_from(received)
             .unwrap_err()
             .into_inner();
         assert_eq!(refused.data().as_ptr(), pointer);
@@ -305,7 +126,7 @@ mod tests {
         let original = destination.clone();
         let pointer = destination.data().as_ptr();
         assert!(borrowed.try_copy_into(&mut destination).is_err());
-        assert!(CompressedVideoFrame::try_from(&borrowed).is_err());
+        assert!(CompressedFrame::<VideoPacketFormat>::try_from(&borrowed).is_err());
         assert_eq!(destination.data(), original.data());
         assert_eq!(destination.data().as_ptr(), pointer);
         assert_eq!(destination.format(), original.format());
@@ -324,7 +145,7 @@ mod tests {
         raw.p_metadata = c"<received/>".as_ptr();
         // SAFETY: bytes and terminated metadata remain live until the guard drops.
         let guard = unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
-        let borrowed = CompressedAudioRef::new(guard).unwrap();
+        let borrowed = CompressedRef::<AudioPacketFormat>::new(guard).unwrap();
         let received = borrowed.to_owned();
         assert_eq!(received.data(), bytes);
         assert_eq!(
@@ -333,7 +154,7 @@ mod tests {
         );
         assert_eq!(received.envelope(), borrowed.envelope());
         let pointer = received.data().as_ptr();
-        let refused = CompressedAudioFrame::try_from(received)
+        let refused = CompressedFrame::<AudioPacketFormat>::try_from(received)
             .unwrap_err()
             .into_inner();
         assert_eq!(refused.data().as_ptr(), pointer);
@@ -343,7 +164,7 @@ mod tests {
         let original = destination.clone();
         let pointer = destination.data().as_ptr();
         assert!(borrowed.try_copy_into(&mut destination).is_err());
-        assert!(CompressedAudioFrame::try_from(&borrowed).is_err());
+        assert!(CompressedFrame::<AudioPacketFormat>::try_from(&borrowed).is_err());
         assert_eq!(destination.data(), original.data());
         assert_eq!(destination.data().as_ptr(), pointer);
         assert_eq!(
@@ -363,7 +184,7 @@ mod tests {
         raw.timestamp = 456;
         // SAFETY: source storage remains live and unchanged through the borrow.
         let guard = unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
-        let borrowed = CompressedVideoRef::new(guard).unwrap();
+        let borrowed = CompressedRef::<VideoPacketFormat>::new(guard).unwrap();
         let mut destination = video();
         destination.set_metadata("<long-original/>").unwrap();
         let pointer = destination.data().as_ptr();
@@ -377,18 +198,19 @@ mod tests {
         assert_eq!(destination.metadata(), borrowed.metadata());
         assert_eq!(destination.metadata_status(), borrowed.metadata_status());
 
-        let mut source = CompressedAudioFrame::new(
-            AudioPacketFormat::new(AudioCodec::Opus, 24_000, 6, 480).unwrap(),
+        let mut source = CompressedFrame::<AudioPacketFormat>::new(
+            AudioPacketFormat::new(AudioCodec::Opus, 24_000, 6, 480)
+                .unwrap()
+                .with_protected(true),
             vec![1; 8],
         )
         .unwrap();
-        source.format = source.format.with_protected(true);
         source.set_timecode(Timecode::from_ticks(789));
         let mut raw = source.raw();
         raw.timestamp = 987;
         // SAFETY: source storage remains live and unchanged through the borrow.
         let guard = unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
-        let borrowed = CompressedAudioRef::new(guard).unwrap();
+        let borrowed = CompressedRef::<AudioPacketFormat>::new(guard).unwrap();
         let mut destination = audio();
         destination.set_metadata("<old/>").unwrap();
         let pointer = destination.data().as_ptr();

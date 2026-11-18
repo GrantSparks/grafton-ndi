@@ -769,7 +769,7 @@ pub(crate) mod in_flight {
         /// Submit a frame whose type already proves send admission.
         pub(crate) fn submit_pending(
             &mut self,
-            frame: crate::advanced::CompressedVideoFrame,
+            frame: crate::advanced::CompressedFrame<crate::advanced::VideoPacketFormat>,
         ) -> Option<crate::advanced::SubmittedVideo> {
             self.submit_prepared(crate::advanced::PendingVideo::Contiguous(frame))
         }
@@ -778,10 +778,10 @@ pub(crate) mod in_flight {
         #[allow(clippy::result_large_err)]
         pub(crate) fn submit_scatter(
             &mut self,
-            frame: crate::advanced::ScatterVideoFrame,
+            frame: crate::advanced::ScatterFrame<crate::advanced::VideoPacketFormat>,
         ) -> std::result::Result<
             Option<crate::advanced::SubmittedVideo>,
-            crate::Rejected<crate::advanced::ScatterVideoFrame>,
+            crate::Rejected<crate::advanced::ScatterFrame<crate::advanced::VideoPacketFormat>>,
         > {
             let proof = crate::advanced::ScatterSendable::new(frame, self.sender.runtime())?;
             Ok(self.submit_prepared(crate::advanced::PendingVideo::Scatter(proof)))

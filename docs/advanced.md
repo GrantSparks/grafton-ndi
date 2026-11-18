@@ -73,8 +73,8 @@ can arrive decoded. `capture_any_ref(timeout)` returns a borrowed
 `PacketItemRef::{Video, Audio, Metadata, Event}`; `capture_any(timeout)` makes the
 same capture and copies it into an owned `PacketItem`. Compressed references
 expose codec bytes without copying their payload or metadata. Their `to_owned`
-and `copy_into` methods make lossless `ReceivedVideoPacket` and
-`ReceivedAudioPacket` values; `copy_into` reuses buffers.
+and `copy_into` methods make lossless `ReceivedPacket<VideoPacketFormat>` and
+`ReceivedPacket<AudioPacketFormat>` values; `copy_into` reuses buffers.
 Notifications use the common `ReceiverEvent` model and are consumed once.
 `Ok(None)` means the wait budget expired, rather than proof that the source
 disconnected. Packet receivers cannot feed `FrameSync`.
@@ -91,7 +91,7 @@ relaying a source's compressed packets.
 
 ### Packet formats
 
-`CompressedVideoFrame` and `CompressedAudioFrame` own their bytes.
+`CompressedFrame<VideoPacketFormat>` and `CompressedFrame<AudioPacketFormat>` own their bytes.
 `VideoPacketFormat` describes codec, stream tier, dimensions, timing, picture
 aspect and scan type. Its default timing is 60 fps: set the rate to match your
 encoded media. `PacketEnvelope::encode` constructs the H.264, HEVC or AAC
@@ -100,18 +100,17 @@ envelope; `parse` reads one. Opus and SpeedHQ use no envelope.
 Constructors validate layout and wrapper send constraints, **not codec
 bitstreams**. Supply valid encoded media and required codec configuration.
 Received envelopes can preserve unknown header fields that sending refuses.
-Use `CompressedVideoFrame::try_from(packet)` or its audio equivalent to move
-received storage into a sendable frame; a refusal returns the original packet.
-Borrowed packets also convert through `TryFrom<&CompressedVideoRef>` and its
-audio equivalent, checking admission before copying. Their `try_copy_into`
-methods reuse an existing sendable frame and leave it unchanged on refusal.
+Use `CompressedFrame::try_from(packet)` to move either kind of received packet
+into a sendable frame. A refusal returns the original packet. The same conversion
+from a borrowed packet checks admission before copying. Its `try_copy_into`
+method reuses an existing sendable frame and leaves it unchanged on refusal.
 Contiguous compressed frames and packets expose `envelope()` as a validated
 view of H.264, HEVC or AAC headers and payloads; SpeedHQ and Opus return `None`.
 
 `validate_for_send` is available on the lossless received packet types for
 inspection; constructed compressed frames carry the sendability guarantee.
 Protection flags describe packet conventions and do not encrypt content.
-The [packet types](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.CompressedVideoFrame.html)
+The [packet types](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.CompressedFrame.html)
 and [envelope reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.PacketEnvelope.html)
 specify exact limits and send validation.
 
@@ -169,7 +168,7 @@ collect completions and retry. A frame whose retained allocation capacity
 alone exceeds `max_bytes` returns `InvalidInput`; waiting cannot make it fit.
 Inspect other errors before retrying.
 `try_next_completed` and `next_completed` return reusable frames on the
-application thread. Pass a `ScatterVideoFrame` directly to `try_submit` when
+application thread. Pass a `ScatterFrame<VideoPacketFormat>` directly to `try_submit` when
 the encoder supplies separate header, payload and parameter-set blocks; it
 returns as `QueuedVideoFrame::Scatter`, and `into_blocks()` recovers the original
 allocations. This requires scatter-send support as well as completion support.

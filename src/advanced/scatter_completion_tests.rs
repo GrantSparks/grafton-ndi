@@ -68,7 +68,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
                 &[0x67; 24],
             )
             .unwrap();
-            let mut frame = ScatterVideoFrame::new(
+            let mut frame = ScatterFrame::<VideoPacketFormat>::new(
                 VideoPacketFormat::new(VideoCodec::H264, 1280, 720)
                     .unwrap()
                     .with_tier(StreamTier::Program),
@@ -80,8 +80,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             )
             .unwrap();
             frame.set_timecode(Timecode::from_ticks(number));
-            let key = frame.storage.blocks[0].as_mut_ptr();
-            let length = frame.storage.first.to_sdk();
+            let (key, length) = frame.lend_first_block();
             frames.push(PendingVideo::Scatter(
                 ScatterSendable::for_test(frame, Some(scatter)).unwrap(),
             ));

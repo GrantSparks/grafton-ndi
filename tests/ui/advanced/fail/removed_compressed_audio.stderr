@@ -8,5 +8,6 @@ error[E0432]: unresolved import `grafton_ndi::advanced::CompressedAudio`
   |
 help: a similar name exists in the module
   |
-1 | use grafton_ndi::advanced::CompressedAudioRef;
-  |                                           +++
+1 - use grafton_ndi::advanced::CompressedAudio;
+1 + use grafton_ndi::advanced::CompressedVideo;
+  |

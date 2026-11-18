@@ -4,12 +4,12 @@
 use crate::capture::CaptureKind;
 use std::time::Duration;
 
-use super::{
-    AdvancedConfig, AudioCodec, CompressedAudioRef, CompressedVideoRef, PacketAttached,
-    ReceivedAudioPacket, ReceivedVideoPacket, ReceiverControls, VideoCodec,
-};
 #[cfg(test)]
-use super::{CompressedAudioFrame, CompressedVideoFrame};
+use super::CompressedFrame;
+use super::{
+    AdvancedConfig, AudioCodec, AudioPacketFormat, CompressedRef, PacketAttached, ReceivedPacket,
+    ReceiverControls, VideoCodec, VideoPacketFormat,
+};
 use crate::{
     capture::{AllSlots, AudioKind, CaptureStrategy, Guard, Media, MetadataKind, VideoKind},
     sys::{
@@ -74,7 +74,7 @@ pub enum ReceivedVideo {
     /// A decoded frame.
     Decoded(VideoFrame),
     /// A codec packet, exactly as the source sent it.
-    Compressed(ReceivedVideoPacket),
+    Compressed(ReceivedPacket<VideoPacketFormat>),
 }
 
 /// Audio from a [`PacketReceiver`]: a codec packet when the source's format is
@@ -85,7 +85,7 @@ pub enum ReceivedAudio {
     /// Decoded planar floating-point audio.
     Decoded(AudioFrame),
     /// A codec packet, exactly as the source sent it.
-    Compressed(ReceivedAudioPacket),
+    Compressed(ReceivedPacket<AudioPacketFormat>),
 }
 
 /// What one [`PacketReceiver::capture_any`] call produced.
@@ -110,7 +110,7 @@ pub enum ReceivedVideoRef<'rx> {
     /// Decoded pixels borrowed from the receiver.
     Decoded(VideoFrameRef<'rx>),
     /// Codec bytes borrowed in place.
-    Compressed(CompressedVideoRef<'rx>),
+    Compressed(CompressedRef<'rx, VideoPacketFormat>),
 }
 
 impl ReceivedVideoRef<'_> {
@@ -130,7 +130,7 @@ pub enum ReceivedAudioRef<'rx> {
     /// Decoded samples borrowed from the receiver.
     Decoded(AudioFrameRef<'rx>),
     /// Codec bytes borrowed in place.
-    Compressed(CompressedAudioRef<'rx>),
+    Compressed(CompressedRef<'rx, AudioPacketFormat>),
 }
 
 impl ReceivedAudioRef<'_> {
@@ -408,7 +408,7 @@ fn creation_options(
 
 fn video_ref_event(frame: Guard<'_, VideoKind>) -> Result<PacketItemRef<'_>> {
     let video = if VideoCodec::from_outer(frame.frame().FourCC).is_some() {
-        ReceivedVideoRef::Compressed(CompressedVideoRef::new(frame)?)
+        ReceivedVideoRef::Compressed(CompressedRef::<VideoPacketFormat>::new(frame)?)
     } else {
         ReceivedVideoRef::Decoded(VideoKind::make_ref(frame)?)
     };
@@ -417,7 +417,7 @@ fn video_ref_event(frame: Guard<'_, VideoKind>) -> Result<PacketItemRef<'_>> {
 
 fn audio_ref_event(frame: Guard<'_, AudioKind>) -> Result<PacketItemRef<'_>> {
     let audio = if AudioCodec::from_outer(frame.frame().FourCC).is_some() {
-        ReceivedAudioRef::Compressed(CompressedAudioRef::new(frame)?)
+        ReceivedAudioRef::Compressed(CompressedRef::<AudioPacketFormat>::new(frame)?)
     } else {
         ReceivedAudioRef::Decoded(AudioKind::make_ref(frame)?)
     };
@@ -566,7 +566,7 @@ mod tests {
         let format = VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap();
         let packet =
             PacketEnvelope::encode(EnvelopeCodec::H264, 10, 9, true, &[1, 2, 3], &[4, 5]).unwrap();
-        let mut sent = CompressedVideoFrame::new(format, packet.clone()).unwrap();
+        let mut sent = CompressedFrame::<VideoPacketFormat>::new(format, packet.clone()).unwrap();
         let (event, releases) = deliver::<VideoKind>(sent.raw(), video_event);
         assert_eq!(releases, 1);
         let PacketItem::Video(ReceivedVideo::Compressed(copied)) = event.unwrap() else {
@@ -622,7 +622,7 @@ mod tests {
         assert!(event.is_err());
         assert_eq!(releases, 1);
 
-        let mut sent = CompressedAudioFrame::new(
+        let mut sent = CompressedFrame::<AudioPacketFormat>::new(
             crate::advanced::AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![1; 8],
         )

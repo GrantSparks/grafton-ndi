@@ -138,8 +138,8 @@ fn malformed_callback_recovers_a_poisoned_state_lock() {
 }
 
 #[cfg(ndi_has_advanced_scatter_send)]
-fn scatter() -> ScatterVideoFrame {
-    ScatterVideoFrame::new(
+fn scatter() -> ScatterFrame<VideoPacketFormat> {
+    ScatterFrame::<VideoPacketFormat>::new(
         super::super::VideoPacketFormat::new(super::super::VideoCodec::SpeedHq422, 16, 16).unwrap(),
         vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
     )
@@ -161,7 +161,7 @@ fn scatter_byte_budget_counts_capacities_arrays_and_metadata() {
         + 3 * (size_of::<*const u8>() + size_of::<i32>());
     #[cfg(ndi_has_advanced_scatter_send)]
     let expected = expected + size_of::<crate::sys::advanced::FrameScatter>();
-    let mut frame = ScatterVideoFrame::new(
+    let mut frame = ScatterFrame::<VideoPacketFormat>::new(
         super::super::VideoPacketFormat::new(super::super::VideoCodec::SpeedHq422, 16, 16).unwrap(),
         vec![first, second],
     )

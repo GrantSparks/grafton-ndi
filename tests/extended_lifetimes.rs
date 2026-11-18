@@ -446,7 +446,7 @@ fn child(case: &str) {
         "compressed_finish" => {
             use grafton_ndi::{
                 advanced::{
-                    CompressedSender, CompressedVideoFrame, SubmittedVideo, VideoCodec,
+                    CompressedFrame, CompressedSender, SubmittedVideo, VideoCodec,
                     VideoPacketFormat,
                 },
                 StreamTier,
@@ -458,7 +458,8 @@ fn child(case: &str) {
                 let format = VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16)
                     .unwrap()
                     .with_tier(tier);
-                let frame = CompressedVideoFrame::new(format, vec![value; 16]).unwrap();
+                let frame =
+                    CompressedFrame::<VideoPacketFormat>::new(format, vec![value; 16]).unwrap();
                 assert!(sender.submit_video(frame).is_none());
             }
             let reclaimed = sender.reclaim_video();
@@ -497,7 +498,7 @@ fn child(case: &str) {
         #[cfg(feature = "advanced")]
         "compressed_destroy" | "compressed_close" => {
             use grafton_ndi::{
-                advanced::{CompressedSender, CompressedVideoFrame, VideoCodec, VideoPacketFormat},
+                advanced::{CompressedFrame, CompressedSender, VideoCodec, VideoPacketFormat},
                 StreamTier,
             };
             std::env::set_var("GRAFTON_FAKE_VALIDATE_COMPRESSED_LOANS", "1");
@@ -507,7 +508,8 @@ fn child(case: &str) {
                 let format = VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16)
                     .unwrap()
                     .with_tier(tier);
-                let frame = CompressedVideoFrame::new(format, vec![value; 16]).unwrap();
+                let frame =
+                    CompressedFrame::<VideoPacketFormat>::new(format, vec![value; 16]).unwrap();
                 assert!(sender.submit_video(frame).is_none());
             }
             if case == "compressed_close" {
@@ -905,11 +907,11 @@ fn child(case: &str) {
 
             // Compressed metadata retains its caller's string allocation;
             // unused capacity must count towards the queue limit too.
-            use grafton_ndi::advanced::{CompressedVideoFrame, VideoCodec, VideoPacketFormat};
+            use grafton_ndi::advanced::{CompressedFrame, VideoCodec, VideoPacketFormat};
             let mut metadata = String::with_capacity(1024);
             metadata.push_str("<pooled/>");
             let metadata_pointer = metadata.as_ptr();
-            let mut packet = CompressedVideoFrame::new(
+            let mut packet = CompressedFrame::<VideoPacketFormat>::new(
                 VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16).unwrap(),
                 vec![0; 4],
             )
@@ -934,7 +936,7 @@ fn child(case: &str) {
             let packet = |capacity| {
                 let mut bytes = Vec::with_capacity(capacity);
                 bytes.extend_from_slice(&[0; 4]);
-                CompressedVideoFrame::new(
+                CompressedFrame::<VideoPacketFormat>::new(
                     VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16).unwrap(),
                     bytes,
                 )
@@ -976,11 +978,11 @@ fn child(case: &str) {
         | "queue_scatter_protocol"
         | "queue_scatter_unavailable" => {
             use grafton_ndi::advanced::{
-                QueueLimits, QueuedSender, QueuedVideoFrame, ScatterVideoFrame, VideoCodec,
+                QueueLimits, QueuedSender, QueuedVideoFrame, ScatterFrame, VideoCodec,
                 VideoPacketFormat,
             };
             let packet = || {
-                ScatterVideoFrame::new(
+                ScatterFrame::<VideoPacketFormat>::new(
                     VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16).unwrap(),
                     vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
                 )
@@ -1142,12 +1144,12 @@ fn child(case: &str) {
         #[cfg(feature = "advanced")]
         "queue_backlog" => {
             use grafton_ndi::advanced::{
-                CompressedVideoFrame, QueueLimits, QueuedSender, QueuedVideoFrame, VideoCodec,
+                CompressedFrame, QueueLimits, QueuedSender, QueuedVideoFrame, VideoCodec,
                 VideoPacketFormat,
             };
             let pixels = QueuedVideoFrame::from(frame());
             let packet = QueuedVideoFrame::from(
-                CompressedVideoFrame::new(
+                CompressedFrame::<VideoPacketFormat>::new(
                     VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16).unwrap(),
                     vec![0, 1, 2, 3],
                 )

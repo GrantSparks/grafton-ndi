@@ -734,45 +734,6 @@ impl VideoPacketFormat {
         self.protected
     }
 
-    /// The number of bytes at the start of a frame of this format that hold
-    /// its header.
-    pub(crate) fn header_bytes(self) -> usize {
-        match self.codec.envelope_codec() {
-            Some(_) => ENVELOPE_HEADER_BYTES,
-            None => SPEEDHQ_HEADER_BYTES,
-        }
-    }
-
-    /// Check that a frame of this format, `total` bytes long and beginning
-    /// with `header`, is one this module can send and the SDK delivers; see
-    /// [`VideoCodec`]. `header` holds [`header_bytes`](Self::header_bytes)
-    /// bytes or more.
-    pub(crate) fn validate_for_send(
-        self,
-        header: &[u8],
-        total: usize,
-    ) -> Result<Option<EnvelopeExtents>> {
-        let Some(codec) = self.codec.envelope_codec() else {
-            if header
-                .first()
-                .is_none_or(|quality| *quality >= SPEEDHQ_QUALITY_LIMIT)
-            {
-                return Err(invalid_frame(crate::FrameDefect::SpeedHqQuality));
-            }
-            return Ok(None);
-        };
-        let header = EnvelopeHeader::read(header)?;
-        let extents = header.validate(codec, total, Use::Send)?;
-        header.validate_video_configuration()?;
-        if self.tier == StreamTier::Preview
-            && (self.width.get() > MAX_PREVIEW_DIMENSION
-                || self.height.get() > MAX_PREVIEW_DIMENSION)
-        {
-            return Err(invalid_frame(crate::FrameDefect::PreviewVideoDimensions));
-        }
-        Ok(Some(extents))
-    }
-
     /// A native frame descriptor with this format and no data, no timecode
     /// and no metadata.
     pub(crate) fn raw(self) -> NDIlib_video_frame_v2_t {
@@ -907,193 +868,11 @@ impl FrameExtras {
     }
 }
 
-/// Accessors and editing operations shared by owned compressed and scatter frames.
-macro_rules! frame_extras_accessors {
-    () => {
-        /// The timecode: [`crate::Timecode::SYNTHESIZE`] on a frame built for
-        /// sending without an explicit timecode.
-        pub fn timecode(&self) -> $crate::Timecode {
-            self.extras.timecode()
-        }
-
-        /// Replace the frame's timecode.
-        pub fn set_timecode(&mut self, timecode: $crate::Timecode) {
-            self.extras.set_timecode(timecode);
-        }
-
-        /// The per-frame metadata, if any. Unreadable received text is omitted.
-        pub fn metadata(&self) -> Option<&str> {
-            self.extras.metadata()
-        }
-
-        /// Cached metadata presence or the reason unreadable text was withheld.
-        pub fn metadata_status(&self) -> $crate::FrameMetadataStatus {
-            self.extras.metadata_status()
-        }
-
-        /// Replace frame metadata. Use [`Self::clear_metadata`] to remove it.
-        ///
-        /// Invalid replacement text leaves the existing metadata unchanged.
-        ///
-        /// # Errors
-        ///
-        /// Returns the unchanged text in [`crate::Rejected`], with
-        /// [`crate::Error::InvalidCString`] for an interior NUL, or
-        /// [`crate::Error::InvalidFrame`] when the emitted C string would
-        /// exceed the metadata size cap. `NulError` retains only the prefix
-        /// through the first NUL; [`crate::Rejected::into_inner`] returns all text.
-        pub fn set_metadata(
-            &mut self,
-            metadata: impl Into<String>,
-        ) -> std::result::Result<(), $crate::Rejected<String>> {
-            self.extras.set_metadata(metadata)
-        }
-
-        /// Remove the frame metadata.
-        pub fn clear_metadata(&mut self) {
-            self.extras.clear_metadata();
-        }
-    };
-}
-pub(crate) use frame_extras_accessors;
-
-/// One field list for each compressed media kind, shared by borrowed, owned
-/// and scatter packets. Storage is always summarized by extent, never contents.
-macro_rules! packet_debug {
-    ($type:ty, $name:literal, $this:ident, $kind:ident, $timestamp:expr;
-        $($field:literal = $value:expr),+ $(,)?) => {
-        impl std::fmt::Debug for $type {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                let $this = self;
-                let mut summary = f.debug_struct($name);
-                packet_debug!(@$kind summary, $this);
-                $(summary.field($field, &$value);)+
-                summary
-                    .field("timecode", &$this.timecode())
-                    .field("timestamp", &$timestamp)
-                    .field("metadata_status", &$this.metadata_status())
-                    .finish()
-            }
-        }
-    };
-    (@video $summary:ident, $this:ident) => {
-        $summary.field("format", &$this.format());
-    };
-    (@audio $summary:ident, $this:ident) => {
-        $summary
-            .field("codec", &$this.format().codec())
-            .field("protected", &$this.format().is_protected())
-            .field("sample_rate", &$this.format().sample_rate())
-            .field("num_channels", &$this.format().num_channels())
-            .field("num_samples", &$this.format().num_samples());
-    };
-}
-pub(crate) use packet_debug;
-
-macro_rules! envelope_accessor {
-    ($($extents:tt)+) => {
-        /// The validated envelope for H.264, HEVC or AAC. Other codecs have no envelope.
-        pub fn envelope(&self) -> Option<PacketEnvelope<'_>> {
-            self.$($extents)+
-                .map(|extents| PacketEnvelope::from_validated(self.data(), extents))
-        }
-    };
-}
-
-/// One owned compressed video frame: a [`VideoPacketFormat`] and the codec
-/// bytes, with optional metadata.
-///
-/// Construction checks the memory layout the SDK relies on (sizes and, for
-/// H.264 and HEVC, the packet envelope). Whether the codec bitstream itself is
-/// decodable is the application's responsibility.
-///
-/// Sending lends the bytes to the SDK, which writes to them: it stamps the
-/// envelope's reserved field. A send therefore takes the frame exclusively or
-/// by value, and a frame stays sendable however often it has been sent.
-#[derive(Clone)]
-pub struct CompressedVideoFrame {
-    pub(crate) format: VideoPacketFormat,
-    pub(crate) payload: PacketBytes,
-    pub(crate) extras: FrameExtras,
-}
-
-packet_debug!(CompressedVideoFrame, "CompressedVideoFrame", frame, video, frame.timestamp();
-    "bytes" = frame.data().len());
-
-impl CompressedVideoFrame {
-    frame_extras_accessors!();
-    envelope_accessor!(payload.extents());
-
-    /// Take ownership of one frame's bytes: a packet envelope for H.264 and
-    /// HEVC (see [`PacketEnvelope::encode`]), a SpeedHQ frame otherwise. The
-    /// timecode is synthesized by the SDK unless
-    /// [`set_timecode`](Self::set_timecode) sets one.
-    ///
-    /// # Errors
-    ///
-    /// Returns the bytes with [`Error::InvalidFrame`] when they are empty, too
-    /// large, not an envelope of the format's codec, an envelope this module
-    /// cannot send (a later header version, unknown flags, trailing bytes, or
-    /// a keyframe without codec configuration), or a frame the SDK does not
-    /// deliver (see [`VideoCodec`]).
-    pub fn new(
-        format: VideoPacketFormat,
-        bytes: Vec<u8>,
-    ) -> std::result::Result<Self, Rejected<Vec<u8>>> {
-        let payload = PacketBytes::new(bytes).map_err(|bytes| {
-            Rejected::new(
-                invalid_frame(crate::FrameDefect::CompressedVideoSize),
-                bytes,
-            )
-        })?;
-        let extents = match validate_video_content(format, payload.view(), Use::Send) {
-            Ok(extents) => extents,
-            Err(error) => return Err(Rejected::new(error, payload.into_vec())),
-        };
-        Ok(Self {
-            format,
-            payload: payload.with_envelope(extents),
-            extras: FrameExtras::default(),
-        })
-    }
-
-    /// The codec bytes.
-    pub fn data(&self) -> &[u8] {
-        self.payload.as_slice()
-    }
-
-    /// The format.
-    pub fn format(&self) -> VideoPacketFormat {
-        self.format
-    }
-
-    /// When the sender submitted a received frame, as the SDK recorded it;
-    /// `None` on a frame built for sending.
-    pub fn timestamp(&self) -> Option<SdkTimestamp> {
-        self.extras.timestamp()
-    }
-
-    /// Take the codec bytes, retaining the original allocation and capacity.
-    pub fn into_data(self) -> Vec<u8> {
-        self.payload.into_vec()
-    }
-
-    /// Bytes this frame keeps allocated.
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.payload.capacity() + self.extras.retained_bytes()
-    }
-
-    /// A native descriptor that lends this frame's bytes and metadata to the
-    /// SDK. The SDK may write to the bytes for as long as it holds the
-    /// descriptor, so the caller keeps the frame exclusively for that long.
-    pub(crate) fn raw(&mut self) -> NDIlib_video_frame_v2_t {
-        let mut raw = self.format.descriptor(&self.extras);
-        let (data, size) = self.payload.lend();
-        raw.__bindgen_anon_1.data_size_in_bytes = size;
-        raw.p_data = data;
-        raw
-    }
-}
+#[path = "packets/roles.rs"]
+mod roles;
+pub use roles::{CompressedFrame, CompressedRef, PacketFormat, ReceivedPacket, ScatterFrame};
+#[cfg(test)]
+use roles::{NativePacketFormat, PacketContent};
 
 /// What a packet is being checked for.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1112,29 +891,8 @@ fn validate_video_packet(
 ) -> Result<PacketLen> {
     let bytes = PacketSlice::new(bytes)
         .ok_or_else(|| invalid_frame(crate::FrameDefect::CompressedVideoSize))?;
-    validate_video_content(format, bytes, purpose)?;
+    format.admit(PacketContent::Contiguous(bytes), purpose)?;
     Ok(bytes.len())
-}
-
-fn validate_video_content(
-    format: VideoPacketFormat,
-    packet: PacketSlice<'_>,
-    purpose: Use,
-) -> Result<Option<EnvelopeExtents>> {
-    let bytes = packet.as_slice();
-    let len = packet.len();
-    if format.codec.envelope_codec().is_none() && bytes.len() < SPEEDHQ_HEADER_BYTES {
-        return Err(invalid_frame(crate::FrameDefect::SpeedHqTruncated));
-    }
-    match purpose {
-        Use::Send => format.validate_for_send(bytes, len.to_usize()),
-        Use::Receive => match format.codec.envelope_codec() {
-            Some(codec) => EnvelopeHeader::read(bytes)?
-                .validate(codec, len.to_usize(), purpose)
-                .map(Some),
-            None => Ok(None),
-        },
-    }
 }
 
 /// The sample rates an AAC configuration can name, in the order of its
@@ -1303,43 +1061,6 @@ impl AudioPacketFormat {
 }
 
 impl AudioCodec {
-    /// The number of bytes at the start of a frame of this codec that hold
-    /// its header: the envelope header for AAC, none for Opus.
-    pub(crate) fn header_bytes(self) -> usize {
-        match self {
-            Self::Aac => ENVELOPE_HEADER_BYTES,
-            Self::Opus => 0,
-        }
-    }
-
-    /// Check that a frame of this codec with `parameters`, `total` bytes long
-    /// and beginning with `header`, is one this module can send and the SDK
-    /// delivers; see [`AudioCodec`]. `header` holds
-    /// [`header_bytes`](Self::header_bytes) bytes or more, and `bytes_at`
-    /// reads the frame's two bytes at an offset, when it has them.
-    ///
-    /// The one admission of compressed audio, whether the frame is held in
-    /// one buffer or in several blocks, as
-    /// [`VideoPacketFormat::validate_for_send`] is for video.
-    pub(crate) fn validate_for_send(
-        self,
-        parameters: AudioPacketFormat,
-        header: &[u8],
-        total: usize,
-        bytes_at: impl FnOnce(usize) -> Option<[u8; 2]>,
-    ) -> Result<Option<EnvelopeExtents>> {
-        self.validate_delivery(parameters)?;
-        match self {
-            Self::Opus => Ok(None),
-            Self::Aac => {
-                let header = EnvelopeHeader::read(header)?;
-                let extents = header.validate(EnvelopeCodec::Aac, total, Use::Send)?;
-                header.validate_aac(bytes_at(extents.extra_offset()), parameters)?;
-                Ok(Some(extents))
-            }
-        }
-    }
-
     /// Check the parameters a frame of this codec is delivered with; see
     /// [`AudioCodec`]. An AAC frame's configuration is checked separately,
     /// against its envelope.
@@ -1396,126 +1117,17 @@ impl AudioCodec {
     }
 }
 
-/// One owned compressed audio frame.
-///
-/// Sending lends the bytes to the SDK, which writes to them, so a send takes
-/// the frame exclusively; see [`CompressedVideoFrame`].
-#[derive(Clone)]
-pub struct CompressedAudioFrame {
-    pub(crate) format: AudioPacketFormat,
-    pub(crate) payload: PacketBytes,
-    pub(crate) extras: FrameExtras,
-}
-
-packet_debug!(CompressedAudioFrame, "CompressedAudioFrame", frame, audio, frame.timestamp();
-    "bytes" = frame.data().len());
-
-impl CompressedAudioFrame {
-    frame_extras_accessors!();
-    envelope_accessor!(payload.extents());
-
-    /// Take ownership of one audio frame's bytes: a packet envelope for AAC
-    /// (see [`PacketEnvelope::encode`]), one bare packet for Opus.
-    ///
-    /// # Errors
-    ///
-    /// Returns the bytes with [`Error::InvalidFrame`] when the bytes are empty
-    /// or too large, the format parameters are
-    /// not ones the codec is delivered with (see [`AudioCodec`]), or an AAC
-    /// envelope is malformed or disagrees with them.
-    pub fn new(
-        format: AudioPacketFormat,
-        bytes: Vec<u8>,
-    ) -> std::result::Result<Self, Rejected<Vec<u8>>> {
-        let payload = PacketBytes::new(bytes).map_err(|bytes| {
-            Rejected::new(
-                invalid_frame(crate::FrameDefect::CompressedAudioSize),
-                bytes,
-            )
-        })?;
-        let extents = match validate_audio_content_for_send(format, payload.view()) {
-            Ok(extents) => extents,
-            Err(error) => return Err(Rejected::new(error, payload.into_vec())),
-        };
-        Ok(Self {
-            format,
-            payload: payload.with_envelope(extents),
-            extras: FrameExtras::default(),
-        })
-    }
-
-    /// The codec bytes.
-    pub fn data(&self) -> &[u8] {
-        self.payload.as_slice()
-    }
-
-    /// The codec and audio format.
-    pub fn format(&self) -> AudioPacketFormat {
-        self.format
-    }
-
-    /// When the sender submitted a received frame, as the SDK recorded it;
-    /// `None` on a frame built for sending.
-    pub fn timestamp(&self) -> Option<SdkTimestamp> {
-        self.extras.timestamp()
-    }
-
-    /// Take the codec bytes, retaining the original allocation and capacity.
-    pub fn into_data(self) -> Vec<u8> {
-        self.payload.into_vec()
-    }
-
-    /// A native descriptor that lends this frame's bytes and metadata to the
-    /// SDK; see [`CompressedVideoFrame::raw`].
-    pub(crate) fn raw(&mut self) -> NDIlib_audio_frame_v3_t {
-        let mut raw = self.format.descriptor(&self.extras);
-        let (data, size) = self.payload.lend();
-        raw.p_data = data;
-        raw.__bindgen_anon_1.data_size_in_bytes = size;
-        raw
-    }
-}
-
 #[cfg(test)]
 fn validate_audio_for_send(format: AudioPacketFormat, bytes: &[u8]) -> Result<PacketLen> {
     let bytes = PacketSlice::new(bytes)
         .ok_or_else(|| invalid_frame(crate::FrameDefect::CompressedAudioSize))?;
-    validate_audio_content_for_send(format, bytes)?;
+    format.admit(PacketContent::Contiguous(bytes), Use::Send)?;
     Ok(bytes.len())
 }
 
-fn validate_audio_content_for_send(
-    format: AudioPacketFormat,
-    packet: PacketSlice<'_>,
-) -> Result<Option<EnvelopeExtents>> {
-    let bytes = packet.as_slice();
-    let len = packet.len();
-    format
-        .codec
-        .validate_for_send(format, bytes, len.to_usize(), |offset| {
-            bytes.get(offset..)?.first_chunk().copied()
-        })
-}
-
-fn validate_received_audio(
-    codec: AudioCodec,
-    packet: PacketSlice<'_>,
-) -> Result<Option<EnvelopeExtents>> {
-    if codec == AudioCodec::Aac {
-        return EnvelopeHeader::read(packet.as_slice())?
-            .validate(EnvelopeCodec::Aac, packet.len().to_usize(), Use::Receive)
-            .map(Some);
-    }
-    Ok(None)
-}
-
-#[path = "packets/received.rs"]
+#[cfg(test)]
+#[path = "packets/received_tests.rs"]
 mod received;
-pub use received::{ReceivedAudioPacket, ReceivedVideoPacket};
-
-#[path = "packets/borrowed.rs"]
-mod borrowed;
-pub use borrowed::{CompressedAudioRef, CompressedVideoRef};
 
 /// Copy a compressed video frame the SDK delivered.
 ///
@@ -1527,12 +1139,12 @@ pub use borrowed::{CompressedAudioRef, CompressedVideoRef};
 #[cfg(test)]
 pub(crate) unsafe fn copy_video_packet(
     raw: &NDIlib_video_frame_v2_t,
-) -> Result<ReceivedVideoPacket> {
+) -> Result<ReceivedPacket<VideoPacketFormat>> {
     // SAFETY: the test caller retains raw's storage, and the synthetic guard
     // borrows it until the copy completes; its release callback frees nothing.
     let guard =
         unsafe { crate::capture::Guard::with_test_free(std::ptr::null_mut(), *raw, |_, _| {}) };
-    CompressedVideoRef::new(guard).map(|frame| frame.to_owned())
+    CompressedRef::<VideoPacketFormat>::new(guard).map(|frame| frame.to_owned())
 }
 
 /// Copy a compressed audio frame the SDK delivered.
@@ -1543,11 +1155,11 @@ pub(crate) unsafe fn copy_video_packet(
 #[cfg(test)]
 pub(crate) unsafe fn copy_audio_packet(
     raw: &NDIlib_audio_frame_v3_t,
-) -> Result<ReceivedAudioPacket> {
+) -> Result<ReceivedPacket<AudioPacketFormat>> {
     // SAFETY: as for the video fixture above.
     let guard =
         unsafe { crate::capture::Guard::with_test_free(std::ptr::null_mut(), *raw, |_, _| {}) };
-    CompressedAudioRef::new(guard).map(|frame| frame.to_owned())
+    CompressedRef::<AudioPacketFormat>::new(guard).map(|frame| frame.to_owned())
 }
 
 // The values above are the NDI wire format, which the data types in this file
@@ -1817,7 +1429,11 @@ mod tests {
             (vec![], crate::FrameDefect::ScatterBlockCount),
             (vec![vec![]], crate::FrameDefect::EmptyScatterBlock),
         ] {
-            let rejected = super::super::ScatterVideoFrame::new(h264_format(), blocks).unwrap_err();
+            let rejected = super::super::ScatterFrame::<super::super::VideoPacketFormat>::new(
+                h264_format(),
+                blocks,
+            )
+            .unwrap_err();
             assert!(matches!(rejected.error(), Error::InvalidFrame(actual) if *actual == expected));
         }
         // SAFETY: a zero extent is refused before a slice is formed.
@@ -1851,13 +1467,14 @@ mod tests {
             ),
             crate::FrameDefect::PacketPayloadSize
         );
-        let rejected = CompressedVideoFrame::new(h264_format(), bytes).unwrap_err();
+        let rejected = CompressedFrame::<VideoPacketFormat>::new(h264_format(), bytes).unwrap_err();
         assert!(matches!(
             rejected.error(),
             Error::InvalidFrame(crate::FrameDefect::CompressedVideoSize)
         ));
         let audio = AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap();
-        let rejected = CompressedAudioFrame::new(audio, rejected.into_inner()).unwrap_err();
+        let rejected =
+            CompressedFrame::<AudioPacketFormat>::new(audio, rejected.into_inner()).unwrap_err();
         assert!(matches!(
             rejected.error(),
             Error::InvalidFrame(crate::FrameDefect::CompressedAudioSize)
@@ -1871,8 +1488,11 @@ mod tests {
             cause(received.map(|_| ())),
             crate::FrameDefect::CompressedBuffer
         );
-        let rejected =
-            super::super::ScatterVideoFrame::new(h264_format(), vec![bytes]).unwrap_err();
+        let rejected = super::super::ScatterFrame::<super::super::VideoPacketFormat>::new(
+            h264_format(),
+            vec![bytes],
+        )
+        .unwrap_err();
         assert!(matches!(
             rejected.error(),
             Error::InvalidFrame(crate::FrameDefect::ScatterSize)
@@ -1890,8 +1510,8 @@ mod tests {
     #[test]
     fn packet_debug_summarizes_every_leaf_and_public_holder() {
         use crate::advanced::{
-            PacketItem, QueuedVideoFrame, ReceivedAudio, ReceivedVideo, ReclaimedVideo,
-            ScatterAudioFrame, ScatterVideoFrame, SubmittedVideo,
+            AudioPacketFormat, PacketItem, QueuedVideoFrame, ReceivedAudio, ReceivedVideo,
+            ReclaimedVideo, ScatterFrame, SubmittedVideo, VideoPacketFormat,
         };
         use crate::capture::Guard;
 
@@ -1899,12 +1519,13 @@ mod tests {
             let bytes =
                 PacketEnvelope::encode(EnvelopeCodec::H264, 17, 13, true, &vec![7; size], &[1, 2])
                     .unwrap();
-            let mut video = CompressedVideoFrame::new(h264_format(), bytes.clone()).unwrap();
+            let mut video =
+                CompressedFrame::<VideoPacketFormat>::new(h264_format(), bytes.clone()).unwrap();
             let raw = video.raw();
             // SAFETY: video owns the readable descriptor storage until the
             // synthetic non-owning receive guard is dropped.
             let guard = unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
-            let borrowed = CompressedVideoRef::new(guard).unwrap();
+            let borrowed = CompressedRef::<VideoPacketFormat>::new(guard).unwrap();
             let received = borrowed.to_owned();
             let debug = format!("{video:?}");
             for other in [format!("{borrowed:?}"), format!("{received:?}")] {
@@ -1913,7 +1534,7 @@ mod tests {
                     other.split_once(" {").unwrap().1
                 );
             }
-            let scatter = ScatterVideoFrame::new(
+            let scatter = ScatterFrame::<VideoPacketFormat>::new(
                 h264_format(),
                 vec![bytes[..44].to_vec(), bytes[44..].to_vec()],
             )
@@ -1946,7 +1567,7 @@ mod tests {
                     AudioCodec::Aac => (1024, aac_packet(48_000, 2, &vec![7; size])),
                     AudioCodec::Opus => (960, vec![7; size]),
                 };
-                let mut audio = CompressedAudioFrame::new(
+                let mut audio = CompressedFrame::<AudioPacketFormat>::new(
                     AudioPacketFormat::new(codec, 48_000, 2, samples).unwrap(),
                     bytes.clone(),
                 )
@@ -1955,7 +1576,7 @@ mod tests {
                 // SAFETY: audio owns the readable descriptor storage until
                 // the synthetic non-owning receive guard is dropped.
                 let guard = unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
-                let borrowed = CompressedAudioRef::new(guard).unwrap();
+                let borrowed = CompressedRef::<AudioPacketFormat>::new(guard).unwrap();
                 let received = borrowed.to_owned();
                 let debug = format!("{audio:?}");
                 for other in [format!("{borrowed:?}"), format!("{received:?}")] {
@@ -1964,7 +1585,7 @@ mod tests {
                         other.split_once(" {").unwrap().1
                     );
                 }
-                let scatter = ScatterAudioFrame::new(
+                let scatter = ScatterFrame::<AudioPacketFormat>::new(
                     AudioPacketFormat::new(codec, 48_000, 2, samples).unwrap(),
                     vec![bytes[..44].to_vec(), bytes[44..].to_vec()],
                 )
@@ -1989,14 +1610,14 @@ mod tests {
 
     fn aac(sample_rate: u32, channels: u32, samples: u32, packet: Vec<u8>) -> Result<()> {
         let format = AudioPacketFormat::new(AudioCodec::Aac, sample_rate, channels, samples)?;
-        CompressedAudioFrame::new(format, packet)
+        CompressedFrame::<AudioPacketFormat>::new(format, packet)
             .map(drop)
             .map_err(Rejected::into_error)
     }
 
     fn opus(sample_rate: u32, channels: u32, samples: u32) -> Result<()> {
         let format = AudioPacketFormat::new(AudioCodec::Opus, sample_rate, channels, samples)?;
-        CompressedAudioFrame::new(format, vec![1; 8])
+        CompressedFrame::<AudioPacketFormat>::new(format, vec![1; 8])
             .map(drop)
             .map_err(Rejected::into_error)
     }
@@ -2010,8 +1631,58 @@ mod tests {
     }
 
     #[test]
+    fn packed_and_scatter_admission_agree_for_every_codec_and_use() {
+        fn check<F: PacketFormat>(format: F, bytes: &[u8], sendable: bool) {
+            let packet = PacketSlice::new(bytes).unwrap();
+            let header = format.header_bytes().max(1);
+            let blocks = [bytes[..header].to_vec(), bytes[header..].to_vec()];
+            for (purpose, accepted) in [(Use::Receive, true), (Use::Send, sendable)] {
+                let contiguous = format.admit(PacketContent::Contiguous(packet), purpose);
+                let scatter = format.admit(
+                    PacketContent::Scatter {
+                        first: &blocks[0],
+                        total: packet.len(),
+                        blocks: &blocks,
+                    },
+                    purpose,
+                );
+                assert_eq!(contiguous.is_ok(), accepted, "{format:?}");
+                assert_eq!(
+                    contiguous.map_err(|error| error.to_string()),
+                    scatter.map_err(|error| error.to_string()),
+                    "{format:?}"
+                );
+            }
+        }
+
+        for codec in VideoCodec::ALL {
+            let format = VideoPacketFormat::new(codec, 1920, 1080).unwrap();
+            if let Some(envelope) = codec.envelope_codec() {
+                for config in [&[2][..], &[]] {
+                    let bytes =
+                        PacketEnvelope::encode(envelope, 0, 0, true, &[1, 2], config).unwrap();
+                    check(format, &bytes, !config.is_empty());
+                }
+            } else {
+                check(format, &[80, 0, 0, 0, 42], true);
+                check(format, &[100, 0, 0, 0, 42], false);
+            }
+        }
+        for codec in AudioCodec::ALL {
+            let (samples, wrong_samples, bytes) = match codec {
+                AudioCodec::Aac => (1024, 960, aac_packet(48_000, 2, &[1, 2])),
+                AudioCodec::Opus => (960, 1440, vec![1, 2]),
+            };
+            for (samples, sendable) in [(samples, true), (wrong_samples, false)] {
+                let format = AudioPacketFormat::new(codec, 48_000, 2, samples).unwrap();
+                check(format, &bytes, sendable);
+            }
+        }
+    }
+
+    #[test]
     fn envelope_causes_agree_across_containers_and_directions() {
-        use crate::advanced::{ScatterAudioFrame, ScatterVideoFrame};
+        use crate::advanced::{AudioPacketFormat, ScatterFrame, VideoPacketFormat};
         use crate::FrameDefect::*;
         let cases: &[(&str, usize, u32, Option<crate::FrameDefect>, bool)] = &[
             (
@@ -2084,14 +1755,14 @@ mod tests {
                     bytes[*offset..*offset + 4].copy_from_slice(&value.to_ne_bytes());
                 }
                 let send = if audio {
-                    CompressedAudioFrame::new(
+                    CompressedFrame::<AudioPacketFormat>::new(
                         AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
                         bytes.clone(),
                     )
                     .map(drop)
                     .map_err(Rejected::into_error)
                 } else {
-                    CompressedVideoFrame::new(h264_format(), bytes.clone())
+                    CompressedFrame::<VideoPacketFormat>::new(h264_format(), bytes.clone())
                         .map(drop)
                         .map_err(Rejected::into_error)
                 };
@@ -2102,14 +1773,14 @@ mod tests {
                         bytes[ENVELOPE_HEADER_BYTES..].to_vec(),
                     ];
                     let scatter = if audio {
-                        ScatterAudioFrame::new(
+                        ScatterFrame::<AudioPacketFormat>::new(
                             AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
                             blocks,
                         )
                         .map(drop)
                         .map_err(Rejected::into_error)
                     } else {
-                        ScatterVideoFrame::new(h264_format(), blocks)
+                        ScatterFrame::<VideoPacketFormat>::new(h264_format(), blocks)
                             .map(drop)
                             .map_err(Rejected::into_error)
                     };
@@ -2260,7 +1931,7 @@ mod tests {
             &[9, 8]
         );
         assert!(validate_video_packet(h264_format(), &bytes, Use::Receive).is_ok());
-        assert!(CompressedVideoFrame::new(h264_format(), bytes.clone()).is_err());
+        assert!(CompressedFrame::<VideoPacketFormat>::new(h264_format(), bytes.clone()).is_err());
         bytes[36..40].copy_from_slice(&u32::MAX.to_ne_bytes());
         assert!(PacketEnvelope::parse(&bytes).is_err());
 
@@ -2305,7 +1976,8 @@ mod tests {
                         Some(code) => PacketEnvelope::encode(code, 0, 0, false, &[1], &[]).unwrap(),
                         None => vec![1, 2, 3, 4],
                     };
-                    let mut frame = CompressedVideoFrame::new(format, bytes).unwrap();
+                    let mut frame =
+                        CompressedFrame::<VideoPacketFormat>::new(format, bytes).unwrap();
                     let raw = frame.raw();
                     assert_eq!(raw.FourCC, codec.outer(tier, protected));
                     let copied = unsafe { copy_video_packet(&raw) }.unwrap();
@@ -2337,7 +2009,8 @@ mod tests {
                             PacketEnvelope::encode(codec, 17, 13, true, &[1, 2], &[3, 4]).unwrap()
                         },
                     );
-                    let mut frame = CompressedVideoFrame::new(format, bytes).unwrap();
+                    let mut frame =
+                        CompressedFrame::<VideoPacketFormat>::new(format, bytes).unwrap();
                     if codec.envelope_codec().is_some() {
                         assert_eq!(frame.envelope().unwrap().reserved(), 0);
                         let raw = frame.raw();
@@ -2357,7 +2030,7 @@ mod tests {
                     // bytes until the synthetic non-owning guard is dropped.
                     let guard =
                         unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
-                    let borrowed = CompressedVideoRef::new(guard).unwrap();
+                    let borrowed = CompressedRef::<VideoPacketFormat>::new(guard).unwrap();
                     let received = borrowed.to_owned();
                     let expected = codec
                         .envelope_codec()
@@ -2375,21 +2048,23 @@ mod tests {
                     AudioCodec::Aac => (1024, testing::aac_packet(48_000, 2, &[1, 2])),
                     AudioCodec::Opus => (960, vec![1, 2]),
                 };
-                let mut frame = CompressedAudioFrame::new(
-                    AudioPacketFormat::new(codec, 48_000, 2, samples).unwrap(),
+                let mut frame = CompressedFrame::<AudioPacketFormat>::new(
+                    AudioPacketFormat::new(codec, 48_000, 2, samples)
+                        .unwrap()
+                        .with_protected(protected),
                     bytes,
                 )
                 .unwrap();
-                frame.format = frame.format.with_protected(protected);
                 let raw = frame.raw();
                 // SAFETY: frame retains all descriptor storage until the
                 // synthetic non-owning guard is dropped.
                 let guard = unsafe { Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}) };
-                let borrowed = CompressedAudioRef::new(guard).unwrap();
+                let borrowed = CompressedRef::<AudioPacketFormat>::new(guard).unwrap();
                 let received = borrowed.to_owned();
                 assert_eq!(borrowed.format(), frame.format());
                 assert_eq!(received.format(), borrowed.format());
-                let sendable = CompressedAudioFrame::try_from(received.clone()).unwrap();
+                let sendable =
+                    CompressedFrame::<AudioPacketFormat>::try_from(received.clone()).unwrap();
                 assert_eq!(sendable.format(), borrowed.format());
                 let expected = (codec == AudioCodec::Aac)
                     .then(|| PacketEnvelope::parse(frame.data()).unwrap());
@@ -2527,7 +2202,8 @@ mod tests {
 
         // A received frame whose descriptor leaves the ratio unset is kept
         // as it is.
-        let mut frame = CompressedVideoFrame::new(format, h264_packet(false, &[])).unwrap();
+        let mut frame =
+            CompressedFrame::<VideoPacketFormat>::new(format, h264_packet(false, &[])).unwrap();
         let raw = frame.raw();
         assert_eq!(raw.picture_aspect_ratio, 0.0);
         let received = unsafe { copy_video_packet(&raw) }.unwrap();
@@ -2558,18 +2234,19 @@ mod tests {
 
     #[test]
     fn rejected_constructors_return_their_input() {
-        let rejected = CompressedVideoFrame::new(h264_format(), vec![7; 20]).unwrap_err();
+        let rejected =
+            CompressedFrame::<VideoPacketFormat>::new(h264_format(), vec![7; 20]).unwrap_err();
         assert_eq!(rejected.into_inner(), vec![7; 20]);
 
         let format = AudioPacketFormat::new(AudioCodec::Opus, 44_100, 2, 960).unwrap();
-        let rejected = CompressedAudioFrame::new(format, vec![1, 2]).unwrap_err();
+        let rejected = CompressedFrame::<AudioPacketFormat>::new(format, vec![1, 2]).unwrap_err();
         assert!(matches!(
             rejected.error(),
             Error::InvalidFrame(crate::FrameDefect::OpusSampleRate)
         ));
         assert_eq!(rejected.into_inner(), [1, 2]);
 
-        let mut frame = CompressedVideoFrame::new(
+        let mut frame = CompressedFrame::<VideoPacketFormat>::new(
             h264_format().with_tier(StreamTier::Preview),
             h264_packet(false, &[]),
         )
@@ -2651,13 +2328,13 @@ mod tests {
     #[test]
     fn protected_aac_preserves_codec_high_bit() {
         let bytes = aac_packet(48_000, 2, &[1]);
-        let mut frame = CompressedAudioFrame::new(
+        let mut frame = CompressedFrame::<AudioPacketFormat>::new(
             AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
             bytes,
         )
         .unwrap();
-        frame.format = frame.format.with_protected(true);
-        let raw = frame.raw();
+        let mut raw = frame.raw();
+        raw.FourCC = AudioCodec::Aac.outer(true);
         let copied = unsafe { copy_audio_packet(&raw) }.unwrap();
         assert_eq!(copied.format().codec(), AudioCodec::Aac);
         assert!(copied.format().is_protected());
@@ -2695,7 +2372,7 @@ mod tests {
     /// whatever its bytes.
     #[test]
     fn delivered_audio_parameters_are_validated_before_they_become_unsigned() {
-        let mut frame = CompressedAudioFrame::new(
+        let mut frame = CompressedFrame::<AudioPacketFormat>::new(
             AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![1; 8],
         )
@@ -2759,21 +2436,21 @@ mod tests {
         ] {
             let format = VideoPacketFormat::new(codec, 1920, 1080).unwrap();
             let bytes = PacketEnvelope::encode(envelope, 0, 0, true, &[1, 2], &[3]).unwrap();
-            let mut frame = CompressedVideoFrame::new(format, bytes).unwrap();
+            let mut frame = CompressedFrame::<VideoPacketFormat>::new(format, bytes).unwrap();
             overwrite(frame.raw().p_data);
             assert_envelope(frame.envelope().unwrap(), envelope, &[3]);
-            let received = ReceivedVideoPacket::from(frame);
+            let received = ReceivedPacket::<VideoPacketFormat>::from(frame);
             assert_envelope(received.envelope().unwrap(), envelope, &[3]);
         }
 
-        let mut frame = CompressedAudioFrame::new(
+        let mut frame = CompressedFrame::<AudioPacketFormat>::new(
             AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
             aac_packet(48_000, 2, &[1, 2]),
         )
         .unwrap();
         overwrite(frame.raw().p_data);
         assert_envelope(frame.envelope().unwrap(), EnvelopeCodec::Aac, &[0x11, 0x90]);
-        let received = ReceivedAudioPacket::from(frame);
+        let received = ReceivedPacket::<AudioPacketFormat>::from(frame);
         assert_envelope(
             received.envelope().unwrap(),
             EnvelopeCodec::Aac,
@@ -2797,25 +2474,26 @@ mod tests {
             let mut video = h264_packet(true, &[2]);
             stamp(&mut video, value);
             assert_eq!(PacketEnvelope::parse(&video).unwrap().reserved(), value);
-            let frame = CompressedVideoFrame::new(format, video).unwrap();
-            ReceivedVideoPacket::from(frame.clone())
+            let frame = CompressedFrame::<VideoPacketFormat>::new(format, video).unwrap();
+            ReceivedPacket::<VideoPacketFormat>::from(frame.clone())
                 .validate_for_send()
                 .unwrap();
 
             let mut audio = aac_packet(48_000, 2, &[1]);
             stamp(&mut audio, value);
-            let frame = CompressedAudioFrame::new(
+            let frame = CompressedFrame::<AudioPacketFormat>::new(
                 AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
                 audio,
             )
             .unwrap();
-            ReceivedAudioPacket::from(frame.clone())
+            ReceivedPacket::<AudioPacketFormat>::from(frame.clone())
                 .validate_for_send()
                 .unwrap();
         }
 
         // As sent: the SDK writes through the pointer the descriptor lends.
-        let mut frame = CompressedVideoFrame::new(format, h264_packet(true, &[2])).unwrap();
+        let mut frame =
+            CompressedFrame::<VideoPacketFormat>::new(format, h264_packet(true, &[2])).unwrap();
         for value in 1..=2u64 {
             let raw = frame.raw();
             // SAFETY: the descriptor lends the frame's own bytes, which hold a
@@ -2830,7 +2508,7 @@ mod tests {
                 PacketEnvelope::parse(frame.data()).unwrap().reserved(),
                 value
             );
-            ReceivedVideoPacket::from(frame.clone())
+            ReceivedPacket::<VideoPacketFormat>::from(frame.clone())
                 .validate_for_send()
                 .unwrap();
         }
@@ -2839,7 +2517,7 @@ mod tests {
     #[test]
     fn video_is_admitted_only_when_the_sdk_delivers_it() {
         let video = |format: VideoPacketFormat, bytes: Vec<u8>| {
-            CompressedVideoFrame::new(format, bytes)
+            CompressedFrame::<VideoPacketFormat>::new(format, bytes)
                 .map(drop)
                 .map_err(Rejected::into_error)
         };
@@ -2930,13 +2608,13 @@ mod tests {
         // and refused when sent: the SDK would drop it without a word.
         let mut packet = aac_packet(48_000, 2, &[1]);
         packet[FLAGS_OFFSET..FLAGS_OFFSET + 4].copy_from_slice(&0u32.to_ne_bytes());
-        let payload = PacketBytes::new(packet.clone()).unwrap();
-        let extents = validate_received_audio(AudioCodec::Aac, payload.view()).unwrap();
-        let received = ReceivedAudioPacket {
-            format: AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024).unwrap(),
-            payload: payload.with_envelope(extents),
-            extras: FrameExtras::default(),
-        };
+        let mut descriptor = AudioPacketFormat::new(AudioCodec::Aac, 48_000, 2, 1024)
+            .unwrap()
+            .descriptor(&FrameExtras::default());
+        descriptor.p_data = packet.as_mut_ptr();
+        descriptor.__bindgen_anon_1.data_size_in_bytes = i32::try_from(packet.len()).unwrap();
+        // SAFETY: packet owns the readable payload without metadata.
+        let received = unsafe { copy_audio_packet(&descriptor) }.unwrap();
         assert!(matches!(
             reason(received.validate_for_send()),
             crate::FrameDefect::AacKeyframeMissing
@@ -3062,7 +2740,9 @@ mod tests {
     /// delivered.
     #[test]
     fn received_frames_keep_their_timecode_and_timestamp() {
-        let mut video = CompressedVideoFrame::new(h264_format(), h264_packet(false, &[])).unwrap();
+        let mut video =
+            CompressedFrame::<VideoPacketFormat>::new(h264_format(), h264_packet(false, &[]))
+                .unwrap();
         video.set_timecode(Timecode::from_ticks(17));
         assert_eq!(video.timestamp(), None);
         let raw = video.raw();
@@ -3077,7 +2757,7 @@ mod tests {
         assert_eq!(received.timestamp(), Some(SdkTimestamp::from_ticks(4242)));
         // Relaying a received frame hands the SDK what it delivered.
         assert_eq!(
-            CompressedVideoFrame::try_from(received.clone())
+            CompressedFrame::<VideoPacketFormat>::try_from(received.clone())
                 .unwrap()
                 .raw()
                 .timestamp,
@@ -3086,7 +2766,7 @@ mod tests {
         let received = unsafe { copy_video_packet(&raw) }.unwrap();
         assert_eq!(received.timestamp(), None);
 
-        let mut audio = CompressedAudioFrame::new(
+        let mut audio = CompressedFrame::<AudioPacketFormat>::new(
             AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![1; 8],
         )
@@ -3106,7 +2786,9 @@ mod tests {
     /// never show in the other.
     #[test]
     fn a_cloned_frame_owns_a_copy_of_its_bytes() {
-        let mut frame = CompressedVideoFrame::new(h264_format(), h264_packet(true, &[2])).unwrap();
+        let mut frame =
+            CompressedFrame::<VideoPacketFormat>::new(h264_format(), h264_packet(true, &[2]))
+                .unwrap();
         frame.set_metadata("<copy/>").unwrap();
         let mut copy = frame.clone();
         assert_eq!(copy.data(), frame.data());
@@ -3119,12 +2801,13 @@ mod tests {
         assert_eq!(copy.data()[RESERVED_OFFSET], 7);
         assert_eq!(frame.data()[RESERVED_OFFSET], 0);
 
-        let mut audio = CompressedAudioFrame::new(
-            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
+        let audio = CompressedFrame::<AudioPacketFormat>::new(
+            AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960)
+                .unwrap()
+                .with_protected(true),
             vec![1; 8],
         )
         .unwrap();
-        audio.format = audio.format.with_protected(true);
         let copy = audio.clone();
         assert_eq!(
             (
@@ -3143,7 +2826,7 @@ mod tests {
         assert!(video.p_data.is_null() && video.p_metadata.is_null());
         assert_eq!(video.timestamp, 0);
 
-        let mut frame = CompressedAudioFrame::new(
+        let mut frame = CompressedFrame::<AudioPacketFormat>::new(
             AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![1; 8],
         )
@@ -3184,18 +2867,21 @@ mod tests {
                 }
             }};
         }
-        check!(CompressedVideoFrame::new(h264_format(), h264_packet(false, &[])).unwrap());
-        check!(CompressedAudioFrame::new(
+        check!(
+            CompressedFrame::<VideoPacketFormat>::new(h264_format(), h264_packet(false, &[]))
+                .unwrap()
+        );
+        check!(CompressedFrame::<AudioPacketFormat>::new(
             AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![1, 2]
         )
         .unwrap());
-        check!(super::super::send::ScatterVideoFrame::new(
+        check!(ScatterFrame::<VideoPacketFormat>::new(
             h264_format(),
             vec![h264_packet(false, &[])]
         )
         .unwrap());
-        check!(super::super::send::ScatterAudioFrame::new(
+        check!(ScatterFrame::<AudioPacketFormat>::new(
             AudioPacketFormat::new(AudioCodec::Opus, 48_000, 2, 960).unwrap(),
             vec![vec![1, 2]]
         )
