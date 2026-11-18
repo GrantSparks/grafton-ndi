@@ -26,35 +26,11 @@ or run `cargo clean -p grafton-ndi` to trigger a rebuild.
 
 ## Finding the runtime
 
-`Ndi::new()` selects and initializes a runtime. The dynamic loader tries:
-
-1. The executable's directory.
-2. An absolute `NDI_RUNTIME_DIR_V6`. Relative values are recorded as refused
-   locations and never searched; the platform loader search still runs.
-3. Platform-specific locations: Windows expands absolute `PATH` directories,
-   then performs a System32-only name lookup; macOS tries `@rpath/<name>` and
-   absolute `DYLD_LIBRARY_PATH` directories; Linux and Android retain their
-   native loader search (`rpath`, `LD_LIBRARY_PATH` and system locations).
-
-On Windows and macOS, the working directory is never added to this search.
-Relative or empty `PATH`/`DYLD_LIBRARY_PATH` entries are recorded as refused
-locations and never opened. On macOS, a relative or empty entry in either
-`DYLD_LIBRARY_PATH` or `DYLD_FALLBACK_LIBRARY_PATH` refuses the entire default
-search before opening a library, including executable and companion candidates.
-In unrestricted macOS processes dyld can use `DYLD_LIBRARY_PATH` to substitute
-an existing explicit file. The crate refuses a substitute
-with `LoadRefusal::ResolvedToAnotherFile`. This identity check follows the native
-load and cannot undo a substitute's initializers. Configure trusted absolute
-`DYLD_LIBRARY_PATH` and `DYLD_FALLBACK_LIBRARY_PATH` entries before launching.
-The crate checks the current process environment at search time, while dyld
-retains its launch-time values; changing `DYLD_*` after launch is unsupported. Native dependencies
-still follow platform loader rules. On Linux and Android, explicitly configured relative
-or empty `LD_LIBRARY_PATH` entries can still name the working directory.
-
-At each location it tries both edition names unless you [request one](#sdk-editions).
-Builds with `advanced`, or with `file-io` on Linux, macOS or Android, try Advanced
-first; other builds try Standard first. Missing, unloadable or incompatible candidates do not stop
-the search.
+`Ndi::new()` loads the first usable library from the executable's directory,
+an absolute `NDI_RUNTIME_DIR_V6`, or the platform's loader locations, in that
+order. Use `RuntimeOptions::library_path` to select an existing absolute file.
+See the [runtime search and trust policy](https://grantsparks.github.io/grafton-ndi/grafton_ndi/runtime/index.html#where-the-runtime-is-loaded-from)
+for edition priority, platform details and path refusals.
 
 | Platform | Standard name | Advanced name |
 | --- | --- | --- |
@@ -63,23 +39,6 @@ the search.
 | macOS | `libndi.dylib` | `libndi_advanced.dylib` |
 | Linux | `libndi.so.6` | `libndi_advanced.so.6` |
 | Android | `libndi.so` | `libndi_advanced.so` |
-
-An absolute `RuntimeOptions::library_path` or `FileApiOptions::library_path`
-must name an existing file. The crate refuses a missing file before calling
-the platform loader. Relative paths return `Error::InvalidInput`. `RuntimeLoadFailed` lists attempted paths and errors;
-failed selection can be retried. A successful selection lasts for the process.
-A different path or incompatible edition then returns `RuntimeConflict`.
-
-On dynamically loaded non-Apple ELF targets, including Linux and Android, a
-runtime already linked or preloaded into the process's global symbol scope must
-also be the selected runtime. Other runtime candidates are refused before they
-are opened; an explicit different file returns
-`SelectionConflict::ForeignRuntimeInScope`. The diagnostic names the runtime
-already in scope. Select that file, or stop linking or preloading the other
-runtime. The same check protects the separate File library's runtime binding.
-
-Rejected libraries that loaded also stay resident. A platform search may resolve
-to the rejected module again; remove or fix that library, or select an exact path.
 
 ## Selecting a runtime
 
@@ -149,31 +108,10 @@ fields for decisions and `Display` for diagnostics.
 
 ## Deploy an application
 
-Package the runtime explicitly; a dynamically loaded library is not a static
-link dependency. **Default search trusts every searched directory:** loading
-native code executes its constructors before symbols or edition can be checked,
-even for rejected candidates. Windows and macOS do not implicitly search the
-working directory; their environment search entries must be absolute. Linux
-and Android retain the native loader's environment search. For a service,
-select an absolute path in an
-application-owner-controlled directory before another component selects a runtime:
-
-```rust
-use grafton_ndi::{Ndi, RuntimeOptions};
-
-fn main() -> grafton_ndi::Result<()> {
-    let ndi = Ndi::with_options(&RuntimeOptions::new()
-        .library_path("/opt/my-service/ndi/libndi.so.6"))?;
-    println!("Runtime: {:?}", ndi.info().library_path());
-    Ok(())
-}
-```
-
-That selection has no fallback. Native dependencies still follow platform loader
-rules and need trusted locations. File API users must also select an absolute
-`FileApiOptions::library_path` or trust all its search directories, starting
-with the core runtime's companion directory. Inspect `FileApi::library_path`;
-see [File library deployment](file-io.md#requirements).
+Include the runtime library and any native dependencies in your deployment.
+For File applications, include the companion File library and follow the
+[File library requirements](file-io.md#requirements). Check the selected
+paths through `RuntimeInfo::library_path` and `FileApi::library_path`.
 
 ## Supported NDI versions and platforms
 

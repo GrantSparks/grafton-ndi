@@ -27,9 +27,14 @@ pub enum StateConflict {
     #[error("finish the previous session before starting another")]
     PreviousSessionOpen,
     /// The session ended with incomplete file tracking after native event
-    /// loss, unreadable lifecycle evidence or a tracking limit. Only a
-    /// successful [`FileRecorder::reset`](super::FileRecorder::reset) replaces the native
-    /// recorder and permits another session, even if every known file closes.
+    /// loss, unreadable lifecycle evidence or a tracking limit. Even after
+    /// every known file closes, unknown files may still be open and cleanup
+    /// uses the remaining [`FileRecorderOptions::drop_wait`] budget. Later
+    /// events do not change the indeterminate report. Start another session
+    /// only after a successful [`FileRecorder::reset`](super::FileRecorder::reset)
+    /// replaces the recorder. A failed reset preserves the recorder and its
+    /// cleanup obligation. Eviction from the async application event queue
+    /// does not affect native file tracking.
     #[error("file tracking is incomplete; reset the recorder before starting another session")]
     IncompleteFileTracking,
     /// Events from an earlier session kept arriving, so a new session was not
@@ -463,11 +468,10 @@ impl FileRecorderOptions {
     /// closure events after it returns. Synchronous
     /// [`FileRecorder::finish`](super::FileRecorder::finish) instead starts its
     /// wait after the stop returns, giving closure its full requested wait.
-    /// Cleanup ends early only when complete tracking establishes every file
-    /// closed. Native event loss, unreadable lifecycle evidence or a tracking
-    /// limit leaves an unknown cleanup obligation: even after every known file
-    /// closes, cleanup consumes the remaining original budget. The final
-    /// indeterminate report does not change. `Duration::ZERO` waits for no future events:
+    /// Async close shares its budget with any finish or wait already submitted.
+    /// Cleanup can end early once there are no known files left to finalize,
+    /// subject to [`StateConflict::IncompleteFileTracking`]. `Duration::ZERO`
+    /// waits for no future events:
     /// the stop is requested and a bounded nonblocking drain takes queued
     /// events before destruction. [`FileRecorder::abandon`](super::FileRecorder::abandon)
     /// takes no events.

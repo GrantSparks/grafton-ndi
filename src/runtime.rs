@@ -58,8 +58,9 @@
 //! # }
 //! ```
 //!
-//! An explicit path must name an existing file. If it does not, the crate
-//! refuses it without calling the platform loader. The crate makes no
+//! An explicit path must be absolute and name an existing file. A relative
+//! path returns [`Error::InvalidInput`]. An absent file returns an absent-path
+//! refusal before calling the platform loader. The crate makes no
 //! executable, environment or platform search for an explicit path. A later
 //! explicit selection cannot undo code already run by an earlier load. Native
 //! dependencies still use platform loader rules and must also come from
@@ -78,6 +79,8 @@
 //!    followed by a System32-only name lookup; on macOS, `@rpath/<name>` and
 //!    absolute `DYLD_LIBRARY_PATH` directories; on Linux and Android, the
 //!    native loader search (`rpath`, `LD_LIBRARY_PATH` and system locations).
+//!    Explicitly configured relative or empty `LD_LIBRARY_PATH` entries can
+//!    still name the working directory on Linux and Android.
 //!
 //! Windows and macOS never add the working directory to this search. Relative
 //! or empty `PATH`/`DYLD_LIBRARY_PATH` entries are recorded as refused locations.
@@ -87,8 +90,9 @@
 //! its launch-time values, so changing `DYLD_*` after launch is unsupported.
 //! On unrestricted macOS processes dyld can use `DYLD_LIBRARY_PATH` to
 //! substitute an existing explicit file. Such substitutions are refused with
-//! [`crate::LoadRefusal::ResolvedToAnotherFile`]. Native dependencies still
-//! follow platform loader rules.
+//! [`crate::LoadRefusal::ResolvedToAnotherFile`] after loading the candidate,
+//! when its initializers have already run. Configure trusted absolute
+//! `DYLD_*` entries before launching.
 //!
 //! Each location is tried for the file names of both SDK editions, for
 //! example `libndi.so.6` and `libndi_advanced.so.6` on Linux, unless
@@ -852,11 +856,8 @@ impl Ndi {
     /// This is [`Runtime::select`] with the default [`RuntimeOptions`]
     /// followed by [`Runtime::initialize`]. It is thread-safe: the first
     /// handle starts NDI and later calls add handles to the running runtime.
-    /// The default search trusts every searched directory: native constructors
-    /// run before validation, including for rejected candidates. Services and
-    /// elevated processes should make their first selection through
-    /// [`Self::with_options`] with an absolute [`RuntimeOptions::library_path`]
-    /// under application-owner control.
+    /// See the [search and trust policy](crate::runtime#where-the-runtime-is-loaded-from)
+    /// before selecting a runtime in a service or elevated process.
     ///
     /// # Errors
     ///

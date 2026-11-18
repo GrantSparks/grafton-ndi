@@ -143,19 +143,10 @@ pub(super) enum CleanupRequest {
 ///
 /// # Finishing
 ///
-/// The SDK finalizes a file only between the stop request and its file-closed
-/// event. [`finish`](Self::finish) performs both and reports the outcome;
-/// treat a recording as complete only when it returns
-/// [`SessionEnd::Closed`]. Dropping a recorder waits up to
-/// [`FileRecorderOptions::drop_wait`] while the session is open or file cleanup
-/// remains pending, including after an indeterminate outcome. Native event
-/// loss, unreadable lifecycle evidence or a tracking limit makes the file set
-/// incomplete. Even if every known file closes, drop then consumes the
-/// remaining original budget and another session requires [`reset`](Self::reset).
-/// This budget starts at drop and includes the native stop; synchronous
-/// `finish` starts its event wait after the stop returns.
-/// Drop cannot report whether cleanup succeeded;
-/// [`abandon`](Self::abandon) skips the wait.
+/// [`finish`](Self::finish) requests a stop and waits for closure events. Check
+/// [`RecordingReport::closure_confirmed`] and the report's error counters.
+/// Drop follows [`FileRecorderOptions::drop_wait`]; [`abandon`](Self::abandon)
+/// skips that wait. See [`StateConflict::IncompleteFileTracking`] for recovery.
 ///
 /// # What a closed file means
 ///
@@ -308,8 +299,7 @@ impl FileRecorder {
     ///   while an earlier session is recording, stopping, awaiting a known
     ///   file's closure under complete tracking; finish or poll it first.
     ///   [`StateConflict::IncompleteFileTracking`] after a session ends with
-    ///   incomplete tracking; [`reset`](Self::reset) is required even after
-    ///   every known file closes. [`StateConflict::EarlierSessionEvents`]
+    ///   incomplete tracking. [`StateConflict::EarlierSessionEvents`]
     ///   when the SDK keeps reporting events of an earlier session.
     /// * [`Error::InvalidInput`] when the resolved output path is not lossless
     ///   UTF-8, or its longest form exceeds the recorder event's exact path
@@ -646,12 +636,9 @@ impl FileRecorder {
     /// Abandon this native recorder and replace it with a new idle recorder.
     ///
     /// Use this after a finalization timeout when the SDK stopped producing
-    /// events, or after native event loss, unreadable lifecycle evidence or a
-    /// tracking limit made the old session's file tracking incomplete. Incomplete
-    /// tracking causes [`StateConflict::IncompleteFileTracking`] on another
-    /// start after the session ends, even if all known files later close. A
-    /// successful reset clears that refusal. The returned
-    /// report preserves that uncertainty; the old file may be truncated.
+    /// events, or to recover from [`StateConflict::IncompleteFileTracking`].
+    /// The returned report preserves what was known about the old session.
+    /// An unfinished file can be left truncated.
     /// The replacement has its own event queue, so delayed events from the old
     /// session cannot affect a new recording. The last report is retained and
     /// session numbers continue increasing across resets.

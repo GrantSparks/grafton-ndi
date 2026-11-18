@@ -812,9 +812,12 @@ impl<E: Send> Expire for EventQueue<E> {
 /// [`Error::InvalidState`] and [`StateConflict::WaiterPending`]. Once the
 /// handle is closed and every queued event has been taken, the future fails
 /// with [`StateConflict::Closed`], or with [`StateConflict::OwnerFailed`] when the
-/// thread failed; that happens as soon as the handle's thread stops taking
-/// events, before the native object is destroyed. Dropping the
-/// future does not stop events from being pumped.
+/// thread failed. When recorder shutdown begins with no submitted
+/// [`finish`](AsyncFileRecorder::finish) or
+/// [`wait_for_finish`](AsyncFileRecorder::wait_for_finish) pending, the queue
+/// closes immediately. Cleanup events, including the last file-closed event,
+/// are never added to that queue. Await `finish` before `close` to observe them.
+/// Dropping the future leaves event pumping active.
 /// Executor callbacks run on File threads; a handle's last clone dropped
 /// there requests shutdown without waiting for native cleanup.
 ///
@@ -2225,15 +2228,10 @@ impl AsyncFilePlayer {
 /// operation before receiving the handle requests cleanup without waiting.
 ///
 /// Dropping the last clone **blocks the dropping thread** until the
-/// recorder's thread has finished: it stops a session that is still open,
-/// waits for the SDK to finalize the file within one
-/// [`FileRecorderOptions::drop_wait`] budget measured from drop and including
-/// the native stop, then destroys the recorder. This is deliberate: when the drop
-/// returns, the file is finalized as far as the SDK reported within that
-/// wait, even when the drop happens as the program exits. The outcome cannot
-/// be reported. A caller that must not block, such as a task on an async
-/// executor, awaits [`close`](Self::close) instead, which does the same
-/// without blocking; dropping the clones afterwards does not block.
+/// recorder's thread has finished. Its cleanup follows
+/// [`FileRecorderOptions::drop_wait`]. Await [`close`](Self::close) to perform
+/// that cleanup without blocking the executor.
+///
 /// While a submitted close or abandon still has a live future, last-clone drop does not
 /// wait because that future reports completion. Dropping the future makes the
 /// last-clone drop wait for cleanup again.
@@ -2291,9 +2289,8 @@ impl AsyncFileRecorder {
     /// Events left by an earlier refused start are delivered through
     /// [`next_event`](Self::next_event) before the new session begins.
     /// A recording or stopping session returns [`StateConflict::PreviousSessionOpen`].
-    /// After it ends, incomplete file tracking returns
-    /// [`StateConflict::IncompleteFileTracking`] until [`reset`](Self::reset)
-    /// succeeds, even if all known files closed.
+    /// After it ends, see [`StateConflict::IncompleteFileTracking`] for when
+    /// a new session requires a reset.
     #[doc(alias = "NDIlib_file_recorder_start")]
     #[doc(alias = "NDIlib_file_recorder_start_with_timecode")]
     pub fn start(
@@ -2331,10 +2328,9 @@ impl AsyncFileRecorder {
     /// existing waits to restore admission; cancellation is reclaimed by the
     /// owner. Ordinary commands and explicit stop requests remain available.
     ///
-    /// If another clone closes the recorder during the wait, this wait ends
-    /// at [`FileRecorderOptions::drop_wait`] from that close's
-    /// submission, including the native stop, or this wait's deadline if earlier. Closure established in
-    /// that time is reported normally; an unsettled session reports
+    /// If another clone closes the recorder during the wait, the
+    /// [`FileRecorderOptions::drop_wait`] deadline can end the wait early.
+    /// Closure established in that time is reported normally; an unsettled session reports
     /// [`StateConflict::Closed`] instead of [`FinishStatus::TimedOut`], because
     /// the recorder is being destroyed and cannot be waited on again.
     ///
@@ -2503,17 +2499,11 @@ impl AsyncFileRecorder {
     /// Stop an open session, destroy the recorder and end its thread, for
     /// every clone of this handle.
     ///
-    /// A session that is still open is stopped and given up to
-    /// [`FileRecorderOptions::drop_wait`] from this close's submission to finalize
-    /// its file, including the native stop and time spent in a submitted finish
-    /// or wait. A finish, queued or running, keeps its own earlier deadline; destruction then uses
-    /// only the remainder of the close's budget. Pending files are given that
-    /// time even after an indeterminate report. Incomplete tracking consumes
-    /// that remainder even if every known file closes: late events cannot prove
-    /// the unknown files finalized or change the final report. The future
-    /// completes when the SDK has destroyed the recorder, and does not say
-    /// whether the file was finalized: await [`finish`](Self::finish) first to
-    /// learn that. Nothing blocks the calling thread. Once submitted by polling
+    /// Shutdown follows [`FileRecorderOptions::drop_wait`]. A submitted
+    /// [`finish`](Self::finish) or [`wait_for_finish`](Self::wait_for_finish)
+    /// keeps its own earlier deadline. The future completes when the SDK has
+    /// destroyed the recorder. Await [`finish`](Self::finish) first to learn
+    /// whether the SDK confirmed closure. Once submitted by polling
     /// or calling [`FileOperation::submit`], the close runs even if its future
     /// is dropped. Closing again, from this or another clone,
     /// while or after it runs completes at the same time, with the same

@@ -653,7 +653,7 @@ pub enum HdrPolicy {
     /// [`ReceiverColorFormat::Best`](crate::ReceiverColorFormat::Best) to keep
     /// them. The tag still decides HDR refusal and the PNG `cICP` chunk.
     ///
-    /// JPEG and WebP refuse such a frame with [`Error::InvalidInput`].
+    /// JPEG and WebP refuse such a frame with [`Error::InvalidInput`](crate::Error::InvalidInput).
     CodeValues,
 }
 

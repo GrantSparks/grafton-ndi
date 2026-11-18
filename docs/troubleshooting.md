@@ -11,15 +11,11 @@ can also describe problems other than an absent file. `RuntimeConflict(failure)`
 exposes its `SelectionConflict` through `failure.kind()` and retains the library
 and paths involved. Its `Display` gives the diagnostic text.
 
-Use absolute paths for `library_path` and `NDI_RUNTIME_DIR_V6`. A relative
-explicit path returns `Error::InvalidInput` before selection on every target.
-A relative environment directory is recorded as refused and never opened;
-the search continues with the platform loader.
-
-For `RuntimeLoadFailed`, inspect the attempted paths and errors, then check the
-[runtime search order](setup.md#finding-the-runtime). An absolute
-`RuntimeOptions::library_path` selects one file without fallback. Verify its
-architecture and dependencies as well as its name.
+For `RuntimeLoadFailed`, inspect the attempted paths and verify the library's
+architecture and dependencies. Consult the
+[runtime search policy](https://grantsparks.github.io/grafton-ndi/grafton_ndi/runtime/index.html#where-the-runtime-is-loaded-from)
+or the [File library search policy](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/index.html#where-the-file-library-is-loaded-from),
+depending on the diagnostic's library.
 
 For `RuntimeConflict(failure)`, inspect `failure.kind()`, `selected()`,
 `requested()` and `foreign_module()` alongside the selected runtime edition.

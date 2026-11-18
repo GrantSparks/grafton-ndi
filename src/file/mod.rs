@@ -1,11 +1,16 @@
 //! Recording NDI sources to disk and playing recordings back, through the NDI
 //! File library.
 //!
+//! # Supported targets
+//!
 //! Enabled by `file-io`, independently of the `advanced` Cargo feature. The
 //! File ABI is included, so desktop and Android builds need no Advanced
-//! headers or `libclang`. Linux, macOS and Android still require the native
-//! Advanced runtime with the shipped 6.4.0.2 File binaries; 64-bit Windows
-//! supports either runtime edition. Both SDK editions distribute the File API.
+//! headers or `libclang`. On Linux, macOS and Android, the 6.4.0.2 File
+//! library imports the Advanced runtime's entry points and is refused before
+//! loading beside a Standard runtime. Select the runtime through
+//! [`RuntimeOptions::edition`](crate::RuntimeOptions::edition). The Windows
+//! File library ships for 64-bit Windows and supports either runtime edition.
+//! Apple mobile targets link the File archive at build time.
 //!
 //! The File library is a separate native library that accompanies the NDI
 //! runtime. [`FileApi::new`] finds it when it is first needed; nothing else in
@@ -21,29 +26,14 @@
 //!
 //! # Where the File library is loaded from
 //!
-//! An explicit [`FileApiOptions::library_path`] must name an existing file.
-//! The crate refuses a missing file before calling the platform loader.
-//! With no explicit path, the first usable library in this order is selected:
+//! An explicit [`FileApiOptions::library_path`] selects a single file. The default
+//! search tries the selected NDI runtime's directory first, followed by the
+//! executable's directory, the absolute `NDI_RUNTIME_DIR_V6` and the platform
+//! loader locations, in that order.
 //!
-//! 1. the directory of the selected NDI runtime library, where the SDK installs it;
-//! 2. the directory containing the running executable;
-//! 3. the absolute directory named by `NDI_RUNTIME_DIR_V6`; relative values
-//!    are recorded as refused locations and never searched;
-//! 4. platform-specific locations: Windows expands absolute `PATH` directories,
-//!    then performs a System32-only name lookup; macOS tries `@rpath/<name>`
-//!    and absolute `DYLD_LIBRARY_PATH` directories; Linux and Android retain
-//!    the native loader search (`rpath`, `LD_LIBRARY_PATH` and system locations).
-//!
-//! Windows and macOS never add the working directory to this search. Relative
-//! or empty `PATH`/`DYLD_LIBRARY_PATH` entries are recorded as refused locations.
-//! On macOS, a relative or empty entry in either `DYLD_LIBRARY_PATH` or
-//! `DYLD_FALLBACK_LIBRARY_PATH` refuses the entire default search before opening
-//! a library. The check reads the process environment at search time; dyld uses
-//! its launch-time values, so changing `DYLD_*` after launch is unsupported.
-//! In unrestricted macOS processes dyld can use `DYLD_LIBRARY_PATH` to
-//! substitute an existing explicit file. The crate refuses a substitute with
-//! [`crate::LoadRefusal::ResolvedToAnotherFile`]. Native dependencies still
-//! follow platform loader rules.
+//! The [runtime search policy](crate::runtime#where-the-runtime-is-loaded-from)
+//! also governs File library paths, platform locations, relative environment
+//! entries and dyld behavior. Use trusted libraries and dependencies.
 //!
 //! When nothing is usable, [`Error::RuntimeLoadFailed`] carries a
 //! [`crate::LoadFailure`] for [`crate::LibraryKind::File`], with each attempted
@@ -51,15 +41,6 @@
 //! native code loaded before being refused. `Display` retains the diagnostic
 //! text for each attempt, including the operating system's reason. Like the NDI runtime, a
 //! loaded File library stays selected and loaded for the life of the process.
-//!
-//! On Linux, macOS and Android the 6.4.0.2 File library imports the NDI runtime's entry
-//! points from the **Advanced** SDK runtime, so it can only be used when that is
-//! the selected runtime (see [`RuntimeOptions::edition`](crate::RuntimeOptions::edition)).
-//! Beside a Standard runtime it is refused with [`Error::RuntimeConflict`]
-//! before anything is loaded. The
-//! Windows File library imports nothing from the NDI runtime, so it is not tied
-//! to an edition; the SDK ships it for 64-bit Windows only. Apple mobile targets
-//! link the File archive at build time.
 //!
 //! A library that loads but cannot be used stays loaded. If the platform
 //! loader's own search then matches the library name to that module, it returns
@@ -83,31 +64,11 @@
 //!
 //! # Finishing a recording
 //!
-//! The SDK finalizes a file asynchronously after a stop request and reports it
-//! with a file-closed event. [`FileRecorder::finish`] requests the stop, waits
-//! for that event and returns a [`FinishStatus`]; treat a recording as complete
-//! only when it is [`SessionEnd::Closed`], and inspect the [`RecordingReport`]
-//! for errors during the session. [`RecordingReport::stopped_by_sdk`] says
-//! whether the SDK ended the session before it was asked to stop. Dropping a
-//! recorder whose session is still open requests the stop and waits within
-//! [`FileRecorderOptions::drop_wait`], but cannot report the outcome. This
-//! budget starts at drop (or async close submission) and includes the native
-//! stop; after it returns, only the remaining budget is available for events.
-//! Synchronous [`FileRecorder::finish`] instead measures its event wait from
-//! the stop's return, giving finalization the full requested wait.
-//! Native event loss, unreadable lifecycle evidence or exhaustion of bounded
-//! file bookkeeping makes tracking incomplete. Cleanup then consumes its
-//! remaining original budget even if every known file closes. Neither an empty
-//! known file set nor a stopped recorder proves that unknown files finalized.
-//! The indeterminate report stays unchanged. After the session ends, another
-//! start returns [`StateConflict::IncompleteFileTracking`] until
-//! [`FileRecorder::reset`] succeeds. Async application-notification eviction does not
-//! affect the separately maintained native file tracking.
-//!
-//! After a finalization timeout, [`FileRecorder::reset`] explicitly abandons
-//! the uncertain session and replaces its native instance. The old report is
-//! returned without confirmation of closure; a new event queue keeps late
-//! events from being attributed to the replacement's next session.
+//! [`FileRecorder::finish`] requests a stop and waits for closure events. See
+//! [`RecordingReport::closure_confirmed`] for what the SDK confirms and check
+//! the report's error counters. Drop and async close follow
+//! [`FileRecorderOptions::drop_wait`]. When file tracking becomes incomplete,
+//! follow [`StateConflict::IncompleteFileTracking`] before restarting.
 //!
 //! # Limits of the NDI 6.4 File library
 //!
