@@ -546,12 +546,16 @@ def obligations(msrv, features, miri_groups):
         ''',
         condition="contains(matrix.package, 'advanced')",
     )
+    table['rust.yml', 'sdk', 'Build the Linux HX decoder'] = Obligation(
+        r'''
+        bash ci/build-hx-decoder.sh "$RUNNER_TEMP/ndi-hx-decoder"
+        echo "LD_LIBRARY_PATH=$RUNNER_TEMP/ndi-hx-decoder/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+        ''',
+        condition="matrix.package == 'current-advanced-linux'",
+    )
     table['rust.yml', 'sdk', 'Provision the SDK'] = Obligation(
         r'''
         python ci/sdk.py install "$PACKAGE" --dest "$RUNNER_TEMP/ndi-sdk" --target "$TARGET" --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT"
-        if [ -n "${{ matrix.hx-driver }}" ]; then
-          python ci/sdk.py install-driver "${{ matrix.hx-driver }}" --sdk "$RUNNER_TEMP/ndi-sdk" --target "$TARGET"
-        fi
         if [ "${{ matrix.role }}" != primary ]; then
           python ci/sdk.py install "${{ matrix.compatibility }}" --dest "$RUNNER_TEMP/ndi-compat" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-standard.env"
           python ci/sdk.py install "${{ matrix.compatibility-advanced }}" --dest "$RUNNER_TEMP/ndi-compat-advanced" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-advanced.env"

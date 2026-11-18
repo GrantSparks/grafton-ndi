@@ -3,8 +3,6 @@
 
     python ci/sdk.py install current-standard-linux --dest /tmp/ndi \\
         --target x86_64-unknown-linux-gnu [--archive FILE] [--github-env FILE]
-    python ci/sdk.py install-driver current-hx-driver-linux --sdk /tmp/ndi \\
-        --target x86_64-unknown-linux-gnu [--archive FILE]
     python ci/sdk.py list
 
 The archive comes from --archive or from the private source map in

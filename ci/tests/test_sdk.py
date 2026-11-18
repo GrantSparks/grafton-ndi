@@ -109,14 +109,6 @@ class Pins(unittest.TestCase):
                 self.assertIn(pins[name]['edition'], name)
         self.assertEqual(len({pin['sha256'] for pin in pins.values()}), len(pins))
 
-    def test_checked_in_driver_accompanies_the_current_linux_sdk(self):
-        pins = sdk.load_pins()
-        drivers = {name for name, pin in pins.items() if 'driver' in pin}
-        self.assertEqual(drivers, {'current-hx-driver-linux'})
-        driver = pins['current-hx-driver-linux']
-        self.assertEqual((driver['driver'], driver['platform'], driver['version']),
-                         ('hx', 'linux', pins['current-advanced-linux']['version']))
-
     def test_malformed_pin_is_rejected(self):
         good = {'version': '6.4.0.2', 'edition': 'standard', 'platform': 'linux', 'size': 1, 'sha256': 'a' * 64}
         driver = {**{k: v for k, v in good.items() if k != 'edition'}, 'driver': 'hx'}
