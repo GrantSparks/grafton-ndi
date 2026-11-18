@@ -379,30 +379,58 @@ fn the_longest_exact_event_path_records_closes_and_starts_again() {
 #[test]
 fn absolute_recording_names_survive_a_working_directory_change() {
     const CHANGED_DIRECTORY: &str = "GRAFTON_NDI_TEST_RECORDING_CHANGED_DIRECTORY";
+    const SOURCE_URL: &str = "GRAFTON_NDI_TEST_RECORDING_SOURCE_URL";
+    const FORMAT_REQUEST: &str = "format-requested";
     let Some(changed_directory) = std::env::var_os(CHANGED_DIRECTORY) else {
-        // The child can change process-wide state without racing other tests.
+        let Some((ndi, _)) = file_api() else {
+            return;
+        };
+        // Discover the sender in the test runner. The child can connect
+        // directly even when discovery is unavailable there, and can change
+        // its own working directory without racing other tests.
+        let source = LiveSource::start(&ndi, "recording-cwd");
         let scratch = FixtureDir::create("recording-cwd");
         let original = scratch.join("original");
         let changed = scratch.join("changed");
         std::fs::create_dir(&original).unwrap();
         std::fs::create_dir(&changed).unwrap();
-        let output = crate::test_support::TestChild::new(
-            "file::sdk_tests::absolute_recording_names_survive_a_working_directory_change",
-        )
-        .current_dir(original)
-        .env(CHANGED_DIRECTORY, changed)
-        .run();
+        let request = scratch.join(FORMAT_REQUEST);
+        let output = thread::scope(|scope| {
+            let (done, wait_for_done) = std::sync::mpsc::channel::<()>();
+            let source = &source;
+            scope.spawn(move || {
+                while !request.try_exists().unwrap() {
+                    if !matches!(
+                        wait_for_done.recv_timeout(Duration::from_millis(10)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        return;
+                    }
+                }
+                source.change_format();
+            });
+            let output = crate::test_support::TestChild::new(
+                "file::sdk_tests::absolute_recording_names_survive_a_working_directory_change",
+            )
+            .current_dir(original)
+            .env(CHANGED_DIRECTORY, changed)
+            .env(SOURCE_URL, source.spec.url().unwrap())
+            .run();
+            drop(done);
+            output
+        });
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
         return;
     };
-    let Some((ndi, api)) = file_api() else {
+    let Some((_ndi, api)) = file_api() else {
         return;
     };
-    let source = LiveSource::start(&ndi, "recording-cwd");
+    let source = SourceSpec::from_url(std::env::var(SOURCE_URL).unwrap()).unwrap();
+    let changed_directory = PathBuf::from(changed_directory);
     let original = std::env::current_dir().unwrap();
     let target = RecordingTarget::new("take").unwrap();
     let recorder = |pattern| {
-        let options = FileRecorderOptions::new(source.spec.clone())
+        let options = FileRecorderOptions::new(source.clone())
             .naming(FileNaming::Pattern(pattern))
             .proxy(false)
             .tracks(MediaTypes::VIDEO);
@@ -455,7 +483,7 @@ fn absolute_recording_names_survive_a_working_directory_change() {
     assert_event_path(recorder.reported_current_file().unwrap(), &first);
 
     std::env::set_current_dir(&changed_directory).unwrap();
-    source.change_format();
+    std::fs::write(changed_directory.with_file_name(FORMAT_REQUEST), []).unwrap();
     let mut timeline = Timeline::new();
     assert_eq!(timeline.await_change(&mut recorder, 0, &first), second);
     assert_event_path(recorder.reported_current_file().unwrap(), &second);
