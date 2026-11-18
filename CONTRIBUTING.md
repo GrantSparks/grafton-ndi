@@ -32,6 +32,9 @@ audit reports and measured results on the relevant GitHub issue. Include the
 workload, environment and limits with performance results; repository docs
 should explain how to use and maintain the library.
 
+Module examples follow the obligations documented by their module and link to
+the runnable example that covers the full workflow.
+
 Keep build outputs, test logs, recordings and reproducible fixture outputs out
 of Git. Commit generators and generate their outputs in temporary directories
 or under `target/`. Compile-failure `.stderr` files are reviewed expectations

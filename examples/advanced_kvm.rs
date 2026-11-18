@@ -18,7 +18,8 @@ use std::{
 };
 
 use grafton_ndi::{
-    advanced::MouseButton, Error, FrameSync, FrameSyncAudioRequest, Ndi, Receiver, ReceiverOptions,
+    advanced::{FrameSyncCapture, KvmSession, MouseButton},
+    Error, FrameSync, FrameSyncAttached, FrameSyncAudioRequest, Ndi, Receiver, ReceiverOptions,
     RuntimeOptions, ScanType, SdkEdition,
 };
 
@@ -52,13 +53,31 @@ fn main() -> Result<(), Error> {
     let mut session = controls.kvm()?;
     // The restricted receiver view keeps shared controls and metadata capture
     // available while the session holds the connection's exclusive borrow.
-    let receiving = session.receiver();
-    println!("KVM target: {}", receiving.connection_target());
+    println!("KVM target: {}", session.receiver().connection_target());
     if !session.is_supported() {
         println!("This source does not offer remote control");
         return Ok(());
     }
 
+    let drag = drag_pointer(&capture, &mut session);
+    let release = session.release_all();
+    if let Err(error) = &drag {
+        eprintln!("Drag failed: {error}");
+    }
+    if let Err(error) = &release {
+        eprintln!("Could not release held input: {error}");
+    }
+    drag.and(release)?;
+    // To change source, end this session and outstanding split/frame borrows
+    // first, connect through sync.receiver(), then start a new session.
+    println!("Dragged, and nothing is left pressed");
+    Ok(())
+}
+
+fn drag_pointer(
+    capture: &FrameSyncCapture<'_>,
+    session: &mut KvmSession<'_, FrameSyncAttached>,
+) -> Result<(), Error> {
     // Drag from the left of the source's screen to the right. The button
     // stays down while the independent capture view samples clocked output.
     // This demonstration samples output every 100 ms: 4,800 samples at 48 kHz.
@@ -71,7 +90,7 @@ fn main() -> Result<(), Error> {
         // The frame stays borrowed from the receiver while input is sent.
         let frame = capture.capture_video_ref(ScanType::Progressive)?;
         let audio = capture.capture_audio_ref(audio_request)?;
-        if !receiving.is_connected() {
+        if !session.receiver().is_connected() {
             println!("Source disconnected");
         }
         if let Some(frame) = &frame {
@@ -83,11 +102,5 @@ fn main() -> Result<(), Error> {
         drop(frame);
         thread::sleep(Duration::from_millis(100).saturating_sub(tick.elapsed()));
     }
-    session.mouse_up(MouseButton::Left)?;
-
-    session.release_all()?;
-    // To change source, end this session and outstanding split/frame borrows
-    // first, connect through sync.receiver(), then start a new session.
-    println!("Dragged, and nothing is left pressed");
-    Ok(())
+    session.mouse_up(MouseButton::Left)
 }

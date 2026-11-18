@@ -101,6 +101,9 @@
 //! }
 //! # }
 //! ```
+//!
+//! See [mixed_media_async.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/mixed_media_async.rs)
+//! for a runnable async discovery and capture loop.
 
 use std::{
     future::Future,
@@ -917,6 +920,9 @@ pub mod tokio {
     //!     Ok(())
     //! }
     //! ```
+    //!
+    //! See [mixed_media_async.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/mixed_media_async.rs)
+    //! for a complete Tokio example.
 
     /// An [`AsyncReceiver`](super::AsyncReceiver) on the Tokio runtime.
     pub type AsyncReceiver = super::AsyncReceiver<super::Tokio>;
@@ -961,6 +967,9 @@ pub mod smol {
     //!     })
     //! }
     //! ```
+    //!
+    //! See [mixed_media_async.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/mixed_media_async.rs)
+    //! for a complete smol example.
 
     /// An [`AsyncReceiver`](super::AsyncReceiver) on the smol runtime.
     pub type AsyncReceiver = super::AsyncReceiver<super::Smol>;

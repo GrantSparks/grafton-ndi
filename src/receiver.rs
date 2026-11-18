@@ -7,12 +7,13 @@
 //! event; that event reports SDK status information, such as source capabilities:
 //!
 //! ```no_run
-//! # use grafton_ndi::{Ndi, Receiver, ReceiverEvent, ReceiverOptions, ReceiverBandwidth, Source};
+//! # use grafton_ndi::{Finder, FinderOptions, Ndi, Receiver, ReceiverEvent, ReceiverOptions, ReceiverBandwidth};
 //! # use std::time::Duration;
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! # let ndi = Ndi::new()?;
-//! # let source = Source::new("CAMERA (Program)").unwrap();
-//! // In real usage, obtain the source from Finder::find_sources().
+//! # let finder = Finder::new(&ndi, &FinderOptions::new())?;
+//! # let Some(source) = finder.find_source_by_name("CAMERA (Program)", Duration::from_secs(5))?
+//! # else { return Ok(()); };
 //! let options = ReceiverOptions::new(source).bandwidth(ReceiverBandwidth::MetadataOnly);
 //! let receiver = Receiver::new(&ndi, &options)?;
 //!
@@ -27,6 +28,9 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! See [status_monitor.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/status_monitor.rs)
+//! for a runnable connection monitor.
 
 #[cfg(test)]
 use crate::RuntimeFeature;
@@ -787,9 +791,9 @@ impl ReceiverOptions {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let ndi = Ndi::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.watch().wait_for_change(Duration::from_secs(1))?;
-    /// # let sources = finder.current_sources()?;
-    /// let options = ReceiverOptions::snapshot_preset(sources[0].clone()).name("Snapshot Receiver");
+    /// # let Some(source) = finder.find_sources(Duration::from_secs(1))?.into_iter().next()
+    /// # else { return Ok(()); };
+    /// let options = ReceiverOptions::snapshot_preset(source).name("Snapshot Receiver");
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// // Capture and encode in one line (requires image-encoding feature)
@@ -834,10 +838,10 @@ impl ReceiverOptions {
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.watch().wait_for_change(Duration::from_secs(1))?;
-    /// # let sources = finder.current_sources()?;
+    /// # let Some(source) = finder.find_sources(Duration::from_secs(1))?.into_iter().next()
+    /// # else { return Ok(()); };
     /// let options =
-    ///     ReceiverOptions::high_quality_preset(sources[0].clone()).name("High Quality Receiver");
+    ///     ReceiverOptions::high_quality_preset(source).name("High Quality Receiver");
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// // Capture full quality frames
@@ -874,9 +878,9 @@ impl ReceiverOptions {
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.watch().wait_for_change(Duration::from_secs(1))?;
-    /// # let sources = finder.current_sources()?;
-    /// let options = ReceiverOptions::monitoring_preset(sources[0].clone()).name("Status Monitor");
+    /// # let Some(source) = finder.find_sources(Duration::from_secs(1))?.into_iter().next()
+    /// # else { return Ok(()); };
+    /// let options = ReceiverOptions::monitoring_preset(source).name("Status Monitor");
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// println!("Connected: {}", receiver.is_connected());

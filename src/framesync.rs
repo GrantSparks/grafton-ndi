@@ -50,28 +50,34 @@
 //! fn main() -> Result<(), grafton_ndi::Error> {
 //!     let ndi = Ndi::new()?;
 //!     let finder = Finder::new(&ndi, &FinderOptions::default())?;
-//!     finder.watch().wait_for_change(Duration::from_secs(1))?;
-//!     let sources = finder.current_sources()?;
+//!     let Some(source) = finder.find_source_by_name("CAMERA (Program)", Duration::from_secs(5))?
+//!     else {
+//!         eprintln!("Camera source not found");
+//!         return Ok(());
+//!     };
 //!
-//!     let options = ReceiverOptions::new(sources[0].clone());
+//!     let options = ReceiverOptions::new(source);
 //!     let receiver = Receiver::new(&ndi, &options)?;
 //!
 //!     // Create frame-sync from receiver
 //!     let framesync = FrameSync::new(receiver)?;
 //!
 //!     // Capture video synced to your output timing
-//!     if let Some(frame) = framesync.capture_video(ScanType::Progressive)? {
+//!     if let Some(frame) = framesync.capture_video_ref(ScanType::Progressive)? {
 //!         println!("{}x{} frame", frame.width(), frame.height());
 //!     }
 //!
 //!     // Capture audio at your sound card's rate
 //!     let request = FrameSyncAudioRequest::capture_at(48_000, 2, 1_024)?;
-//!     let audio = framesync.capture_audio(request)?;
+//!     let audio = framesync.capture_audio_ref(request)?;
 //!     println!("{} audio samples", audio.num_samples());
 //!
 //!     Ok(())
 //! }
 //! ```
+//!
+//! See [receive_framesync.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/receive_framesync.rs)
+//! for a runnable synchronized capture loop.
 
 pub(crate) mod capture;
 

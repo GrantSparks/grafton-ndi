@@ -703,11 +703,12 @@ def readme_feature_violations(root, manifest):
     return found
 
 
-def doc_comment_text(text):
+def doc_comment_text(text, *, inner_only=False):
     """Extract line doc comments as Markdown without changing line numbers."""
+    prefix = r'\s*//! ?(.*)' if inner_only else r'\s*(?:///(?!/)|//!) ?(.*)'
     lines = []
     for line in text.splitlines():
-        match = re.match(r'\s*(?:///(?!/)|//!) ?(.*)', line)
+        match = re.match(prefix, line)
         lines.append(match.group(1) if match else '')
     return '\n'.join(lines)
 
@@ -825,12 +826,26 @@ def link_violations(root, source, text, release, repository_only=False):
     return found
 
 
+MODULE_EXAMPLES = {
+    Path('src/file/mod.rs'), Path('src/framesync.rs'), Path('src/receiver.rs'),
+    Path('src/advanced/mod.rs'), Path('src/discovery/mod.rs'), Path('src/asynchronous.rs'),
+}
+RUSTDOC_EXAMPLE = re.compile(r'(?:rust|no_run|ignore(?:-[\w-]+)?|should_panic|edition\d+)')
+
+
+def has_nearby_example(root, source, release, lines, first, last, examples):
+    nearby = '\n'.join(lines[max(0, first - 13):min(len(lines), (last or first) + 12)])
+    targets = (destination(root, source, url, release) for url, _ in links(prose(nearby)))
+    return any(target and not target[2] and target[0].resolve() in examples for target in targets)
+
+
 def check(root):
     """Return (violations, standalone Rust snippets) for the current docs."""
     root = root.resolve()
     manifest = tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))
     release = manifest['package']['version']
     found, snippets = readme_feature_violations(root, manifest), []
+    examples = {example.resolve() for example in (root / 'examples').glob('*.rs')}
     for path in documents(root):
         text = path.read_text(encoding='utf-8')
         found.extend(link_violations(root, path, text, release))
@@ -850,10 +865,7 @@ def check(root):
             if re.search(r'^\s*#(?:\s|$)', code, re.MULTILINE):
                 found.append(f'{label}: rustdoc hidden lines are visible in Markdown; use a complete example')
             if 'ignore' in tags:
-                nearby = '\n'.join(lines[max(0, first - 13):min(len(lines), (last or first) + 12)])
-                examples = {example.resolve() for example in (root / 'examples').glob('*.rs')}
-                targets = [destination(root, path, url, release) for url, _ in links(prose(nearby))]
-                if not any(target and not target[2] and target[0].resolve() in examples for target in targets):
+                if not has_nearby_example(root, path, release, lines, first, last, examples):
                     found.append(f'{label}: an illustrative Rust fragment needs a nearby link to a runnable .rs example')
             elif not re.search(r'\bfn\s+main\s*\(', code):
                 found.append(f'{label}: Rust fence must be standalone, or rust,ignore with a linked runnable example')
@@ -872,6 +884,15 @@ def check(root):
     for path, rustdoc in source_documentation(root):
         found.extend(link_violations(root, path, rustdoc, release, repository_only=True))
         found.extend(release_link_violations(root, path, rustdoc, release))
+        relative = path.relative_to(root)
+        if relative in MODULE_EXAMPLES:
+            inner = doc_comment_text(path.read_text(encoding='utf-8'), inner_only=True)
+            lines = inner.splitlines()
+            for first, last, info, _ in fences(inner):
+                tags = info.split(',') if info else ['rust']
+                if ('compile_fail' not in tags and all(RUSTDOC_EXAMPLE.fullmatch(tag.strip()) for tag in tags)
+                        and not has_nearby_example(root, path, release, lines, first, last, examples)):
+                    found.append(f'{relative}:{first}: a module example needs a nearby link to a runnable .rs example')
     return found, snippets
 
 

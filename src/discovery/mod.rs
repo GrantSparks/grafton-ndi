@@ -81,6 +81,9 @@
 //! # }
 //! ```
 //!
+//! See [discovery_server.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/discovery_server.rs)
+//! for runnable registration and listener workflows.
+//!
 //! # Connecting
 //!
 //! Each object is created for a Discovery Server address: the one given in its
@@ -153,6 +156,9 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! See [discovery_server.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/discovery_server.rs)
+//! for a complete listener loop.
 
 #![warn(missing_docs)]
 

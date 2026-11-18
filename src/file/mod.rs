@@ -169,12 +169,12 @@
 //! # Examples
 //!
 //! ```no_run
-//! use std::time::Duration;
+//! use std::time::{Duration, Instant};
 //!
 //! use grafton_ndi::{
 //!     file::{
-//!         FileApi, FileApiOptions, FileRecorder, FinishStatus, SessionEnd, FileRecorderOptions, RecordingTarget,
-//!         RecordingTimecode, SourceSpec,
+//!         FileApi, FileApiOptions, FileRecorder, FileRecorderOptions, FinishStatus,
+//!         RecordingTarget, RecordingTimecode, SessionEnd, SourceSpec,
 //!     },
 //!     Ndi,
 //! };
@@ -186,15 +186,32 @@
 //! let options = FileRecorderOptions::new(SourceSpec::new("STUDIO (Camera 1)")?);
 //! let mut recorder = FileRecorder::new(&file, &options)?;
 //! recorder.start(&RecordingTarget::new("take")?, RecordingTimecode::Preserve)?;
-//! std::thread::sleep(Duration::from_secs(10));
+//! let duration = Duration::from_secs(10);
+//! let start = Instant::now();
+//! while start.elapsed() < duration {
+//!     let wait = duration.saturating_sub(start.elapsed()).min(Duration::from_millis(250));
+//!     if let Some(event) = recorder.next_event(wait)? {
+//!         println!("{:?}", event.kind());
+//!     }
+//! }
 //!
 //! match recorder.finish(Duration::from_secs(5))? {
-//!     FinishStatus::Ended(SessionEnd::Closed(report)) => println!("closed {} file(s)", report.closed_files()),
-//!     other => println!("not confirmed complete: {other:?}"),
+//!     FinishStatus::Ended(SessionEnd::Closed(report)) => {
+//!         if report.error_events() != 0 || report.write_failures() != 0
+//!             || report.empty_files() != 0 || report.stopped_by_sdk()
+//!         {
+//!             return Err(format!("recording incomplete: {report:?}").into());
+//!         }
+//!         println!("closed {} file(s)", report.closed_files());
+//!     }
+//!     other => return Err(format!("closure unconfirmed: {other:?}").into()),
 //! }
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! See [file_record.rs](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/file_record.rs)
+//! for the complete recording workflow.
 
 #![warn(missing_docs)]
 

@@ -298,6 +298,16 @@ class Documentation(unittest.TestCase):
         self.write('examples/README.md', '[One](one.rs)')
         self.assertEqual(self.check('# Example')[0], [])
 
+    def test_module_example_requires_a_nearby_runnable_link(self):
+        self.write('examples/receive.rs', 'fn main() {}')
+        self.write('examples/README.md', '[Run](receive.rs)')
+        module = '//! # Example\n//! ```no_run\n//! fn main() {}\n//! ```\n'
+        self.write('src/receiver.rs', module + '/// [Item example](../examples/receive.rs)\n')
+        errors, _ = self.check('# Example')
+        self.assertTrue(any('src/receiver.rs:2: a module example needs' in error for error in errors))
+        self.write('src/receiver.rs', module + '//! [Run](../examples/receive.rs)\n')
+        self.assertEqual(self.check('# Example')[0], [])
+
     def test_changelog_keeps_historical_code_but_links_are_checked(self):
         self.write('CHANGELOG.md', '```rust\nold_api();\n```\n[missing](missing.md)')
         errors, snippets = self.check('# Example')
