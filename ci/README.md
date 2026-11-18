@@ -213,20 +213,22 @@ include SDK archives, credentials or private recordings.
 
 ## Release controls
 
-Workflows cannot establish repository settings. Before publishing, verify these
-controls in order:
+Configure the repository before publishing. The release job verifies the first
+three controls through read-only GitHub API requests. Verify items 4 and 5
+before pushing a release tag. [Release check](release.py)
 
-1. The `crates-io` environment requires reviewers, an appropriate self-review
-   rule, and deployment restricted to `v*` tags.
-2. A tag ruleset restricts creating, moving and deleting `v*` tags.
-3. Protection of `main` requires pull requests, Code Owner review and
-   `required-ci`. [CODEOWNERS](../.github/CODEOWNERS) covers files that control CI
-   and publishing.
+1. The `crates-io` environment requires reviewers and has exactly one custom
+   deployment policy for `v*` tags.
+2. An active tag ruleset includes `refs/tags/v*` without exclusions and
+   restricts creating, updating and deleting those tags.
+3. Active rules on `main` require pull requests, Code Owner review and
+   the `required-ci` status check. [CODEOWNERS](../.github/CODEOWNERS)
 4. The crates.io trusted publisher binds this repository, `publish.yml` and the
-   `crates-io` environment.
+   `crates-io` environment. The GitHub API cannot read crates.io settings.
 5. SDK CI has `NDI_SDK_SOURCES_JSON`, a scoped `NDI_SDK_ARCHIVE_TOKEN`, and
-   `NDI_CI_RELEASED=true` when enabled.
+   `NDI_CI_RELEASED=true` when enabled. The release check has no access to
+   secret values.
 
 Anyone who can replace a workflow on a tag or branch can replace its checks.
-Repository rules and review enforce these boundaries; the tag-on-main check
-catches mistakes.
+Repository rules and review enforce these boundaries. The release job catches
+configuration mistakes before the jobs that build or publish the release.

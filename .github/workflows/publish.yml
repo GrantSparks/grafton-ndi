@@ -45,6 +45,10 @@ jobs:
             echo "::error::$GITHUB_REF_NAME does not point at a commit of main"
             exit 1
           fi
+      - name: Verify GitHub release controls
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 ci/release.py --controls "$GITHUB_REPOSITORY"
 
   ci:
     name: ci
