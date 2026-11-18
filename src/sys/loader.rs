@@ -1614,11 +1614,7 @@ mod linked {
             _: Option<ExplicitLibrary<'_>>,
         ) -> Result<Self> {
             Self::describe(Linked, LINKED_EDITION).map_err(|reason| {
-                Error::RuntimeLoadFailed(LoadFailure::linked(
-                    LibraryKind::Runtime,
-                    "the linked SDK",
-                    reason,
-                ))
+                Error::RuntimeLoadFailed(LoadFailure::linked(LibraryKind::Runtime, reason))
             })
         }
     }

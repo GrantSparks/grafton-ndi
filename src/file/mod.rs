@@ -383,8 +383,9 @@ impl FileApi {
     ///   any native code loaded before being refused. This is retryable, and
     ///   the rest of the crate keeps working.
     /// * [`Error::RuntimeConflict`] when the selected NDI runtime is not one
-    ///   the File library can accompany, or `options` names a library other
-    ///   than the one already selected. [`crate::SelectionFailure::kind`] names
+    ///   the File library can accompany, `options` names a library other than
+    ///   the one already selected, or native loading re-enters File library
+    ///   selection on the same thread. [`crate::SelectionFailure::kind`] names
     ///   the [`crate::SelectionConflict`]; its `Display` gives the diagnostic text.
     /// * [`Error::InvalidInput`] when `options` names a relative path.
     pub fn new(ndi: &Ndi, options: &FileApiOptions) -> Result<Self> {

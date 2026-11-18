@@ -863,7 +863,8 @@ impl Ndi {
     /// found in the [search order](crate::runtime#where-the-runtime-is-loaded-from).
     /// Its [`crate::LoadFailure`] distinguishes code that loaded and was refused
     /// from locations that could not be opened. Returns
-    /// [`Error::UnsupportedCpu`] if the runtime does not start because this
+    /// [`Error::RuntimeConflict`] if native loading re-enters runtime selection
+    /// on the same thread. Returns [`Error::UnsupportedCpu`] if the runtime does not start because this
     /// CPU cannot run it, and [`Error::InitializationFailed`] if it does not
     /// start for another reason or the count of handles is exhausted.
     ///

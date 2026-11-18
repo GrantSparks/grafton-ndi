@@ -172,15 +172,15 @@ pub enum Error {
     /// * On dynamically loaded, non-Apple ELF targets, an explicit runtime
     ///   path is refused while another NDI runtime occupies the process's
     ///   global symbol scope, with [`SelectionConflict::ForeignRuntimeInScope`].
-    /// * Loading a native library re-entered runtime selection on the same
-    ///   thread.
+    /// * Loading a native library re-entered runtime or File library selection
+    ///   on the same thread.
     /// * The File API options name a File library other than the selected one,
     ///   or any library when the File library is linked into the program.
     /// * The File library cannot accompany the selected runtime: on Linux,
     ///   macOS and Android it needs the Advanced SDK runtime, and it is
     ///   refused while the process's global symbol scope holds an NDI runtime
     ///   other than the selected one, which it would bind to.
-    #[error("Conflicting NDI runtime selection: {0}")]
+    #[error("Conflicting {0}")]
     RuntimeConflict(SelectionFailure),
 
     /// The native SDK did not perform an operation.

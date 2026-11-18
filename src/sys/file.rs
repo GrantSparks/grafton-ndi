@@ -313,11 +313,7 @@ impl FileRuntime {
     fn load(_runtime: &Runtime, explicit: Option<ExplicitLibrary<'_>>) -> Result<Self> {
         Self::reject_path(explicit)?;
         let families = Families::load(&Linked).map_err(|reason| {
-            Error::RuntimeLoadFailed(LoadFailure::linked(
-                LibraryKind::File,
-                "the linked NDI SDK archive",
-                reason,
-            ))
+            Error::RuntimeLoadFailed(LoadFailure::linked(LibraryKind::File, reason))
         })?;
         Ok(Self { families })
     }
