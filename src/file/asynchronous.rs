@@ -3546,7 +3546,7 @@ mod tests {
         };
         let owner_thread = drop_entry.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_ne!(owner_thread, dropper.thread().id());
-        let returned = drop_return.recv_timeout(Duration::from_millis(100));
+        let returned = drop_return.recv_timeout(Duration::from_secs(2));
         // Always release and join before asserting, including on a regression.
         drop_release.send(()).unwrap();
         drop_finish.recv_timeout(Duration::from_secs(1)).unwrap();

@@ -3618,48 +3618,58 @@ mod tests {
 
         #[test]
         fn replay_does_not_wait_for_another_pollers_native_query() {
-            static ENTERED: AtomicBool = AtomicBool::new(false);
-            unsafe extern "C" fn slow_query(
+            use std::sync::mpsc;
+
+            type QueryGate = (mpsc::Sender<()>, mpsc::Receiver<()>);
+            static GATE: Mutex<Option<QueryGate>> = Mutex::new(None);
+            unsafe extern "C" fn held_query(
                 _instance: NDIlib_recv_instance_t,
                 name: *mut *const c_char,
                 _timeout_ms: u32,
             ) -> bool {
-                ENTERED.store(true, Ordering::Release);
-                std::thread::sleep(Duration::from_millis(100));
+                let (entered, release) = GATE.lock().take().unwrap();
+                let _ = entered.send(());
+                let _ = release.recv();
                 // SAFETY: the caller provides writable storage for the pointer.
                 unsafe { name.write(c"second".as_ptr()) };
                 true
             }
+
             let Some(ndi) = crate::test_support::ndi() else {
                 return;
             };
             let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
             let abandoned = poll(&receiver.core, Some(c"first")).unwrap();
-            ENTERED.store(false, Ordering::Release);
             std::thread::scope(|scope| {
+                let (entered, waiting) = mpsc::channel();
+                let (release, blocked) = mpsc::channel();
+                *GATE.lock() = Some((entered, blocked));
                 let worker = scope.spawn(|| {
                     receiver
                         .core
                         .wait_for_source_name_change_with(
                             &sys::ReceiverSourceName {
-                                NDIlib_recv_get_source_name: slow_query,
+                                NDIlib_recv_get_source_name: held_query,
                             },
                             &sys::ReceiverStrings {
                                 NDIlib_recv_free_string: free,
                             },
-                            Deadline::after(Duration::from_millis(100)).unwrap(),
+                            Deadline::after(Duration::from_secs(3)).unwrap(),
                             NeverStop,
                         )
                         .unwrap()
                 });
-                let waiting = Instant::now();
-                while !ENTERED.load(Ordering::Acquire) {
-                    assert!(waiting.elapsed() < Duration::from_secs(2));
-                    std::thread::yield_now();
-                }
-                let started = Instant::now();
-                receiver.core.retain_source_name_change(abandoned);
-                assert!(started.elapsed() < Duration::from_millis(10));
+                waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+                let (done, completed) = mpsc::channel();
+                let receiver = &receiver;
+                scope.spawn(move || {
+                    receiver.core.retain_source_name_change(abandoned);
+                    done.send(()).unwrap();
+                });
+                let replayed = completed.recv_timeout(Duration::from_secs(2));
+                // Disconnecting the channel also releases the query on unwind.
+                drop(release);
+                replayed.expect("replay waited for the native query");
                 assert_eq!(
                     worker.join().unwrap().unwrap().value,
                     SourceNameChange::Connected("second".into())
@@ -3992,7 +4002,7 @@ mod tests {
                     .unwrap();
             });
             waiting.recv_timeout(Duration::from_secs(2)).unwrap();
-            let concurrent = completed.recv_timeout(Duration::from_millis(100));
+            let concurrent = completed.recv_timeout(Duration::from_secs(2));
             drop(permission);
             member.join().unwrap();
             assert_eq!(
@@ -4074,7 +4084,7 @@ mod tests {
             let getter = scope.spawn(move || {
                 done.send(receiver.connection_target()).unwrap();
             });
-            let snapshot = completed.recv_timeout(Duration::from_millis(20));
+            let snapshot = completed.recv_timeout(Duration::from_secs(2));
             // Release the connection lock before inspecting the outcome, so a
             // regression fails instead of leaving scoped threads deadlocked.
             drop(connection);
@@ -4104,7 +4114,7 @@ mod tests {
                 });
                 // Keep the attempt live across this wait. An accidental Rust
                 // exclusion would hold the reconnect off until this block ends.
-                completed.recv_timeout(Duration::from_millis(20))
+                completed.recv_timeout(Duration::from_secs(2))
             };
             result.expect("reconnect waited for the capture attempt");
         });

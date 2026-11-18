@@ -242,7 +242,6 @@ fn wait(ndi: &Ndi, publish: impl Fn()) {
         }
         ready.wait();
         wait_for_entries("finder-wait-begin", 1);
-        thread::sleep(Duration::from_millis(40));
         publish();
         for _ in 0..4 {
             assert!(rx
@@ -624,7 +623,6 @@ fn keyframe(ndi: &Ndi, clear_after_query: bool) {
             );
             thread::sleep(Duration::from_millis(1));
         }
-        thread::sleep(Duration::from_millis(40));
         receiver.request_keyframe().unwrap();
         for _ in 0..waiters {
             assert!(rx

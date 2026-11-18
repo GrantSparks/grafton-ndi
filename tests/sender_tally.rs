@@ -116,6 +116,8 @@ fn concurrent_tally_pollers_cannot_take_a_waiters_change() {
                     finished.store(true, Ordering::Release);
                     result.unwrap()
                 });
+                // Give the waiter a chance to start. The fake runtime in
+                // tests/sender_tally_boundary.rs observes native entry directly.
                 thread::sleep(Duration::from_millis(40));
                 let poller = scope.spawn(|| {
                     while !finished.load(Ordering::Acquire) {
