@@ -1,8 +1,11 @@
 //! Receiver identities are available through every wrapper without SDK work.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
-#[path = "support/fixture.rs"]
-mod fixture;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(child, fixture);
+
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
@@ -14,7 +17,7 @@ fn wrappers_print_the_named_receiver_without_native_calls() {
         exercise(&Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap());
         return;
     }
-    let fixture = fixture::FixtureDir::create("receiver-debug");
+    let fixture = common::FixtureDir::create("receiver-debug");
     let library = runtime_fixture::FakeRuntime {
         cfgs: vec![
             "fake_objects",
@@ -25,22 +28,10 @@ fn wrappers_print_the_named_receiver_without_native_calls() {
         ..Default::default()
     }
     .build(&fixture.path().join("fake-ndi.so"));
-    let result = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "wrappers_print_the_named_receiver_without_native_calls",
-            "--nocapture",
-        ])
+    common::TestChild::new("wrappers_print_the_named_receiver_without_native_calls")
         .env("GRAFTON_DEBUG_RECEIVER_RUNTIME", library)
         .env("GRAFTON_FAKE_NDI_LOG", fixture.path().join("native.log"))
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+        .run();
 }
 
 const NAME: &str = "debug studio";
@@ -71,8 +62,7 @@ fn exercise(ndi: &Ndi) {
 }
 
 fn check(value: &dyn std::fmt::Debug, kind: &str, mode: &str) {
-    let log =
-        || std::fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap();
+    let log = runtime_fixture::read_fake_log;
     let before = log();
     let debug = format!("{value:?}");
     assert!(debug.starts_with(kind), "{debug}");
