@@ -8,8 +8,9 @@ deployment changes. The [migration index](README.md) links earlier upgrades.
 Native event loss, unreadable lifecycle evidence or a file-bookkeeping limit
 now preserves an unknown cleanup obligation. Previously, a recorder could start
 another session once every known file closed, even after a lost open event.
-Both `FileRecorder::start` and `AsyncFileRecorder::start` now return
-`InvalidState(StateConflict::PreviousSessionOpen)` until a successful `reset`
+After the previous session ends, both `FileRecorder::start` and
+`AsyncFileRecorder::start` now return
+`InvalidState(StateConflict::IncompleteFileTracking)` until a successful `reset`
 replaces that native recorder. Reset even if every observed file closed and
 the SDK stopped recording; those observations cannot account for hidden files.
 
@@ -24,3 +25,10 @@ when tracking is incomplete, including after all known files close. They do not
 restart that budget or change an already-final indeterminate report. Normal
 sessions with complete tracking still finish cleanup early after all files close.
 Async application-notification eviction alone does not make tracking incomplete.
+
+## Borrowed video frame module
+
+Import `BorrowedVideoFrame` and `BorrowedVideoFrameBuilder` from
+`grafton_ndi::frames` instead of `grafton_ndi::sender`. Both frame families now
+keep their checked layouts and borrowed storage in the same private module.
+Existing imports from the crate root remain available.

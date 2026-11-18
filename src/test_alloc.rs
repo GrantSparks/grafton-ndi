@@ -119,7 +119,6 @@ pub(crate) fn observe_deallocations<T>(
 
 /// Refuse large allocations only on this test thread, restoring the previous
 /// threshold even if the closure unwinds. Source frames must be built first.
-#[cfg(any(feature = "image-encoding", feature = "file-io"))]
 pub(crate) fn fail_allocations_at_least<T>(minimum: usize, f: impl FnOnce() -> T) -> T {
     struct Reset(Option<usize>);
     impl Drop for Reset {

@@ -760,9 +760,10 @@ pub enum InputDefect {
     /// The SDK refused the supplied address; arbitrary address text is boxed.
     #[error("{0}")]
     DiscoveryAddressRejected(Box<DiscoveryAddressFailure>),
-    /// No address was supplied or configured.
-    #[error("the SDK created no {object}: no Discovery Server was named and the NDI configuration supplies none")]
-    DiscoveryAddressMissing {
+    /// No server was named in the options, and the SDK resolved no usable
+    /// Discovery Server from its configuration.
+    #[error("the SDK created no {object}: no Discovery Server was named, and the configuration names none it accepts")]
+    DiscoveryConfigurationRejected {
         /// The kind of object the SDK refused to create.
         object: &'static str,
     },

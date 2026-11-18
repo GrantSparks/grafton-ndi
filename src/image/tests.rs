@@ -1545,7 +1545,7 @@ fn every_image_format_has_its_documented_quality_bounds() {
         (ImageFormat::WebpLossless, None),
         (ImageFormat::WebpLossy(75), Some(0..=100)),
     ] {
-        assert_eq!(format.quality_bounds(), expected);
+        assert_eq!(format.info().quality, expected);
     }
 }
 
@@ -1584,7 +1584,7 @@ fn hdr_frames_are_refused_by_default_in_every_format() {
             ] {
                 let message = invalid_input(frame.encode_image(&hdr(refused)));
                 assert!(
-                    matches!(message, crate::InputDefect::HdrNeedsPng {codec, transfer} if codec == refused.codec() && transfer == if name=="PQ" {crate::TransferFunction::Pq} else {crate::TransferFunction::Hlg}),
+                    matches!(message, crate::InputDefect::HdrNeedsPng {codec, transfer} if codec == refused.info().codec && transfer == if name=="PQ" {crate::TransferFunction::Pq} else {crate::TransferFunction::Hlg}),
                     "{message}"
                 );
             }
@@ -1968,10 +1968,10 @@ fn conflicting_options_are_refused_before_anything_is_written() {
         assert!(
             match needle {
                 "quality" | "WebP quality" =>
-                    matches!(message, crate::InputDefect::ImageQuality { codec, .. } if codec == options.format.codec()),
+                    matches!(message, crate::InputDefect::ImageQuality { codec, .. } if codec == options.format.info().codec),
                 "WebP effort" => matches!(message, crate::InputDefect::WebpEffort { .. }),
                 "SampleDepth::Sixteen" =>
-                    matches!(message, crate::InputDefect::SixteenBitNeedsPng { codec } if codec == options.format.codec()),
+                    matches!(message, crate::InputDefect::SixteenBitNeedsPng { codec } if codec == options.format.info().codec),
                 other => panic!("unexpected case {other}"),
             },
             "{message}"
@@ -2422,7 +2422,13 @@ fn warm_workspace_conversion_does_not_allocate() {
                     for codec in [ImageFormat::WebpLossless, ImageFormat::WebpLossy(75)] {
                         let options = options(codec).alpha(alpha).downscale(reduction);
                         let plan = Plan::new(&source, &options).unwrap();
-                        let shape = plan.shape().buffered();
+                        let shape = super::BufferedImageShape::new(
+                            webp::MAX_LOSSLESS_DIMENSION,
+                            plan.shape().width,
+                            plan.shape().height,
+                            plan.shape().channels,
+                        )
+                        .unwrap();
                         let mut convert = || {
                             plan.with_pixels::<u8, _>(&mut workspace.sums8, |pixels| {
                                 webp::image_with(pixels, shape, &mut workspace.image)?;
@@ -2556,7 +2562,18 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                         let plan = Plan::new(&source, &options).unwrap();
                         let mut pixels = plan.pixels::<u8>();
                         let ((image, allocations), peak) = peak_bytes(|| {
-                            allocation_count(|| webp::image(&mut pixels, plan.shape().buffered()))
+                            allocation_count(|| {
+                                webp::image(
+                                    &mut pixels,
+                                    super::BufferedImageShape::new(
+                                        webp::MAX_LOSSLESS_DIMENSION,
+                                        plan.shape().width,
+                                        plan.shape().height,
+                                        plan.shape().channels,
+                                    )
+                                    .unwrap(),
+                                )
+                            })
                         });
                         let len = reduced.0 * reduced.1 * channels;
                         let borrowed = matches!(image, std::borrow::Cow::Borrowed(_));
@@ -3411,7 +3428,6 @@ fn reader_format_facts_match_the_frame_layout_for_every_format() {
         };
         assert_eq!(info.sample_width().bits(), expected_bits, "{format:?}");
         assert_eq!(info.has_alpha(), expected_alpha, "{format:?}");
-        assert_eq!(info.plane_count(), frame.planes().len(), "{format:?}");
         for keep in [false, true] {
             let source = Source::new(&frame);
             let reader =
@@ -3534,4 +3550,159 @@ fn workspace_debug_summarizes_retained_conversion_storage() {
         format!("{workspace:?}")
     }
     crate::test_support::assert_bounded_debug(&[summary(4, 2)], &[summary(1920, 1080)]);
+}
+
+#[test]
+fn every_image_format_states_its_capabilities_once() {
+    use super::options::AlphaChannel;
+    let mut frame = VideoFrame::builder()
+        .resolution(4, 4)
+        .pixel_format(PixelFormat::Rgba)
+        .data([40, 80, 120, 90].repeat(16))
+        .build()
+        .unwrap();
+    frame.set_picture_aspect_ratio(crate::PictureAspectRatio::new(2.0).unwrap());
+    for format in ImageFormat::ALL {
+        let info = format.info();
+        let expected = match format {
+            ImageFormat::Png => (
+                crate::ImageCodecKind::Png,
+                "image/png",
+                None,
+                AlphaChannel::Optional,
+                true,
+                true,
+                true,
+            ),
+            ImageFormat::Jpeg(_) => (
+                crate::ImageCodecKind::Jpeg,
+                "image/jpeg",
+                Some(1..=100),
+                AlphaChannel::None,
+                false,
+                false,
+                true,
+            ),
+            ImageFormat::WebpLossless => (
+                crate::ImageCodecKind::Webp,
+                "image/webp",
+                None,
+                AlphaChannel::Optional,
+                false,
+                false,
+                false,
+            ),
+            ImageFormat::WebpLossy(_) => (
+                crate::ImageCodecKind::Webp,
+                "image/webp",
+                Some(0..=100),
+                AlphaChannel::AlwaysRgba,
+                false,
+                false,
+                false,
+            ),
+        };
+        assert_eq!(
+            (
+                info.codec,
+                info.media_type,
+                info.quality.clone(),
+                info.alpha,
+                info.sixteen_bit,
+                info.hdr_code_values,
+                info.aspect_tag
+            ),
+            expected
+        );
+        for keep in [false, true] {
+            let options = options(format).alpha(if keep {
+                AlphaMode::Keep
+            } else {
+                AlphaMode::Discard
+            });
+            let source = Source::new(&frame);
+            let plan = Plan::new(&source, &options).unwrap();
+            let alpha = keep && info.alpha != AlphaChannel::None;
+            assert_eq!(plan.alpha, alpha);
+            assert_eq!(
+                plan.channels().count(),
+                if info.alpha == AlphaChannel::AlwaysRgba || alpha {
+                    4
+                } else {
+                    3
+                }
+            );
+            let image = frame.encode_image(&options).unwrap();
+            let decoded = match format {
+                ImageFormat::Png | ImageFormat::Jpeg(_) => decode_density_image(format, &image),
+                ImageFormat::WebpLossless | ImageFormat::WebpLossy(_) => decode_webp(&image),
+            };
+            assert_eq!(
+                decoded.channels,
+                if alpha { 4 } else { 3 },
+                "{format:?} {keep}"
+            );
+            match format {
+                ImageFormat::Png => {
+                    assert!(png_chunks(&image).iter().any(|(kind, _)| kind == b"pHYs"))
+                }
+                ImageFormat::Jpeg(_) => assert_ne!(image_density(format, &image).1, (1, 1)),
+                ImageFormat::WebpLossless | ImageFormat::WebpLossy(_) => assert!(!info.aspect_tag),
+            }
+        }
+        let source = Source::new(&frame);
+        let sixteen = options(format).depth(SampleDepth::Sixteen);
+        if info.sixteen_bit {
+            assert_eq!(
+                Plan::new(&source, &sixteen).unwrap().shape().depth,
+                SampleDepth::Sixteen
+            );
+        } else {
+            assert!(
+                matches!(Plan::new(&source, &sixteen), Err(Error::InvalidInput(crate::InputDefect::SixteenBitNeedsPng { codec })) if codec == info.codec)
+            );
+        }
+        let hdr = VideoFrame::builder()
+            .resolution(4, 4)
+            .metadata("<ndi_color_info transfer=\"bt_2100_pq\" primaries=\"bt_2100\"/>")
+            .build()
+            .unwrap();
+        let source = Source::new(&hdr);
+        assert!(matches!(
+            Plan::new(&source, &options(format)),
+            Err(Error::InvalidFrame(crate::FrameDefect::HdrRefused { .. }))
+        ));
+        let options = options(format).hdr(HdrPolicy::CodeValues);
+        if info.hdr_code_values {
+            let image = hdr.encode_image(&options).unwrap();
+            assert!(png_chunks(&image).iter().any(|(kind, _)| kind == b"cICP"));
+        } else {
+            assert!(
+                matches!(Plan::new(&source, &options), Err(Error::InvalidInput(crate::InputDefect::HdrNeedsPng { codec, .. })) if codec == info.codec)
+            );
+        }
+    }
+}
+
+#[test]
+fn buffered_shapes_check_each_webp_dimension_before_computing_storage() {
+    for limit in [webp::MAX_LOSSLESS_DIMENSION, webp::MAX_LOSSY_DIMENSION] {
+        let size = limit as u32;
+        for channels in [super::Channels::Rgb, super::Channels::Rgba] {
+            let shape = super::BufferedImageShape::new(limit, size, size, channels).unwrap();
+            assert_eq!(shape.image_bytes, limit * limit * channels.count());
+            assert_eq!(shape.rows.depth, SampleDepth::Eight);
+            for (width, height, dimension) in [
+                (size + 1, size, crate::ImageAxisKind::Width),
+                (size, size + 1, crate::ImageAxisKind::Height),
+            ] {
+                assert!(
+                    matches!(super::BufferedImageShape::new(limit, width, height, channels),
+                    Err(Error::InvalidFrame(crate::FrameDefect::ImageDimension {
+                        codec: crate::ImageCodecKind::Webp, dimension: actual, length, maximum
+                    })) if actual == dimension && length == limit + 1 && maximum == limit)
+                );
+            }
+        }
+    }
 }

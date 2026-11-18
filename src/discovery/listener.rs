@@ -127,7 +127,8 @@ listener_api!(
 /// The Discovery Server a listener connects to.
 ///
 /// Without an explicit server the SDK uses the Discovery Server from the NDI
-/// configuration. If that names none either, the listener cannot be created.
+/// configuration. Creation fails when it names no server or one the SDK
+/// cannot use.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ListenerOptions {
     server: Option<String>,
@@ -363,7 +364,7 @@ pub struct AdvertisedSender {
     id: Option<SenderId>,
     name: Option<SourceText>,
     metadata: Option<String>,
-    address: Option<String>,
+    address: Option<SourceText>,
     port: Option<u16>,
     groups: Vec<String>,
     subscribed: bool,
@@ -383,7 +384,7 @@ impl AdvertisedSender {
     }
     /// The sender's network address.
     pub fn address(&self) -> Option<&str> {
-        self.address.as_deref()
+        self.address.as_ref().map(SourceText::as_str)
     }
     /// The sender's network port, or `None` when the advertised value is not a
     /// port number.
@@ -402,14 +403,7 @@ impl AdvertisedSender {
     pub fn to_source(&self) -> Option<crate::Source> {
         let mut source = crate::Source::from_text(self.name.as_ref()?.clone(), None);
         if let (Some(address), Some(port)) = (&self.address, self.port) {
-            let endpoint = if address.parse::<std::net::Ipv6Addr>().is_ok() {
-                format!("[{address}]:{port}")
-            } else {
-                format!("{address}:{port}")
-            };
-            // SAFETY: scanned SDK address text contains no NUL, and formatting
-            // adds only brackets, a colon and decimal port digits.
-            let endpoint = unsafe { SourceText::from_nul_free_string(endpoint) };
+            let endpoint = address.with_port(port);
             source = source.with_address(crate::SourceAddress::from_text(endpoint));
         }
         Some(source)
@@ -615,21 +609,17 @@ impl<A: ListenerApi> Listener<A> {
     }
     fn subscription(&mut self, id: &A::Id, subscribe: bool) {
         if subscribe {
-            if !self.0.retained().contains(id) {
-                self.0.retained_mut().insert(id.clone());
-            }
-            let retained = self
-                .0
-                .retained()
-                .get(id)
-                .expect("subscribed identifier was retained");
+            let pointer = if let Some(retained) = self.0.retained().get(id) {
+                retained.as_c_str().as_ptr()
+            } else {
+                let retained = id.clone();
+                let pointer = retained.as_c_str().as_ptr();
+                self.0.retained_mut().insert(retained);
+                pointer
+            };
             // SAFETY: the listener and its stable identifier allocation stay
             // live until unsubscribe returns or after native destruction.
-            unsafe {
-                self.0
-                    .api
-                    .subscribe(self.0.instance(), retained.as_c_str().as_ptr())
-            };
+            unsafe { self.0.api.subscribe(self.0.instance(), pointer) };
         } else {
             let retained = self.0.retained().get(id).unwrap_or(id);
             // SAFETY: a retained identifier stays live through unsubscribe;
@@ -852,9 +842,10 @@ impl SendListener {
     /// options carry an Advanced configuration that the runtime or this build
     /// cannot take; [`Error::InvalidCString`] when the endpoint contains a NUL
     /// byte; and [`Error::InvalidInput`] when the options name more than one
-    /// endpoint, or the SDK creates no listener. It creates none for an
-    /// address it cannot parse, and none when `options` name no server and the
-    /// NDI configuration supplies none.
+    /// endpoint, or the SDK creates no listener. Without an explicit server the
+    /// SDK uses its configuration; creation fails when it names no server or
+    /// one the SDK cannot use. An explicit address the SDK cannot parse is also
+    /// refused.
     ///
     /// [sender discovery]: crate::capabilities::RuntimeFeature::SenderDiscovery
     #[doc(alias = "NDIlib_send_listener_create")]
@@ -892,7 +883,7 @@ impl SendListener {
                     id: budget.id(sender.p_uuid)?.map(SenderId::from_exact),
                     name: budget.source_text(sender.p_name)?,
                     metadata: budget.text(sender.p_metadata)?,
-                    address: budget.text(sender.p_address)?,
+                    address: budget.source_text(sender.p_address)?,
                     port: u16::try_from(sender.port).ok(),
                     groups,
                     subscribed: sender.events_subscribed,
@@ -914,9 +905,10 @@ impl RecvListener {
     /// options carry an Advanced configuration that the runtime or this build
     /// cannot take; [`Error::InvalidCString`] when the endpoint contains a NUL
     /// byte; and [`Error::InvalidInput`] when the options name more than one
-    /// endpoint, or the SDK creates no listener. It creates none for an
-    /// address it cannot parse, and none when `options` name no server and the
-    /// NDI configuration supplies none.
+    /// endpoint, or the SDK creates no listener. Without an explicit server the
+    /// SDK uses its configuration; creation fails when it names no server or
+    /// one the SDK cannot use. An explicit address the SDK cannot parse is also
+    /// refused.
     ///
     /// [receiver discovery]: crate::capabilities::RuntimeFeature::ReceiverDiscovery
     #[doc(alias = "NDIlib_recv_listener_create")]
@@ -1046,7 +1038,7 @@ mod tests {
             id: None,
             name: Some(SourceText::new("Studio (Camera)".into()).unwrap()),
             metadata: None,
-            address: Some("192.0.2.10".into()),
+            address: Some(SourceText::new("192.0.2.10".into()).unwrap()),
             port: Some(5960),
             groups: vec![],
             subscribed: false,
@@ -1060,7 +1052,7 @@ mod tests {
             ("2001:db8::10", "[2001:db8::10]:5960"),
             ("[2001:db8::10]", "[2001:db8::10]:5960"),
         ] {
-            sender.address = Some(address.into());
+            sender.address = Some(SourceText::new(address.into()).unwrap());
             let source = sender.to_source().unwrap();
             let actual = source.address().unwrap();
             assert_eq!(actual.as_str(), endpoint);

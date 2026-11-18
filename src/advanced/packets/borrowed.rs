@@ -38,13 +38,14 @@ macro_rules! borrowed_extras {
     () => {
         /// The codec payload, borrowed in place without copying.
         pub fn data(&self) -> &[u8] {
+            self.packet_slice().as_slice()
+        }
+
+        fn packet_slice(&self) -> PacketSlice<'_> {
             // SAFETY: construction validated the positive payload extent; the
             // guard retains its initialized, immutable allocation for this borrow.
             unsafe {
-                std::slice::from_raw_parts(
-                    self.frame.descriptor().p_data,
-                    self.frame.parts().len.to_usize(),
-                )
+                PacketSlice::from_validated(self.frame.descriptor().p_data, self.frame.parts().len)
             }
         }
 
@@ -82,11 +83,14 @@ unsafe impl DescriptorParts<NDIlib_video_frame_v2_t> for VideoPacketParts {
     unsafe fn validate(raw: &NDIlib_video_frame_v2_t) -> Result<Self> {
         let format = VideoPacketFormat::from_sdk(raw)?;
         // SAFETY: the delivered size union names the guard's readable
-        // initialized allocation; packet_bytes checks its extent.
-        let (bytes, len) =
-            unsafe { packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
-        validate_video_content(format, bytes, len, Use::Receive)?;
-        Ok(Self { format, len })
+        // initialized allocation; PacketSlice checks its extent.
+        let bytes =
+            unsafe { PacketSlice::from_sdk(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
+        validate_video_content(format, bytes, Use::Receive)?;
+        Ok(Self {
+            format,
+            len: bytes.len(),
+        })
     }
 }
 
@@ -111,8 +115,7 @@ impl<'rx> CompressedVideoRef<'rx> {
         extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
         ReceivedVideoPacket {
             format: self.format(),
-            bytes: self.data().to_vec(),
-            len: self.frame.parts().len,
+            payload: PacketBytes::copied(self.packet_slice()),
             extras,
         }
     }
@@ -123,15 +126,12 @@ impl<'rx> CompressedVideoRef<'rx> {
     pub fn copy_into(&self, destination: &mut ReceivedVideoPacket) {
         let ReceivedVideoPacket {
             format,
-            bytes,
-            len,
+            payload,
             extras,
         } = destination;
-        bytes.clear();
-        bytes.extend_from_slice(self.data());
+        payload.refill(self.packet_slice());
         extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
         *format = self.format();
-        *len = self.frame.parts().len;
     }
 
     /// Copy into sendable storage after checking this borrowed packet.
@@ -142,22 +142,15 @@ impl<'rx> CompressedVideoRef<'rx> {
     ///
     /// [`Error::InvalidFrame`] when this packet cannot be sent.
     pub fn try_copy_into(&self, destination: &mut CompressedVideoFrame) -> Result<()> {
-        validate_video_content(
-            self.format(),
-            self.data(),
-            self.frame.parts().len,
-            Use::Send,
-        )?;
+        validate_video_content(self.format(), self.packet_slice(), Use::Send)?;
         let CompressedVideoFrame {
             format,
-            bytes,
-            len,
+            payload,
             extras,
         } = destination;
-        bytes.copy_from_slice(self.data());
+        payload.refill(self.packet_slice());
         extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
         *format = self.format();
-        *len = self.frame.parts().len;
         Ok(())
     }
 }
@@ -169,11 +162,14 @@ unsafe impl DescriptorParts<NDIlib_audio_frame_v3_t> for AudioPacketParts {
     unsafe fn validate(raw: &NDIlib_audio_frame_v3_t) -> Result<Self> {
         let format = AudioPacketFormat::from_sdk(raw)?;
         // SAFETY: this delivered union names the guard's initialized
-        // readable payload; packet_bytes checks the positive extent.
-        let (bytes, len) =
-            unsafe { packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
-        validate_received_audio(format.codec(), bytes, len)?;
-        Ok(Self { format, len })
+        // readable payload; PacketSlice checks the positive extent.
+        let bytes =
+            unsafe { PacketSlice::from_sdk(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
+        validate_received_audio(format.codec(), bytes)?;
+        Ok(Self {
+            format,
+            len: bytes.len(),
+        })
     }
 }
 
@@ -198,8 +194,7 @@ impl<'rx> CompressedAudioRef<'rx> {
         extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
         ReceivedAudioPacket {
             format: self.format(),
-            bytes: self.data().to_vec(),
-            len: self.frame.parts().len,
+            payload: PacketBytes::copied(self.packet_slice()),
             extras,
         }
     }
@@ -209,15 +204,12 @@ impl<'rx> CompressedAudioRef<'rx> {
     pub fn copy_into(&self, destination: &mut ReceivedAudioPacket) {
         let ReceivedAudioPacket {
             format,
-            bytes,
-            len,
+            payload,
             extras,
         } = destination;
-        bytes.clear();
-        bytes.extend_from_slice(self.data());
+        payload.refill(self.packet_slice());
         extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
         *format = self.format();
-        *len = self.frame.parts().len;
     }
 
     /// Copy into sendable storage after checking this borrowed packet.
@@ -228,17 +220,15 @@ impl<'rx> CompressedAudioRef<'rx> {
     ///
     /// [`Error::InvalidFrame`] when this packet cannot be sent.
     pub fn try_copy_into(&self, destination: &mut CompressedAudioFrame) -> Result<()> {
-        validate_audio_content_for_send(self.format(), self.data(), self.frame.parts().len)?;
+        validate_audio_content_for_send(self.format(), self.packet_slice())?;
         let CompressedAudioFrame {
             format,
-            bytes,
-            len,
+            payload,
             extras,
         } = destination;
-        bytes.copy_from_slice(self.data());
+        payload.refill(self.packet_slice());
         extras.copy_received(self.timecode(), self.timestamp(), self.frame_metadata());
         *format = self.format();
-        *len = self.frame.parts().len;
         Ok(())
     }
 }
@@ -253,23 +243,16 @@ impl TryFrom<&CompressedVideoRef<'_>> for CompressedVideoFrame {
 
     /// Admit the borrowed packet before allocating its owned copy.
     fn try_from(packet: &CompressedVideoRef<'_>) -> Result<Self> {
-        validate_video_content(
-            packet.format(),
-            packet.data(),
-            packet.frame.parts().len,
-            Use::Send,
-        )?;
+        validate_video_content(packet.format(), packet.packet_slice(), Use::Send)?;
         // The same borrowed packet was admitted above; no second check or copy.
         let ReceivedVideoPacket {
             format,
-            bytes,
-            len,
+            payload,
             extras,
         } = packet.to_owned();
         Ok(Self {
             format,
-            bytes: AliasableVec::new(bytes),
-            len,
+            payload,
             extras,
         })
     }
@@ -280,17 +263,15 @@ impl TryFrom<&CompressedAudioRef<'_>> for CompressedAudioFrame {
 
     /// Admit the borrowed packet before allocating its owned copy.
     fn try_from(packet: &CompressedAudioRef<'_>) -> Result<Self> {
-        validate_audio_content_for_send(packet.format(), packet.data(), packet.frame.parts().len)?;
+        validate_audio_content_for_send(packet.format(), packet.packet_slice())?;
         let ReceivedAudioPacket {
             format,
-            bytes,
-            len,
+            payload,
             extras,
         } = packet.to_owned();
         Ok(Self {
             format,
-            bytes: AliasableVec::new(bytes),
-            len,
+            payload,
             extras,
         })
     }

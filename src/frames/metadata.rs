@@ -351,6 +351,10 @@ impl TerminatedText {
         let len_with_nul = text.len() + 1;
         validate_metadata_len_with_nul(len_with_nul)?;
         if let Some(position) = text.as_bytes().iter().position(|&byte| byte == 0) {
+            #[expect(
+                clippy::expect_used,
+                reason = "the searched prefix includes its first NUL; NulError has no public constructor"
+            )]
             return Err(Error::InvalidCString(
                 CString::new(&text.as_bytes()[..=position])
                     .expect_err("the prefix includes its first NUL"),
@@ -451,6 +455,13 @@ impl Default for OwnedFrameMetadata {
 }
 
 impl OwnedFrameMetadata {
+    pub(super) fn into_supplied_text(self) -> Option<String> {
+        match self {
+            Self::Text(text) => Some(text.into_string()),
+            Self::Absent(_) | Self::Withheld { .. } => None,
+        }
+    }
+
     pub(crate) fn new(metadata: impl Into<String>) -> std::result::Result<Self, Rejected<String>> {
         Ok(Self::Text(TerminatedText::new(metadata)?))
     }

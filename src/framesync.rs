@@ -456,6 +456,28 @@ enum AudioCall {
     InputFormat,
 }
 
+impl crate::capture::source_sealed::Sealed for &FrameSyncResource {}
+
+macro_rules! framesync_frame_source {
+    ($strategy:ty) => {
+        // SAFETY: this resource owns the synchronizer and retains its creating
+        // receiver/runtime. Its borrow prevents destruction until frame free.
+        unsafe impl<'owner> crate::capture::FrameSource<'owner, $strategy>
+            for &'owner FrameSyncResource
+        {
+            fn runtime(&self) -> &'owner crate::Ndi {
+                self.receiver().ndi()
+            }
+
+            fn instance(&self) -> NDIlib_framesync_instance_t {
+                self.instance.0
+            }
+        }
+    };
+}
+framesync_frame_source!(FrameSyncVideoFree);
+framesync_frame_source!(FrameSyncAudioFree);
+
 impl FrameSyncResource {
     /// Capture video for `scan_type`: the guard of the frame the SDK
     /// returned, or `None` for the documented all-zero "no video yet" state,
@@ -480,7 +502,7 @@ impl FrameSyncResource {
         // destroys the instance only when dropped, so the instance outlives
         // the guard, which frees the frame exactly once through
         // NDIlib_framesync_free_video, including when validation fails.
-        Some(unsafe { Guard::new(self.receiver().ndi(), self.instance.0, frame) })
+        Some(unsafe { Guard::new(self, frame) })
     }
 
     /// Make `call`: the guard of what the SDK returned, which it returns
@@ -527,7 +549,7 @@ impl FrameSyncResource {
         // destroys the instance only when dropped, so the instance outlives
         // the guard, which frees the frame exactly once through
         // NDIlib_framesync_free_audio_v2, including when validation fails.
-        unsafe { Guard::new(self.receiver().ndi(), self.instance.0, frame) }
+        unsafe { Guard::new(self, frame) }
     }
 }
 
@@ -1064,7 +1086,7 @@ mod tests {
         let mut sync = FrameSync::new(receiver).unwrap();
         let original = (
             sync.inner.resource().instance,
-            sync.receiver().core.lock_connection().instance(),
+            sync.receiver().core.lock_control().instance(),
         );
         let (results, allocations) = crate::test_alloc::allocation_count(|| {
             let tier = sync.controls().set_stream_tier(crate::StreamTier::Preview);
@@ -1078,7 +1100,7 @@ mod tests {
         assert_eq!(
             (
                 sync.inner.resource().instance,
-                sync.receiver().core.lock_connection().instance()
+                sync.receiver().core.lock_control().instance()
             ),
             original
         );
@@ -1127,13 +1149,13 @@ mod tests {
                     &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
                 )
                 .unwrap();
-                let original = receiver.core.lock_connection().instance();
+                let original = receiver.core.lock_control().instance();
                 drop(ndi);
                 for _ in 0..3 {
                     let fs = FrameSync::new(receiver).unwrap();
-                    assert_eq!(fs.receiver().core.lock_connection().instance(), original);
+                    assert_eq!(fs.receiver().core.lock_control().instance(), original);
                     receiver = fs.into_receiver();
-                    assert_eq!(receiver.core.lock_connection().instance(), original);
+                    assert_eq!(receiver.core.lock_control().instance(), original);
                     assert!(receiver.capture_video(std::time::Duration::ZERO).is_ok());
                 }
                 let fs = FrameSync::new(receiver).unwrap();

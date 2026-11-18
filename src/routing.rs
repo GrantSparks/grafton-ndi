@@ -134,13 +134,6 @@ pub struct Router {
     // The SDK may retain both an effective route and its last refused request.
     sources: RetainedSources,
     #[cfg(feature = "advanced")]
-    #[cfg_attr(
-        not(ndi_has_advanced_router_connection_metadata),
-        expect(
-            dead_code,
-            reason = "only native router metadata operations use this storage"
-        )
-    )]
     pub(crate) connection_metadata: crate::connection_metadata::ConnectionMetadata,
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
@@ -236,16 +229,17 @@ impl Router {
         })
     }
 
-    /// The native router, for calls through an Advanced table.
-    #[cfg(all(feature = "advanced", ndi_has_advanced_router_connection_metadata))]
-    pub(crate) fn native_instance(&self) -> NDIlib_routing_instance_t {
-        self.instance.0
-    }
-
-    /// The runtime this router was created through.
+    /// Split the gated metadata table, native instance and retained registrations.
     #[cfg(feature = "advanced")]
-    pub(crate) fn runtime(&self) -> &Ndi {
-        self.routing.ndi()
+    pub(crate) fn connection_metadata_parts(
+        &mut self,
+    ) -> Result<(
+        &sys::advanced::RouterConnectionMetadata,
+        NDIlib_routing_instance_t,
+        &mut crate::connection_metadata::ConnectionMetadata,
+    )> {
+        let table = self.routing.ndi().table()?;
+        Ok((table, self.instance.0, &mut self.connection_metadata))
     }
 
     /// Route connected and future receivers to `source`.
@@ -325,6 +319,7 @@ impl Router {
     /// descriptor, or one that names neither a source nor an address, and
     /// [`crate::Error::UnexpectedSdkResult`] when its name or address is longer than
     /// the 4 MiB one SDK string may be.
+    /// [`crate::Error::AllocationFailed`] when source descriptor storage cannot be reserved.
     #[doc(alias = "NDIlib_routing_get_source_name")]
     pub fn source(&self) -> Result<Source> {
         // SAFETY: the router is live, and the descriptor the SDK returns stays

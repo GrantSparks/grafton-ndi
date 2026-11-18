@@ -23,7 +23,7 @@ use crate::{
 };
 
 mod tracker;
-use tracker::FileTracker;
+use tracker::{FileClose, FileTracker};
 
 /// The longest single wait for an event while finalization is pending. Short
 /// enough that a caller's interruption is noticed promptly.
@@ -50,8 +50,11 @@ pub enum RecorderState {
     Stopping,
     /// The session ended and every file it opened was reported closed.
     Closed,
-    /// The session ended, but events were lost or inconsistent, so it cannot
-    /// be said whether every file was finalized.
+    /// The session ended without [`RecordingReport::closure_confirmed`].
+    /// Events were lost, unreadable or inconsistent, or the session ended
+    /// before reporting any file. Incomplete tracking requires
+    /// [`FileRecorder::reset`] before starting another session; see
+    /// [`StateConflict::IncompleteFileTracking`].
     Indeterminate,
 }
 
@@ -128,7 +131,11 @@ impl RecordingReport {
     pub fn session(&self) -> u64 {
         self.session
     }
-    /// Whether every file the session opened was reported closed.
+    /// Whether at least one file was reported closed, every reported open
+    /// was matched by its close, and file tracking stayed complete.
+    ///
+    /// A session that ends before reporting any file has no confirmed
+    /// closure, even when no event was lost and no cleanup remains pending.
     pub fn closure_confirmed(&self) -> bool {
         matches!(self.phase, SessionPhase::Closed { .. })
     }
@@ -139,14 +146,19 @@ impl RecordingReport {
     pub fn closed_files(&self) -> u64 {
         self.closed_files
     }
-    /// How many of the closed files had no audio or video written to them.
+    /// How many closed files were confirmed to contain no audio or video.
     ///
     /// The SDK opens a file as soon as a session or a rollover starts, and
     /// closes it as finalized even if no frame ever reached it: a stop before
     /// the source delivered anything, a switch to a source that is not there,
     /// a rollover while the source is lost. Such a file is empty or holds
     /// only a header, and may not open in a player. A file counts here when
-    /// it was closed without the SDK having reported its first frame.
+    /// it closed under complete tracking without a reported first frame.
+    ///
+    /// The count is exact when [`closure_confirmed`](Self::closure_confirmed)
+    /// is true. Otherwise it is a lower bound: files confirmed empty before
+    /// tracking became incomplete remain counted, while later closes cannot
+    /// establish that a missing first-frame event was never delivered.
     ///
     /// Always zero for a recorder that records neither audio nor video,
     /// because the SDK reports no first frame for metadata.
@@ -615,6 +627,29 @@ struct OpenSession {
     dropped_base: u64,
 }
 
+impl OpenSession {
+    fn final_phase(&self, stopping: Option<bool>) -> Option<SessionPhase> {
+        let requested = stopping.unwrap_or(false);
+        if !self.files.is_complete() {
+            Some(SessionPhase::Indeterminate { requested })
+        } else if self.files.is_empty() && self.report.closed_files > 0 {
+            Some(SessionPhase::Closed { requested })
+        } else if stopping.is_some() && self.files.is_empty() {
+            Some(SessionPhase::Indeterminate { requested })
+        } else {
+            None
+        }
+    }
+
+    fn end(self, phase: SessionPhase) -> Session {
+        Session::Ended {
+            report: self.report.into_report(phase),
+            files: self.files,
+            dropped_base: self.dropped_base,
+        }
+    }
+}
+
 /// Each state owns only the data it can use. A stopping session has already
 /// issued its stop; a final session retains only its report and cleanup files.
 enum Session {
@@ -634,6 +669,33 @@ enum Session {
         files: FileTracker,
         dropped_base: u64,
     },
+}
+
+impl Session {
+    /// Moving out of Open transfers its only native-stop obligation.
+    fn stop_requested(self, requested: bool) -> (Self, Option<StopOwed>) {
+        match self {
+            Self::Open { data, stop } => (Self::Stopping { data, requested }, Some(stop)),
+            previous => (previous, None),
+        }
+    }
+
+    fn drained(self, native_recording: bool) -> (Self, Option<StopOwed>) {
+        if native_recording {
+            return (self, None);
+        }
+        match self {
+            Self::Open { data, stop } => match data.final_phase(None) {
+                Some(phase) => (data.end(phase), Some(stop)),
+                None => (Self::Open { data, stop }, None),
+            },
+            Self::Stopping { data, requested } => match data.final_phase(Some(requested)) {
+                Some(phase) => (data.end(phase), None),
+                None => (Self::Stopping { data, requested }, None),
+            },
+            previous => (previous, None),
+        }
+    }
 }
 
 /// The record of one session, built from the recorder's events.
@@ -770,6 +832,23 @@ impl Ledger {
         self.session_open() || self.tracker().is_some_and(FileTracker::cleanup_pending)
     }
 
+    fn admit_start(&self) -> Result<()> {
+        let conflict = if self.session_open() {
+            Some(StateConflict::PreviousSessionOpen)
+        } else {
+            self.tracker().and_then(|files| {
+                if !files.is_complete() {
+                    Some(StateConflict::IncompleteFileTracking)
+                } else if !files.is_empty() {
+                    Some(StateConflict::PreviousSessionOpen)
+                } else {
+                    None
+                }
+            })
+        };
+        conflict.map_or(Ok(()), |state| Err(Error::InvalidState(state)))
+    }
+
     fn all_closed(&self) -> bool {
         self.open()
             .is_some_and(|data| !data.files.cleanup_pending() && data.report.closed_files > 0)
@@ -784,20 +863,18 @@ impl Ledger {
         }
     }
 
-    /// Moving out of Open transfers the only native-stop obligation to its
-    /// caller; repeating the transition cannot mint another one.
-    fn stop_requested(&mut self, requested: bool) -> Option<StopOwed> {
+    fn transition(
+        &mut self,
+        transition: impl FnOnce(Session) -> (Session, Option<StopOwed>),
+    ) -> Option<StopOwed> {
         let previous = std::mem::replace(&mut self.session, Session::Idle { last: None });
-        match previous {
-            Session::Open { data, stop } => {
-                self.session = Session::Stopping { data, requested };
-                Some(stop)
-            }
-            previous => {
-                self.session = previous;
-                None
-            }
-        }
+        let (next, stop) = transition(previous);
+        self.session = next;
+        stop
+    }
+
+    fn stop_requested(&mut self, requested: bool) -> Option<StopOwed> {
+        self.transition(|session| session.stop_requested(requested))
     }
 
     fn mark_uncertain(&mut self) {
@@ -861,7 +938,7 @@ impl Ledger {
                 data.files.first_frame(&path);
             }
             RecorderEventKind::FileClosed => {
-                if data.files.close(&path) == Some(false) && data.records_media {
+                if data.files.close(&path) == FileClose::ConfirmedEmpty && data.records_media {
                     data.report.empty_files = data.report.empty_files.saturating_add(1);
                 }
                 data.report.closed_files = data.report.closed_files.saturating_add(1);
@@ -886,35 +963,7 @@ impl Ledger {
     /// Finality relies on open-before-close rollover events, pinned by the
     /// native rollover-order test. Every exit transfers any owed native stop.
     fn drained(&mut self, native_recording: bool) -> Option<StopOwed> {
-        if native_recording {
-            return None;
-        }
-        let data = self.open()?;
-        let requested = match self.session {
-            Session::Stopping { requested, .. } => requested,
-            _ => false,
-        };
-        let phase = if !data.files.is_complete() {
-            SessionPhase::Indeterminate { requested }
-        } else if data.files.is_empty() && data.report.closed_files > 0 {
-            SessionPhase::Closed { requested }
-        } else if matches!(self.session, Session::Stopping { .. }) && data.files.is_empty() {
-            SessionPhase::Indeterminate { requested }
-        } else {
-            return None;
-        };
-        let previous = std::mem::replace(&mut self.session, Session::Idle { last: None });
-        let (data, stop) = match previous {
-            Session::Open { data, stop } => (data, Some(stop)),
-            Session::Stopping { data, .. } => (data, None),
-            _ => unreachable!("only an open session can finish"),
-        };
-        self.session = Session::Ended {
-            report: data.report.into_report(phase),
-            files: data.files,
-            dropped_base: data.dropped_base,
-        };
-        stop
+        self.transition(|session| session.drained(native_recording))
     }
 }
 
@@ -1159,11 +1208,11 @@ impl FileRecorder {
     ///
     /// * [`Error::InvalidState`] with [`StateConflict::PreviousSessionOpen`]
     ///   while an earlier session is recording, stopping, awaiting a known
-    ///   file's closure, or has incomplete file tracking. Finish or poll it
-    ///   first when tracking is complete; incomplete tracking requires
-    ///   [`reset`](Self::reset), even after every known file closes. With
-    ///   [`StateConflict::EarlierSessionEvents`] when the SDK keeps reporting
-    ///   events of an earlier session.
+    ///   file's closure under complete tracking; finish or poll it first.
+    ///   [`StateConflict::IncompleteFileTracking`] after a session ends with
+    ///   incomplete tracking; [`reset`](Self::reset) is required even after
+    ///   every known file closes. [`StateConflict::EarlierSessionEvents`]
+    ///   when the SDK keeps reporting events of an earlier session.
     /// * [`Error::InvalidInput`] when the resolved output path is not lossless
     ///   UTF-8, or its longest form exceeds the recorder event's exact path
     ///   limit (4094 UTF-8 bytes with the current SDK), reserving at least
@@ -1191,9 +1240,7 @@ impl FileRecorder {
         timecode: RecordingTimecode,
         sink: &mut impl FnMut(Result<RecorderEvent>),
     ) -> Result<u64> {
-        if self.ledger.cleanup_pending() {
-            return Err(Error::InvalidState(StateConflict::PreviousSessionOpen));
-        }
+        self.ledger.admit_start()?;
         self.naming.check(target)?;
         // Events left over from an earlier session must not be counted in this one.
         self.discard_stale_events(sink)?;
@@ -1201,9 +1248,7 @@ impl FileRecorder {
         // previously final session. Its immutable report does not release
         // the resulting unknown native-file obligation.
         self.ledger.dropped(self.dropped_event_count());
-        if self.ledger.cleanup_pending() {
-            return Err(Error::InvalidState(StateConflict::PreviousSessionOpen));
-        }
+        self.ledger.admit_start()?;
         let session = self
             .ledger
             .session_number()
@@ -1556,8 +1601,9 @@ impl FileRecorder {
     /// Use this after a finalization timeout when the SDK stopped producing
     /// events, or after native event loss, unreadable lifecycle evidence or a
     /// tracking limit made the old session's file tracking incomplete. Incomplete
-    /// tracking requires a reset before another session, even if all known
-    /// files later close. The returned
+    /// tracking causes [`StateConflict::IncompleteFileTracking`] on another
+    /// start after the session ends, even if all known files later close. A
+    /// successful reset clears that refusal. The returned
     /// report preserves that uncertainty; the old file may be truncated.
     /// The replacement has its own event queue, so delayed events from the old
     /// session cannot affect a new recording. The last report is retained and
@@ -1945,6 +1991,72 @@ mod tests {
     };
 
     #[test]
+    fn idle_and_ended_session_transitions_preserve_their_reports_and_owe_no_stop() {
+        let mut closed = session();
+        let _ = closed.observe(Started, path("take.mkv"));
+        let _ = closed.observe(FileClosed, path("take.mkv"));
+        assert!(closed.drained(false).is_some());
+        for mut ledger in [Ledger::idle(), closed] {
+            let state = ledger.state();
+            let report = ledger.report();
+            for requested in [false, true] {
+                assert!(ledger.stop_requested(requested).is_none());
+                for native_recording in [false, true] {
+                    assert!(ledger.drained(native_recording).is_none());
+                    assert_eq!(ledger.state(), state);
+                    assert_eq!(ledger.report(), report);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn active_incomplete_tracking_keeps_the_session_refusal_until_it_ends() {
+        let mut ledger = session();
+        let _ = ledger.observe(Started, path("known.mkv"));
+        ledger.dropped(1);
+        for stopping in [false, true] {
+            if stopping {
+                assert!(ledger.stop_requested(true).is_some());
+            }
+            assert!(matches!(
+                ledger.admit_start(),
+                Err(crate::Error::InvalidState(
+                    StateConflict::PreviousSessionOpen
+                ))
+            ));
+        }
+        assert!(
+            ledger.drained(false).is_none(),
+            "the stop was already issued"
+        );
+        assert_eq!(ledger.state(), RecorderState::Indeterminate);
+        assert!(matches!(
+            ledger.admit_start(),
+            Err(crate::Error::InvalidState(
+                StateConflict::IncompleteFileTracking
+            ))
+        ));
+        let report = ledger.report();
+        let _ = ledger.observe(FileClosed, path("known.mkv"));
+        assert!(
+            ledger.cleanup_pending(),
+            "a known close cannot retire unknown files"
+        );
+        assert_eq!(
+            ledger.report(),
+            report,
+            "cleanup keeps the final report fixed"
+        );
+        assert!(matches!(
+            ledger.admit_start(),
+            Err(crate::Error::InvalidState(
+                StateConflict::IncompleteFileTracking
+            ))
+        ));
+    }
+
+    #[test]
     fn every_drain_uses_one_expiry_read_and_one_bounded_late_phase() {
         let at = Instant::now();
         let deadline =
@@ -2032,6 +2144,33 @@ mod tests {
         let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
         assert!(!ledger.report().closure_confirmed());
+    }
+
+    #[test]
+    fn empty_file_counts_use_only_evidence_observed_under_complete_tracking() {
+        for empty_before_loss in [false, true] {
+            let mut ledger = session();
+            let _ = ledger.observe(Started, path("known.mkv"));
+            if empty_before_loss {
+                let _ = ledger.observe(FileClosed, path("known.mkv"));
+                assert_eq!(ledger.report().empty_files(), 1);
+            }
+            ledger.dropped(1);
+            if !empty_before_loss {
+                // The lost event could have been this file's first frame.
+                let _ = ledger.observe(FileClosed, path("known.mkv"));
+            }
+            // Opens after lost evidence are deliberately not retained, and
+            // neither they nor their closes can prove another empty file.
+            let _ = ledger.observe(Rollover, path("hidden.mkv"));
+            let _ = ledger.observe(FileClosed, path("hidden.mkv"));
+            let _ = ledger.drained(false);
+            let report = ledger.report();
+            assert_eq!(report.empty_files(), u64::from(empty_before_loss));
+            assert_eq!(report.closed_files(), 2);
+            assert!(!report.closure_confirmed());
+            assert_eq!(report.dropped_events(), 1);
+        }
     }
 
     #[test]
@@ -2243,6 +2382,9 @@ mod tests {
         let _ = ledger.stop_requested(true);
         let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
+        assert!(!ledger.report().closure_confirmed());
+        assert_eq!(ledger.report().dropped_events(), 0);
+        assert!(!ledger.cleanup_pending());
     }
 
     #[test]

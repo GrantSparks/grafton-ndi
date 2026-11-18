@@ -170,8 +170,8 @@ pub use listener::{
 /// The error for an advertiser or listener the SDK did not create.
 ///
 /// The SDK creates these objects for any address it can parse, reachable or
-/// not, so a refusal is about the configuration: `server` is the address that
-/// was given.
+/// not. With no explicit `server`, refusal covers both no configured server
+/// and a configured server the SDK cannot use; the crate cannot tell them apart.
 fn not_created(object: &'static str, server: Option<&ServerEndpoint<'_>>) -> crate::Error {
     crate::Error::InvalidInput(match server {
         Some(server) => {
@@ -183,7 +183,7 @@ fn not_created(object: &'static str, server: Option<&ServerEndpoint<'_>>) -> cra
                 },
             }))
         }
-        None => crate::InputDefect::DiscoveryAddressMissing { object },
+        None => crate::InputDefect::DiscoveryConfigurationRejected { object },
     })
 }
 

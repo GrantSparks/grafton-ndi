@@ -31,7 +31,7 @@
 //! // Internal schematic; this module is not part of the public API
 //! use crate::capture::{Guard, VideoKind};
 //!
-//! let guard = unsafe { Guard::<VideoKind>::new(runtime, instance, frame) };
+//! let guard = unsafe { Guard::<VideoKind>::new(source, frame) };
 //! // Guard automatically calls the correct free function when dropped
 //! ```
 
@@ -39,7 +39,7 @@ use std::{marker::PhantomData, rc::Rc};
 
 use crate::{
     frames::{AudioFrameRef, MetadataFrameRef, VideoFrameRef},
-    receiver::CaptureLock,
+    receiver::{CaptureLock, ReceiverFrameSource},
     sys::{self, bindings::*},
     Error, Ndi, Result,
 };
@@ -415,6 +415,26 @@ unsafe impl FrameFree for AvSyncAudioFree {
     }
 }
 
+/// Implemented only by capture owners and the proofs they mint.
+pub(crate) mod source_sealed {
+    pub(crate) trait Sealed {}
+}
+
+/// A borrowed native owner paired with its runtime and matching free strategy.
+///
+/// # Safety
+///
+/// The returned instance must belong to the returned runtime, and both must
+/// remain live for `'owner`. Any free entry point carried by the instance must
+/// come from that owner's bound table. Construction must retain a borrow of
+/// the owner whose destruction invalidates the instance.
+pub(crate) unsafe trait FrameSource<'owner, S: FrameFree>:
+    source_sealed::Sealed + Copy
+{
+    fn runtime(&self) -> &'owner Ndi;
+    fn instance(&self) -> S::Instance;
+}
+
 /// Generic RAII guard for captured NDI frames.
 ///
 /// This guard ensures that captured frames are freed exactly once via the free
@@ -483,10 +503,8 @@ impl<'owner, S: FrameFree> Guard<'owner, S> {
     /// # Safety
     ///
     /// The caller must ensure that:
-    /// - `instance` is a valid instance for the free strategy `S`, created
-    ///   through `runtime`
-    /// - `frame` belongs to the matching capture/free family `S` and has not
-    ///   been freed. Until this guard releases it, every non-null pointer
+    /// - `frame` was delivered by `source` through the matching capture/free
+    ///   family `S` and has not been freed. Until this guard releases it, every non-null pointer
     ///   describes live storage valid for that descriptor: active pixel rows
     ///   or channel samples are initialized, and metadata is readable through
     ///   its first NUL or `MAX_METADATA_BYTES`. Standalone metadata with a
@@ -497,18 +515,13 @@ impl<'owner, S: FrameFree> Guard<'owner, S> {
     ///   (which can exclude that terminator). The borrowed view validates that
     ///   count without treating it as an initialized storage extent.
     ///   Padding need not be initialized.
-    /// - the owning instance and all described storage remain valid and
-    ///   unchanged for `'owner`; tie this lifetime to a borrow of that owner.
+    ///   The described storage remains valid and unchanged for `'owner`.
     ///   Null request descriptors and empty synchronization results are valid.
-    pub(crate) unsafe fn new(
-        runtime: &'owner Ndi,
-        instance: S::Instance,
-        frame: S::RawFrame,
-    ) -> Self {
+    pub(crate) unsafe fn new(source: impl FrameSource<'owner, S>, frame: S::RawFrame) -> Self {
         Self {
-            instance,
+            instance: source.instance(),
             frame,
-            release: Release::Native(runtime),
+            release: Release::Native(source.runtime()),
             _thread_affine: PhantomData,
         }
     }
@@ -673,8 +686,7 @@ impl Slots {
 /// [takes](Self::take) every kind it gave a slot: a frame left in its slot
 /// would never be freed.
 struct Captured<'rx> {
-    runtime: &'rx Ndi,
-    instance: NDIlib_recv_instance_t,
+    source: ReceiverFrameSource<'rx>,
     frame_type: NDIlib_frame_type_e,
     slots: Slots,
 }
@@ -689,8 +701,7 @@ impl<'rx> Captured<'rx> {
             slots.metadata.as_mut(),
         );
         Self {
-            runtime: lock.runtime(),
-            instance: lock.instance(),
+            source: lock.source(),
             frame_type,
             slots,
         }
@@ -706,13 +717,9 @@ impl<'rx> Captured<'rx> {
         let frame = K::slot(&mut self.slots).take()?;
         // SAFETY: the SDK reported a frame of kind `K` and was given `K`'s
         // descriptor, so it wrote that frame there (Processing.NDI.Recv.h:
-        // it fills only the descriptor of the kind it returns). `capture`
-        // made that call on `instance`, created through `runtime`, and
-        // taking the descriptor out of its slot wraps the frame once. The
-        // lock borrowed the receiver for 'rx, as `runtime` and the guard do,
-        // so the instance outlives the guard, which frees the frame exactly
-        // once through the matching NDIlib_recv_free_* function.
-        Some(unsafe { Guard::new(self.runtime, self.instance, frame) })
+        // it fills only the descriptor of the kind it returns). Taking the
+        // descriptor out of its slot wraps the frame once. The capture proof pairs its owning receiver with the matching free.
+        Some(unsafe { Guard::new(self.source, frame) })
     }
 
     /// What the capture reported in place of a frame a caller took.

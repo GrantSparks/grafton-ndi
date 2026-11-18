@@ -26,6 +26,24 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Fixed
 
+- Standard Windows receiver controls no longer read a connection being replaced
+  by a local connect, disconnect or reconnect. Connection-reading commands
+  report `NotConnected` during that transition; tally changes are retained and
+  replayed afterward, and getters remain independent of the native connect.
+
+- Queued senders publish unknown-completion failures in the admission lock,
+  so a racing submission cannot enter after failure is detected.
+- Receiver shared controls use a separate permit from local connection changes,
+  allowing allocator callbacks to use controls without deadlocking a connect,
+  disconnect or reconnect. Getters no longer wait for the connection permit.
+- Single-source descriptor allocation failures identify `SourceDescriptor`
+  storage and its requested byte count; sender, router and File player getters
+  document that failure.
+- Recorder reports count only files confirmed empty under complete tracking;
+  after lost lifecycle evidence, `empty_files` is a lower bound.
+
+- Owned video and audio keep validated layouts with their storage and copy from
+  one layout observation, preserving valid frames when a copy unwinds.
 - Recorder file tracking stays bounded after native event loss and preserves
   unknown cleanup obligations even after all known files close. Drop and async
   close consume the remaining original cleanup budget; final reports stay fixed.
@@ -48,9 +66,15 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- Discovery Server creation from SDK configuration reports
+  `InputDefect::DiscoveryConfigurationRejected` when no usable server was
+  resolved, covering both absent and unusable configured servers.
+- `BorrowedVideoFrame` and `BorrowedVideoFrameBuilder` now live alongside
+  borrowed audio in `frames`; their crate-root imports remain available.
+
 - Starting another recording after incomplete file tracking now requires a
   successful `reset`, even after all known files close; otherwise `start`
-  returns `InvalidState(StateConflict::PreviousSessionOpen)`. See the
+  returns `InvalidState(StateConflict::IncompleteFileTracking)`. See the
   [migration notes](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/migration/unreleased.md#restarting-a-recorder-after-incomplete-file-tracking).
 - `FrameSyncAudioRequest` rejects invalid rates, counts and payload extents with
   `InvalidInput(InputDefect::Layout(..))`, matching reusable audio requests.

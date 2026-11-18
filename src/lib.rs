@@ -46,6 +46,15 @@
 
 #![deny(missing_debug_implementations)]
 #![warn(clippy::return_self_not_must_use)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::unreachable,
+        clippy::panic
+    )
+)]
 // Android has no native thread-locals, so std expands `thread_local!` through
 // its OS-key implementation, which wraps even a `const { .. }` initializer in
 // an ordinary function; clippy then asks for the `const` the test-only
@@ -113,10 +122,10 @@ pub use {
     finder::{Finder, FinderOptions, Source, SourceAddress, SourceCache, SourceWatch},
     frames::{
         AudioChannels, AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioSource,
-        BorrowedAudioFrame, BorrowedAudioFrameBuilder, FormatCategory, FrameMetadataStatus,
-        MetadataFrame, MetadataFrameRef, MetadataSource, PixelFormat, PixelFormatInfo, ScanType,
-        VideoFrame, VideoFrameBuilder, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows,
-        VideoSource,
+        BorrowedAudioFrame, BorrowedAudioFrameBuilder, BorrowedVideoFrame,
+        BorrowedVideoFrameBuilder, FormatCategory, FrameMetadataStatus, MetadataFrame,
+        MetadataFrameRef, MetadataSource, PixelFormat, PixelFormatInfo, ScanType, VideoFrame,
+        VideoFrameBuilder, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows, VideoSource,
     },
     framesync::{
         AudioInputFormat, FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef,
@@ -128,10 +137,7 @@ pub use {
         SourceNameChange, Tally, VideoMode,
     },
     runtime::{Ndi, ProcessLifetimeRuntime, Runtime, RuntimeOptions},
-    sender::{
-        AudioSendMode, BorrowedVideoFrame, BorrowedVideoFrameBuilder, RawSend, RawVideo, Sender,
-        SenderMode, SenderOptions,
-    },
+    sender::{AudioSendMode, RawSend, RawVideo, Sender, SenderMode, SenderOptions},
 };
 
 pub use color_info::{ColorInfo, ColorPrimaries, TransferFunction, YuvMatrix};
@@ -180,3 +186,7 @@ mod receiver_proofs;
 ))]
 #[path = "../tests/ui/internal/runtime_binding.rs"]
 mod runtime_binding_contract;
+
+#[cfg(ndi_test_frame_source)]
+#[path = "../tests/ui/internal/frame_source.rs"]
+mod frame_source_contract;

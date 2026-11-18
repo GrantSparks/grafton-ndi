@@ -5,7 +5,7 @@ fn retain(state: &CallbackState, id: u64) -> usize {
     let bytes = pixels.retained_bytes();
     let frame = QueuedVideoFrame::from(pixels).authorize_for_test(None);
     let mut locked = state.state.lock().unwrap();
-    let admitted = locked.admit(frame, bytes, &state.protocol_error).unwrap();
+    let admitted = locked.admit(frame, bytes).unwrap();
     assert_eq!(admitted.id.get(), id);
     admitted.lent.descriptor().p_data as usize
 }
@@ -38,7 +38,7 @@ fn completion_trampoline_accepts_copied_descriptors_on_concurrent_threads() {
     assert_eq!(completed, [1, 2]);
     assert_eq!(locked.retained(), 0);
     assert_eq!(locked.bytes, 0);
-    assert!(!state.protocol_error.load(Ordering::Acquire));
+    assert!(!locked.failed);
 }
 
 #[test]
@@ -47,7 +47,7 @@ fn malformed_callback_retains_pending_ownership_and_reports_protocol_failure() {
     retain(&state, 1);
     let opaque = (&mut *state as *mut CallbackState).cast();
     unsafe { completion(opaque, std::ptr::null()) };
-    assert!(state.protocol_error.load(Ordering::Acquire));
+    assert!(state.completion_protocol_failed());
     let locked = state.state.lock().unwrap();
     assert_eq!((locked.in_flight.len(), locked.ready.len()), (1, 0));
     assert!(locked.bytes > 0);
@@ -73,10 +73,10 @@ fn malformed_callback_publishes_only_after_acquiring_the_state_lock() {
         });
         entering.recv().unwrap();
         assert!(done.recv_timeout(Duration::from_millis(50)).is_err());
-        assert!(!state.protocol_error.load(Ordering::Acquire));
+        assert!(!locked.failed);
         drop(locked);
         done.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(state.protocol_error.load(Ordering::Acquire));
+        assert!(state.completion_protocol_failed());
     });
 }
 
@@ -128,7 +128,7 @@ fn malformed_callback_recovers_a_poisoned_state_lock() {
             std::ptr::null(),
         )
     };
-    assert!(state.protocol_error.load(Ordering::Acquire));
+    assert!(state.completion_protocol_failed());
     assert!(matches!(
         state.next_completed(Deadline::after(Duration::ZERO).unwrap()),
         Err(Error::UnexpectedSdkResult(
@@ -195,9 +195,8 @@ fn scatter_keys_and_concurrent_completions_preserve_allocations() {
             "authorization retains capabilities without allocating"
         );
         let mut locked = state.state.lock().unwrap();
-        let (admitted, allocations) = crate::test_alloc::allocation_count(|| {
-            locked.admit(frame, bytes, &state.protocol_error)
-        });
+        let (admitted, allocations) =
+            crate::test_alloc::allocation_count(|| locked.admit(frame, bytes));
         let admitted = admitted.unwrap();
         assert_eq!(
             allocations, 0,
@@ -242,5 +241,5 @@ fn scatter_keys_and_concurrent_completions_preserve_allocations() {
     completed.sort_unstable();
     assert_eq!(completed, [1, 2, 3, 4]);
     assert_eq!(locked.bytes, 0);
-    assert!(!state.protocol_error.load(Ordering::Acquire));
+    assert!(!locked.failed);
 }

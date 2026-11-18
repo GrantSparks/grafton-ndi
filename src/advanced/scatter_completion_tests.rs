@@ -81,7 +81,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             .unwrap();
             frame.set_timecode(Timecode::from_ticks(number));
             let key = frame.storage.blocks[0].as_mut_ptr();
-            let length = frame.storage.sizes[0].unwrap().to_sdk();
+            let length = frame.storage.first.to_sdk();
             frames.push(PendingVideo::Scatter(
                 ScatterSendable::for_test(frame, Some(scatter)).unwrap(),
             ));

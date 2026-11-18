@@ -347,3 +347,103 @@ fn abandoned_waits_release_the_receiver_without_spending_their_timeout() {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+async fn source_name_worker_retains_runtime<R: AsyncRuntime>(ndi: Ndi) {
+    let receiver = AsyncReceiver::<R>::new(
+        Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
+    );
+    drop(ndi);
+    let before = calls(true);
+    let mut future = Box::pin(receiver.wait_for_source_name_change(Duration::from_secs(30)));
+    assert!(matches!(
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Pending
+    ));
+    await_condition(|| calls(true) > before, "source-name worker never started");
+    drop(future);
+    drop(receiver);
+    assert!(Ndi::is_running(), "worker lost its initialized runtime");
+    assert_eq!(destroyed(), 0, "receiver destroyed during its native query");
+    fs::write(
+        std::env::var_os("GRAFTON_FAKE_SOURCE_NAME_RELEASE_FILE").unwrap(),
+        [],
+    )
+    .unwrap();
+    await_condition(
+        || !Ndi::is_running(),
+        "worker retained the runtime after its query",
+    );
+    // Stopping already reports not running, before the native destroy has
+    // necessarily finished writing its lifecycle evidence.
+    await_condition(
+        || log().lines().any(|line| line == "destroy"),
+        "runtime destruction did not complete",
+    );
+    let events = log();
+    assert_eq!(destroyed(), 1);
+    assert_eq!(events.lines().filter(|line| *line == "destroy").count(), 1);
+    assert!(events.find("receiver-destroy").unwrap() < events.find("\ndestroy").unwrap());
+}
+
+#[test]
+fn a_source_name_worker_keeps_its_runtime_until_its_binding_drops() {
+    if let Some(library) = std::env::var_os("GRAFTON_BINDING_CHILD") {
+        let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
+        #[cfg(feature = "tokio")]
+        if std::env::var("GRAFTON_BINDING_RUNTIME").unwrap() == "tokio" {
+            ::tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(source_name_worker_retains_runtime::<
+                    grafton_ndi::asynchronous::Tokio,
+                >(ndi));
+            return;
+        }
+        #[cfg(feature = "smol")]
+        ::smol::block_on(source_name_worker_retains_runtime::<
+            grafton_ndi::asynchronous::Smol,
+        >(ndi));
+        return;
+    }
+    let directory = fixture::FixtureDir::create("async-source-binding");
+    let library = directory.path().join("libndi_binding.so");
+    runtime_fixture::FakeRuntime {
+        cfgs: vec!["fake_objects", "fake_capture", "fake_source_name"],
+        ..Default::default()
+    }
+    .build(&library);
+    let runtimes = [
+        #[cfg(feature = "tokio")]
+        "tokio",
+        #[cfg(feature = "smol")]
+        "smol",
+    ];
+    for runtime in runtimes {
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_source_name_worker_keeps_its_runtime_until_its_binding_drops",
+                "--nocapture",
+            ])
+            .env("GRAFTON_BINDING_CHILD", &library)
+            .env("GRAFTON_BINDING_RUNTIME", runtime)
+            .env(
+                "GRAFTON_FAKE_NDI_LOG",
+                directory.path().join(format!("{runtime}.log")),
+            )
+            .env(
+                "GRAFTON_FAKE_SOURCE_NAME_RELEASE_FILE",
+                directory.path().join(format!("{runtime}.release")),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}

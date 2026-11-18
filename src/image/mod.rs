@@ -37,12 +37,13 @@ use std::{
 use self::{
     color::Sample,
     downscale::{reduced, Downscaler},
+    options::AlphaChannel,
     read::{Reader, Sink},
 };
-use crate::frames::VideoPartsExt;
+use crate::frames::{PlaneRoles, VideoPartsExt};
 use crate::{
     color_info, frames::VideoParts, ColorInfo, ColorPrimaries, Error, PixelFormat, Result,
-    TransferFunction, VideoPlane, VideoPlanes, YuvMatrix,
+    TransferFunction, VideoPlane, YuvMatrix,
 };
 
 /// The parts of a video frame an encode reads, borrowed from any frame type.
@@ -50,7 +51,7 @@ pub(crate) struct Source<'a> {
     width: u32,
     height: u32,
     format: PixelFormat,
-    planes: VideoPlanes<'a>,
+    planes: PlaneRoles<'a>,
     aspect: crate::PictureAspectRatio,
     metadata: color_info::Metadata<'a>,
 }
@@ -62,7 +63,7 @@ impl<'a> Source<'a> {
             width: layout.width(),
             height: layout.height(),
             format: layout.pixel_format(),
-            planes: frame.plane_views(),
+            planes: frame.plane_roles(),
             aspect: frame.header().picture_aspect_ratio(),
             metadata: frame.color_metadata(),
         }
@@ -385,7 +386,11 @@ pub(crate) fn encode_data_url(source: Source<'_>, options: &ImageOptions) -> Res
 
 fn data_url(image: &[u8], format: ImageFormat) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine};
-    let media_type = format.media_type();
+    let media_type = format.info().media_type;
+    #[expect(
+        clippy::expect_used,
+        reason = "a Vec's length is bounded by isize::MAX, so its padded base64 length fits usize"
+    )]
     let encoded_len =
         base64::encoded_len(image.len(), true).expect("the base64 of a Vec's bytes fits in usize");
     let mut url = String::with_capacity("data:;base64,".len() + media_type.len() + encoded_len);
@@ -454,18 +459,6 @@ impl ImageShape {
             row_bytes,
         }
     }
-
-    /// Only used for WebP, after checking the codec's dimension limit.
-    fn buffered(self) -> BufferedImageShape {
-        debug_assert!(self.width as usize <= webp::MAX_LOSSLESS_DIMENSION);
-        debug_assert!(self.height as usize <= webp::MAX_LOSSLESS_DIMENSION);
-        debug_assert_eq!(self.depth, SampleDepth::Eight);
-        // The largest WebP dimension squared times four fits a 32-bit usize.
-        BufferedImageShape {
-            rows: self,
-            image_bytes: self.row_bytes * self.height as usize,
-        }
-    }
 }
 
 /// Whole-image codecs additionally carry their checked allocation size.
@@ -473,6 +466,31 @@ impl ImageShape {
 struct BufferedImageShape {
     rows: ImageShape,
     image_bytes: usize,
+}
+
+impl BufferedImageShape {
+    fn new(limit: usize, width: u32, height: u32, channels: Channels) -> Result<Self> {
+        for (dimension, length) in [
+            (crate::ImageAxisKind::Width, width as usize),
+            (crate::ImageAxisKind::Height, height as usize),
+        ] {
+            if length > limit {
+                return Err(Error::InvalidFrame(crate::FrameDefect::ImageDimension {
+                    codec: crate::ImageCodecKind::Webp,
+                    dimension,
+                    length,
+                    maximum: limit,
+                }));
+            }
+        }
+        let rows = ImageShape::new(width, height, channels, SampleDepth::Eight);
+        // The WebP dimension constants bound this product on 32-bit targets,
+        // as asserted in webp.rs. Only a checked shape reaches a whole-image codec.
+        Ok(Self {
+            rows,
+            image_bytes: rows.row_bytes * height as usize,
+        })
+    }
 }
 
 /// Positive relative pixel densities. PNG and JFIF both store density, so
@@ -573,14 +591,12 @@ impl<'a> Plan<'a> {
     /// Check `options` with `source`, in this order: the options alone, then
     /// the frame's color description, its HDR transfer, and the image's size.
     fn new(source: &'a Source<'a>, options: &ImageOptions) -> Result<Self> {
-        let format = options.format;
+        let info = options.format.info();
         let settings = CodecSettings::new(options)?;
         let depth = options.depth;
-        if depth == SampleDepth::Sixteen && format != ImageFormat::Png {
+        if depth == SampleDepth::Sixteen && !info.sixteen_bit {
             return Err(Error::InvalidInput(
-                crate::InputDefect::SixteenBitNeedsPng {
-                    codec: format.codec(),
-                },
+                crate::InputDefect::SixteenBitNeedsPng { codec: info.codec },
             ));
         }
 
@@ -597,9 +613,9 @@ impl<'a> Plan<'a> {
                         transfer,
                     }))
                 }
-                HdrPolicy::CodeValues if format != ImageFormat::Png => {
+                HdrPolicy::CodeValues if !info.hdr_code_values => {
                     return Err(Error::InvalidInput(crate::InputDefect::HdrNeedsPng {
-                        codec: format.codec(),
+                        codec: info.codec,
                         transfer,
                     }))
                 }
@@ -621,20 +637,18 @@ impl<'a> Plan<'a> {
             source.width.div_ceil(1 << shift),
             source.height.div_ceil(1 << shift),
         );
-        let alpha = options.alpha.keeps_alpha() && !matches!(format, ImageFormat::Jpeg(_));
-        let channels = match format {
-            ImageFormat::WebpLossy(_) => Channels::Rgba,
-            ImageFormat::Png | ImageFormat::Jpeg(_) | ImageFormat::WebpLossless => {
-                Channels::from_alpha(alpha)
+        let (alpha, channels) = match info.alpha {
+            AlphaChannel::None => (false, Channels::Rgb),
+            AlphaChannel::Optional => {
+                let alpha = options.alpha.keeps_alpha();
+                (alpha, Channels::from_alpha(alpha))
             }
+            AlphaChannel::AlwaysRgba => (options.alpha.keeps_alpha(), Channels::Rgba),
         };
-        let depth = match format {
-            ImageFormat::Png => depth,
-            ImageFormat::Jpeg(_) | ImageFormat::WebpLossless | ImageFormat::WebpLossy(_) => {
-                SampleDepth::Eight
-            }
-        };
-        let density = PixelDensity::for_source(source, width, height);
+        let density = info
+            .aspect_tag
+            .then(|| PixelDensity::for_source(source, width, height))
+            .flatten();
         // Build each checked dimension value at the size stage, after the
         // options, colour metadata and HDR policy have been validated.
         let codec = match settings {
@@ -649,31 +663,20 @@ impl<'a> Plan<'a> {
                 dimensions: jpeg::JpegDimensions::new(width as usize, height as usize)?,
                 density,
             },
-            CodecSettings::WebpLossless => {
-                check_size(
-                    crate::ImageCodecKind::Webp,
-                    width as usize,
-                    height as usize,
+            CodecSettings::WebpLossless => Codec::WebpLossless {
+                shape: BufferedImageShape::new(
                     webp::MAX_LOSSLESS_DIMENSION,
-                )?;
-                Codec::WebpLossless {
-                    shape: ImageShape::new(width, height, channels, depth).buffered(),
-                }
-            }
-            CodecSettings::WebpLossy(quality, effort) => {
-                check_size(
-                    crate::ImageCodecKind::Webp,
-                    width as usize,
-                    height as usize,
-                    webp::MAX_LOSSY_DIMENSION,
-                )?;
-                Codec::WebpLossy {
-                    shape: ImageShape::new(width, height, channels, depth).buffered(),
-                    quality,
-                    effort,
-                    sharp_yuv: options.webp_sharp_yuv,
-                }
-            }
+                    width,
+                    height,
+                    channels,
+                )?,
+            },
+            CodecSettings::WebpLossy(quality, effort) => Codec::WebpLossy {
+                shape: BufferedImageShape::new(webp::MAX_LOSSY_DIMENSION, width, height, channels)?,
+                quality,
+                effort,
+                sharp_yuv: options.webp_sharp_yuv,
+            },
         };
         Ok(Self {
             source,
@@ -752,24 +755,6 @@ fn cicp(color: &ColorInfo) -> Option<[u8; 4]> {
     let transfer = color.transfer().map_or(1, TransferFunction::h273_code);
     let primaries = color.primaries().map_or(2, ColorPrimaries::h273_code);
     (primaries == 9 || color.is_hdr()).then_some([primaries, transfer, 0, 1])
-}
-
-/// Refuse an image larger than its codec can write.
-fn check_size(codec: crate::ImageCodecKind, width: usize, height: usize, max: usize) -> Result<()> {
-    for (dimension, length) in [
-        (crate::ImageAxisKind::Width, width),
-        (crate::ImageAxisKind::Height, height),
-    ] {
-        if length > max {
-            return Err(Error::InvalidFrame(crate::FrameDefect::ImageDimension {
-                codec,
-                dimension,
-                length,
-                maximum: max,
-            }));
-        }
-    }
-    Ok(())
 }
 
 /// The converted pixels of one encode, a row at a time: the reader alone,

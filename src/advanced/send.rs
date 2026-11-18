@@ -9,7 +9,10 @@ use super::{AudioCodec, MAX_PACKET_BYTES};
 use super::{
     aliasable::AliasableVec,
     invalid_frame,
-    packets::{frame_extras_accessors, packet_debug, AudioPacketFormat, FrameExtras, PacketLen},
+    packets::{
+        frame_extras_accessors, packet_debug, AudioPacketFormat, FrameExtras, PacketBytes,
+        PacketLen,
+    },
     AdvancedConfig, CompressedAttached, CompressedAudioFrame, CompressedAudioSendMode,
     CompressedVideoFrame, VideoPacketFormat,
 };
@@ -51,6 +54,17 @@ struct ScatterStorage {
     // reads this array; it writes only the packet blocks.
     sizes: AliasableBox<[Option<PacketLen>]>,
     total: PacketLen,
+    #[cfg(ndi_has_advanced_scatter_send)]
+    first: PacketLen,
+}
+
+/// One validation pass supplies every extent the scatter descriptors need.
+struct ScatterSizes {
+    total: PacketLen,
+    #[cfg(any(test, ndi_has_advanced_scatter_send))]
+    sizes: Box<[Option<PacketLen>]>,
+    #[cfg(ndi_has_advanced_scatter_send)]
+    first: PacketLen,
 }
 
 /// Addresses lent to the SDK, never dereferenced by Rust.
@@ -83,7 +97,16 @@ const _: () = {
 impl Clone for ScatterStorage {
     /// Copies of the blocks, with arrays that describe the copies.
     fn clone(&self) -> Self {
-        Self::new(self.blocks().map(<[u8]>::to_vec).collect(), self.total)
+        Self::new(
+            self.blocks().map(<[u8]>::to_vec).collect(),
+            ScatterSizes {
+                total: self.total,
+                #[cfg(any(test, ndi_has_advanced_scatter_send))]
+                sizes: Box::from(&*self.sizes),
+                #[cfg(ndi_has_advanced_scatter_send)]
+                first: self.first,
+            },
+        )
     }
 }
 
@@ -102,27 +125,48 @@ impl ScatterStorage {
         bytes
     }
 
-    /// Check a block list and return its total size in bytes.
-    fn total(blocks: &[Vec<u8>]) -> Result<PacketLen> {
-        if blocks.is_empty() || blocks.len() > MAX_SCATTER_BLOCKS {
-            return Err(invalid_frame(crate::FrameDefect::ScatterBlockCount));
-        }
-        let mut total = 0usize;
-        for block in blocks {
-            if block.is_empty() {
-                return Err(invalid_frame(crate::FrameDefect::EmptyScatterBlock));
-            }
+    /// Check each block and the sum once, retaining every checked extent.
+    fn check(blocks: &[Vec<u8>]) -> Result<ScatterSizes> {
+        let (first, rest) = blocks
+            .split_first()
+            .filter(|_| blocks.len() <= MAX_SCATTER_BLOCKS)
+            .ok_or_else(|| invalid_frame(crate::FrameDefect::ScatterBlockCount))?;
+        let checked = |block: &Vec<u8>| {
+            PacketLen::new(block.len()).ok_or_else(|| {
+                invalid_frame(if block.is_empty() {
+                    crate::FrameDefect::EmptyScatterBlock
+                } else {
+                    crate::FrameDefect::ScatterSize
+                })
+            })
+        };
+        let first = checked(first)?;
+        let mut total = first;
+        #[cfg(any(test, ndi_has_advanced_scatter_send))]
+        let mut sizes = Vec::with_capacity(blocks.len() + 1);
+        #[cfg(any(test, ndi_has_advanced_scatter_send))]
+        sizes.push(Some(first));
+        for block in rest {
+            let size = checked(block)?;
             total = total
-                .checked_add(block.len())
-                .and_then(PacketLen::new)
-                .ok_or_else(|| invalid_frame(crate::FrameDefect::ScatterSize))?
-                .to_usize();
+                .checked_add(size)
+                .ok_or_else(|| invalid_frame(crate::FrameDefect::ScatterSize))?;
+            #[cfg(any(test, ndi_has_advanced_scatter_send))]
+            sizes.push(Some(size));
         }
-        PacketLen::new(total).ok_or_else(|| invalid_frame(crate::FrameDefect::ScatterSize))
+        #[cfg(any(test, ndi_has_advanced_scatter_send))]
+        sizes.push(None);
+        Ok(ScatterSizes {
+            total,
+            #[cfg(any(test, ndi_has_advanced_scatter_send))]
+            sizes: sizes.into_boxed_slice(),
+            #[cfg(ndi_has_advanced_scatter_send)]
+            first,
+        })
     }
 
-    /// Take ownership of blocks that [`total`](Self::total) accepted.
-    fn new(blocks: Vec<Vec<u8>>, total: PacketLen) -> Self {
+    /// Take ownership of the blocks and the extents that `check` accepted.
+    fn new(blocks: Vec<Vec<u8>>, checked: ScatterSizes) -> Self {
         let blocks: Box<[_]> = blocks.into_iter().map(AliasableVec::new).collect();
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
         let mut blocks = blocks;
@@ -136,18 +180,7 @@ impl ScatterStorage {
                 .collect(),
         );
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
-        let sizes = AliasableBox::new(
-            blocks
-                .iter()
-                .map(|block| {
-                    Some(
-                        PacketLen::new(block.len())
-                            .expect("the checked total bounds every nonempty block"),
-                    )
-                })
-                .chain(std::iter::once(None))
-                .collect(),
-        );
+        let sizes = AliasableBox::new(checked.sizes);
         #[cfg(ndi_has_advanced_scatter_send)]
         let list = AliasableBox::new(Box::new(FrameScatter {
             p_data_blocks: pointers.as_ptr().cast(),
@@ -163,7 +196,9 @@ impl ScatterStorage {
             },
             #[cfg(any(test, ndi_has_advanced_scatter_send))]
             sizes,
-            total,
+            total: checked.total,
+            #[cfg(ndi_has_advanced_scatter_send)]
+            first: checked.first,
         }
     }
 
@@ -187,12 +222,12 @@ impl ScatterStorage {
             .collect()
     }
 
-    fn copy_contiguous(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.total.to_usize());
-        for block in self.blocks() {
-            bytes.extend_from_slice(block);
-        }
-        bytes
+    fn copy_contiguous(&self) -> PacketBytes {
+        PacketBytes::with_len(self.total, |bytes| {
+            for block in self.blocks() {
+                bytes.extend_from_slice(block);
+            }
+        })
     }
 }
 
@@ -268,17 +303,17 @@ impl ScatterVideoFrame {
         blocks: Vec<Vec<u8>>,
     ) -> std::result::Result<Self, Rejected<Vec<Vec<u8>>>> {
         let check = || {
-            let total = ScatterStorage::total(&blocks)?;
+            let sizes = ScatterStorage::check(&blocks)?;
             format.validate_for_send(
                 first_block(&blocks, format.header_bytes())?,
-                total.to_usize(),
+                sizes.total.to_usize(),
             )?;
-            Ok(total)
+            Ok(sizes)
         };
         match check() {
-            Ok(total) => Ok(Self {
+            Ok(sizes) => Ok(Self {
                 format,
-                storage: ScatterStorage::new(blocks, total),
+                storage: ScatterStorage::new(blocks, sizes),
                 extras: FrameExtras::default(),
             }),
             Err(error) => Err(Rejected::new(error, blocks)),
@@ -318,8 +353,7 @@ impl ScatterVideoFrame {
     pub fn into_contiguous_copy(self) -> CompressedVideoFrame {
         CompressedVideoFrame {
             format: self.format,
-            bytes: AliasableVec::new(self.storage.copy_contiguous()),
-            len: self.storage.total,
+            payload: self.storage.copy_contiguous(),
             extras: self.extras,
         }
     }
@@ -363,19 +397,19 @@ impl ScatterAudioFrame {
         blocks: Vec<Vec<u8>>,
     ) -> std::result::Result<Self, Rejected<Vec<Vec<u8>>>> {
         let check = || {
-            let total = ScatterStorage::total(&blocks)?;
+            let sizes = ScatterStorage::check(&blocks)?;
             let header = first_block(&blocks, format.codec().header_bytes())?;
             format
                 .codec()
-                .validate_for_send(format, header, total.to_usize(), |offset| {
+                .validate_for_send(format, header, sizes.total.to_usize(), |offset| {
                     bytes_at(&blocks, offset)
                 })?;
-            Ok(total)
+            Ok(sizes)
         };
         match check() {
-            Ok(total) => Ok(Self {
+            Ok(sizes) => Ok(Self {
                 format,
-                storage: ScatterStorage::new(blocks, total),
+                storage: ScatterStorage::new(blocks, sizes),
                 extras: FrameExtras::default(),
             }),
             Err(error) => Err(Rejected::new(error, blocks)),
@@ -409,8 +443,7 @@ impl ScatterAudioFrame {
     pub fn into_contiguous_copy(self) -> CompressedAudioFrame {
         CompressedAudioFrame {
             format: self.format,
-            bytes: AliasableVec::new(self.storage.copy_contiguous()),
-            len: self.storage.total,
+            payload: self.storage.copy_contiguous(),
             extras: self.extras,
         }
     }
@@ -604,12 +637,7 @@ impl ScatterSendable<ScatterVideoFrame> {
     #[cfg(ndi_has_advanced_scatter_send)]
     pub(super) fn completion_key(&mut self) -> (*mut u8, i32) {
         let first = &mut self.frame.storage.blocks[0];
-        (
-            first.as_mut_ptr(),
-            self.frame.storage.sizes[0]
-                .expect("the first block has a checked nonzero length")
-                .to_sdk(),
-        )
+        (first.as_mut_ptr(), self.frame.storage.first.to_sdk())
     }
 }
 
@@ -1177,6 +1205,73 @@ mod tests {
             blocks,
         )
         .map_err(Rejected::into_error)
+    }
+
+    #[test]
+    fn a_scatter_check_retains_every_extent_and_the_terminator() {
+        let blocks = vec![vec![1; 44], vec![2; 3], vec![3; 2]];
+        let checked = ScatterStorage::check(&blocks).unwrap();
+        assert_eq!(checked.total.to_usize(), 49);
+        assert_eq!(
+            checked
+                .sizes
+                .iter()
+                .map(|size| size.map(PacketLen::to_usize))
+                .collect::<Vec<_>>(),
+            [Some(44), Some(3), Some(2), None]
+        );
+        #[cfg(ndi_has_advanced_scatter_send)]
+        assert_eq!(checked.first.to_usize(), 44);
+        for (blocks, cause) in [
+            (vec![], crate::FrameDefect::ScatterBlockCount),
+            (vec![vec![]], crate::FrameDefect::EmptyScatterBlock),
+            (vec![vec![1], vec![]], crate::FrameDefect::EmptyScatterBlock),
+        ] {
+            assert!(
+                matches!(ScatterStorage::check(&blocks), Err(crate::Error::InvalidFrame(actual)) if actual == cause)
+            );
+        }
+        let max = PacketLen::new(super::super::MAX_PACKET_BYTES).unwrap();
+        assert_eq!(max.checked_add(PacketLen::new(1).unwrap()), None);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "the 256 MiB extent is checked by the native test run")]
+    fn a_scatter_check_refuses_an_oversized_sum() {
+        let blocks = vec![vec![0; super::super::MAX_PACKET_BYTES], vec![1]];
+        assert!(matches!(
+            ScatterStorage::check(&blocks),
+            Err(crate::Error::InvalidFrame(crate::FrameDefect::ScatterSize))
+        ));
+    }
+
+    #[test]
+    fn joining_three_blocks_keeps_video_and_audio_extents_paired() {
+        let (format, bytes) = h264();
+        let mut video = ScatterVideoFrame::new(format, split(&bytes, &[44, 47]))
+            .unwrap()
+            .into_contiguous_copy();
+        let raw = video.raw();
+        // SAFETY: compressed descriptors use the data-size member of the union.
+        assert_eq!(
+            unsafe { raw.__bindgen_anon_1.data_size_in_bytes } as usize,
+            video.data().len()
+        );
+        assert_eq!(video.data(), bytes);
+        assert!(PacketEnvelope::parse(video.data()).is_ok());
+
+        let bytes = aac_packet(48_000, 2, &[1; 8]);
+        let mut audio = scatter_audio(AudioCodec::Aac, 48_000, 2, 1024, split(&bytes, &[44, 46]))
+            .unwrap()
+            .into_contiguous_copy();
+        let raw = audio.raw();
+        // SAFETY: as for the video descriptor.
+        assert_eq!(
+            unsafe { raw.__bindgen_anon_1.data_size_in_bytes } as usize,
+            audio.data().len()
+        );
+        assert_eq!(audio.data(), bytes);
+        assert!(PacketEnvelope::parse(audio.data()).is_ok());
     }
 
     #[test]

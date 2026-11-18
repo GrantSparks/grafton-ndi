@@ -289,7 +289,9 @@ impl PacketReceiver {
 
     /// Borrow exclusive stream controls or start KVM, without permitting
     /// receiver replacement. This allocates nothing and makes no SDK call.
-    /// A KVM session captures packets through its own `capture_any` method.
+    /// During a KVM session, capture packets through the session's
+    /// [`receiver()`](super::KvmSession::receiver) view, with `capture_any` or
+    /// `capture_any_ref`.
     pub fn controls(&mut self) -> ReceiverControls<'_, PacketAttached> {
         ReceiverControls::new(&mut self.receiver)
     }
@@ -726,10 +728,13 @@ mod tests {
         // An Advanced 6.3.2 runtime that exports every function the crate
         // knows, gated as the loader gates the runtime it selects.
         let exports = ExportsWhere(|_: &str| true);
-        let gates = Resolved::load(&exports).unwrap().seal(
-            SdkVersion::parse("NDI SDK TEST 6.3.2.0"),
-            SdkEdition::Advanced,
-        );
+        let gates = Resolved::load(&exports)
+            .unwrap()
+            .seal(
+                SdkVersion::parse("NDI SDK TEST 6.3.2.0"),
+                SdkEdition::Advanced,
+            )
+            .1;
         let runtime = gates.evidence();
         let capabilities = gates.capabilities();
         let too_old = |result: Result<crate::receiver::ValidatedReceiveOptions<'_>>,
@@ -764,12 +769,12 @@ mod tests {
                 continue;
             };
             let packets = creation_options(&best, color_format);
+            let target = crate::source_retention::RetainedSource::new(&Source::new("").unwrap());
             let settings = packets
                 .validate_runtime(runtime)
                 .unwrap()
-                .to_raw()
-                .unwrap()
-                .raw;
+                .settings(&target, None);
+            let settings = settings.raw();
             assert_eq!(settings.color_format, color_format, "{preset:?}");
             assert!(settings.allow_video_fields);
 

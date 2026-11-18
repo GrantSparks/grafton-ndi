@@ -39,10 +39,14 @@ fn main() {
         "ndi_has_advanced_header",
         "ndi_test_capture_permissions",
         "ndi_test_receiver_proofs",
+        "ndi_test_frame_source",
         "ndi_test_send_ownership",
         "ndi_test_send_ownership_control",
         "ndi_test_send_ownership_types",
+        "ndi_test_packet_payload",
+        "ndi_test_packet_payload_mutation",
         "ndi_test_descriptor_parts",
+        "ndi_test_frames_privacy",
         "ndi_test_runtime_binding",
         "ndi_test_runtime_binding_control",
         "ndi_test_runtime_binding_privacy",
@@ -102,11 +106,10 @@ fn main() {
         .map(|sdk| generate_advanced_bindings(sdk, &target, &out));
     #[cfg(not(feature = "advanced"))]
     let advanced_declarations: Option<String> = None;
-    #[cfg(feature = "advanced")]
     if advanced_declarations.is_none() {
         fs::write(
             out.join("ndi_advanced_selection.rs"),
-            build_advanced::selection("", "").source,
+            build_advanced::unavailable_selection(),
         )
         .expect("Write unavailable Advanced declarations");
     }

@@ -11,6 +11,8 @@
 #[path = "common/mod.rs"]
 mod helpers;
 common_helpers!(runtime, prerequisites, name, discovery_server);
+#[path = "support/fixture.rs"]
+mod fixture;
 
 use grafton_ndi::{
     capabilities::RuntimeFeature,
@@ -406,6 +408,84 @@ fn creation_does_not_wait_for_the_server() {
             };
             assert_eq!(&*detail.address, address);
         }
+    }
+}
+
+/// Each configuration runs before SDK initialization in a fresh process.
+#[test]
+fn configured_servers_without_a_usable_endpoint_report_configuration_rejection() {
+    const SCENARIO: &str = "GRAFTON_DISCOVERY_CONFIGURATION_SCENARIO";
+    if let Ok(scenario) = std::env::var(SCENARIO) {
+        let Some(ndi) = discovery_runtime() else {
+            return;
+        };
+        let advertisers = AdvertiserOptions::default();
+        let listeners = ListenerOptions::default();
+        #[cfg(feature = "advanced")]
+        let (advertisers, listeners) = if scenario == "advanced" {
+            if let Err(error) =
+                ndi.require_feature(RuntimeFeature::AdvancedSenderAdvertiserConfiguration)
+            {
+                common::skip(common::Requirement::Advanced, &error.to_string());
+                return;
+            }
+            let config = grafton_ndi::advanced::AdvancedConfig::parse(
+                r#"{"ndi":{"networks":{"discovery":"not a host:xyz"}}}"#,
+            )
+            .unwrap();
+            (advertisers.config(config.clone()), listeners.config(config))
+        } else {
+            (advertisers, listeners)
+        };
+        #[cfg(not(feature = "advanced"))]
+        assert_ne!(scenario, "advanced");
+        for (object, result) in [
+            ("advertiser", SendAdvertiser::new(&ndi, &advertisers).err()),
+            ("advertiser", RecvAdvertiser::new(&ndi, &advertisers).err()),
+            ("listener", SendListener::new(&ndi, &listeners).err()),
+            ("listener", RecvListener::new(&ndi, &listeners).err()),
+        ] {
+            assert!(
+                matches!(&result, Some(Error::InvalidInput(
+                grafton_ndi::InputDefect::DiscoveryConfigurationRejected { object: refused }
+            )) if *refused == object),
+                "{scenario}, {object}: {result:?}"
+            );
+        }
+        return;
+    }
+    let fixture = fixture::FixtureDir::create("discovery-configuration");
+    let scenarios = [
+        ("absent", r#"{"ndi":{}}"#),
+        (
+            "unusable",
+            r#"{"ndi":{"networks":{"discovery":"not a host:xyz"}}}"#,
+        ),
+        #[cfg(feature = "advanced")]
+        ("advanced", r#"{"ndi":{}}"#),
+    ];
+    for (scenario, configuration) in scenarios {
+        let directory = fixture.path().join(scenario);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("ndi-config.v1.json"), configuration).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "configured_servers_without_a_usable_endpoint_report_configuration_rejection",
+                "--nocapture",
+            ])
+            .env(SCENARIO, scenario)
+            .env("NDI_CONFIG_DIR", &directory)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{scenario}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
     }
 }
 

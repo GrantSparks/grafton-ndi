@@ -130,7 +130,7 @@ struct TestSender;
 
 #[cfg(not(ndi_has_advanced_kvm))]
 impl InputSender for TestSender {
-    fn key(&self, connection: &Connection<'_>, value: i32, down: bool) -> Result<()> {
+    fn key(&self, connection: &Control<'_>, value: i32, down: bool) -> Result<()> {
         let (accepted, operation) = if down {
             // SAFETY: these synthetic callbacks only record their arguments.
             (
@@ -146,7 +146,7 @@ impl InputSender for TestSender {
         crate::sys::table::for_test(accepted, operation).performed()
     }
 
-    fn mouse(&self, connection: &Connection<'_>, button: MouseButton, down: bool) -> Result<()> {
+    fn mouse(&self, connection: &Control<'_>, button: MouseButton, down: bool) -> Result<()> {
         if down {
             record(connection.instance());
             return Ok(());
@@ -169,13 +169,13 @@ impl InputSender for TestSender {
         crate::sys::table::for_test(accepted, operation).performed()
     }
 
-    fn touch(&self, connection: &Connection<'_>, count: i32, points: &[[f32; 2]]) -> Result<()> {
-        // SAFETY: HeldInputs lends this validated count of initialized pairs.
-        let accepted = unsafe { touch(connection.instance(), count, points.as_ptr().cast()) };
+    fn touch(&self, connection: &Control<'_>, points: TouchPoints<'_>) -> Result<()> {
+        // SAFETY: TouchPoints lends its exact validated count of initialized pairs.
+        let accepted = unsafe { touch(connection.instance(), points.count(), points.as_ptr()) };
         crate::sys::table::for_test(accepted, c"NDIlib_recv_kvm_send_touch_positions").performed()
     }
 
-    fn finish_touch(&self, connection: &Connection<'_>) -> Result<()> {
+    fn finish_touch(&self, connection: &Control<'_>) -> Result<()> {
         // SAFETY: the synthetic callback only records its instance argument.
         let accepted = unsafe { finish_touch(connection.instance()) };
         crate::sys::table::for_test(accepted, c"NDIlib_recv_kvm_send_touch_finish").performed()
@@ -209,26 +209,26 @@ impl TestSession {
     }
 
     fn key_down(&mut self, keysym: u32) -> Result<()> {
-        Connection::with_test_instance(self.instance, |connection| {
+        Control::with_test_instance(self.instance, |connection| {
             self.held
                 .key(connection, sender(), key_symbol(keysym)?, true)
         })
     }
 
     fn mouse_down(&mut self, button: MouseButton) -> Result<()> {
-        Connection::with_test_instance(self.instance, |connection| {
+        Control::with_test_instance(self.instance, |connection| {
             self.held.mouse(connection, sender(), button, true)
         })
     }
 
     fn touch(&mut self, points: &[[f32; 2]]) -> Result<()> {
-        Connection::with_test_instance(self.instance, |connection| {
+        Control::with_test_instance(self.instance, |connection| {
             self.held.touch(connection, sender(), points)
         })
     }
 
     fn release_all(&mut self) -> Result<()> {
-        Connection::with_test_instance(self.instance, |connection| {
+        Control::with_test_instance(self.instance, |connection| {
             self.held.release_all(connection, sender())
         })
     }
@@ -236,7 +236,7 @@ impl TestSession {
 
 impl Drop for TestSession {
     fn drop(&mut self) {
-        Connection::with_test_instance(self.instance, |connection| {
+        Control::with_test_instance(self.instance, |connection| {
             self.held.release_on_drop(connection, sender());
         });
     }
@@ -370,4 +370,16 @@ fn every_held_input_combination_retries_only_failed_releases() {
             });
         }
     }
+}
+
+#[test]
+fn touch_points_carry_their_count() {
+    let coordinates = [[0.0, 1.0], [0.25, 0.5], [1.0, 0.0]];
+    let points = TouchPoints::new(&coordinates).unwrap().unwrap();
+    assert_eq!(points.count(), 3);
+    // SAFETY: TouchPoints pairs its exact count with this initialized slice.
+    let scalars =
+        unsafe { std::slice::from_raw_parts(points.as_ptr(), points.count() as usize * 2) };
+    assert_eq!(scalars, &[0.0, 1.0, 0.25, 0.5, 1.0, 0.0]);
+    assert!(TouchPoints::new(&[]).unwrap().is_none());
 }

@@ -26,7 +26,7 @@ use std::{
 
 use crate::{
     change_feed::ChangeFeed,
-    sdk_copy::{copy_sdk_string, LossyText},
+    sdk_copy::LossyText,
     sys::{self, bindings::*},
     timeout::{Deadline, NeverStop, Stop, StopResult, POLL_INTERVAL},
     Error, Ndi, ResourceKind, Result,
@@ -297,33 +297,6 @@ pub(crate) unsafe trait FinderSnapshot: snapshot_sealed::Sealed {
     ) -> Result<Option<Self::Item>>;
 }
 
-impl snapshot_sealed::Sealed for sys::Core {}
-
-// SAFETY: the v1 SDK snapshot follows FinderSnapshot's contract, and its copier
-// produces owned source names and addresses within the shared byte budget.
-unsafe impl FinderSnapshot for sys::Core {
-    type Descriptor = NDIlib_source_t;
-    type Item = Source;
-
-    unsafe fn fetch(
-        &self,
-        instance: NDIlib_find_instance_t,
-        count: &mut u32,
-    ) -> *const Self::Descriptor {
-        // SAFETY: the guard supplies a live serialized finder instance.
-        unsafe { self.NDIlib_find_get_current_sources(instance, count) }
-    }
-
-    unsafe fn copy(
-        &self,
-        source: &Self::Descriptor,
-        budget: &mut SnapshotBudget,
-    ) -> Result<Option<Self::Item>> {
-        // SAFETY: FinderSnapshot's caller keeps this snapshot's strings live.
-        unsafe { snapshot_entry(source, budget) }
-    }
-}
-
 /// The same native snapshot and copy budget, with allocation deferred until
 /// an internal selector accepts the borrowed, bounded source text.
 struct SelectingSnapshot<'a, F> {
@@ -347,7 +320,7 @@ unsafe impl<F: Fn(&BorrowedSource<'_>) -> Result<bool>> FinderSnapshot
         count: &mut u32,
     ) -> *const Self::Descriptor {
         // SAFETY: forwarded to the serialized live-instance obligation.
-        unsafe { self.core.fetch(instance, count) }
+        unsafe { self.core.NDIlib_find_get_current_sources(instance, count) }
     }
 
     unsafe fn copy(
@@ -357,7 +330,7 @@ unsafe impl<F: Fn(&BorrowedSource<'_>) -> Result<bool>> FinderSnapshot
     ) -> Result<Option<Source>> {
         let (name, address) = source_pointers(source);
         // SAFETY: the snapshot guard keeps both native strings readable.
-        unsafe { snapshot_selected_source(name, address, budget, &self.select) }
+        unsafe { decode_source(name, address, budget, &self.select) }
     }
 }
 
@@ -606,41 +579,7 @@ impl SourceWatch<'_> {
     }
 }
 
-/// One entry of a [`Finder::current_sources`] snapshot, or `None` for a
-/// descriptor the SDK should not produce, which the snapshot leaves out.
-///
-/// # Safety
-///
-/// As for [`Source::try_from_raw`].
-pub(crate) unsafe fn snapshot_entry(
-    source: &NDIlib_source_t,
-    budget: &mut SnapshotBudget,
-) -> Result<Option<Source>> {
-    let (name, address) = source_pointers(source);
-    // SAFETY: forwarded from the descriptor's bounded string contract.
-    unsafe { snapshot_source(name, address, budget) }
-}
-
-/// Copy source text through the policy shared by every finder snapshot.
-///
-/// # Safety
-/// Each non-null pointer stays readable through its first NUL or the SDK
-/// string bound, whichever comes first, until copying finishes.
-pub(crate) unsafe fn snapshot_source(
-    name: *const c_char,
-    address: *const c_char,
-    budget: &mut SnapshotBudget,
-) -> Result<Option<Source>> {
-    if name.is_null() && !address.is_null() {
-        budget.empty_source_name()?;
-    }
-    // SAFETY: the caller keeps both strings readable through their terminator
-    // or the SDK string bound. This policy skips malformed strings while
-    // retaining their scan charges in the snapshot's shared budget.
-    unsafe { decode_source(name, address, |pointer| budget.text(pointer)) }
-}
-
-struct BorrowedSource<'a> {
+pub(crate) struct BorrowedSource<'a> {
     name: LossyText<'a>,
     address: Option<LossyText<'a>>,
 }
@@ -672,27 +611,76 @@ impl BorrowedSource<'_> {
     }
 }
 
-/// Preserve scan order and every ordinary-copy charge, including rejected
-/// entries. Only allocation is conditional; no borrowed native text escapes.
+mod descriptor_sealed {
+    pub trait Sealed {}
+}
+
+/// A descriptor's bounded-text policy. The decoder alone owns null handling,
+/// selection order and source construction.
+pub(crate) trait DescriptorText: descriptor_sealed::Sealed {
+    const ALLOCATION_KIND: crate::AllocationKind;
+
+    fn empty_source_name(&mut self) -> Result<()>;
+
+    /// # Safety
+    /// The non-null pointer remains readable through its first NUL or the SDK
+    /// string bound, for the returned lifetime.
+    unsafe fn view<'a>(&mut self, pointer: *const c_char) -> Result<Option<LossyText<'a>>>;
+}
+
+impl descriptor_sealed::Sealed for SnapshotBudget {}
+impl DescriptorText for SnapshotBudget {
+    const ALLOCATION_KIND: crate::AllocationKind = crate::AllocationKind::DiscoveryResults;
+
+    fn empty_source_name(&mut self) -> Result<()> {
+        self.charge_empty_source_name()
+    }
+
+    unsafe fn view<'a>(&mut self, pointer: *const c_char) -> Result<Option<LossyText<'a>>> {
+        // SAFETY: forwarded to the decoder's bounded string obligation.
+        unsafe { self.source_text_view(pointer) }
+    }
+}
+
+struct SingleSourceText(sys::table::Called<()>);
+impl descriptor_sealed::Sealed for SingleSourceText {}
+impl DescriptorText for SingleSourceText {
+    const ALLOCATION_KIND: crate::AllocationKind = crate::AllocationKind::SourceDescriptor;
+
+    fn empty_source_name(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    unsafe fn view<'a>(&mut self, pointer: *const c_char) -> Result<Option<LossyText<'a>>> {
+        // SAFETY: the descriptor caller keeps each non-null string readable.
+        let text = unsafe { crate::sdk_copy::sdk_text(self.0.map(|()| pointer)) }?;
+        Ok(Some(LossyText::new(text)))
+    }
+}
+
+/// Decode a source through one view-then-build policy. Both null pointers name
+/// no source; a null name beside an address becomes the shared empty name.
+/// Rejected entries retain all text charges but allocate no source storage.
 ///
 /// # Safety
-/// Each non-null pointer stays readable through its first NUL or the SDK bound
-/// until selection and any accepted source copy have finished.
-unsafe fn snapshot_selected_source(
+/// Each non-null pointer remains readable through its first NUL or
+/// `MAX_SDK_STRING_BYTES`, whichever comes first, until selection and copying
+/// finish. The policy must preserve that lifetime.
+pub(crate) unsafe fn decode_source<T: DescriptorText>(
     name: *const c_char,
     address: *const c_char,
-    budget: &mut SnapshotBudget,
+    text: &mut T,
     select: impl FnOnce(&BorrowedSource<'_>) -> Result<bool>,
 ) -> Result<Option<Source>> {
     if name.is_null() && address.is_null() {
         return Ok(None);
     }
     let name = if name.is_null() {
-        budget.empty_source_name()?;
-        LossyText::new(b"")
+        text.empty_source_name()?;
+        LossyText::new(c"")
     } else {
         // SAFETY: forwarded to the caller's bounded string obligation.
-        let Some(name) = (unsafe { budget.source_text_view(name) })? else {
+        let Some(name) = (unsafe { text.view(name) })? else {
             return Ok(None);
         };
         name
@@ -701,7 +689,7 @@ unsafe fn snapshot_selected_source(
         None
     } else {
         // SAFETY: forwarded to the caller's bounded string obligation.
-        let Some(address) = (unsafe { budget.source_text_view(address) })? else {
+        let Some(address) = (unsafe { text.view(address) })? else {
             return Ok(None);
         };
         Some(address)
@@ -710,17 +698,13 @@ unsafe fn snapshot_selected_source(
     if !select(&source)? {
         return Ok(None);
     }
-    // SAFETY: both classified strings came from bounded scans excluding NUL;
-    // the source copy charges were already paid, even if selection rejected it.
-    unsafe {
-        Ok(Some(Source::from_text(
-            SourceText::from_sdk(source.name)?,
-            source
-                .address
-                .map(|address| SourceText::from_sdk(address).map(SourceAddress))
-                .transpose()?,
-        )))
-    }
+    Ok(Some(Source::from_text(
+        SourceText::from_sdk(source.name, T::ALLOCATION_KIND)?,
+        source
+            .address
+            .map(|address| SourceText::from_sdk(address, T::ALLOCATION_KIND).map(SourceAddress))
+            .transpose()?,
+    )))
 }
 
 /// The descriptor's address is one pointer, whether the SDK calls it an IP
@@ -729,43 +713,6 @@ fn source_pointers(source: &NDIlib_source_t) -> (*const c_char, *const c_char) {
     // SAFETY: both union fields are pointers of the same type.
     let address = unsafe { source.__bindgen_anon_1.p_url_address };
     (source.p_ndi_name, address)
-}
-
-/// Decode a source's two strings with the caller's copy policy. A null name
-/// is allowed when an address is present; both null pointers name no source.
-/// `copy` is called only for non-null pointers, and `None` omits the source.
-///
-/// # Safety
-///
-/// Each non-null pointer must stay readable through its first NUL or
-/// [`crate::sdk_copy::MAX_SDK_STRING_BYTES`] bytes, whichever comes first,
-/// until its copy finishes. The copy policy must preserve those lifetimes.
-pub(crate) unsafe fn decode_source(
-    name: *const c_char,
-    address: *const c_char,
-    mut copy: impl FnMut(*const c_char) -> Result<Option<SourceText>>,
-) -> Result<Option<Source>> {
-    if name.is_null() && address.is_null() {
-        return Ok(None);
-    }
-    let name = if name.is_null() {
-        // SAFETY: empty bytes are NUL-free.
-        unsafe { SourceText::from_sdk(LossyText::new(b"")) }?
-    } else {
-        let Some(name) = copy(name)? else {
-            return Ok(None);
-        };
-        name
-    };
-    let address = if address.is_null() {
-        None
-    } else {
-        let Some(address) = copy(address)? else {
-            return Ok(None);
-        };
-        Some(SourceAddress(address))
-    };
-    Ok(Some(Source::from_text(name, address)))
 }
 
 impl Finder {
@@ -919,7 +866,12 @@ impl Finder {
 
     pub(crate) fn current_sources_stoppable<S: Stop>(&self, stop: S) -> StopResult<Vec<Source>, S> {
         match self.lock_snapshots(stop) {
-            Ok(guard) => guard.snapshot(&*self.sdk).map(Ok),
+            Ok(guard) => guard
+                .snapshot(&SelectingSnapshot {
+                    core: &self.sdk,
+                    select: |_: &BorrowedSource<'_>| Ok(true),
+                })
+                .map(Ok),
             Err(stopped) => Ok(Err(stopped)),
         }
     }
@@ -1277,6 +1229,10 @@ impl<'a> SourceName<'a> {
             }));
         }
         if name.contains('\0') {
+            #[expect(
+                clippy::unwrap_used,
+                reason = "contains proved an interior NUL; NulError has no public constructor"
+            )]
             return Err(CString::new(name).unwrap_err().into());
         }
         Ok(Self(name))
@@ -1538,56 +1494,89 @@ impl OwnedHostQuery {
     }
 }
 
-/// Canonical retained cache identity. IPs use their numeric display spelling;
-/// names use the parser's final-dot policy and ASCII lowercase. Those domains
-/// are disjoint: text that parses as an IP is always an IP query, and names
-/// cannot equal the dotted-numeric or colon-containing display of an IP.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct HostKey(String);
+/// A retained cache identity keeps numeric addresses separate from names.
+#[derive(Debug, PartialEq, Eq)]
+enum HostKey {
+    Ip(IpAddr),
+    Name(Box<str>),
+}
 
-impl std::borrow::Borrow<str> for HostKey {
-    fn borrow(&self) -> &str {
-        &self.0
+/// Owned keys and borrowed queries share identity without allocating a key.
+pub(crate) trait HostIdentity {
+    fn identity(&self) -> HostQuery<'_>;
+}
+
+impl HostIdentity for HostQuery<'_> {
+    fn identity(&self) -> HostQuery<'_> {
+        *self
     }
 }
 
-/// Bounded normalization keeps lookups and eviction free of key allocations.
-/// Only a published entry needs an owned string.
-struct HostKeyBuffer {
-    bytes: [u8; 253],
-    len: usize,
+impl HostIdentity for HostKey {
+    fn identity(&self) -> HostQuery<'_> {
+        match self {
+            Self::Ip(ip) => HostQuery::Ip(*ip),
+            Self::Name(name) => HostQuery::Host(name),
+        }
+    }
 }
 
-impl HostKeyBuffer {
-    fn new(query: HostQuery<'_>) -> Self {
-        let mut key = Self {
-            bytes: [0; 253],
-            len: 0,
-        };
-        match query {
+impl Hash for dyn HostIdentity + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self.identity() {
             HostQuery::Ip(ip) => {
-                use std::io::Write;
-                let mut cursor = std::io::Cursor::new(key.bytes.as_mut_slice());
-                // The longest numeric IP spelling is shorter than 253 bytes.
-                write!(cursor, "{ip}").expect("IP fits in host key buffer");
-                key.len = cursor.position() as usize;
+                0u8.hash(state);
+                ip.hash(state);
             }
             HostQuery::Host(name) | HostQuery::Machine(name) => {
-                key.len = name.len();
-                key.bytes[..key.len].copy_from_slice(name.as_bytes());
-                key.bytes[..key.len].make_ascii_lowercase();
+                1u8.hash(state);
+                name.len().hash(state);
+                for byte in name.bytes() {
+                    byte.to_ascii_lowercase().hash(state);
+                }
             }
         }
-        key
     }
+}
 
-    fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.bytes[..self.len])
-            .expect("ASCII lowercase preserves a host key's UTF-8")
+impl PartialEq for dyn HostIdentity + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.identity(), other.identity()) {
+            (HostQuery::Ip(a), HostQuery::Ip(b)) => a == b,
+            (
+                HostQuery::Host(a) | HostQuery::Machine(a),
+                HostQuery::Host(b) | HostQuery::Machine(b),
+            ) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        }
     }
+}
+impl Eq for dyn HostIdentity + '_ {}
 
-    fn into_owned(self) -> Result<HostKey> {
-        budget::copy_string(self.as_str()).map(HostKey)
+impl Hash for HostKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self as &dyn HostIdentity).hash(state);
+    }
+}
+
+impl<'a> Borrow<dyn HostIdentity + 'a> for HostKey {
+    fn borrow(&self) -> &(dyn HostIdentity + 'a) {
+        self
+    }
+}
+
+impl TryFrom<HostQuery<'_>> for HostKey {
+    type Error = Error;
+
+    fn try_from(query: HostQuery<'_>) -> Result<Self> {
+        Ok(match query {
+            HostQuery::Ip(ip) => Self::Ip(ip),
+            HostQuery::Host(name) | HostQuery::Machine(name) => {
+                let mut name = budget::copy_string(name)?;
+                name.make_ascii_lowercase();
+                Self::Name(name.into_boxed_str())
+            }
+        })
     }
 }
 
@@ -1610,17 +1599,13 @@ impl SourceText {
         2 * std::mem::size_of::<usize>() + std::mem::size_of::<CString>() + 1;
 
     /// Copy classified SDK text directly into its final shared native storage.
-    ///
-    /// # Safety
-    /// `source` must have been classified from bytes containing no NUL, as
-    /// guaranteed by a bounded SDK string scan.
-    pub(crate) unsafe fn from_sdk(source: LossyText<'_>) -> Result<Self> {
+    pub(crate) fn from_sdk(source: LossyText<'_>, kind: crate::AllocationKind) -> Result<Self> {
         let mut text = String::new();
-        text.try_reserve_exact(source.len() + 1)
-            .map_err(|_| budget::allocation_failed())?;
+        let bytes = source.len() + 1;
+        text.try_reserve_exact(bytes)
+            .map_err(|_| crate::error::allocation_failed(kind, Some(bytes)))?;
         source.push_to(&mut text);
-        // SAFETY: the caller's bounded scan excluded NUL; UTF-8 replacement
-        // introduces none. The only terminator is appended below.
+        // SAFETY: LossyText carries the NUL-free representation invariant.
         Ok(unsafe { Self::from_nul_free_string(text) })
     }
 
@@ -1628,13 +1613,25 @@ impl SourceText {
     ///
     /// # Safety
     /// `text` must contain no NUL.
-    pub(crate) unsafe fn from_nul_free_string(text: String) -> Self {
+    unsafe fn from_nul_free_string(text: String) -> Self {
         let mut bytes = text.into_bytes();
         bytes.push(0);
         // SAFETY: the caller excludes interior NUL and we appended the sole NUL.
         Self(Arc::new(unsafe {
             CString::from_vec_with_nul_unchecked(bytes)
         }))
+    }
+
+    pub(crate) fn with_port(&self, port: u16) -> Self {
+        let address = self.as_str();
+        let endpoint = if address.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{address}]:{port}")
+        } else {
+            format!("{address}:{port}")
+        };
+        // SAFETY: SourceText contains no interior NUL, and formatting adds
+        // only brackets, a colon and decimal digits.
+        unsafe { Self::from_nul_free_string(endpoint) }
     }
 
     pub(crate) fn new(text: String) -> Result<Self> {
@@ -2010,9 +2007,12 @@ impl Source {
         // terminator or the SDK string bound. The decoder passes only non-null
         // pointers to this strict policy, which reports malformed SDK text.
         unsafe {
-            decode_source(name, address, |pointer| {
-                copy_sdk_string(source.map(|_| pointer)).map(Some)
-            })
+            decode_source(
+                name,
+                address,
+                &mut SingleSourceText(source.map(|_| ())),
+                |_| Ok(true),
+            )
         }?
         .ok_or_else(failed)
     }
@@ -2020,17 +2020,19 @@ impl Source {
     /// Retain the source's validated storage and lend its native descriptor.
     /// No strings are allocated or validated again.
     pub(crate) fn to_raw(&self) -> RawSource {
-        RawSource {
-            _source: self.clone(),
-            raw: NDIlib_source_t {
-                p_ndi_name: self.name.as_ptr(),
-                __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
-                    p_url_address: self
-                        .address
-                        .as_ref()
-                        .map_or(ptr::null(), |address| address.0.as_ptr()),
-                },
+        let source = self.clone();
+        let raw = NDIlib_source_t {
+            p_ndi_name: source.name.as_ptr(),
+            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                p_url_address: source
+                    .address
+                    .as_ref()
+                    .map_or(ptr::null(), |address| address.0.as_ptr()),
             },
+        };
+        RawSource {
+            _source: source,
+            raw,
         }
     }
 }
@@ -2140,9 +2142,7 @@ impl SourceCache {
 
     #[cfg(all(test, any(feature = "tokio", feature = "smol")))]
     pub(crate) fn seed_for_test(&self, host: &str, sources: Vec<Source>) {
-        let key = HostKeyBuffer::new(HostQuery::checked(host).unwrap())
-            .into_owned()
-            .unwrap();
+        let key = HostKey::try_from(HostQuery::checked(host).unwrap()).unwrap();
         self.entries.publish(Some(0), key, Arc::new(sources));
     }
 
@@ -2276,21 +2276,23 @@ fn copy_sources(sources: &[Source]) -> Result<Vec<Source>> {
 impl CachedSources {
     /// Clone the map entry under the short lock, then copy descriptors outside it.
     /// The miss generation belongs to the same lookup used for publication.
-    fn probe(
+    fn probe<'a>(
         &self,
-        query: HostQuery<'_>,
+        query: HostQuery<'a>,
         copy: impl FnOnce(&[Source]) -> Result<Vec<Source>>,
-    ) -> Result<(HostKeyBuffer, Option<Vec<Source>>, Option<u64>)> {
-        let key = HostKeyBuffer::new(query);
+    ) -> Result<(HostQuery<'a>, Option<Vec<Source>>, Option<u64>)> {
         let (snapshot, generation) = {
             let cache = self
                 .cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (cache.entries.get(key.as_str()).cloned(), cache.generation)
+            (
+                cache.entries.get(&query as &dyn HostIdentity).cloned(),
+                cache.generation,
+            )
         };
         let sources = snapshot.map(|snapshot| copy(&snapshot)).transpose()?;
-        Ok((key, sources, generation))
+        Ok((query, sources, generation))
     }
 
     fn find_sources_by_host_with<S: Stop>(
@@ -2327,7 +2329,7 @@ impl CachedSources {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if generation.is_none()
                     || cache.generation != generation
-                    || cache.entries.contains_key(key.as_str())
+                    || cache.entries.contains_key(&key as &dyn HostIdentity)
                 {
                     return Ok(Ok(sources));
                 }
@@ -2338,7 +2340,7 @@ impl CachedSources {
             let Ok(snapshot) = copy(&sources) else {
                 return Ok(Ok(sources));
             };
-            let Ok(key) = key.into_owned() else {
+            let Ok(key) = HostKey::try_from(key) else {
                 return Ok(Ok(sources));
             };
             self.publish(generation, key, Arc::new(snapshot));
@@ -2355,7 +2357,7 @@ impl CachedSources {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if generation.is_some()
             && cache.generation == generation
-            && !cache.entries.contains_key(key.0.as_str())
+            && !cache.entries.contains_key(&key)
             && cache.entries.try_reserve(1).is_ok()
         {
             cache.entries.insert(key, snapshot);
@@ -2369,11 +2371,8 @@ impl CachedSources {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             cache.invalidate_pending();
-            HostQuery::parse(host).and_then(|query| {
-                cache
-                    .entries
-                    .remove_entry(HostKeyBuffer::new(query).as_str())
-            })
+            HostQuery::parse(host)
+                .and_then(|query| cache.entries.remove_entry(&query as &dyn HostIdentity))
         };
         // Transfer the complete entry, including its key, before reclaiming
         // strings or the final snapshot owner. Readers only wait for removal.
@@ -2702,7 +2701,7 @@ mod tests {
         ] {
             let text = host.to_owned();
             let parsed = HostQuery::checked(&text).unwrap();
-            let expected = HostKeyBuffer::new(parsed).into_owned().unwrap();
+            let expected = HostKey::try_from(parsed).unwrap();
             let owned = parsed.into_owned();
             drop(text);
             let query = owned.as_query();
@@ -2710,7 +2709,7 @@ mod tests {
                 (kind, query),
                 (0, HostQuery::Ip(_)) | (1, HostQuery::Host(_)) | (2, HostQuery::Machine(_)),
             ));
-            assert_eq!(HostKeyBuffer::new(query).into_owned().unwrap(), expected);
+            assert_eq!(HostKey::try_from(query).unwrap(), expected);
         }
     }
 
@@ -2910,19 +2909,20 @@ mod tests {
 
     #[test]
     fn successful_cache_publication_keeps_its_allocation_count() {
-        let cache = CachedSources::default();
-        // Apple pthread mutexes allocate their native storage on the first
-        // lock. Initialize it before measuring publication into the empty map.
-        assert!(cache.is_empty());
-        let sources = vec![Source::new("camera (Program)").unwrap()];
-        let (result, allocations) = crate::test_alloc::allocation_count(|| {
-            cache.lookup("camera", Duration::ZERO, |_| Ok(sources))
-        });
-        assert_eq!(result.unwrap().len(), 1);
-        // One vector, its Arc header, host key and map storage. The validated
-        // source name is shared with the caller rather than allocated again.
-        assert_eq!(allocations, 4);
-        assert_eq!(cache.len(), 1);
+        for (host, expected) in [("camera", 4), ("192.0.2.1", 3)] {
+            let cache = CachedSources::default();
+            // Initialize native mutex storage before measuring publication.
+            assert!(cache.is_empty());
+            let sources = vec![Source::new("camera (Program)").unwrap()];
+            let (result, allocations) = crate::test_alloc::allocation_count(|| {
+                cache.lookup(host, Duration::ZERO, |_| Ok(sources))
+            });
+            assert_eq!(result.unwrap().len(), 1);
+            // One vector, its Arc header and map storage; only names need an
+            // allocated key. Source strings remain shared with the caller.
+            assert_eq!(allocations, expected, "{host}");
+            assert_eq!(cache.len(), 1);
+        }
     }
 
     #[cfg(any(feature = "tokio", feature = "smol"))]
@@ -3043,9 +3043,7 @@ mod tests {
     }
 
     fn host_key(host: &str) -> HostKey {
-        HostKeyBuffer::new(HostQuery::parse(host).unwrap())
-            .into_owned()
-            .unwrap()
+        HostKey::try_from(HostQuery::parse(host).unwrap()).unwrap()
     }
 
     #[test]
@@ -3056,7 +3054,7 @@ mod tests {
             key.hash(&mut state);
             let owned_hash = state.finish();
             let mut borrowed_state = DefaultHasher::new();
-            std::borrow::Borrow::<str>::borrow(key).hash(&mut borrowed_state);
+            std::borrow::Borrow::<dyn HostIdentity>::borrow(key).hash(&mut borrowed_state);
             assert_eq!(owned_hash, borrowed_state.finish());
             owned_hash
         };
@@ -3133,6 +3131,111 @@ mod tests {
                 .len(),
             distinct.len()
         );
+    }
+
+    #[test]
+    fn typed_host_keys_match_borrowed_identity_and_hashes() {
+        use std::hash::DefaultHasher;
+        fn hash(key: &dyn HostIdentity) -> u64 {
+            let mut state = DefaultHasher::new();
+            key.hash(&mut state);
+            state.finish()
+        }
+        for (a, b, equal) in [
+            ("192.0.2.1", "[::ffff:192.0.2.1]", false),
+            ("[2001:db8::1]", "2001:DB8::1", true),
+            ("Camera.Local.", "camera.local", true),
+            ("MY MACHINE", "my machine", true),
+            ("Ä", "ä", false),
+            ("camera..", "camera", false),
+        ] {
+            let a = HostQuery::checked(a).unwrap();
+            let b = HostQuery::checked(b).unwrap();
+            let key_a = HostKey::try_from(a).unwrap();
+            let key_b = HostKey::try_from(b).unwrap();
+            assert_eq!(key_a == key_b, equal);
+            assert_eq!(hash(&a) == hash(&b), equal);
+            assert_eq!(hash(&key_a), hash(&a));
+            assert_eq!(hash(&key_b), hash(&b));
+            let map = HashMap::from([(key_a, ())]);
+            assert_eq!(map.contains_key(&b as &dyn HostIdentity), equal);
+        }
+        // The type keeps an IP and an identically spelled future name disjoint.
+        let ip = HostKey::try_from(HostQuery::Ip("192.0.2.1".parse().unwrap())).unwrap();
+        let name = HostKey::try_from(HostQuery::Machine("192.0.2.1")).unwrap();
+        assert_ne!(ip, name);
+        let map = HashMap::from([(ip, ())]);
+        assert!(!map.contains_key(&HostQuery::Machine("192.0.2.1") as &dyn HostIdentity));
+    }
+
+    #[test]
+    fn borrowed_host_identity_preserves_map_laws_without_allocating_for_edge_spellings() {
+        use std::hash::DefaultHasher;
+        let spellings = [
+            "camera",
+            "Camera.",
+            "camera..",
+            "CAMERA..",
+            "camera...",
+            "Étage A",
+            "ÉTAGE a.",
+            "étage a",
+            "E\u{301}tage A",
+            "İS",
+            "İs.",
+            "is",
+            "K",
+            "K",
+            "k.",
+            "192.0.2.1",
+            "[192.0.2.1]",
+            "::ffff:192.0.2.1",
+            "[::ffff:192.0.2.1]",
+            "[2001:db8::1]",
+            "2001:DB8::1",
+        ];
+        let queries: Vec<_> = spellings
+            .iter()
+            .map(|text| HostQuery::checked(text).unwrap())
+            .collect();
+        let keys: Vec<_> = queries
+            .iter()
+            .map(|&query| HostKey::try_from(query).unwrap())
+            .collect();
+        let hash = |value: &dyn HostIdentity| {
+            let mut state = DefaultHasher::new();
+            value.hash(&mut state);
+            state.finish()
+        };
+        for (i, &query) in queries.iter().enumerate() {
+            let mut map = HashMap::from([(HostKey::try_from(query).unwrap(), ())]);
+            let ((), allocations) = crate::test_alloc::allocation_count(|| {
+                for (j, other) in queries.iter().enumerate() {
+                    let equal = keys[i] == keys[j];
+                    assert_eq!(
+                        (&query as &dyn HostIdentity) == (other as &dyn HostIdentity),
+                        equal
+                    );
+                    assert_eq!(hash(&keys[j]), hash(other));
+                    if equal {
+                        assert_eq!(hash(&query), hash(other));
+                    }
+                    assert_eq!(
+                        map.contains_key(other as &dyn HostIdentity),
+                        equal,
+                        "{} versus {}",
+                        spellings[i],
+                        spellings[j]
+                    );
+                    let removed = map.remove_entry(other as &dyn HostIdentity);
+                    assert_eq!(removed.is_some(), equal);
+                    if let Some((key, value)) = removed {
+                        map.insert(key, value);
+                    }
+                }
+            });
+            assert_eq!(allocations, 0, "{}", spellings[i]);
+        }
     }
 
     #[test]
@@ -3261,8 +3364,11 @@ mod tests {
                 assert!(ipv6.matches_host("2001:db8::1"));
                 assert!(studio.matches_host("STUDIO A."));
                 assert!(unicode.matches_host("Étage a"));
-                let key = HostKeyBuffer::new(HostQuery::parse("Studio A").unwrap());
-                assert_eq!(key.as_str(), "studio a");
+                let query = HostQuery::parse("Studio A").unwrap();
+                assert!(
+                    (&query as &dyn HostIdentity)
+                        == (&HostQuery::Machine("studio a") as &dyn HostIdentity)
+                );
             }
         });
         assert_eq!(allocations, 0);
@@ -3559,9 +3665,7 @@ mod tests {
     fn cache_validates_timeout_before_returning_cached_source() {
         let cache = CachedSources::default();
         cache.cache.lock().unwrap().entries.insert(
-            HostKeyBuffer::new(HostQuery::parse("camera").unwrap())
-                .into_owned()
-                .unwrap(),
+            HostKey::try_from(HostQuery::parse("camera").unwrap()).unwrap(),
             Arc::new(vec![Source::new("camera").unwrap()]),
         );
         for host in ["camera", "not_cached"] {
@@ -3620,7 +3724,12 @@ mod tests {
                 assert!(self.finder.sources_lock.try_lock().is_none());
                 std::thread::yield_now();
                 // SAFETY: the probe's borrowed C strings remain live.
-                let owned = unsafe { snapshot_entry(source, budget) };
+                let owned = unsafe {
+                    {
+                        let (name, address) = source_pointers(source);
+                        decode_source(name, address, budget, |_| Ok(true))
+                    }
+                };
                 assert_eq!(self.active.fetch_sub(1, Ordering::SeqCst), 1);
                 owned
             }
@@ -3790,12 +3899,32 @@ mod tests {
             // SAFETY: pointers are null, live C string literals, or the live
             // buffer readable for the complete SDK string bound. Both copies
             // finish before any backing storage is dropped.
-            let (snapshot, single) = unsafe {
+            let mut accepted_budget = SnapshotBudget::new();
+            let mut rejected_budget = SnapshotBudget::new();
+            let ((snapshot, accepted_allocations), (rejected, rejected_allocations), single) = unsafe {
                 (
-                    snapshot_entry(&raw, &mut SnapshotBudget::new()),
+                    crate::test_alloc::allocation_count(|| {
+                        decode_source(name, address, &mut accepted_budget, |_| Ok(true))
+                    }),
+                    crate::test_alloc::allocation_count(|| {
+                        decode_source(name, address, &mut rejected_budget, |_| Ok(false))
+                    }),
                     source_from_raw(&raw, c"test source query"),
                 )
             };
+            assert!(rejected.unwrap().is_none(), "{label}");
+            assert_eq!(rejected_allocations, 0, "{label}");
+            assert_eq!(accepted_budget.spent(), rejected_budget.spent(), "{label}");
+            let strings = usize::from(!address.is_null()) + 1;
+            assert_eq!(
+                accepted_allocations,
+                if snapshot.as_ref().is_ok_and(Option::is_some) {
+                    2 * strings
+                } else {
+                    0
+                },
+                "{label}"
+            );
             match expected {
                 Expected::Source(expected) => {
                     assert_eq!(snapshot.unwrap().as_ref(), Some(&expected), "{label}");
@@ -3821,6 +3950,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn descriptor_selector_errors_preserve_text_charges_without_building_storage() {
+        for (name, address) in [
+            (c"Camera".as_ptr(), c"192.0.2.1:5960".as_ptr()),
+            (c"Cam\xff".as_ptr(), c"ndi://host\xfe:5960".as_ptr()),
+            (ptr::null(), c"[2001:db8::1]:5960".as_ptr()),
+            (c"".as_ptr(), ptr::null()),
+        ] {
+            let mut rejected_budget = SnapshotBudget::new();
+            let mut failed_budget = SnapshotBudget::new();
+            // SAFETY: the null pointers and complete C literals stay live for
+            // both decodes; neither selector retains its borrowed source.
+            let rejected =
+                unsafe { decode_source(name, address, &mut rejected_budget, |_| Ok(false)) };
+            assert!(rejected.unwrap().is_none());
+            let (failed, allocations) = crate::test_alloc::allocation_count(|| {
+                // SAFETY: the same descriptor and lifetime obligations as above.
+                unsafe {
+                    decode_source(name, address, &mut failed_budget, |_| {
+                        Err(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))
+                    })
+                }
+            });
+            assert!(matches!(
+                failed,
+                Err(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))
+            ));
+            assert_eq!(allocations, 0);
+            assert_eq!(failed_budget.spent(), rejected_budget.spent());
+        }
+    }
+
+    #[test]
+    fn source_descriptor_and_snapshot_allocations_name_their_storage() {
+        let name = CString::new(vec![b'x'; 1 << 20]).unwrap();
+        let raw = NDIlib_source_t {
+            p_ndi_name: name.as_ptr(),
+            ..Default::default()
+        };
+        let single = crate::test_alloc::fail_allocations_at_least(1 << 20, || {
+            // SAFETY: the descriptor and its complete terminated name stay live.
+            unsafe { source_from_raw(&raw, c"test source query") }
+        });
+        assert!(matches!(
+            single,
+            Err(Error::AllocationFailed(crate::AllocationFailure {
+                kind: crate::AllocationKind::SourceDescriptor,
+                bytes: Some(1_048_577),
+            }))
+        ));
+        let snapshot = crate::test_alloc::fail_allocations_at_least(1 << 20, || {
+            // SAFETY: the descriptor and its complete terminated name stay live.
+            unsafe {
+                decode_source(
+                    name.as_ptr(),
+                    ptr::null(),
+                    &mut SnapshotBudget::new(),
+                    |_| Ok(true),
+                )
+            }
+        });
+        assert!(matches!(
+            snapshot,
+            Err(Error::AllocationFailed(crate::AllocationFailure {
+                kind: crate::AllocationKind::DiscoveryResults,
+                bytes: Some(1_048_577),
+            }))
+        ));
     }
 
     #[test]
@@ -3907,7 +4106,12 @@ mod tests {
                 budget: &mut SnapshotBudget,
             ) -> Result<Option<Source>> {
                 // SAFETY: all fixture strings remain live through this call.
-                unsafe { snapshot_entry(source, budget) }
+                unsafe {
+                    {
+                        let (name, address) = source_pointers(source);
+                        decode_source(name, address, budget, |_| Ok(true))
+                    }
+                }
             }
         }
         let sources = finder.snapshot(&SliceSnapshot(&snapshot));

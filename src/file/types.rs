@@ -22,14 +22,16 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
 pub enum StateConflict {
-    /// A session is recording or stopping, has a file awaiting closure, or has
-    /// incomplete file tracking, so another cannot start.
-    /// Finish or poll a session whose tracking is complete. After native event
-    /// loss, unreadable lifecycle evidence or a tracking limit, only
-    /// [`FileRecorder::reset`](super::FileRecorder::reset) replaces the native
-    /// recorder and permits another session, even if every known file closes.
+    /// A session is recording or stopping, or a known file awaits closure
+    /// under complete tracking. Finish or poll it before starting another.
     #[error("finish the previous session before starting another")]
     PreviousSessionOpen,
+    /// The session ended with incomplete file tracking after native event
+    /// loss, unreadable lifecycle evidence or a tracking limit. Only a
+    /// successful [`FileRecorder::reset`](super::FileRecorder::reset) replaces the native
+    /// recorder and permits another session, even if every known file closes.
+    #[error("file tracking is incomplete; reset the recorder before starting another session")]
+    IncompleteFileTracking,
     /// Events from an earlier session kept arriving, so a new session was not
     /// started.
     #[error("the recorder keeps producing events from an earlier session")]
@@ -105,6 +107,10 @@ impl FileText {
             return Err(Error::InvalidInput(crate::InputDefect::Empty { what }));
         }
         if value.contains('\0') {
+            #[expect(
+                clippy::unwrap_used,
+                reason = "contains proved an interior NUL; NulError has no public constructor"
+            )]
             return Err(CString::new(value).unwrap_err().into());
         }
         Ok(Self::from_checked(value))
@@ -916,6 +922,10 @@ pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<(PathBuf, 
     // Windows path resolution rejects NULs as an I/O error. Keep the SDK
     // string error consistent with absolute paths and the other platforms.
     if text.contains('\0') {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "contains proved an interior NUL; NulError has no public constructor"
+        )]
         return Err(CString::new(text).unwrap_err().into());
     }
     let absolute = if path.is_absolute() {
@@ -2318,6 +2328,7 @@ mod tests {
         use StateConflict::*;
         for (state, retryable) in [
             (PreviousSessionOpen, false),
+            (IncompleteFileTracking, false),
             (EarlierSessionEvents, false),
             (StopNotRequested, false),
             (Stopping, false),
@@ -2336,6 +2347,10 @@ mod tests {
         assert_eq!(
             StateConflict::PreviousSessionOpen.to_string(),
             "finish the previous session before starting another"
+        );
+        assert_eq!(
+            StateConflict::IncompleteFileTracking.to_string(),
+            "file tracking is incomplete; reset the recorder before starting another session"
         );
         assert_eq!(
             Error::InvalidState(StateConflict::Stopping).to_string(),

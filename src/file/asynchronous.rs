@@ -372,11 +372,19 @@ impl<T> Future for FileOperation<T> {
                 let value = WakerSlot::poll(&shared.slot, cx.waker(), |slot, _| match slot {
                     Slot::Pending(waker) => WakerPoll::Pending(Some(waker)),
                     Slot::Ready(_) => {
+                        #[expect(
+                            clippy::unreachable,
+                            reason = "Pending must stay borrowed for waker registration; the locked Ready slot cannot change before replacement"
+                        )]
                         let Slot::Ready(value) = std::mem::replace(slot, Slot::Taken) else {
                             unreachable!()
                         };
                         WakerPoll::Ready(value, None)
                     }
+                    #[expect(
+                        clippy::unreachable,
+                        reason = "only this operation takes the response and marks its stage Done before another poll"
+                    )]
                     Slot::Taken => unreachable!("a response is taken only by its operation"),
                 });
                 if value.as_ref().is_some_and(Result::is_ok) {
@@ -387,13 +395,24 @@ impl<T> Future for FileOperation<T> {
                 value
             }
             Stage::Live(Live::Immediate(_)) => {
-                let Stage::Live(Live::Immediate(value)) = std::mem::replace(stage, Stage::Done)
-                else {
+                #[expect(
+                    clippy::unreachable,
+                    reason = "Waiting must stay stored for cancellation if waker cloning unwinds; the exclusively matched Immediate stage cannot change"
+                )]
+                let Stage::Live(Live::Immediate(value)) = std::mem::replace(stage, Stage::Done) else {
                     unreachable!()
                 };
                 Some(value)
             }
+            #[expect(
+                clippy::panic,
+                reason = "polling a completed FileOperation violates its documented Future contract"
+            )]
             Stage::Done => panic!("a completed FileOperation was polled again"),
+            #[expect(
+                clippy::unreachable,
+                reason = "start replaces Deferred with Live; a panicking submission leaves Done for cancellation"
+            )]
             Stage::Deferred(_) => unreachable!("start resolves the one deferral"),
         };
         if let Some(value) = value {
@@ -520,12 +539,10 @@ impl<T> FileOperation<T> {
 
     fn start(&mut self) {
         let stage = self.stage.get_mut().unwrap_or_else(PoisonError::into_inner);
-        if matches!(stage, Stage::Deferred(_)) {
-            let Stage::Deferred(start) = std::mem::replace(stage, Stage::Done) else {
-                unreachable!()
-            };
-            *stage = Stage::Live(start());
-        }
+        *stage = match std::mem::replace(stage, Stage::Done) {
+            Stage::Deferred(start) => Stage::Live(start()),
+            started => started,
+        };
     }
 
     #[cfg(test)]
@@ -2274,8 +2291,10 @@ impl AsyncFileRecorder {
     /// [`SessionTimecode`](super::SessionTimecode), validated before queuing.
     /// Events left by an earlier refused start are delivered through
     /// [`next_event`](Self::next_event) before the new session begins.
-    /// Incomplete file tracking returns [`StateConflict::PreviousSessionOpen`]
-    /// until [`reset`](Self::reset) succeeds, even if all known files closed.
+    /// A recording or stopping session returns [`StateConflict::PreviousSessionOpen`].
+    /// After it ends, incomplete file tracking returns
+    /// [`StateConflict::IncompleteFileTracking`] until [`reset`](Self::reset)
+    /// succeeds, even if all known files closed.
     #[doc(alias = "NDIlib_file_recorder_start")]
     #[doc(alias = "NDIlib_file_recorder_start_with_timecode")]
     pub fn start(
@@ -4814,7 +4833,7 @@ mod tests {
         assert!(matches!(outcome, FinishStatus::Indeterminate(_)));
         assert!(matches!(
             recorder.start(&target, RecordingTimecode::Preserve),
-            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+            Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
         ));
         drop(recorder);
         assert!(device.closed_before_destroy.load(Ordering::Acquire));
@@ -4856,14 +4875,14 @@ mod tests {
         let report = recorder.report();
         assert!(matches!(
             recorder.start(&target, RecordingTimecode::Preserve),
-            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+            Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
         ));
         device.close();
         recorder.next_event(Duration::ZERO).unwrap();
         assert_eq!(recorder.report(), report);
         assert!(matches!(
             recorder.start(&target, RecordingTimecode::Preserve),
-            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+            Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
         ));
         assert_eq!(device.starts.load(Ordering::Acquire), 1);
         let replacement = mock::Recorder::new(Closing::AtStop);
@@ -4932,7 +4951,7 @@ mod tests {
                 RecordingTarget::new(std::env::temp_dir().join("hidden-open-restart")).unwrap();
             assert!(matches!(
                 block_on(recorder.start(&target, RecordingTimecode::Preserve)),
-                Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+                Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
             ));
             assert_eq!(device.starts.load(Ordering::Acquire), 1);
 
@@ -4989,6 +5008,100 @@ mod tests {
     }
 
     #[test]
+    fn async_indeterminate_reports_count_only_files_confirmed_empty_before_loss() {
+        for empty_before_loss in [false, true] {
+            let (device, recorder) = mock_recorder_with_drop_wait(
+                Closing::Never,
+                AsyncFileOptions::new(),
+                Duration::ZERO,
+            );
+            block_on(recorder.next_event(Duration::from_secs(1))).unwrap();
+            if empty_before_loss {
+                device.push(mock::FILE_CLOSED, mock::TAKE);
+                let limit = Instant::now() + Duration::from_secs(1);
+                loop {
+                    let report = block_on(recorder.report()).unwrap();
+                    if report.closed_files() == 1 {
+                        assert_eq!(report.empty_files(), 1);
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < limit,
+                        "the complete close was never observed"
+                    );
+                }
+            }
+            device.dropped_events.store(1, Ordering::Release);
+            if !empty_before_loss {
+                device.push(mock::FILE_CLOSED, mock::TAKE);
+            }
+            device.push(mock::ROLLOVER, "hidden.mkv");
+            device.push(mock::FILE_CLOSED, "hidden.mkv");
+            let FinishStatus::Indeterminate(report) =
+                block_on(recorder.finish(Duration::ZERO)).unwrap()
+            else {
+                panic!("lost file evidence prevents confirmed closure");
+            };
+            assert_eq!(report.empty_files(), u64::from(empty_before_loss));
+            assert_eq!(report.closed_files(), 2);
+            assert_eq!(report.dropped_events(), 1);
+            block_on(recorder.abandon()).unwrap();
+        }
+    }
+
+    #[test]
+    fn async_start_distinguishes_active_sessions_from_incomplete_tracking() {
+        let (device, recorder) =
+            mock_recorder_with_drop_wait(Closing::Never, AsyncFileOptions::new(), Duration::ZERO);
+        let target = RecordingTarget::new(std::env::temp_dir().join("async-admission")).unwrap();
+        for stopping in [false, true] {
+            if stopping {
+                block_on(recorder.request_stop()).unwrap();
+            }
+            assert!(matches!(
+                block_on(recorder.start(&target, RecordingTimecode::Preserve)),
+                Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+            ));
+        }
+        device.close();
+        let FinishStatus::Closed(report) =
+            block_on(recorder.finish(Duration::from_secs(1))).unwrap()
+        else {
+            panic!("the known file closed");
+        };
+        device.dropped_events.store(1, Ordering::Release);
+        for _ in 0..2 {
+            assert!(matches!(
+                block_on(recorder.start(&target, RecordingTimecode::Preserve)),
+                Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
+            ));
+            assert_eq!(
+                block_on(recorder.finish(Duration::ZERO)).unwrap(),
+                FinishStatus::Closed(report.clone())
+            );
+        }
+        let replacement = mock::Recorder::new(Closing::AtStop);
+        let installed = Arc::clone(&replacement);
+        block_on(recorder.worker.call(move |_| {
+            installed.install();
+            Ok(())
+        }))
+        .unwrap();
+        assert_eq!(
+            block_on(recorder.reset(&FileRecorderOptions::new(
+                SourceSpec::new("replacement").unwrap()
+            )))
+            .unwrap(),
+            report
+        );
+        assert_eq!(
+            block_on(recorder.start(&target, RecordingTimecode::Preserve)).unwrap(),
+            2
+        );
+        block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
     fn async_reset_retires_unknown_cleanup_only_after_replacement_succeeds() {
         let (device, recorder) = mock_recorder_with_drop_wait(
             Closing::AtStop,
@@ -5021,7 +5134,7 @@ mod tests {
         assert_eq!(block_on(recorder.report()).unwrap(), report);
         assert!(matches!(
             block_on(recorder.start(&target, RecordingTimecode::Preserve)),
-            Err(Error::InvalidState(StateConflict::PreviousSessionOpen))
+            Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
         ));
         assert_eq!(device.starts.load(Ordering::Acquire), 1);
 

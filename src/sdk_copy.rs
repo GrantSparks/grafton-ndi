@@ -34,28 +34,6 @@ pub(crate) unsafe fn bounded_sdk_text<'a>(text: *const c_char, limit: usize) -> 
 /// advertised metadata.
 pub(crate) const MAX_SDK_STRING_BYTES: usize = 4 * 1024 * 1024;
 
-/// Copy SDK source text of at most [`MAX_SDK_STRING_BYTES`], terminator
-/// included, into shared native storage, replacing bytes that are not UTF-8.
-///
-/// # Errors
-///
-/// [`Error::UnexpectedSdkResult`] naming the SDK function retained by `text`,
-/// when there is no terminator within the limit, and [`Error::AllocationFailed`]
-/// when the final source string storage cannot be reserved.
-///
-/// # Safety
-///
-/// `text` must be non-null and readable byte-by-byte until either its first
-/// NUL or [`MAX_SDK_STRING_BYTES`] bytes have been read.
-pub(crate) unsafe fn copy_sdk_string(
-    text: crate::sys::table::Called<*const c_char>,
-) -> Result<crate::finder::SourceText> {
-    // SAFETY: forwarded to the caller's obligation.
-    let bytes = unsafe { sdk_text(text) }?;
-    // SAFETY: sdk_text stops at the first NUL and excludes it.
-    unsafe { crate::finder::SourceText::from_sdk(LossyText::new(bytes)) }
-}
-
 /// Read one bounded SDK C string, retaining its producing entry point.
 ///
 /// # Safety
@@ -64,12 +42,16 @@ pub(crate) unsafe fn copy_sdk_string(
 /// first NUL or [`MAX_SDK_STRING_BYTES`] bytes, and remain live for `'a`.
 pub(crate) unsafe fn sdk_text<'a>(
     text: crate::sys::table::Called<*const c_char>,
-) -> Result<&'a [u8]> {
+) -> Result<&'a CStr> {
     let (text, operation) = text.into_parts();
     // SAFETY: forwarded to the caller's lifetime and readable-bound obligation.
-    unsafe { bounded_sdk_text(text, MAX_SDK_STRING_BYTES) }.ok_or(Error::UnexpectedSdkResult(
-        crate::SdkResultDefect::UnterminatedText { operation },
-    ))
+    let bytes = unsafe { bounded_sdk_text(text, MAX_SDK_STRING_BYTES) }.ok_or(
+        Error::UnexpectedSdkResult(crate::SdkResultDefect::UnterminatedText { operation }),
+    )?;
+    // SAFETY: the scan found the first NUL, and the caller keeps this complete
+    // prefix readable for the returned lifetime.
+    let terminated = unsafe { slice::from_raw_parts(text.cast(), bytes.len() + 1) };
+    Ok(unsafe { CStr::from_bytes_with_nul_unchecked(terminated) })
 }
 
 /// Copy scanned SDK text, replacing invalid UTF-8 with U+FFFD.
@@ -280,7 +262,7 @@ impl CopyBudget {
         // SAFETY: forwarded to the caller's obligations.
         let text = unsafe { self.c_str(value)? };
         text.map(|text| {
-            let text = LossyText::new(text.to_bytes());
+            let text = LossyText::new(text);
             self.take(text.len())?;
             text.copy().map_err(|_| allocation_failed().into())
         })
@@ -298,8 +280,8 @@ impl CopyBudget {
         // SAFETY: forwarded to the caller's obligations.
         unsafe { self.source_text_view(value)? }
             .map(|text| {
-                // SAFETY: the bounded C string scan excludes its first NUL.
-                unsafe { crate::finder::SourceText::from_sdk(text) }.map_err(Into::into)
+                crate::finder::SourceText::from_sdk(text, crate::AllocationKind::DiscoveryResults)
+                    .map_err(Into::into)
             })
             .transpose()
     }
@@ -316,7 +298,7 @@ impl CopyBudget {
         // SAFETY: forwarded to the caller's obligations.
         unsafe { self.c_str(value)? }
             .map(|text| {
-                let text = LossyText::new(text.to_bytes());
+                let text = LossyText::new(text);
                 self.take(text.len() + crate::finder::SourceText::STORAGE_OVERHEAD)?;
                 Ok(text)
             })
@@ -382,7 +364,10 @@ enum ClassifiedText<'a> {
 }
 
 impl<'a> LossyText<'a> {
-    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(source: &'a CStr) -> Self {
+        // A CStr excludes interior NUL; UTF-8 replacement introduces none.
+        // Every classified representation therefore remains NUL-free.
+        let bytes = source.to_bytes();
         Self(match std::str::from_utf8(bytes) {
             Ok(text) => ClassifiedText::Valid(text),
             Err(_) => {
@@ -787,7 +772,8 @@ mod tests {
             b"\xff\xfe",
             "é\u{fffd}".as_bytes(),
         ] {
-            let text = LossyText::new(bytes);
+            let source = CString::new(bytes).unwrap();
+            let text = LossyText::new(&source);
             let expected = String::from_utf8_lossy(bytes);
             let (matches, allocations) =
                 crate::test_alloc::allocation_count(|| text.equals(&expected));
@@ -811,7 +797,8 @@ mod tests {
             &b"\xe2\x82A\xff\xf0\x9f\xa6\x80"[..],
         ] {
             let expected = String::from_utf8_lossy(bytes);
-            let text = LossyText::new(bytes);
+            let source = CString::new(bytes).unwrap();
+            let text = LossyText::new(&source);
             assert_eq!(text.len(), expected.len());
             assert_eq!(text.copy().unwrap(), expected);
             let mut copied = String::new();
@@ -823,8 +810,12 @@ mod tests {
     #[test]
     fn exact_copies_match_standard_utf8_replacement() {
         let check = |bytes: &[u8]| {
+            if bytes.contains(&0) {
+                return;
+            }
             let expected = String::from_utf8_lossy(bytes);
-            let text = LossyText::new(bytes);
+            let source = CString::new(bytes).unwrap();
+            let text = LossyText::new(&source);
             assert_eq!(text.len(), expected.len());
             assert_eq!(text.copy().unwrap(), expected);
             let mut appended = String::with_capacity(text.len());

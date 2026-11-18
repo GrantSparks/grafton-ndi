@@ -49,13 +49,12 @@ impl JpegDimensions {
         })
     }
     pub(super) fn shape(self) -> ImageShape {
-        ImageShape {
-            width: self.width.into(),
-            height: self.height.into(),
-            channels: Channels::Rgb,
-            depth: SampleDepth::Eight,
-            row_bytes: usize::from(self.width) * 3,
-        }
+        ImageShape::new(
+            self.width.into(),
+            self.height.into(),
+            Channels::Rgb,
+            SampleDepth::Eight,
+        )
     }
 }
 

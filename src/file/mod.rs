@@ -99,8 +99,9 @@
 //! file bookkeeping makes tracking incomplete. Cleanup then consumes its
 //! remaining original budget even if every known file closes. Neither an empty
 //! known file set nor a stopped recorder proves that unknown files finalized.
-//! The indeterminate report stays unchanged, and a new session requires
-//! [`FileRecorder::reset`]. Async application-notification eviction does not
+//! The indeterminate report stays unchanged. After the session ends, another
+//! start returns [`StateConflict::IncompleteFileTracking`] until
+//! [`FileRecorder::reset`] succeeds. Async application-notification eviction does not
 //! affect the separately maintained native file tracking.
 //!
 //! After a finalization timeout, [`FileRecorder::reset`] explicitly abandons
@@ -134,7 +135,9 @@
 //!   soon as a session or a rollover starts, and reports it closed even if no
 //!   frame arrived: after a stop before the source delivered anything, a
 //!   switch to a source that is not there, or a rollover while the source is
-//!   lost. [`RecordingReport::empty_files`] counts these files.
+//!   lost. [`RecordingReport::empty_files`] counts confirmed empty files:
+//!   exactly under confirmed closure, and as a lower bound after incomplete
+//!   tracking.
 //! * **On Linux with the NDI 6.4 File library, a rollover the library cannot
 //!   carry out ends the session.** It accepts
 //!   the request, fails to open the new file, closes the old one and stops.
@@ -383,10 +386,7 @@ impl FileApi {
     ///   the [`crate::SelectionConflict`]; its `Display` gives the diagnostic text.
     /// * [`Error::InvalidInput`] when `options` names a relative path.
     pub fn new(ndi: &Ndi, options: &FileApiOptions) -> Result<Self> {
-        let runtime = sys::select_file(
-            ndi.runtime().selected_runtime(),
-            options.library_path.as_deref(),
-        )?;
+        let runtime = sys::select_file(ndi.selected(), options.library_path.as_deref())?;
         Ok(Self {
             runtime: FileBound::Native(ndi.bind_file_runtime(runtime)),
         })

@@ -429,6 +429,21 @@ class Documentation(unittest.TestCase):
                    '#[must_use]\npub fn public() {}')
         self.assertEqual(docs.sdk_alias_violations(self.root), [])
 
+    def test_cfg_test_field_does_not_hide_later_public_sdk_alias(self):
+        self.write('src/sys/api.rs', 'native_table! { fn NDIlib_public(); }')
+        self.write('src/public.rs', '''
+            pub struct Receiver {
+                #[cfg(test)]
+                test_only: Option<Result<u8, u16>>,
+                live: u8,
+            }
+            impl Receiver {
+                #[doc(alias = "NDIlib_public")]
+                pub fn new() -> Self { Self { live: 0 } }
+            }
+        ''')
+        self.assertEqual(docs.sdk_alias_violations(self.root), [])
+
     def test_macro_aliases_must_be_forwarded_to_the_matching_public_method(self):
         self.write('src/sys/api.rs', 'native_table! { fn NDIlib_public(); }')
         template = ('macro_rules! methods { '

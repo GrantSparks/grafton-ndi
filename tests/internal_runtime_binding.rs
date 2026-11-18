@@ -26,6 +26,12 @@ fn native_tables_cannot_escape_their_runtime_owner() {
         "escaping_api",
         "escaping_optional",
         "escaping_bound",
+        "copied_core",
+        "copied_optional",
+        "copied_bound",
+        "detach",
+        "E0507",
+        "E0277",
         "lifetime may not live long enough",
     ] {
         assert!(

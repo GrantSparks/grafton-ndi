@@ -9,8 +9,7 @@ use super::*;
 #[derive(Clone)]
 pub struct ReceivedVideoPacket {
     pub(crate) format: VideoPacketFormat,
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) len: PacketLen,
+    pub(crate) payload: PacketBytes,
     pub(crate) extras: FrameExtras,
 }
 
@@ -23,7 +22,7 @@ impl ReceivedVideoPacket {
 
     /// The complete codec bytes, including retained envelope extensions.
     pub fn data(&self) -> &[u8] {
-        &self.bytes
+        self.payload.as_slice()
     }
 
     /// The codec and video format delivered by the receiver.
@@ -38,7 +37,7 @@ impl ReceivedVideoPacket {
 
     /// Take the original byte allocation and its capacity.
     pub fn into_data(self) -> Vec<u8> {
-        self.bytes
+        self.payload.into_vec()
     }
 
     /// Check whether this lossless packet can be admitted for sending.
@@ -48,7 +47,7 @@ impl ReceivedVideoPacket {
     /// [`Error::InvalidFrame`] when the envelope or codec parameters are not
     /// supported for sending. The packet remains unchanged.
     pub fn validate_for_send(&self) -> Result<()> {
-        validate_video_content(self.format, &self.bytes, self.len, Use::Send)
+        validate_video_content(self.format, self.payload.view(), Use::Send)
     }
 }
 
@@ -61,14 +60,12 @@ impl TryFrom<ReceivedVideoPacket> for CompressedVideoFrame {
         }
         let ReceivedVideoPacket {
             format,
-            bytes,
-            len,
+            payload,
             extras,
         } = packet;
         Ok(Self {
             format,
-            bytes: AliasableVec::new(bytes),
-            len,
+            payload,
             extras,
         })
     }
@@ -78,14 +75,12 @@ impl From<CompressedVideoFrame> for ReceivedVideoPacket {
     fn from(frame: CompressedVideoFrame) -> Self {
         let CompressedVideoFrame {
             format,
-            bytes,
-            len,
+            payload,
             extras,
         } = frame;
         Self {
             format,
-            bytes: bytes.into_vec(),
-            len,
+            payload,
             extras,
         }
     }
@@ -99,8 +94,7 @@ impl From<CompressedVideoFrame> for ReceivedVideoPacket {
 #[derive(Clone)]
 pub struct ReceivedAudioPacket {
     pub(crate) format: AudioPacketFormat,
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) len: PacketLen,
+    pub(crate) payload: PacketBytes,
     pub(crate) extras: FrameExtras,
 }
 
@@ -113,7 +107,7 @@ impl ReceivedAudioPacket {
 
     /// The complete codec bytes, including retained envelope extensions.
     pub fn data(&self) -> &[u8] {
-        &self.bytes
+        self.payload.as_slice()
     }
 
     /// The codec and audio format delivered by the receiver.
@@ -128,7 +122,7 @@ impl ReceivedAudioPacket {
 
     /// Take the original byte allocation and its capacity.
     pub fn into_data(self) -> Vec<u8> {
-        self.bytes
+        self.payload.into_vec()
     }
 
     /// Check whether this packet's codec parameters and envelope can be sent.
@@ -138,7 +132,7 @@ impl ReceivedAudioPacket {
     /// [`Error::InvalidFrame`] for unsupported delivery parameters or envelope
     /// details. The packet remains unchanged.
     pub fn validate_for_send(&self) -> Result<()> {
-        validate_audio_content_for_send(self.format, &self.bytes, self.len)
+        validate_audio_content_for_send(self.format, self.payload.view())
     }
 }
 
@@ -151,14 +145,12 @@ impl TryFrom<ReceivedAudioPacket> for CompressedAudioFrame {
         }
         let ReceivedAudioPacket {
             format,
-            bytes,
-            len,
+            payload,
             extras,
         } = packet;
         Ok(Self {
             format,
-            bytes: AliasableVec::new(bytes),
-            len,
+            payload,
             extras,
         })
     }
@@ -168,14 +160,12 @@ impl From<CompressedAudioFrame> for ReceivedAudioPacket {
     fn from(frame: CompressedAudioFrame) -> Self {
         let CompressedAudioFrame {
             format,
-            bytes,
-            len,
+            payload,
             extras,
         } = frame;
         Self {
             format,
-            bytes: bytes.into_vec(),
-            len,
+            payload,
             extras,
         }
     }

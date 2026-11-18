@@ -327,8 +327,10 @@ callback, copy media for retention across awaits.
 [`mixed_media_async`](../examples/mixed_media_async.rs) shows both runtimes.
 Use async reconnect/event methods for waits; waiting through the synchronous
 `receiver()` blocks the calling thread.
-Use that same `receiver()` view for non-blocking controls and diagnostics,
-including `is_connected`, `connection_stats`, tally and PTZ.
+Use that same `receiver()` view for controls and diagnostics, including
+`is_connected`, `connection_stats`, tally and PTZ. See the
+[`Receiver` waiting contract](https://grantsparks.github.io/grafton-ndi/grafton_ndi/receiver/struct.Receiver.html#waiting),
+which also covers destruction on the thread dropping the last owner.
 
 ## Optional workflows
 
@@ -345,4 +347,4 @@ change the picture. Direct external sending requires enough initialized space
 and `allow_send_from_padding_and_tail(true)`. Include all trailing room in the
 slice passed to the builder; padding/tail bytes may affect encoded output once
 opted in. Allocate with `PixelFormat::send_buffer_len` and follow the
-[`BorrowedVideoFrameBuilder` padding policy](https://grantsparks.github.io/grafton-ndi/grafton_ndi/sender/struct.BorrowedVideoFrameBuilder.html).
+[`BorrowedVideoFrameBuilder` padding policy](https://grantsparks.github.io/grafton-ndi/grafton_ndi/frames/struct.BorrowedVideoFrameBuilder.html).

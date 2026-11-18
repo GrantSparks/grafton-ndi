@@ -387,6 +387,8 @@ MIRI_BATCHES = {
         'file::out_param::tests::',
     ],
     'media': [
+        'frames::descriptor_tests::',
+        'pixels::tests::',
         'frames::tests::video_padding_all_formats',
         'frames::tests::video_padding_single_rows',
         'frames::tests::video_padding_encoders',
@@ -411,6 +413,7 @@ MIRI_BATCHES = {
         'advanced::reserved_map::tests::',
         'advanced::send_slots::tests::',
         'advanced::aliasable::tests::',
+        'advanced::packets::payload::tests::',
         'advanced::packets::received::tests::',
         'advanced::queued::boundary_tests::',
         'sender::in_flight::tests::',

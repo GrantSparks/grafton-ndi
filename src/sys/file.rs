@@ -267,30 +267,29 @@ impl FileRuntime {
                 ),
             ));
         }
+        let companion = runtime.module();
         Search {
             kind: LibraryKind::File,
             explicit,
-            beside: core.library_path(),
+            companion,
             names: &[Self::LIBRARY_NAME],
             anchor: Self::ANCHOR,
-            #[cfg(all(unix, not(target_vendor = "apple")))]
-            selected_core: Some(runtime.gates.api().core.NDIlib_version as *const std::ffi::c_void),
             description: "NDI File library",
         }
-        .open(|module| Self::describe(module, runtime))
+        .open(|module| Self::describe(module, companion.ok_or(LoadRefusal::BoundToAnotherRuntime)?))
     }
 
     /// Resolve the tables of an opened File library.
     ///
     /// The error is the reason this library cannot be used.
-    fn describe(module: Module, runtime: &Runtime) -> std::result::Result<Self, LoadRefusal> {
-        // A lookup through the library's handle shows which module the platform
-        // loader bound its core imports to. That must be the selected core: a
-        // second copy of the runtime would not share its initialization. The
-        // Windows File library imports and exports no core entry point, so
-        // there the lookup finds nothing and there is no binding to check.
-        if let Some(bound) = module.binding(Self::CORE_ENTRY)? {
-            if bound.as_ptr() != runtime.lifecycle.initialize_address().cast_mut() {
+    fn describe(module: Module, core: &Module) -> std::result::Result<Self, LoadRefusal> {
+        // A handle lookup identifies the definition in the handle's local
+        // dependency scope. The separate ELF global-scope check covers the
+        // global-first relocation rule before the File library is opened.
+        // A second runtime module would not share the selected core's state.
+        // Windows imports no core entry point, so its lookup remains empty.
+        if let Some(bound) = module.bound_module(Self::CORE_ENTRY)? {
+            if bound != core.id() {
                 return Err(LoadRefusal::BoundToAnotherRuntime);
             }
         }

@@ -12,6 +12,15 @@ pub(super) enum FileTracker {
     Incomplete(Files),
 }
 
+/// What the available lifecycle evidence proves about a closed file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FileClose {
+    ConfirmedEmpty,
+    HadMedia,
+    Unconfirmed,
+}
+
+#[derive(Default)]
 pub(super) struct Files {
     // Sorted by exact path bytes, so an unmatched open does not compare its
     // path with every earlier open. Insertion/removal only moves bounded data.
@@ -22,11 +31,7 @@ pub(super) struct Files {
 
 impl FileTracker {
     pub(super) fn new() -> Self {
-        Self::Complete(Files {
-            entries: Vec::new(),
-            path_bytes: 0,
-            next_order: 0,
-        })
+        Self::Complete(Files::default())
     }
 
     fn data(&self) -> &Files {
@@ -42,11 +47,8 @@ impl FileTracker {
     }
 
     pub(super) fn mark_incomplete(&mut self) {
-        if self.is_complete() {
-            let Self::Complete(files) = std::mem::replace(self, Self::new()) else {
-                unreachable!()
-            };
-            *self = Self::Incomplete(files);
+        if let Self::Complete(files) = self {
+            *self = Self::Incomplete(std::mem::take(files));
         }
     }
 
@@ -106,7 +108,10 @@ impl FileTracker {
             }
             Err(index) => index,
         };
-        let next_order = files.next_order.checked_add(1);
+        let Some(next_order) = files.next_order.checked_add(1) else {
+            self.mark_incomplete();
+            return;
+        };
         let capacity = if files.entries.len() == files.entries.capacity() {
             (files.entries.capacity().max(4) * 2).min(MAX_FILES)
         } else {
@@ -115,7 +120,6 @@ impl FileTracker {
         let bytes = capacity * size_of::<OpenFile>() + files.path_bytes;
         if files.entries.len() == MAX_FILES
             || path.retained_bytes() > MAX_BYTES.saturating_sub(bytes)
-            || next_order.is_none()
             || files
                 .entries
                 .try_reserve_exact(capacity - files.entries.len())
@@ -147,7 +151,7 @@ impl FileTracker {
                 order: files.next_order,
             },
         );
-        files.next_order = next_order.unwrap();
+        files.next_order = next_order;
     }
 
     pub(super) fn first_frame(&mut self, path: &EventText) {
@@ -164,9 +168,10 @@ impl FileTracker {
         self.mark_incomplete();
     }
 
-    /// Remove a matching known file, reporting whether it had media. This
-    /// releases known storage even after the public report has become final.
-    pub(super) fn close(&mut self, path: &EventText) -> Option<bool> {
+    /// Release a matching known file, even after the report has become final.
+    /// Absence of a first frame proves emptiness only under complete tracking.
+    pub(super) fn close(&mut self, path: &EventText) -> FileClose {
+        let complete = self.is_complete();
         if Self::exact(path) {
             let files = self.data_mut();
             if let Ok(index) = files
@@ -175,11 +180,17 @@ impl FileTracker {
             {
                 let closed = files.entries.remove(index);
                 files.path_bytes -= closed.path.retained_bytes();
-                return Some(closed.has_media);
+                return if closed.has_media {
+                    FileClose::HadMedia
+                } else if complete {
+                    FileClose::ConfirmedEmpty
+                } else {
+                    FileClose::Unconfirmed
+                };
             }
         }
         self.mark_incomplete();
-        None
+        FileClose::Unconfirmed
     }
 }
 

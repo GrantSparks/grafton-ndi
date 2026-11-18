@@ -35,20 +35,20 @@ impl SnapshotBudget {
         ))
     }
 
-    #[cfg(all(test, feature = "advanced"))]
+    #[cfg(test)]
     pub(crate) fn spent(&self) -> usize {
         MAX_BYTES - self.0.remaining()
     }
 
     /// Charge the shared empty name used for an address-only source.
-    pub(super) fn empty_source_name(&mut self) -> Result<()> {
+    pub(super) fn charge_empty_source_name(&mut self) -> Result<()> {
         self.0.take(SourceText::STORAGE_OVERHEAD)
     }
 
     /// Copy advertised metadata without building native source storage.
     ///
     /// # Safety
-    /// As for [`Self::text`].
+    /// As for [`Self::source_text_view`].
     #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_source_metadata)))]
     pub(crate) unsafe fn metadata_text(
         &mut self,
@@ -65,25 +65,14 @@ impl SnapshotBudget {
     /// Borrow classified text after charging exactly the ordinary source copy.
     ///
     /// # Safety
-    /// As for [`Self::text`], with storage kept live for the returned lifetime.
+    /// A non-null pointer stays readable through its first NUL or the SDK
+    /// string bound, with storage kept live for the returned lifetime.
     pub(super) unsafe fn source_text_view<'a>(
         &mut self,
         pointer: *const c_char,
     ) -> Result<Option<LossyText<'a>>> {
         // SAFETY: forwarded to the caller's obligations.
         match unsafe { self.0.source_text_view(pointer) } {
-            Ok(text) => Ok(text),
-            Err(TextError::Unterminated) => Ok(None),
-            Err(TextError::Failed(error)) => Err(error),
-        }
-    }
-
-    /// # Safety
-    /// A non-null pointer remains readable through its first NUL or the SDK
-    /// string bound, whichever comes first.
-    pub(crate) unsafe fn text(&mut self, pointer: *const c_char) -> Result<Option<SourceText>> {
-        // SAFETY: forwarded to the caller's obligations.
-        match unsafe { self.0.source_text(pointer) } {
             Ok(text) => Ok(text),
             Err(TextError::Unterminated) => Ok(None),
             Err(TextError::Failed(error)) => Err(error),
@@ -128,10 +117,22 @@ pub(super) fn copy_string(text: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::{
-        finder::snapshot_entry, sdk_copy::MAX_SDK_STRING_BYTES, sys::bindings::NDIlib_source_t,
+        finder::{decode_source, source_pointers},
+        sdk_copy::MAX_SDK_STRING_BYTES,
+        sys::bindings::NDIlib_source_t,
         Source,
     };
     use std::{ffi::CString, ptr};
+
+    unsafe fn copy_text(
+        budget: &mut SnapshotBudget,
+        pointer: *const c_char,
+    ) -> Result<Option<SourceText>> {
+        // SAFETY: tests keep the bounded string readable.
+        unsafe { budget.source_text_view(pointer) }?
+            .map(|text| SourceText::from_sdk(text, crate::AllocationKind::DiscoveryResults))
+            .transpose()
+    }
 
     fn named(pointer: *const c_char) -> NDIlib_source_t {
         NDIlib_source_t {
@@ -144,7 +145,8 @@ mod tests {
         // SAFETY: tests keep all arrays and their strings live until return.
         unsafe {
             copy_snapshot(entries.as_ptr(), entries.len() as u32, |entry, budget| {
-                snapshot_entry(entry, budget)
+                let (name, address) = source_pointers(entry);
+                decode_source(name, address, budget, |_| Ok(true))
             })
         }
     }
@@ -161,14 +163,16 @@ mod tests {
         };
         let mut exact = budget(charged);
         // SAFETY: the literal remains live through its NUL terminator.
-        let copied = unsafe { exact.text(bytes.as_ptr()) }.unwrap().unwrap();
+        let copied = unsafe { copy_text(&mut exact, bytes.as_ptr()) }
+            .unwrap()
+            .unwrap();
         assert_eq!(copied.as_str(), "a\u{fffd}");
         assert_eq!(exact.0.remaining(), 0);
 
         let mut short = budget(charged - 1);
         let (result, allocations) = crate::test_alloc::allocation_count(|| {
             // SAFETY: the literal remains live through its NUL terminator.
-            unsafe { short.text(bytes.as_ptr()) }
+            unsafe { copy_text(&mut short, bytes.as_ptr()) }
         });
         assert!(matches!(result, Err(Error::ResourceLimit { .. })));
         assert_eq!(allocations, 0);
@@ -176,7 +180,7 @@ mod tests {
         let unterminated = [b'x'; 8];
         let mut scan = budget(unterminated.len());
         // SAFETY: every byte within this budget's scan bound is live.
-        let result = unsafe { scan.text(unterminated.as_ptr().cast()) };
+        let result = unsafe { copy_text(&mut scan, unterminated.as_ptr().cast()) };
         assert!(matches!(result, Err(Error::ResourceLimit { .. })));
         assert_eq!(scan.0.remaining(), 0);
         assert_eq!(descriptor_bytes(MAX_SOURCES, 16).unwrap(), MAX_SOURCES * 16);
@@ -204,7 +208,7 @@ mod tests {
         unsafe {
             copy_snapshot(entries.as_ptr(), entries.len() as u32, |entry, budget| {
                 let (name, address) = super::super::source_pointers(entry);
-                super::super::snapshot_selected_source(name, address, budget, &select)
+                super::super::decode_source(name, address, budget, &select)
             })
         }
     }
@@ -319,20 +323,14 @@ mod tests {
             let (name, address) = super::super::source_pointers(&entry);
             let mut old = SnapshotBudget::new();
             let mut selected = SnapshotBudget::new();
-            if name.is_null() && !address.is_null() {
-                old.empty_source_name().unwrap();
-            }
             // SAFETY: each test descriptor points to live terminated literals.
             unsafe {
-                super::super::decode_source(name, address, |pointer| old.text(pointer)).unwrap();
-                assert!(super::super::snapshot_selected_source(
-                    name,
-                    address,
-                    &mut selected,
-                    |_| Ok(false)
-                )
-                .unwrap()
-                .is_none());
+                super::super::decode_source(name, address, &mut old, |_| Ok(true)).unwrap();
+                assert!(
+                    super::super::decode_source(name, address, &mut selected, |_| Ok(false))
+                        .unwrap()
+                        .is_none()
+                );
             }
             assert_eq!(selected.0.remaining(), old.0.remaining());
         }
@@ -350,12 +348,9 @@ mod tests {
             // SAFETY: the descriptor points to live terminated literals.
             let (expected, actual) = unsafe {
                 (
-                    super::super::decode_source(name, address, |pointer| old.text(pointer))
+                    super::super::decode_source(name, address, &mut old, |_| Ok(true)).map(|_| ()),
+                    super::super::decode_source(name, address, &mut selected, |_| Ok(false))
                         .map(|_| ()),
-                    super::super::snapshot_selected_source(name, address, &mut selected, |_| {
-                        Ok(false)
-                    })
-                    .map(|_| ()),
                 )
             };
             assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
@@ -452,7 +447,9 @@ mod tests {
         let mut budget = SnapshotBudget::new();
         let bytes = c"a\xff\xe2\x82\xac\xe2\x82";
         // SAFETY: live literal, including a NUL terminator.
-        let copied = unsafe { budget.text(bytes.as_ptr()) }.unwrap().unwrap();
+        let copied = unsafe { copy_text(&mut budget, bytes.as_ptr()) }
+            .unwrap()
+            .unwrap();
         assert_eq!(copied.as_str(), bytes.to_string_lossy());
     }
 

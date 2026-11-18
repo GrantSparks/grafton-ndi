@@ -33,8 +33,9 @@
 //! [`connect_to`](AsyncReceiver::connect_to),
 //! [`disconnect`](AsyncReceiver::disconnect) and
 //! [`reconnect`](AsyncReceiver::reconnect). It lends the [`Receiver`] itself,
-//! through [`receiver`](AsyncReceiver::receiver), for the controls that do not
-//! wait.
+//! through [`receiver`](AsyncReceiver::receiver), for shared controls. See
+//! [`Receiver`'s waiting contract](Receiver#waiting), including native destruction
+//! on the thread dropping the last owner.
 //!
 //! For owned/scoped captures, `next_event` and `wait_for_source_name_change`, the timeout
 //! budget starts when the future is first polled, rather than when it is
@@ -320,7 +321,8 @@ impl private::Spawn for Smol {
 /// a frame keeps that change for [`next_event`](Self::next_event), as the
 /// synchronous captures keep it for [`Receiver::next_event`]: both read the
 /// same pending events. [`receiver`](Self::receiver) lends the receiver for
-/// its controls that do not wait, such as tally, PTZ and upstream metadata.
+/// shared controls, such as tally, PTZ and upstream metadata; see
+/// [`Receiver`'s waiting contract](Receiver#waiting).
 ///
 /// # Error Handling
 ///
@@ -410,18 +412,12 @@ struct ReceiverDelivery<T: ReplayReceiverValue<R>, R = Receiver> {
 }
 
 impl<T: ReplayReceiverValue<R>, R> ReceiverDelivery<T, R> {
-    fn new(receiver: Arc<R>, value: T) -> Self {
-        Self {
-            receiver,
-            value: Some(value),
-        }
+    fn new(receiver: Arc<R>, value: Option<T>) -> Self {
+        Self { receiver, value }
     }
 
-    fn take(mut self) -> T::Value {
-        self.value
-            .take()
-            .expect("delivery is consumed once")
-            .into_value()
+    fn take(mut self) -> Option<T::Value> {
+        self.value.take().map(ReplayReceiverValue::into_value)
     }
 }
 
@@ -565,10 +561,10 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
                             .map(|item| ReceiverReport::unsequenced(item.to_owned()))
                     },
                 )?;
-                Ok(value.map(|value| ReceiverDelivery::new(receiver, value)))
+                Ok(ReceiverDelivery::new(receiver, value))
             })
             .await?
-            .map(ReceiverDelivery::take),
+            .take(),
         )
     }
 
@@ -667,10 +663,10 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
                     |report| report,
                     |media| match media {},
                 )?;
-                Ok(value.map(|value| ReceiverDelivery::new(receiver, value)))
+                Ok(ReceiverDelivery::new(receiver, value))
             })
             .await?
-            .map(ReceiverDelivery::take),
+            .take(),
         )
     }
 
@@ -712,21 +708,25 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
         timeout: Duration,
     ) -> Result<Option<SourceNameChange>> {
         let deadline = Deadline::after(timeout)?;
-        // The task owns copies of the immutable tables it validated, keeping
-        // its inputs independent of reference-lifetime inference on the MSRV.
-        let (source_name, strings) = *self.inner.core.source_name_tables()?;
+        // The task owns the gated tables together with the receiver core
+        // that keeps their runtime initialized for the entire native wait.
+        let tables = crate::runtime::Bound::<
+            (crate::sys::ReceiverSourceName, crate::sys::ReceiverStrings),
+            Arc<crate::receiver::ReceiverCore>,
+        >::with_owner(Arc::clone(&self.inner.core))?;
         let receiver = Arc::clone(&self.inner);
         Ok(R::spawn_stoppable(private::Token, move |stop| {
-            let value = receiver.core.wait_for_source_name_change_with(
-                &source_name,
-                &strings,
+            let (source_name, strings) = &*tables;
+            let value = tables.owner().wait_for_source_name_change_with(
+                source_name,
+                strings,
                 deadline,
                 stop,
             )?;
-            Ok::<_, Error>(value.map(|value| ReceiverDelivery::new(receiver, value)))
+            Ok::<_, Error>(ReceiverDelivery::new(receiver, value))
         })
         .await??
-        .map(ReceiverDelivery::take))
+        .take())
     }
 
     /// Point the underlying receiver at a different source and remember it as
@@ -1332,12 +1332,26 @@ mod receiver_tests {
         let event = ReceiverEvent::SourceChanged;
         drop(ReceiverDelivery::new(
             Arc::clone(&pending),
-            ReceiverReport::unsequenced(event),
+            Some(ReceiverReport::unsequenced(event)),
         ));
         assert_eq!(take(), Some(event));
         assert_eq!(
-            ReceiverDelivery::new(Arc::clone(&pending), ReceiverReport::unsequenced(event)).take(),
-            event
+            ReceiverDelivery::new(
+                Arc::clone(&pending),
+                Some(ReceiverReport::unsequenced(event))
+            )
+            .take(),
+            Some(event)
+        );
+        assert_eq!(take(), None);
+        drop(ReceiverDelivery::<ReceiverReport<ReceiverEvent>, _>::new(
+            Arc::clone(&pending),
+            None,
+        ));
+        assert_eq!(
+            ReceiverDelivery::<ReceiverReport<ReceiverEvent>, _>::new(Arc::clone(&pending), None)
+                .take(),
+            None
         );
         assert_eq!(take(), None);
     }

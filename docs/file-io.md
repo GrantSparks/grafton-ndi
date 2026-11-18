@@ -126,7 +126,7 @@ Call `finish(timeout)` and inspect both its status and `RecordingReport`:
 | --- | --- |
 | `Closed` | The SDK reported every opened file finalized. Check errors, write failures, empty files and `stopped_by_sdk` for an early end. |
 | `TimedOut` | Use `wait_for_finish` to continue waiting. |
-| `Indeterminate` | Closure could not be established from the events; waiting longer does not repair the report. Reset before restarting when file tracking is incomplete. |
+| `Indeterminate` | Closure could not be established from the events; waiting longer does not repair the report. `empty_files` is a lower bound counting files confirmed empty under complete tracking. Reset before restarting when file tracking is incomplete. |
 
 `finish(timeout)` requests the stop and reports that bounded completion attempt,
 including `FinishStatus::TimedOut(report)`. A later
@@ -143,19 +143,19 @@ native stop; events already queued when it expires are still taken. Native event
 loss, unreadable lifecycle evidence or exhaustion of file bookkeeping makes
 tracking incomplete. A final indeterminate report stays unchanged as later
 events arrive. Even if every known file closes and the SDK stops recording,
-unknown files can still need finalization; another `start` returns
-`PreviousSessionOpen` until `reset` succeeds. A failed reset keeps the original
-recorder and its cleanup obligation. `reset` replaces the native
+unknown files can still need finalization. After the session ends, another
+`start` returns `IncompleteFileTracking` until `reset` succeeds. A failed reset
+keeps the original recorder and its cleanup obligation. `reset` replaces the native
 recorder and returns the old session's report; `abandon` destroys it without
 waiting. Async callers await `AsyncFileRecorder::abandon()` for the same
 immediate teardown and last session report. It bypasses a full command queue
 and ends an existing close's cleanup wait. Either recovery can leave an
 unfinished file.
 
-An indeterminate report alone does not imply incomplete tracking. For example,
-a session stopped before any file opens can have an indeterminate report with
-no pending file obligation. The reset requirement applies when file tracking
-became incomplete.
+An indeterminate report alone does not imply incomplete tracking. See
+[`RecordingReport::closure_confirmed`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.RecordingReport.html#method.closure_confirmed)
+for the closure rule, including sessions that report no file. The reset
+requirement applies when file tracking became incomplete.
 
 Drop requests a stop and waits for closure events within one `drop_wait`
 budget (five seconds by default), including cleanup after an indeterminate
@@ -167,7 +167,8 @@ measures its event wait from the stop's return, giving closure its full
 requested wait. Complete tracking allows cleanup to end early once all files
 close; while a file remains open, a new start returns `PreviousSessionOpen`.
 Incomplete tracking consumes the remaining original cleanup budget even after
-every known file closes, and requires `reset` before another session. Use
+every known file closes. Once the session ends, a new start returns
+`IncompleteFileTracking` until `reset` succeeds. Use
 `abandon` for immediate teardown without the cleanup wait.
 Use explicit finishing when the result matters. See
 [`FileRecorder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorder.html)

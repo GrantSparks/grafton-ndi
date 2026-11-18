@@ -87,6 +87,10 @@ pub(crate) struct AliasableVec<T> {
 impl<T> AliasableVec<T> {
     pub(crate) fn new(value: Vec<T>) -> Self {
         let mut value = ManuallyDrop::new(value);
+        #[expect(
+            clippy::expect_used,
+            reason = "Vec::as_mut_ptr guarantees a non-null pointer, including for zero capacity"
+        )]
         Self {
             pointer: NonNull::new(value.as_mut_ptr()).expect("Vec pointers are non-null"),
             len: value.len(),
@@ -107,16 +111,6 @@ impl<T> AliasableVec<T> {
         // SAFETY: all three values came from one Vec in `new`, its elements
         // and allocation remain live, and the original destructor was skipped.
         unsafe { Vec::from_raw_parts(this.pointer.as_ptr(), this.len, this.capacity) }
-    }
-}
-
-impl AliasableVec<u8> {
-    /// Refill a released frame's byte allocation, growing only when needed.
-    pub(crate) fn copy_from_slice(&mut self, bytes: &[u8]) {
-        let mut storage = std::mem::replace(self, Self::new(Vec::new())).into_vec();
-        storage.clear();
-        storage.extend_from_slice(bytes);
-        *self = Self::new(storage);
     }
 }
 

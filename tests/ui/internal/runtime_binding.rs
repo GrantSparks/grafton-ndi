@@ -36,3 +36,28 @@ fn forge_binding(ndi: Ndi) -> Bound<sys::Core> {
         table: (),
     }
 }
+
+#[cfg(ndi_test_runtime_binding)]
+fn copied_core(ndi: &Ndi) -> sys::Core {
+    let copied_core = ndi.api().core;
+    copied_core
+}
+
+#[cfg(ndi_test_runtime_binding)]
+fn copied_optional(ndi: &Ndi) -> Result<sys::Routing> {
+    let copied_optional = ndi.table().copied();
+    copied_optional
+}
+
+#[cfg(ndi_test_runtime_binding)]
+fn copied_bound(bound: &Bound<sys::Core>) -> sys::Core {
+    let copied_bound = **bound;
+    copied_bound
+}
+
+#[cfg(ndi_test_runtime_binding)]
+fn detach(ndi: Ndi) -> sys::Core {
+    let detach = ndi.api().core;
+    drop(ndi);
+    detach
+}

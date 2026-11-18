@@ -27,7 +27,7 @@ fn receiver_handles_and_input_dispatch_require_their_proofs() {
         "field `instance`",
         "field `0`",
         "E0308",
-        "&Connection",
+        "&Control",
     ] {
         assert!(
             stderr.contains(diagnostic),

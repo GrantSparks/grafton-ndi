@@ -158,7 +158,6 @@ version_gates!(Planar444Video, ReceiveBest444, ReceiveVideoOnly);
 #[derive(Clone, Copy)]
 pub(crate) struct Evidence<'a> {
     pub(in crate::sys) api: &'a Api,
-    #[cfg(feature = "advanced")]
     pub(in crate::sys) advanced: &'a super::advanced::AdvancedApi,
     pub(in crate::sys) capabilities: &'a Capabilities,
 }
@@ -166,7 +165,6 @@ pub(crate) struct Evidence<'a> {
 /// Resolution evidence, which cannot hand out optional tables.
 pub(crate) struct Resolved {
     api: ResolvedApi,
-    #[cfg(feature = "advanced")]
     advanced: super::advanced::ResolvedAdvancedApi,
 }
 
@@ -175,7 +173,6 @@ impl Resolved {
     pub(crate) fn load(resolver: &dyn Resolver) -> std::result::Result<Self, LoadRefusal> {
         Ok(Self {
             api: Api::load(resolver)?,
-            #[cfg(feature = "advanced")]
             advanced: super::advanced::AdvancedApi::load(resolver)?,
         })
     }
@@ -200,33 +197,28 @@ impl Resolved {
         &self.api.core
     }
 
-    /// The required start/stop table, before it is moved into its sole owner.
-    pub(in crate::sys) fn lifecycle(&self) -> Lifecycle {
-        self.api.lifecycle
-    }
-
     /// Consume resolution evidence and construct every immutable capability gate.
-    pub(crate) fn seal(self, version: Option<SdkVersion>, edition: SdkEdition) -> Gates {
-        let capabilities = Capabilities::detect(
-            &self.api,
-            #[cfg(feature = "advanced")]
-            &self.advanced,
-            version,
-            edition,
-        );
-        Gates {
-            api: self.api.seal(&capabilities),
-            #[cfg(feature = "advanced")]
-            advanced: self.advanced.seal(&capabilities),
-            capabilities,
-        }
+    pub(crate) fn seal(
+        self,
+        version: Option<SdkVersion>,
+        edition: SdkEdition,
+    ) -> (Lifecycle, Gates) {
+        let capabilities = Capabilities::detect(&self.api, &self.advanced, version, edition);
+        let (lifecycle, api) = self.api.seal(&capabilities);
+        (
+            lifecycle,
+            Gates {
+                api,
+                advanced: self.advanced.seal(&capabilities),
+                capabilities,
+            },
+        )
     }
 }
 
 /// Tables constructed under their one recorded capability decision.
 pub(crate) struct Gates {
     api: Api,
-    #[cfg(feature = "advanced")]
     advanced: super::advanced::AdvancedApi,
     capabilities: Capabilities,
 }
@@ -244,7 +236,6 @@ impl Gates {
     pub(crate) fn evidence(&self) -> Evidence<'_> {
         Evidence {
             api: &self.api,
-            #[cfg(feature = "advanced")]
             advanced: &self.advanced,
             capabilities: &self.capabilities,
         }
@@ -344,11 +335,11 @@ macro_rules! optional_tables {
 
         impl ResolvedApi {
             /// Construct each table only under its final recorded decision.
-            fn seal(self, capabilities: &Capabilities) -> Api {
-                Api {
+            fn seal(self, capabilities: &Capabilities) -> (Lifecycle, Api) {
+                (self.lifecycle, Api {
                     core: self.core,
                     $($field: capabilities.decision(RuntimeFeature::$feature).and(self.$field),)+
-                }
+                })
             }
 
             /// The first entry point behind `feature` that the implementation
@@ -547,7 +538,8 @@ pub(crate) fn with_test_evidence<T>(version: &str, run: impl FnOnce(Evidence<'_>
     let exports = super::table::ExportsWhere(|_: &str| true);
     let gates = Resolved::load(&exports)
         .unwrap()
-        .seal(SdkVersion::parse(version), SdkEdition::Advanced);
+        .seal(SdkVersion::parse(version), SdkEdition::Advanced)
+        .1;
     run(gates.evidence())
 }
 

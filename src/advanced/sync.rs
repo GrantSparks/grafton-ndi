@@ -251,6 +251,26 @@ pub(crate) struct AvSyncKind {
 
 type AvResource = Resource<AvSyncKind>;
 
+#[cfg(ndi_has_advanced_av_sync)]
+impl crate::capture::source_sealed::Sealed for &AvResource {}
+
+// SAFETY: this resource owns the synchronizer and its bound table retains the
+// creating receiver/runtime. The handle and release entry point are read from
+// that resource, and its borrow prevents destruction before the frame is freed.
+#[cfg(ndi_has_advanced_av_sync)]
+unsafe impl<'owner> crate::capture::FrameSource<'owner, AvSyncAudioFree> for &'owner AvResource {
+    fn runtime(&self) -> &'owner Ndi {
+        self.table.ndi()
+    }
+
+    fn instance(&self) -> AvSyncAudioInstance {
+        AvSyncAudioInstance::Native {
+            handle: self.handle.0,
+            free: self.table.NDIlib_avsync_free_audio,
+        }
+    }
+}
+
 // The bound table uses the receiver lease the resource already retained:
 // one handle, one table pointer and one receiver Arc, with no separate Ndi.
 #[cfg(ndi_has_advanced_av_sync)]
@@ -680,10 +700,9 @@ impl<'a> AvSyncCapture<'a> {
                     other => Synchronized::Unknown(other),
                 })
             };
-            let instance = AvSyncAudioInstance::Native { handle: handle.0, free: table.NDIlib_avsync_free_audio };
             // SAFETY: the synchronizer and runtime remain borrowed through
             // the result; its guard returns this descriptor exactly once.
-            let guard = unsafe { Guard::new(self.resource.receiver().ndi(), instance, audio) };
+            let guard = unsafe { Guard::new(self.resource, audio) };
             outcome_with_call(status, guard)
         })
     }
@@ -2015,16 +2034,7 @@ mod tests {
         };
         assert_eq!(status.into_value(), crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_no_audio_stream_received);
         assert_eq!(raw.timestamp, 0);
-        let guard = unsafe {
-            Guard::<AvSyncAudioFree>::new(
-                &ndi,
-                AvSyncAudioInstance::Native {
-                    handle: handle.0,
-                    free: table.NDIlib_avsync_free_audio,
-                },
-                raw,
-            )
-        };
+        let guard = unsafe { Guard::<AvSyncAudioFree>::new(resource, raw) };
         assert_eq!(guard.audio_timestamp(raw.timestamp), None);
         assert!(matches!(
             outcome(Synchronized::NoAudioStream, guard).unwrap(),
@@ -2032,3 +2042,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(ndi_test_frame_source, ndi_has_advanced_av_sync))]
+#[path = "../../tests/ui/internal/av_frame_source.rs"]
+mod frame_source_contract;
