@@ -18,7 +18,7 @@ use grafton_ndi::{
     Source,
 };
 use runtime_fixture::read_fake_log;
-use std::{fs, time::Duration};
+use std::time::Duration;
 
 #[test]
 fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {

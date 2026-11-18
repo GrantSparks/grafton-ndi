@@ -493,12 +493,12 @@ fn child(case: &str) {
             let mut synchronous =
                 CompressedFrame::<VideoPacketFormat>::new(format, vec![33; 16]).unwrap();
             sender.send_video(&mut synchronous);
-            let after_send = log();
+            let after_send = read_fake_log();
             assert_eq!(after_send.matches("sender-flush\n").count(), 1);
             let reclaimed = sender.reclaim_video();
             assert!(reclaimed.program.is_some() && reclaimed.preview.is_some());
             assert_eq!(
-                log(),
+                read_fake_log(),
                 after_send,
                 "synchronous video already released both loans"
             );
@@ -521,13 +521,13 @@ fn child(case: &str) {
                     assert!(sender.submit_video(frame).is_none());
                 }
                 sender.send_scatter_video(&mut scatter).unwrap();
-                let after_send = log();
+                let after_send = read_fake_log();
                 assert!(after_send.contains("sender-scatter-send\n"));
                 assert_eq!(after_send.matches("sender-flush\n").count(), 1);
                 let reclaimed = sender.reclaim_video();
                 assert!(reclaimed.program.is_some() && reclaimed.preview.is_some());
                 assert_eq!(
-                    log(),
+                    read_fake_log(),
                     after_send,
                     "synchronous scatter already released both loans"
                 );
