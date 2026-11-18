@@ -419,9 +419,8 @@ impl FileRecorder {
             RecorderState::Stopping => StopRequest::AlreadyStopping,
             RecorderState::Recording => {
                 let still_recording = self.is_recording();
-                if let Some(stop) = self.ledger.stop_requested(still_recording).stop {
-                    self.native.stop(stop);
-                }
+                self.native
+                    .apply(self.ledger.stop_requested(still_recording));
                 StopRequest::Requested
             }
         }
@@ -458,26 +457,17 @@ impl FileRecorder {
             self.ledger.dropped(self.dropped_event_count());
         }
         let Some(event) = event.inspect_err(|_| self.ledger.mark_uncertain())? else {
-            // This empty-capture/recording check relies on open-before-close
-            // rollover events, pinned by the native File test
-            // `rollovers_open_the_next_file_before_closing_the_previous_file`.
-            if self.ledger.session_open() {
-                if let Some(stop) = self.ledger.drained(self.native.is_recording()).stop {
-                    self.native.stop(stop);
-                }
-            }
+            // Query recording only when the closed or incomplete file set
+            // can end the session. This relies on open-before-close rollover
+            // events, pinned by `rollovers_open_the_next_file_before_closing_the_previous_file`.
+            let transition = self.ledger.drained(|| self.native.is_recording());
+            self.native.apply(transition);
             return Ok(None);
         };
-        if let Some(stop) = self
-            .ledger
-            .observe(
-                RecorderEventKind::from_raw(event.type_),
-                EventText::from_buffer(&event.p_path),
-            )
-            .stop
-        {
-            self.native.stop(stop);
-        }
+        self.native.apply(self.ledger.observe(
+            RecorderEventKind::from_raw(event.type_),
+            EventText::from_buffer(&event.p_path),
+        ));
         // Decoded after the ledger is updated, so that a malformed payload
         // cannot hide the event that closes a file.
         Ok(Some(RecorderEvent::from_sdk(&event)))

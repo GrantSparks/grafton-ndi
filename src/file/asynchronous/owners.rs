@@ -494,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn recording_and_stopping_pumps_keep_sampling_live_session_evidence() {
+    fn empty_pumps_query_recording_only_after_the_last_file_closes() {
         for stopping in [false, true] {
             let device = mock::Recorder::new(Closing::WhenTold);
             device.install();
@@ -524,8 +524,18 @@ mod tests {
                 owner.after_events(&events, &control);
             }
             assert_eq!(device.captures.load(Ordering::Acquire) - before, 100);
-            assert_eq!(device.recording_queries.load(Ordering::Acquire), 100);
+            assert_eq!(device.recording_queries.load(Ordering::Acquire), 0);
             assert_eq!(device.dropped_queries.load(Ordering::Acquire), 100);
+
+            // The SDK keeps reporting recording while we simulate a final
+            // close arriving before its recording flag clears.
+            device.push(mock::FILE_CLOSED, mock::TAKE);
+            assert!(owner.poll_native().unwrap().is_some());
+            for _ in 0..100 {
+                assert!(owner.poll_native().unwrap().is_none());
+                owner.after_events(&events, &control);
+            }
+            assert_eq!(device.recording_queries.load(Ordering::Acquire), 100);
             owner.recorder.abandon();
         }
     }

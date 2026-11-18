@@ -2,7 +2,10 @@
 
 use std::{marker::PhantomData, ptr::NonNull, rc::Rc};
 
-use super::{ledger::StopOwed, CheckedRecorderOptions};
+use super::{
+    ledger::{StopOwed, Transition},
+    CheckedRecorderOptions,
+};
 use crate::{
     file::{
         out_param,
@@ -63,7 +66,13 @@ impl NativeRecorder {
         )
     }
 
-    pub(super) fn stop(&mut self, _stop: StopOwed) {
+    pub(super) fn apply(&mut self, transition: Transition) {
+        if let Some(stop) = transition.stop {
+            self.stop(stop);
+        }
+    }
+
+    fn stop(&mut self, _stop: StopOwed) {
         // SAFETY: the recorder is live and the consumed token is the one
         // obligation minted by its successful native start.
         unsafe {

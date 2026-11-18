@@ -263,19 +263,19 @@ impl Session {
         }
     }
 
-    fn drained(self, native_recording: bool) -> (Self, Option<StopOwed>) {
-        if native_recording {
-            return (self, None);
-        }
+    fn phase_after_drain(&self, native_recording: impl FnOnce() -> bool) -> Option<FinalPhase> {
+        let phase = match self {
+            Self::Open { data, .. } => data.final_phase(None),
+            Self::Stopping { data, requested } => data.final_phase(Some(*requested)),
+            Self::Idle { .. } | Self::Ended { .. } => None,
+        };
+        phase.filter(|_| !native_recording())
+    }
+
+    fn end(self, phase: FinalPhase) -> (Self, Option<StopOwed>) {
         match self {
-            Self::Open { data, stop } => match data.final_phase(None) {
-                Some(phase) => (data.end(phase), Some(stop)),
-                None => (Self::Open { data, stop }, None),
-            },
-            Self::Stopping { data, requested } => match data.final_phase(Some(requested)) {
-                Some(phase) => (data.end(phase), None),
-                None => (Self::Stopping { data, requested }, None),
-            },
+            Self::Open { data, stop } => (data.end(phase), Some(stop)),
+            Self::Stopping { data, .. } => (data.end(phase), None),
             previous => (previous, None),
         }
     }
@@ -549,8 +549,11 @@ impl Ledger {
 
     /// Finality relies on open-before-close rollover events, pinned by the
     /// native rollover-order test. Every exit transfers any owed native stop.
-    pub(super) fn drained(&mut self, native_recording: bool) -> Transition {
-        self.transition(|session| session.drained(native_recording))
+    pub(super) fn drained(&mut self, native_recording: impl FnOnce() -> bool) -> Transition {
+        let Some(phase) = self.session.phase_after_drain(native_recording) else {
+            return Transition { stop: None };
+        };
+        self.transition(|session| session.end(phase))
     }
 }
 
@@ -598,14 +601,14 @@ mod tests {
         let mut closed = session();
         let _ = closed.observe(Started, path("take.mkv"));
         let _ = closed.observe(FileClosed, path("take.mkv"));
-        assert!(closed.drained(false).stop.is_some());
+        assert!(closed.drained(|| false).stop.is_some());
         for mut ledger in [Ledger::idle(), closed] {
             let state = ledger.state();
             let report = ledger.report();
             for requested in [false, true] {
                 assert!(ledger.stop_requested(requested).stop.is_none());
                 for native_recording in [false, true] {
-                    assert!(ledger.drained(native_recording).stop.is_none());
+                    assert!(ledger.drained(|| native_recording).stop.is_none());
                     assert_eq!(ledger.state(), state);
                     assert_eq!(ledger.report(), report);
                 }
@@ -630,7 +633,7 @@ mod tests {
             ));
         }
         assert!(
-            ledger.drained(false).stop.is_none(),
+            ledger.drained(|| false).stop.is_none(),
             "the stop was already issued"
         );
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
@@ -660,15 +663,59 @@ mod tests {
     }
 
     #[test]
+    fn empty_polls_query_native_recording_only_when_the_session_can_end() {
+        for (state, decisive) in [
+            (RecorderState::Idle, [false; 4]),
+            (RecorderState::Recording, [false, false, true, true]),
+            (RecorderState::Stopping, [true, false, true, true]),
+            (RecorderState::Closed, [false; 4]),
+        ] {
+            for (evidence, expected_query) in decisive.into_iter().enumerate() {
+                let mut ledger = if state == RecorderState::Idle {
+                    Ledger::idle()
+                } else {
+                    session()
+                };
+                if state == RecorderState::Closed {
+                    let _ = ledger.observe(Started, path("previous.mkv"));
+                    let _ = ledger.observe(FileClosed, path("previous.mkv"));
+                    let _ = ledger.drained(|| false);
+                }
+                if state == RecorderState::Stopping {
+                    let _ = ledger.stop_requested(true);
+                }
+                if evidence == 1 || evidence == 2 {
+                    let _ = ledger.observe(Started, path("take.mkv"));
+                }
+                if evidence == 2 {
+                    let _ = ledger.observe(FileClosed, path("take.mkv"));
+                }
+                if evidence == 3 {
+                    ledger.dropped(1);
+                }
+
+                let mut queried = false;
+                let transition = ledger.drained(|| {
+                    queried = true;
+                    true
+                });
+                assert!(transition.stop.is_none());
+                assert_eq!(queried, expected_query, "{state:?}, evidence {evidence}");
+                assert_eq!(ledger.state(), state);
+            }
+        }
+    }
+
+    #[test]
     fn closure_needs_the_matching_file_and_a_stopped_drained_recorder() {
         let mut ledger = session();
         let _ = ledger.observe(Started, path("take.mkv"));
         let _ = ledger.stop_requested(true);
         let _ = ledger.observe(FileClosed, path("take.mkv"));
         assert!(!ledger.report().closure_confirmed());
-        let _ = ledger.drained(true);
+        let _ = ledger.drained(|| true);
         assert_eq!(ledger.state(), RecorderState::Stopping);
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Closed);
         assert!(ledger.report().closure_confirmed());
     }
@@ -679,7 +726,7 @@ mod tests {
         let _ = ledger.observe(Started, path("first.mkv"));
         let _ = ledger.stop_requested(true);
         let _ = ledger.observe(FileClosed, path("other.mkv"));
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
         assert!(!ledger.report().closure_confirmed());
     }
@@ -702,7 +749,7 @@ mod tests {
             // neither they nor their closes can prove another empty file.
             let _ = ledger.observe(Rollover, path("hidden.mkv"));
             let _ = ledger.observe(FileClosed, path("hidden.mkv"));
-            let _ = ledger.drained(false);
+            let _ = ledger.drained(|| false);
             let report = ledger.report();
             assert_eq!(report.empty_files(), u64::from(empty_before_loss));
             assert_eq!(report.closed_files(), 2);
@@ -718,7 +765,7 @@ mod tests {
         let _ = ledger.stop_requested(true);
         let _ = ledger.observe(FileClosed, path("take.mkv"));
         ledger.dropped(8);
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
         assert_eq!(ledger.report().dropped_events(), 1);
     }
@@ -728,7 +775,7 @@ mod tests {
         let mut ledger = session();
         let _ = ledger.observe(Started, path("take.mkv"));
         ledger.dropped(1);
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
         assert!(ledger.cleanup_pending());
         let report = ledger.report();
@@ -748,9 +795,9 @@ mod tests {
         ledger.dropped(1);
         let _ = ledger.observe(FileClosed, path("known.mkv"));
         assert!(ledger.files().is_empty());
-        let stop = ledger.drained(false).stop;
+        let stop = ledger.drained(|| false).stop;
         assert!(stop.is_some());
-        assert!(ledger.drained(false).stop.is_none());
+        assert!(ledger.drained(|| false).stop.is_none());
         let report = ledger.report();
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
         assert!(ledger.cleanup_pending());
@@ -768,7 +815,7 @@ mod tests {
         let _ = ledger.observe(RecorderEventKind::Unknown(4321), path("hidden.mkv"));
         let _ = ledger.observe(FileClosed, path("known.mkv"));
         assert!(ledger.files().is_empty());
-        let stop = ledger.drained(false).stop;
+        let stop = ledger.drained(|| false).stop;
         assert!(stop.is_some());
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
         assert!(ledger.cleanup_pending());
@@ -783,7 +830,7 @@ mod tests {
             let mut ledger = session();
             let _ = ledger.observe(Started, path("known.mkv"));
             let _ = ledger.observe(FileClosed, path("known.mkv"));
-            let _ = ledger.drained(false);
+            let _ = ledger.drained(|| false);
             assert_eq!(ledger.state(), RecorderState::Closed);
             assert!(!ledger.cleanup_pending());
             let report = ledger.report();
@@ -824,7 +871,7 @@ mod tests {
             Some(WaitOutcome::Expired(..))
         ));
         let _ = ledger.observe(FileClosed, path("take.mkv"));
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert!(matches!(
             ledger.settle(None),
             Some(WaitOutcome::Ended(SessionEnd::Closed(_)))
@@ -843,11 +890,11 @@ mod tests {
         let _ = ledger.observe(Rollover, path("second.mkv"));
         assert_eq!(ledger.files().len(), 2);
         let _ = ledger.observe(FileClosed, path("first.mkv"));
-        let _ = ledger.drained(true);
+        let _ = ledger.drained(|| true);
         assert_eq!(ledger.state(), RecorderState::Recording);
         let _ = ledger.stop_requested(true);
         let _ = ledger.observe(FileClosed, path("second.mkv"));
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Closed);
         assert_eq!(ledger.report().closed_files(), 2);
     }
@@ -858,14 +905,14 @@ mod tests {
         let _ = ledger.observe(Started, path("first.mkv"));
         let _ = ledger.observe(FileClosed, path("first.mkv"));
         // Still recording: the close of the first file is not the end.
-        let _ = ledger.drained(true);
+        let _ = ledger.drained(|| true);
         assert_eq!(ledger.state(), RecorderState::Recording);
         let _ = ledger.observe(Rollover, path("second.mkv"));
         let _ = ledger.stop_requested(true);
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Stopping);
         let _ = ledger.observe(FileClosed, path("second.mkv"));
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Closed);
     }
 
@@ -877,7 +924,7 @@ mod tests {
         let _ = ledger.observe(Started, path("first.mkv"));
         let _ = ledger.stop_requested(true);
         let _ = ledger.observe(FileClosed, path("first.mkv"));
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Closed);
     }
 
@@ -887,7 +934,7 @@ mod tests {
         let _ = ledger.observe(Started, path("take.mkv"));
         let _ = ledger.observe(FormatChanged, path("take.mkv"));
         let _ = ledger.observe(FileClosed, path("take.mkv"));
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Closed);
         assert!(ledger.report().closure_confirmed());
     }
@@ -900,7 +947,7 @@ mod tests {
         let _ = ledger.observe(Error, path("take.mkv"));
         assert_eq!(ledger.state(), RecorderState::Stopping);
         let _ = ledger.observe(FileClosed, path("take.mkv"));
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Closed);
         assert_eq!(ledger.report().error_events(), 1);
         assert_eq!(ledger.report().write_failures(), 1);
@@ -912,7 +959,7 @@ mod tests {
         let _ = ledger.observe(Started, path("first.mkv"));
         let _ = ledger.observe(OpenFailed, path("second.mkv"));
         let _ = ledger.observe(FileClosed, path("first.mkv"));
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Closed);
         assert_eq!(ledger.report().error_events(), 1);
     }
@@ -921,7 +968,7 @@ mod tests {
     fn a_session_that_stops_without_reporting_a_file_is_indeterminate_not_pending() {
         let mut ledger = session();
         let _ = ledger.stop_requested(true);
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
         assert!(!ledger.report().closure_confirmed());
         assert_eq!(ledger.report().dropped_events(), 0);
@@ -936,7 +983,7 @@ mod tests {
         let _ = ledger.observe(Started, path("take.mkv"));
         let _ = ledger.stop_requested(true);
         let _ = ledger.observe(FileClosed, path("take.mkv"));
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Closed);
         let _ = ledger.observe(OpenFailed, path("next.mkv"));
         ledger.dropped(3);
@@ -952,9 +999,9 @@ mod tests {
         assert!(!ledger.report().stopped_by_sdk(), "an open session");
         let _ = ledger.stop_requested(true);
         let _ = ledger.observe(FileClosed, path("take.mkv"));
-        let _ = ledger.drained(true);
+        let _ = ledger.drained(|| true);
         assert!(!ledger.report().stopped_by_sdk(), "still stopping");
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Closed);
         assert!(!ledger.report().stopped_by_sdk());
     }
@@ -967,7 +1014,7 @@ mod tests {
         let _ = ledger.observe(Error, path(""));
         assert_eq!(ledger.state(), RecorderState::Stopping);
         let _ = ledger.observe(FileClosed, path("take.mkv"));
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Closed);
         assert!(ledger.report().closure_confirmed());
         assert!(ledger.report().stopped_by_sdk());
@@ -979,7 +1026,7 @@ mod tests {
         let _ = ledger.observe(Started, path("take.mkv"));
         let _ = ledger.observe(FormatChanged, path("take.mkv"));
         let _ = ledger.observe(FileClosed, path("take.mkv"));
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Closed);
         assert!(ledger.report().stopped_by_sdk());
     }
@@ -991,7 +1038,7 @@ mod tests {
         // The SDK had ended the session before the request reached it.
         let _ = ledger.stop_requested(false);
         let _ = ledger.observe(FileClosed, path("take.mkv"));
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Closed);
         assert!(ledger.report().stopped_by_sdk());
     }
@@ -1001,7 +1048,7 @@ mod tests {
         let mut ledger = session();
         let _ = ledger.observe(Started, path("take.mkv"));
         ledger.dropped(1);
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
         assert!(ledger.report().stopped_by_sdk());
     }
@@ -1038,7 +1085,7 @@ mod tests {
                 if requested || !opened_and_closed {
                     let _ = ledger.stop_requested(requested);
                 }
-                let _ = ledger.drained(false);
+                let _ = ledger.drained(|| false);
                 let confirmed = opened_and_closed && !lost_event;
                 let report = ledger.report();
                 let expected = if confirmed {
@@ -1130,7 +1177,7 @@ mod tests {
         let _ = ledger.stop_requested(true);
         let _ = ledger.observe(Error, path("take.mkv"));
         let _ = ledger.observe(FileClosed, path("take.mkv"));
-        let _ = ledger.drained(false);
+        let _ = ledger.drained(|| false);
         assert_eq!(ledger.state(), RecorderState::Closed);
         assert!(!ledger.report().stopped_by_sdk());
     }
