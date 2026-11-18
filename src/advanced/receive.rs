@@ -7,7 +7,7 @@ use std::time::Duration;
 #[cfg(test)]
 use super::CompressedFrame;
 use super::{
-    AdvancedConfig, AudioCodec, AudioPacketFormat, CompressedRef, PacketAttached, ReceivedPacket,
+    AudioCodec, AudioPacketFormat, CompressedRef, PacketAttached, ReceivedPacket,
     ReceiverControls, VideoCodec, VideoPacketFormat,
 };
 use crate::{

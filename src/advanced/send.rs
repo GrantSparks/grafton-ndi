@@ -7,7 +7,7 @@ use super::{
     aliasable::AliasableVec,
     invalid_frame,
     packets::{EnvelopeExtents, PacketBytes, PacketLen},
-    AdvancedConfig, AudioPacketFormat, CompressedAttached, CompressedAudioSendMode,
+    AudioPacketFormat, CompressedAttached, CompressedAudioSendMode,
     CompressedFrame, ScatterFrame, VideoPacketFormat,
 };
 use crate::{
