@@ -443,13 +443,7 @@ impl FileApi {
     /// Returns [`Error::UnsupportedCapability`] with the missing symbol when
     /// the selected File library does not provide `family`.
     pub fn require_family(&self, family: FileFamily) -> Result<()> {
-        match self.status(family) {
-            CapabilityStatus::Available => Ok(()),
-            CapabilityStatus::Unavailable(refusal) => Err(crate::Error::UnsupportedCapability {
-                capability: crate::capabilities::Capability::File(family),
-                refusal,
-            }),
-        }
+        self.runtime.require(family)
     }
 
     /// The table of a family, or the error for the first of its entry points

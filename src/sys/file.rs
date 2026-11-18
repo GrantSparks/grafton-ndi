@@ -220,18 +220,31 @@ impl FileRuntime {
     pub(crate) fn table<T: FileTable>(&self) -> Result<&T> {
         T::resolved(self)
             .as_ref()
-            .map_err(|symbol| Error::UnsupportedCapability {
-                capability: Capability::File(T::FAMILY),
-                refusal: CapabilityRefusal::SymbolUnavailable(symbol),
-            })
+            .map_err(|symbol| Self::unsupported_family(T::FAMILY, symbol))
+    }
+
+    fn unsupported_family(family: FileFamily, symbol: &'static CStr) -> Error {
+        Error::UnsupportedCapability {
+            capability: Capability::File(family),
+            refusal: CapabilityRefusal::SymbolUnavailable(symbol),
+        }
+    }
+
+    pub(crate) fn require(&self, family: FileFamily) -> Result<()> {
+        self.require_symbol_family(family)
+            .map_err(|symbol| Self::unsupported_family(family, symbol))
+    }
+
+    fn require_symbol_family(&self, family: FileFamily) -> std::result::Result<(), &'static CStr> {
+        self.families.missing(family).map_or(Ok(()), Err)
     }
 
     /// Whether the library provides `family`: unavailable exactly when
     /// [`Self::table`] refuses the family's table.
     pub(crate) fn status(&self, family: FileFamily) -> CapabilityStatus {
-        match self.families.missing(family) {
-            None => CapabilityStatus::Available,
-            Some(symbol) => {
+        match self.require_symbol_family(family) {
+            Ok(()) => CapabilityStatus::Available,
+            Err(symbol) => {
                 CapabilityStatus::Unavailable(CapabilityRefusal::SymbolUnavailable(symbol))
             }
         }
@@ -418,15 +431,21 @@ mod tests {
         for lacking in std::iter::once(None).chain(every_symbol.map(Some)) {
             let library = library(|name| Some(name) != lacking).unwrap();
             for family in FileFamily::ALL {
-                let ((refused, status), allocations) = crate::test_alloc::allocation_count(|| {
-                    let refused = match family {
-                        FileFamily::Playback => refusal(library.table::<FilePlayback>()),
-                        FileFamily::Recording => refusal(library.table::<FileRecording>()),
-                    };
-                    (refused, library.status(family))
-                });
+                let ((refused, required, status), allocations) =
+                    crate::test_alloc::allocation_count(|| {
+                        let refused = match family {
+                            FileFamily::Playback => refusal(library.table::<FilePlayback>()),
+                            FileFamily::Recording => refusal(library.table::<FileRecording>()),
+                        };
+                        (
+                            refused,
+                            refusal(library.require(family)),
+                            library.status(family),
+                        )
+                    });
                 let context = format!("{family:?} lacking {lacking:?}");
                 assert_eq!(allocations, 0, "{context}");
+                assert_eq!(required, refused, "{context}");
                 match status {
                     CapabilityStatus::Available => assert_eq!(refused, None, "{context}"),
                     CapabilityStatus::Unavailable(reason) => {

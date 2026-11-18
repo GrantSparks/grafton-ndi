@@ -880,7 +880,9 @@ impl<E> FileEventFuture<E> {
     }
 
     /// Stop being the queue's waiter and return executor state for disposal
-    /// after unlocking. Another future's waiter is never removed.
+    /// after unlocking. An installed waiter belongs to a live future, or to
+    /// a leaked future whose token stays live. Another future's waiter is
+    /// never removed.
     fn release_waiter(&self) -> Option<Waker> {
         let token = Arc::downgrade(&self.token);
         let mut events = lock(&self.events.0);
@@ -925,7 +927,7 @@ impl<E> Future for FileEventFuture<E> {
             if events
                 .waiter
                 .as_ref()
-                .is_some_and(|w| w.token.strong_count() != 0 && !w.token.ptr_eq(&token))
+                .is_some_and(|w| !w.token.ptr_eq(&token))
             {
                 return WakerPoll::Ready(
                     Err(Error::InvalidState(StateConflict::WaiterPending)),
@@ -948,13 +950,11 @@ impl<E> Future for FileEventFuture<E> {
                 );
             }
             if register {
-                let waiter = events.waiter.get_or_insert_with(|| EventWaiter {
+                events.waiter.get_or_insert_with(|| EventWaiter {
                     token: Weak::clone(&token),
                     deadline: deadline.end(),
                     waker: WakerSlot::default(),
                 });
-                waiter.token = Weak::clone(&token);
-                waiter.deadline = deadline.end();
             }
             WakerPoll::Pending(events.waiter.as_mut().map(|waiter| &mut waiter.waker))
         });
@@ -1521,25 +1521,6 @@ impl<H: Owner> Worker<H> {
     where
         W: FnOnce(&mut H) -> Result<T> + Send + 'static,
     {
-        self.prepare_reply(
-            move || {
-                let work = prepare()?;
-                Ok(move |owner: &mut H, reply: CommandReply<T, H::Closed>| {
-                    reply.complete(work(owner));
-                })
-            },
-            stop,
-        )
-    }
-
-    fn prepare_reply<T: Send + 'static, W>(
-        &self,
-        prepare: impl FnOnce() -> Result<W> + Send + 'static,
-        stop: bool,
-    ) -> FileOperation<T>
-    where
-        W: FnOnce(&mut H, CommandReply<T, H::Closed>) + Send + 'static,
-    {
         // Keep submission state, not Worker: an unpolled future must not
         // delay last-handle shutdown or make its own drop join the owner.
         let sender = self.sender.clone();
@@ -1560,7 +1541,7 @@ impl<H: Owner> Worker<H> {
                         if !stop && reply.cancelled() {
                             return;
                         }
-                        work(owner, reply);
+                        reply.complete(work(owner));
                     }))
                 },
             )

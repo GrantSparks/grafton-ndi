@@ -258,6 +258,22 @@ fn a_waiter_registered_during_clone_keeps_its_reservation_when_the_first_poll_lo
 }
 
 #[test]
+fn dropping_a_pending_event_waiter_allows_the_next_future_to_register() {
+    let events = Arc::new(EventQueue::<u32>::new(1));
+    let mut first = events.wait(Duration::from_secs(60));
+    assert!(poll(&mut first, Waker::noop()).is_pending());
+    drop(first);
+
+    let mut next = events.wait(Duration::from_secs(60));
+    assert!(poll(&mut next, Waker::noop()).is_pending());
+    events.push(Ok(7));
+    assert!(matches!(
+        poll(&mut next, Waker::noop()),
+        Poll::Ready(Ok(Some(7)))
+    ));
+}
+
+#[test]
 fn polling_a_completed_file_event_future_panics() {
     let events = Arc::new(EventQueue::<u32>::new(1));
     events.push(Ok(7));
