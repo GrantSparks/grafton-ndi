@@ -96,9 +96,17 @@ pub(super) unsafe fn copy_snapshot<D, T>(
     // SAFETY: the count and native span passed preflight; the caller keeps
     // this array live and excludes snapshot replacement.
     let raw = unsafe { budget.0.slice(descriptors, count) }?;
-    let mut copied = budget.0.reserve(raw.len())?;
-    for entry in raw {
+    budget.0.charge_span::<T>(raw.len())?;
+    let mut copied = Vec::new();
+    for (index, entry) in raw.iter().enumerate() {
         if let Some(value) = copy(entry, &mut budget)? {
+            // Every remaining entry may match. Reserve that tail once, only
+            // after this snapshot has something to store.
+            if copied.is_empty() {
+                copied
+                    .try_reserve_exact(raw.len() - index)
+                    .map_err(|_| allocation_failed())?;
+            }
             copied.push(value);
         }
     }
@@ -226,7 +234,7 @@ mod tests {
                 selected_snapshot(&entries, |source| Ok(source.name.equals(name)))
             });
             assert_eq!(sources.unwrap().len(), expected);
-            assert_eq!(allocations, 1 + 4 * expected);
+            assert_eq!(allocations, 4 * expected + usize::from(expected > 0));
         }
         let query = super::super::HostQuery::checked("192.0.2.7").unwrap();
         let (sources, allocations) = crate::test_alloc::allocation_count(|| {
@@ -245,9 +253,28 @@ mod tests {
         });
         assert!(sources.unwrap().is_empty());
         assert_eq!(
-            allocations, 1,
-            "a repeated snapshot copies no source strings"
+            allocations, 0,
+            "a repeated snapshot allocates no results or source strings"
         );
+    }
+
+    #[test]
+    fn selecting_host_and_seen_identity_decodes_lossy_text_once() {
+        let mut entry = named(c"STUDIO \xff (Camera)".as_ptr());
+        entry.__bindgen_anon_1.p_url_address = c"192.0.2.7:5961".as_ptr();
+        let seen = snapshot(&[entry])
+            .unwrap()
+            .into_iter()
+            .map(super::super::SeenSource)
+            .collect();
+        let query = super::super::HostQuery::checked("192.0.2.7").unwrap();
+        let (sources, allocations) = crate::test_alloc::allocation_count(|| {
+            selected_snapshot(&[entry], |source| {
+                source.selected_by(Some(query), Some(&seen))
+            })
+        });
+        assert!(sources.unwrap().is_empty());
+        assert_eq!(allocations, 1, "only the lossy name costs an allocation");
     }
 
     #[test]
@@ -441,8 +468,8 @@ mod tests {
             crate::test_alloc::allocation_count(|| snapshot(&[named(text.as_ptr())]));
         assert!(matches!(result, Err(Error::ResourceLimit { .. })));
         assert_eq!(
-            allocations, 1,
-            "only the bounded result vector was reserved"
+            allocations, 0,
+            "a copy limit error occurs before any output allocation"
         );
         let mut budget = SnapshotBudget::new();
         let bytes = c"a\xff\xe2\x82\xac\xe2\x82";

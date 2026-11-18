@@ -178,10 +178,16 @@ impl CopyBudget {
             .ok_or(SpanError::Array(crate::DiscoveryDefect::ArraySpanOverflow))
     }
 
+    /// Charge the full element span, independently of whether a copy stores it.
+    pub(crate) fn charge_span<T>(&mut self, count: usize) -> SpanResult<()> {
+        self.take(Self::span_bytes(count, size_of::<T>())?)?;
+        Ok(())
+    }
+
     /// Charge complete owned element storage before reserving it, including
     /// elements whose contents may be omitted during conversion.
     pub(crate) fn reserve<T>(&mut self, count: usize) -> SpanResult<Vec<T>> {
-        self.take(Self::span_bytes(count, size_of::<T>())?)?;
+        self.charge_span::<T>(count)?;
         let mut values = Vec::new();
         values
             .try_reserve_exact(count)

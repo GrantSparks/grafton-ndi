@@ -574,12 +574,25 @@ impl BorrowedSource<'_> {
         Ok(inspect((&name, address.as_deref())))
     }
 
-    fn matches_query(&self, query: HostQuery<'_>) -> Result<bool> {
-        self.with_key(|(name, address)| source_matches_query(name, address, query))
+    fn selected_by(
+        &self,
+        query: Option<HostQuery<'_>>,
+        seen: Option<&HashSet<SeenSource>>,
+    ) -> Result<bool> {
+        self.with_key(|key @ (name, address)| {
+            query.is_none_or(|query| source_matches_query(name, address, query))
+                && seen.is_none_or(|seen| !seen.contains(&key as &dyn SourceIdentity))
+        })
     }
 
+    #[cfg(test)]
+    fn matches_query(&self, query: HostQuery<'_>) -> Result<bool> {
+        self.selected_by(Some(query), None)
+    }
+
+    #[cfg(test)]
     fn seen_in(&self, seen: &HashSet<SeenSource>) -> Result<bool> {
-        self.with_key(|key| seen.contains(&key as &dyn SourceIdentity))
+        Ok(!self.selected_by(None, Some(seen))?)
     }
 }
 
@@ -1165,14 +1178,7 @@ impl Finder {
             deadline,
             stop,
             &mut state,
-            |(_, seen, _), source| {
-                if let Some(query) = query {
-                    if !source.matches_query(query)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(!source.seen_in(seen)?)
-            },
+            |(_, seen, _), source| source.selected_by(query, Some(seen)),
             |(discovered, seen, retained_bytes), sources| {
                 accumulate_sources(discovered, seen, retained_bytes, sources)?;
                 Ok(None::<()>)
