@@ -1,0 +1,89 @@
+name: Windows metadata probe
+
+on:
+  push:
+    branches: [receiver-diagnostic-windows-metadata]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-metadata-probe
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TARGET: x86_64-pc-windows-msvc
+  WINDOWS_LLVM_VERSION: 20.1.8
+  WINDOWS_LLVM_SHA256: 3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b
+
+jobs:
+  probe:
+    if: github.repository == 'GrantSparks/grafton-ndi'
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: 1.100.0
+          targets: x86_64-pc-windows-msvc
+      - name: Windows libclang
+        shell: pwsh
+        run: |
+          $version = $env:WINDOWS_LLVM_VERSION
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-$version-win64.exe"
+          $directory = Join-Path $env:RUNNER_TEMP "llvm-$version"
+          Invoke-WebRequest "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe" -OutFile $installer
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash
+          if ($digest -ne $env:WINDOWS_LLVM_SHA256) { throw "LLVM $version SHA-256 mismatch: $digest" }
+          Write-Host "Verified LLVM $version SHA-256: $digest"
+          $process = Start-Process -Wait -PassThru -FilePath $installer -ArgumentList "/S /D=$directory"
+          if ($process.ExitCode -ne 0) { throw "LLVM installer exited $($process.ExitCode)" }
+          $env:LIBCLANG_PATH = Join-Path $directory 'bin'
+          $clang = Join-Path $env:LIBCLANG_PATH 'clang.exe'
+          $resource = & $clang -print-resource-dir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path -LiteralPath (Join-Path $resource 'include/stdbool.h') -PathType Leaf)) { throw "LLVM builtin headers are missing from $resource" }
+          python ci/libclang_version.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Use the pinned installation for both Clang's include discovery and
+          # the builtin headers opened by libclang.
+          $bindgenArgs = 'BINDGEN_EXTRA_CLANG_ARGS="-resource-dir={0}"' -f $resource.Replace('\', '/')
+          Write-Host "LLVM resource directory: $resource"
+          "LIBCLANG_PATH=$env:LIBCLANG_PATH" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "CLANG_PATH=$clang" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          $bindgenArgs | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install the exact Windows headers and Standard runtime
+        env:
+          NDI_SDK_SOURCES_JSON: ${{ secrets.NDI_SDK_SOURCES_JSON }}
+          NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}
+        run: |
+          python ci/sdk.py install current-advanced-windows --dest "$RUNNER_TEMP/ndi-headers" --target "$TARGET" --github-env "$RUNNER_TEMP/headers.env"
+          python ci/sdk.py install 6.3.2-standard-windows --dest "$RUNNER_TEMP/ndi-runtime" --target "$TARGET" --github-env "$GITHUB_ENV"
+          grep '^NDI_SDK_DIR=' "$RUNNER_TEMP/headers.env" >> "$GITHUB_ENV"
+          echo 'GRAFTON_NDI_REQUIRE_RUNTIME=1' >> "$GITHUB_ENV"
+      - name: Repeat the Windows metadata test with its original test neighbor
+        run: |
+          cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features --test metadata_roundtrip --no-run
+          misses=0
+          for attempt in {1..40}; do
+            if cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features --test metadata_roundtrip -- --skip metadata_probe_compares_reconnect_transitions > "$RUNNER_TEMP/metadata-probe-baseline.log" 2>&1; then
+              echo "Baseline attempt $attempt passed"
+            else
+              echo "Baseline attempt $attempt failed"
+              cat "$RUNNER_TEMP/metadata-probe-baseline.log"
+              misses=$((misses + 1))
+              if [ "$misses" -ge 3 ]; then break; fi
+            fi
+          done
+          echo "Baseline: $misses failures in $attempt attempts"
+      - name: Compare immediate and observed disconnects
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features --test metadata_roundtrip -- --ignored --exact metadata_probe_compares_reconnect_transitions --nocapture

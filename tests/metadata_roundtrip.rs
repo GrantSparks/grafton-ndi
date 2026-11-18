@@ -177,3 +177,103 @@ fn receiver_connection_metadata_survives_its_input_and_reconnect() -> Result<(),
     receiver.clear_connection_metadata()?;
     Ok(())
 }
+
+#[test]
+#[ignore = "hosted Windows investigation"]
+fn metadata_probe_compares_reconnect_transitions() -> Result<(), grafton_ndi::Error> {
+    let ndi = common::ndi().expect("diagnostic runtime");
+    eprintln!("metadata probe runtime: {:?}", ndi.info());
+    let mut misses = [0usize; 2];
+    let mut trials = [0usize; 2];
+    for round in 0usize..40 {
+        let observe_disconnect = !round.is_multiple_of(2);
+        let mode = usize::from(observe_disconnect);
+        if misses[mode] >= 3 {
+            continue;
+        }
+        trials[mode] += 1;
+        let sender = Sender::new(
+            &ndi,
+            &SenderOptions::new(common::unique_name("metadata reconnect probe")).clock_video(false),
+        )?;
+        let receiver = Receiver::new(
+            &ndi,
+            &ReceiverOptions::new(grafton_ndi::Source::new("").unwrap()),
+        )?;
+        let text = "<receiver-registration/>";
+        receiver.add_connection_metadata(
+            &MetadataFrame::new(text)?.with_timecode(Timecode::from_ticks(21)),
+        )?;
+        let target = common::loopback_source(&ndi, &sender)?;
+        let video = VideoFrame::builder().resolution(16, 16).build()?;
+        receiver.connect_to(&target);
+        let mut observed_zero = None;
+        for stage in 0..2 {
+            let now = Instant::now();
+            let mut pictures = 0;
+            let mut unexpected = 0;
+            let mut first_picture = None;
+            let mut arrivals = None;
+            let mut last_sender = None;
+            let mut changed_counts = Vec::new();
+            while now.elapsed() < Duration::from_secs(10) {
+                sender.send_video(&video)?;
+                if receiver
+                    .capture_video_ref(Duration::from_millis(10))?
+                    .is_some()
+                {
+                    pictures += 1;
+                    first_picture.get_or_insert_with(|| now.elapsed());
+                }
+                if let Some(metadata) = sender.capture_metadata(Duration::from_millis(100))? {
+                    if metadata.data() == text {
+                        arrivals = Some(now.elapsed());
+                        break;
+                    }
+                    unexpected += 1;
+                }
+                let count = sender.connection_count()?;
+                if Some(count) != last_sender {
+                    changed_counts.push((now.elapsed(), count));
+                    last_sender = Some(count);
+                }
+            }
+            eprintln!(
+                "round={round} observed={observe_disconnect} stage={stage} zero={observed_zero:?} registration={arrivals:?} first_video={first_picture:?} video={pictures} other_metadata={unexpected} sender_changes={changed_counts:?} final_sender={} final_receiver={}",
+                sender.connection_count()?,
+                receiver.connection_stats()?.connections(),
+            );
+            if arrivals.is_none() {
+                misses[mode] += 1;
+                break;
+            }
+            if stage == 0 {
+                while sender.capture_metadata(Duration::ZERO)?.is_some() {}
+                receiver.disconnect();
+                if observe_disconnect {
+                    let since = Instant::now();
+                    while since.elapsed() < Duration::from_secs(5) {
+                        if sender.connection_count()? == 0
+                            && receiver.connection_stats()?.connections() == 0
+                        {
+                            observed_zero = Some(since.elapsed());
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(
+                        observed_zero.is_some(),
+                        "disconnect did not reach zero on both ends"
+                    );
+                }
+                receiver.reconnect();
+            }
+        }
+        receiver.clear_connection_metadata()?;
+    }
+    eprintln!(
+        "metadata probe: immediate {}/{} misses, observed {}/{} misses",
+        misses[0], trials[0], misses[1], trials[1]
+    );
+    Ok(())
+}
