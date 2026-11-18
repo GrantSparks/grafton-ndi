@@ -280,10 +280,10 @@ pub(super) struct ResolvedPlayerOptions {
 
 /// How a recorder names the files of a session from its [`RecordingTarget`].
 ///
-/// The directory the name leads to must exist. The wrapper rejects ordinary
-/// collisions at preflight; native creation after that check depends on the
-/// platform and SDK. See [`Self::Exact`] for the tested exclusive-open
-/// behavior and the limits of this check.
+/// The directory the name leads to must exist and be writable. Preflight
+/// uses the filesystem to check the exact name or the first indexed
+/// candidate. See [`Self::Exact`] for the tested exclusive-open behavior
+/// and the limits of this check.
 ///
 /// Every absolute output path must fit exactly in the recorder's event field:
 /// at most 4094 UTF-8 bytes with the current SDK. Preflight reserves at least
@@ -784,7 +784,8 @@ impl NamePattern {
 
     /// Confirm that the SDK can create the file this pattern gives `target`:
     /// that its longest path can be reported exactly, its directory exists
-    /// and can be written to, and, for an exact name, the file does not exist.
+    /// and can be written to, and the filesystem accepts the candidate name.
+    /// An existing candidate is allowed only for indexed naming.
     ///
     /// The SDK accepts a rollover to a file it cannot create and then ends
     /// the whole session, so the mistake is caught here, while the session
@@ -810,16 +811,17 @@ impl NamePattern {
             ));
         }
         check_directory(file.parent().unwrap_or(&file))?;
-        if self.exact && std::fs::symlink_metadata(&file).is_ok() {
-            return Err(Error::Io(std::io::Error::new(
+        match std::fs::symlink_metadata(&file) {
+            Ok(_) if self.exact => Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!(
                     "the recording file {} already exists at preflight",
                     file.display()
                 ),
-            )));
+            ))),
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(Error::Io(error)),
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 

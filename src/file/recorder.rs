@@ -306,9 +306,9 @@ impl FileRecorder {
     ///   limit (4094 UTF-8 bytes with the current SDK), reserving at least
     ///   20 digits per index token. The SDK is not called.
     /// * [`Error::Io`] when the directory of the file the pattern names
-    ///   does not exist or cannot be written to, or, with an exact file name,
-    ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
-    ///   that file exists. The SDK is not called.
+    ///   does not exist or cannot be written to, the filesystem rejects the
+    ///   candidate path, or an exact file name exists (kind
+    ///   [`AlreadyExists`](std::io::ErrorKind::AlreadyExists)). The SDK is not called.
     ///   On Windows, also reports security queries that could not be completed.
     /// * [`Error::NativeOperationFailed`] when the SDK cannot start the source
     ///   or open the first file. `Processing.NDI.Lib.File.Recorder.h` specifies
@@ -774,8 +774,9 @@ impl FileRecorder {
     /// The SDK accepts a rollover it then cannot carry out, and ends the
     /// session when the new file cannot be opened: it reports open-failed,
     /// closes the old file and reports an error. The file the pattern names
-    /// for the target is therefore checked first: its directory must exist
-    /// and be writable, and with an exact file name the file must not exist.
+    /// for the target is therefore checked first. Its directory must exist
+    /// and be writable, the filesystem must accept the candidate path, and
+    /// an exact file name must be available.
     /// The usual mistakes then leave the session running, and the target,
     /// which is only read, stays with the caller to correct and try again.
     /// The preflight is not a reservation: a path created after it can make
@@ -795,9 +796,10 @@ impl FileRecorder {
     ///   limit (4094 UTF-8 bytes with the current SDK), reserving at least
     ///   20 digits per index token. The SDK is not called and the session goes on.
     /// * [`Error::Io`] when the directory of the file the pattern names
-    ///   does not exist or cannot be written to, or, with an exact file name,
-    ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
-    ///   that file exists. The SDK is not called and the session goes on.
+    ///   does not exist or cannot be written to, the filesystem rejects the
+    ///   candidate path, or an exact file name exists (kind
+    ///   [`AlreadyExists`](std::io::ErrorKind::AlreadyExists)).
+    ///   The SDK is not called and the session goes on.
     ///   On Windows, also reports security queries that could not be completed.
     /// * [`Error::NativeOperationFailed`] when the SDK refuses the target.
     #[doc(alias = "NDIlib_file_recorder_rollover")]
