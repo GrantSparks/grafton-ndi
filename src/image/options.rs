@@ -134,20 +134,21 @@ impl ImageFormat {
 macro_rules! image_format_variants {
     ($($variant:ident $(($argument:pat))? => $sample:expr),+ $(,)?) => {
         impl ImageFormat {
-            pub(super) const ALL: [Self; [$(stringify!($variant)),+].len()] = [$($sample),+];
+            pub(super) const ALL: [Self; [$(stringify!($variant)),+].len()] = {
+                let variants = [$($sample),+];
+                let mut index = 0;
+                while index < variants.len() {
+                    assert!(variants[index].variant_index() == index);
+                    index += 1;
+                }
+                variants
+            };
 
             const fn variant_index(self) -> usize {
                 enum Index { $($variant),+ }
                 match self { $(Self::$variant $(($argument))? => Index::$variant as usize),+ }
             }
         }
-        const_assert!({
-            let mut index = 0;
-            while index < ImageFormat::ALL.len() {
-                assert!(ImageFormat::ALL[index].variant_index() == index);
-                index += 1;
-            }
-        });
     };
 }
 #[cfg(test)]
