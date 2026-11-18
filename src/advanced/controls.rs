@@ -387,7 +387,12 @@ impl<M: ReceiverMode> Receiver<M> {
                 StreamTier::Program => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
                 StreamTier::Preview => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
             };
-            // SAFETY: exclusive receiver authority excludes advertiser changes.
+            // SAFETY: the exclusive receiver borrow rules out other Rust
+            // stream writers. Advertiser membership uses a separate native
+            // registry lock over retained creation state. For the measured
+            // runtimes, the RecvInstance inventory records the native lock
+            // covering this setter's access to the connection. That locking
+            // evidence is specific to Linux and Advanced Windows.
             let switched = unsafe { table.NDIlib_recv_set_bandwidth(exclusive.instance(), bandwidth) };
             Ok(SettingChange::from_sdk(switched))
         })
@@ -410,7 +415,12 @@ impl<M: ReceiverMode> Receiver<M> {
         let exclusive = self.exclusive();
         let table = exclusive.ndi().table::<ReceiverStreamControl>()?;
         native!(ReceiverStreamControl, table, uses(streams) => {
-            // SAFETY: exclusive receiver authority excludes advertiser changes.
+            // SAFETY: the exclusive receiver borrow rules out other Rust
+            // stream writers. Advertiser membership uses a separate native
+            // registry lock over retained creation state. For the measured
+            // runtimes, the RecvInstance inventory records the native lock
+            // covering this setter's access to the connection. That locking
+            // evidence is specific to Linux and Advanced Windows.
             let changed = unsafe {
                 table.NDIlib_recv_set_enabled_streams(
                     exclusive.instance(),

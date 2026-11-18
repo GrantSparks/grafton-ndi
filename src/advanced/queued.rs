@@ -725,8 +725,9 @@ impl Loans for AliasableBox<CallbackState> {
 // `NDIlib_send_destroy` call every outstanding completion before it returns;
 // it puts no thread requirement on the sender or on its completion
 // registration. The lent sender is the crate's ordinary `Send + Sync` native
-// sender, all state the callback shares is behind `CallbackState`'s mutex
-// and atomic, and every operation that changes the queue takes `&mut self`.
+// sender. CallbackState keeps an immutable byte limit and shares mutable
+// state through one mutex and its condition variable. Application operations
+// that change the queue take `&mut self`.
 // The runtime test `a_queued_sender_moves_between_threads` sends, completes,
 // reads and drops one on threads other than the one that created it.
 const_assert!({

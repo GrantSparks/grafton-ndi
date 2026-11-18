@@ -2870,10 +2870,12 @@ const_assert!({
 // the target and pending unknown event are replaced whole; the string-query
 // lock protects complete retained changes. Control-owned registrations install
 // retained storage before native add and release it only after native clear;
-// unwinding leaves that storage valid. Native connection changes can run
-// application allocator code under the independent change permit, which holds
-// no partially modified state. The remaining mutable state is atomic. The `parking_lot` locks do not poison and so do not declare
-// this themselves, which would otherwise leave `Receiver` short of
+// unwinding leaves that storage valid. A native connection change can run
+// application allocator code under the independent change permit. The
+// ConnectionChange drop guard restores ControlPermit's changing phase and
+// takes and replays its pending tally before releasing the change lock.
+// The `parking_lot` locks do not poison and so do not declare this themselves,
+// which would otherwise leave `Receiver` short of
 // `RefUnwindSafe` and a `RecvAdvertiser`, which keeps registered receivers
 // alive, short of the unwind safety a `SendAdvertiser` has.
 impl std::panic::RefUnwindSafe for ReceiverCore {}

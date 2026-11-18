@@ -12,8 +12,8 @@ use std::{fmt, mem::ManuallyDrop, ops::Deref, ptr::NonNull};
 /// all derive from the one pointer the allocation was created with, so moving
 /// the owner changes nothing about what the SDK's copy of that pointer may do.
 ///
-/// Shared mutation goes through interior mutability: callback state uses its
-/// locks and atomics, and descriptor keys initialize their disjoint slot cells
+/// Shared mutation goes through interior mutability: mutable CallbackState
+/// is covered by its state mutex, and descriptor keys initialize their disjoint slot cells
 /// through raw pointers. Other writes, including SDK writes to lent storage,
 /// require the allocation to be held exclusively or by value with no live
 /// reference into the written contents. Moving this owner preserves pointers.
