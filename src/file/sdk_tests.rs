@@ -1314,6 +1314,65 @@ fn an_indexed_rollover_uses_the_next_free_candidate() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn an_indexed_rollover_that_outgrows_the_basename_limit_is_refused() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = FixtureDir::create("indexed-rollover-growth");
+    let basename = "x".repeat(250);
+    let candidate = |index| scratch.join(format!("{basename}{index}.mkv"));
+    let first = std::fs::symlink_metadata(candidate(1));
+    let tenth = std::fs::symlink_metadata(candidate(10));
+    if !matches!(first, Err(err) if err.raw_os_error() == Some(libc::ENOENT))
+        || !matches!(tenth, Err(err) if err.raw_os_error() == Some(libc::ENAMETOOLONG))
+    {
+        eprintln!("skipping indexed rollover growth: requires a 255-byte basename limit");
+        return;
+    }
+    for index in 1..=9 {
+        std::fs::write(candidate(index), [index]).unwrap();
+    }
+
+    let source = LiveSource::start(&ndi, "indexed-rollover-growth");
+    let options = exact_video(&source).naming(FileNaming::Pattern("{prefix}{index}.mkv".into()));
+    let mut recorder = FileRecorder::new(&api, &options).unwrap();
+    recorder
+        .start(
+            &RecordingTarget::new(scratch.join("first")).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    let mut timeline = Timeline::new();
+    let first = timeline.await_event(&mut recorder, 0, RecorderEventKind::FirstFrame, None);
+    let result = recorder.rollover(&RecordingTarget::new(scratch.join(&basename)).unwrap());
+    let Err(Error::Io(error)) = result else {
+        panic!("the filesystem should reject the wider basename at preflight: {result:?}");
+    };
+    assert_eq!(error.raw_os_error(), Some(libc::ENAMETOOLONG));
+    assert_eq!(recorder.state(), RecorderState::Recording);
+    assert!(recorder.is_recording());
+
+    let since = timeline.mark();
+    recorder
+        .rollover(&RecordingTarget::new(scratch.join("second")).unwrap())
+        .unwrap();
+    assert_eq!(
+        timeline.await_change(&mut recorder, since, &first),
+        scratch.join("second1.mkv")
+    );
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap() else {
+        panic!("the recording was not confirmed closed");
+    };
+    assert_eq!(report.closed_files(), 2);
+    assert_eq!(report.error_events(), 0);
+    assert!(!report.stopped_by_sdk());
+    for index in 1..=9 {
+        assert_eq!(std::fs::read(candidate(index)).unwrap(), [index]);
+    }
+}
+
+#[test]
 fn a_file_that_received_nothing_is_reported_as_empty() {
     let Some((ndi, api)) = file_api() else {
         return;

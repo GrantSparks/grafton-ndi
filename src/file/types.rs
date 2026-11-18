@@ -280,10 +280,9 @@ pub(super) struct ResolvedPlayerOptions {
 
 /// How a recorder names the files of a session from its [`RecordingTarget`].
 ///
-/// The directory the name leads to must exist and be writable. Preflight
-/// uses the filesystem to check the exact name or the first indexed
-/// candidate. See [`Self::Exact`] for the tested exclusive-open behavior
-/// and the limits of this check.
+/// The directory the name leads to must exist and be writable. See
+/// [`Self::Exact`] for the tested exclusive-open behavior and the limits of
+/// preflight.
 ///
 /// The expanded filename must be absolute. It must fit exactly in the
 /// recorder's event field, at most 4094 UTF-8 bytes with the current SDK.
@@ -291,6 +290,13 @@ pub(super) struct ResolvedPlayerOptions {
 /// separators and `.` components, and reserves at least 20 digits for each
 /// index token to cover future rollovers. Start and rollover refuse relative
 /// or oversized filenames with [`Error::InvalidInput`].
+///
+/// Preflight checks the exact filename or the first indexed candidate against
+/// the destination filesystem. If later indexes can add digits, it also checks
+/// a candidate with the maximum index width. Start and rollover return
+/// [`Error::Io`] if the widest basename exceeds a filesystem limit, even
+/// when the first candidate fits. Shorten the basename prefix or remove a
+/// repeated index token to fit the limit.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum FileNaming {
@@ -635,17 +641,42 @@ const EXACT_PATTERN: &str = "{prefix}";
 const RECORDER_PATH_LIMIT: usize = NDIlib_file_recorder_event_path_max_size as usize - 2;
 const INDEX_DIGITS: usize = u64::MAX.ilog10() as usize + 1;
 const MAX_INDEX_WIDTH: usize = 1024;
-const FIRST_INDEX: &str = {
-    const DIGITS: [u8; MAX_INDEX_WIDTH] = {
-        let mut digits = [b'0'; MAX_INDEX_WIDTH];
-        digits[MAX_INDEX_WIDTH - 1] = b'1';
-        digits
-    };
-    match std::str::from_utf8(&DIGITS) {
+const FIRST_INDEX: &str = index_text(&padded_index(1));
+const MAX_INDEX: &str = index_text(&padded_index(u64::MAX));
+
+const fn padded_index(mut index: u64) -> [u8; MAX_INDEX_WIDTH] {
+    let mut digits = [b'0'; MAX_INDEX_WIDTH];
+    let mut offset = MAX_INDEX_WIDTH;
+    while index != 0 {
+        offset -= 1;
+        digits[offset] += (index % 10) as u8;
+        index /= 10;
+    }
+    digits
+}
+
+#[expect(clippy::panic, reason = "the const callers supply only ASCII digits")]
+const fn index_text(digits: &[u8; MAX_INDEX_WIDTH]) -> &str {
+    match std::str::from_utf8(digits) {
         Ok(text) => text,
         Err(_) => panic!("index padding must be ASCII"),
     }
-};
+}
+
+#[derive(Clone, Copy)]
+enum IndexSample {
+    First,
+    Maximum,
+}
+
+impl IndexSample {
+    fn with_width(self, width: usize) -> &'static str {
+        match self {
+            Self::First => &FIRST_INDEX[MAX_INDEX_WIDTH - width.max(1)..],
+            Self::Maximum => &MAX_INDEX[MAX_INDEX_WIDTH - width.max(INDEX_DIGITS)..],
+        }
+    }
+}
 
 /// One part of a filename pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -769,9 +800,10 @@ impl NamePattern {
         self.exact
     }
 
-    fn first_file_pieces<'a>(
+    fn file_pieces<'a>(
         &'a self,
         target: &'a RecordingTarget,
+        index: IndexSample,
     ) -> impl Iterator<Item = &'a str> + Clone {
         let pattern = self
             .pattern
@@ -780,14 +812,20 @@ impl NamePattern {
         self.parts.iter().map(move |part| match part {
             PatternPart::Text(range) => &pattern[range.clone()],
             PatternPart::Prefix => target.prefix.as_str(),
-            PatternPart::Index(width) => &FIRST_INDEX[MAX_INDEX_WIDTH - (*width).max(1)..],
+            PatternPart::Index(width) => index.with_width(*width),
         })
+    }
+
+    fn render_name<'a>(pieces: impl Iterator<Item = &'a str>, bytes: usize) -> String {
+        let mut name = String::with_capacity(bytes);
+        pieces.for_each(|piece| name.push_str(piece));
+        name
     }
 
     /// Expand the exact filename or the one with index 1. Check its raw byte
     /// length and the reserve for later indexes before allocating it.
     fn first_file(&self, target: &RecordingTarget) -> Result<PathBuf> {
-        let pieces = self.first_file_pieces(target);
+        let pieces = self.file_pieces(target, IndexSample::First);
         let bytes = pieces
             .clone()
             .fold(0usize, |total, piece| total.saturating_add(piece.len()));
@@ -802,8 +840,7 @@ impl NamePattern {
             ));
         }
 
-        let mut name = String::with_capacity(bytes);
-        pieces.for_each(|piece| name.push_str(piece));
+        let name = Self::render_name(pieces, bytes);
         let path = Path::new(&name);
         if !path.is_absolute() {
             return Err(Error::InvalidInput(
@@ -824,16 +861,44 @@ impl NamePattern {
 
     /// Confirm that the SDK can create the file this pattern gives `target`:
     /// that its longest path can be reported exactly, its directory exists
-    /// and can be written to, and the filesystem accepts the candidate name.
-    /// An existing candidate is allowed only for indexed naming.
+    /// and can be written to, and the filesystem accepts the candidate name
+    /// even at its full index width. An existing candidate is allowed only
+    /// for indexed naming.
     ///
     /// The SDK accepts a rollover to a file it cannot create and then ends
     /// the whole session, so the mistake is caught here, while the session
     /// can still go on. Nothing is created.
     pub(super) fn check(&self, target: &RecordingTarget) -> Result<()> {
+        self.check_with_metadata(target, |path| std::fs::symlink_metadata(path))
+    }
+
+    fn check_with_metadata(
+        &self,
+        target: &RecordingTarget,
+        mut metadata: impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+    ) -> Result<()> {
         let file = self.first_file(target)?;
         check_directory(file.parent().unwrap_or(&file))?;
-        match std::fs::symlink_metadata(&file) {
+        self.check_candidate(&file, metadata(&file))?;
+        if self.index_digits_reserved > 0 {
+            drop(file);
+            // first_file already bounded the longest spelling. The directory
+            // stays the same because every index is in the basename.
+            let pieces = self.file_pieces(target, IndexSample::Maximum);
+            let bytes = pieces.clone().map(str::len).sum();
+            let name = Self::render_name(pieces, bytes);
+            let widest = Path::new(&name);
+            self.check_candidate(widest, metadata(widest))?;
+        }
+        Ok(())
+    }
+
+    fn check_candidate(
+        &self,
+        file: &Path,
+        metadata: std::io::Result<std::fs::Metadata>,
+    ) -> Result<()> {
+        match metadata {
             Ok(_) if self.exact => Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!(
@@ -2647,6 +2712,84 @@ mod tests {
         std::fs::write(directory.join("take_001.mkv"), b"kept").unwrap();
         indexed.check(&target).unwrap();
         assert_eq!(std::fs::read(directory.join("take.mkv")).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn indexed_preflight_checks_the_maximum_basename_width() {
+        use std::io::{Error as IoError, ErrorKind};
+
+        let directory = crate::test_support::FixtureDir::create("basename-width");
+        let max = u64::MAX.to_string();
+        for (pattern, first, widest) in [
+            ("{prefix}.mkv", String::from(".mkv"), String::from(".mkv")),
+            (
+                "{prefix}{index}.mkv",
+                String::from("1.mkv"),
+                format!("{max}.mkv"),
+            ),
+            (
+                "{prefix}{index}-{index:03}-{index:23}.mkv",
+                format!("1-001-{:023}.mkv", 1),
+                format!("{max}-{max}-000{max}.mkv"),
+            ),
+            (
+                "{prefix}{index:20}-{index:23}.mkv",
+                format!("{:020}-{:023}.mkv", 1, 1),
+                format!("{max}-000{max}.mkv"),
+            ),
+        ] {
+            let naming = NamePattern::new(Some(pattern)).unwrap();
+            let max_prefix = 255 - widest.len();
+            for (prefix_bytes, fits) in [(max_prefix, true), (max_prefix + 1, false)] {
+                let prefix = "x".repeat(prefix_bytes);
+                let target = RecordingTarget::new(directory.join(&prefix)).unwrap();
+                let mut probes = Vec::new();
+                let result = naming.check_with_metadata(&target, |path| {
+                    let basename = path.file_name().unwrap().to_str().unwrap();
+                    probes.push(basename.to_owned());
+                    let kind = if basename.len() <= 255 {
+                        ErrorKind::NotFound
+                    } else {
+                        ErrorKind::InvalidInput
+                    };
+                    Err(IoError::from(kind))
+                });
+                let mut expected = vec![format!("{prefix}{first}")];
+                if first.len() != widest.len() {
+                    expected.push(format!("{prefix}{widest}"));
+                }
+                assert_eq!(probes, expected, "{pattern}");
+                if fits {
+                    result.unwrap();
+                } else {
+                    assert_eq!(io_kind(result), ErrorKind::InvalidInput, "{pattern}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_preflight_probe_count_is_independent_of_occupied_indices() {
+        let directory = crate::test_support::FixtureDir::create("indexed-probes");
+        let target = RecordingTarget::new(directory.join("take")).unwrap();
+        let naming = NamePattern::new(Some("{prefix}{index}.mkv")).unwrap();
+        let metadata = std::fs::metadata(directory.path()).unwrap();
+        for occupied in [0, 1, 9, 1_000, u64::MAX] {
+            let mut indices = Vec::new();
+            naming
+                .check_with_metadata(&target, |path| {
+                    let name = path.file_stem().unwrap().to_str().unwrap();
+                    let index: u64 = name.strip_prefix("take").unwrap().parse().unwrap();
+                    indices.push(index);
+                    if index <= occupied {
+                        Ok(metadata.clone())
+                    } else {
+                        Err(std::io::ErrorKind::NotFound.into())
+                    }
+                })
+                .unwrap();
+            assert_eq!(indices, [1, u64::MAX], "{occupied} occupied indices");
+        }
     }
 
     #[test]
