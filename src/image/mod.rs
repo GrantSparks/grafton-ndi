@@ -493,29 +493,61 @@ impl PixelDensity {
                 aspect
             };
         // Use the actual reduced shape: ceil division can change the stored
-        // width/height ratio even for a square-pixel source. Only a square
-        // output can omit the density correction.
+        // width/height ratio even for a square-pixel source. Square output
+        // pixels can omit the density correction.
         let pixel_aspect = aspect * height as f64 / width as f64;
         if (pixel_aspect - 1.0).abs() <= f64::from(f32::EPSILON) {
             return None;
         }
-        let maximum = f64::from(u16::MAX);
-        let (x, y) = if pixel_aspect >= 1.0 {
-            (
-                (maximum / pixel_aspect).round().clamp(1.0, maximum) as u16,
-                u16::MAX,
-            )
-        } else {
-            (
-                u16::MAX,
-                (maximum * pixel_aspect).round().clamp(1.0, maximum) as u16,
-            )
-        };
-        let (mut a, mut b) = (x, y);
-        while b != 0 {
-            (a, b) = (b, a % b);
+        Some(Self::nearest(pixel_aspect))
+    }
+
+    fn nearest(pixel_aspect: f64) -> Self {
+        const MAX: u32 = u16::MAX as u32;
+        if pixel_aspect >= f64::from(MAX) {
+            return Self { x: 1, y: u16::MAX };
         }
-        Some(Self { x: x / a, y: y / a })
+        if pixel_aspect <= f64::from(MAX).recip() {
+            return Self { x: u16::MAX, y: 1 };
+        }
+
+        // Within the endpoints the ratio is at least 2^-16. A power-of-two
+        // denominator covering its 52 fractional significand bits lets us
+        // work exactly. The numerator fits in 84 bits, leaving room in u128
+        // to multiply by two 16-bit coordinates when comparing errors.
+        const SCALE: u128 = 1 << (f64::MANTISSA_DIGITS - 1 + u16::BITS);
+        let numerator = (pixel_aspect * SCALE as f64) as u128;
+        let (mut dividend, mut divisor) = (numerator, SCALE);
+        let (mut previous, mut current) = ((1u32, 0u32), (0u32, 1u32));
+        let (x, y) = loop {
+            let term = dividend / divisor;
+            let limit_x = (MAX - previous.0).checked_div(current.0).unwrap_or(MAX);
+            let limit_y = (MAX - previous.1).checked_div(current.1).unwrap_or(MAX);
+            let step = term.min(u128::from(limit_x.min(limit_y))) as u32;
+            let next = (previous.0 + step * current.0, previous.1 + step * current.1);
+            if u128::from(step) < term {
+                // The last convergent and the truncated next one bracket the
+                // target. Their determinant has magnitude one, so any ratio
+                // strictly between them needs at least their summed x and y.
+                // That sum exceeds a bound because we used the largest step.
+                let error = |(x, y)| (numerator * u128::from(x)).abs_diff(SCALE * u128::from(y));
+                break if error(next) * u128::from(current.0) < error(current) * u128::from(next.0) {
+                    next
+                } else {
+                    current
+                };
+            }
+            let remainder = dividend - u128::from(step) * divisor;
+            if remainder == 0 {
+                break next;
+            }
+            (previous, current) = (current, next);
+            (dividend, divisor) = (divisor, remainder);
+        };
+        Self {
+            x: x as u16,
+            y: y as u16,
+        }
     }
 }
 

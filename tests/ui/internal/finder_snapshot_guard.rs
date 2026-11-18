@@ -9,10 +9,7 @@ fn a_finder_issued_guard_is_accepted(finder: &Finder) -> Result<Vec<Source>> {
     finder
         .lock_snapshots(crate::timeout::NeverStop)
         .unwrap()
-        .snapshot(&SelectingSnapshot {
-            core: &finder.sdk,
-            select: |_: &BorrowedSource<'_>| Ok(true),
-        })
+        .snapshot(&SourceSnapshot(&finder.sdk))
 }
 
 // The old MutexGuard<()> protocol accepted this unrelated lock. The actual
@@ -23,8 +20,5 @@ fn a_foreign_mutex_guard_is_rejected(
     snapshot: &sys::Core,
 ) -> Result<Vec<Source>> {
     let instance = foreign.lock();
-    SnapshotGuard { instance }.snapshot(&SelectingSnapshot {
-        core: snapshot,
-        select: |_: &BorrowedSource<'_>| Ok(true),
-    })
+    SnapshotGuard { instance }.snapshot(&SourceSnapshot(snapshot))
 }

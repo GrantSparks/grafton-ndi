@@ -61,9 +61,9 @@ their default density behavior. This correction changes encoded bytes and
 aspect-aware rendering for affected thumbnails. WebP carries no pixel-shape
 tag; callers needing its display aspect retain `picture_aspect_ratio()` separately.
 
-Both density components are positive integers no larger than 65,535. Ordinary
-ratios are approximated to that precision; extreme ratios clamp to the nearest
-representable endpoint. No resampling to square pixels is performed.
+Both density components are positive integers no larger than 65,535. The
+encoder uses the pair whose vertical-to-horizontal density ratio is closest
+to the required pixel aspect. Extreme ratios clamp to the nearest endpoint.
 
 ## Formats
 
@@ -122,6 +122,10 @@ high bit depth and HDR code values. Both deliver individual fields even with
 ### `ndi_color_info`
 
 Every frame's `color_info()` exposes this metadata without `image-encoding`.
+Separate attributes with XML whitespace. Recognized color values may use
+literal characters or XML character references, for example `bt_&#55;09`
+for BT.709. Color values also recognize predefined XML entities. Custom
+entity expansion is outside the color reader's supported syntax.
 Malformed or conflicting descriptions produce `InvalidFrame`, as does received
 metadata withheld with `FrameMetadataStatus::NotUtf8` or `Unterminated`. Owned
 copies and clones preserve that status without retaining the unreadable text,

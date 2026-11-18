@@ -15,6 +15,9 @@ use crate::{Error, Result};
 /// Each attribute may be missing, and its accessor then returns `None`. A
 /// missing `matrix` means BT.709 and a missing `transfer` means SDR, which is
 /// how image encoding reads them; missing `primaries` are unknown.
+/// Separate attributes with XML whitespace. Color values may contain decimal
+/// or hexadecimal character references. The reader recognizes predefined XML
+/// entities and reads color values without expanding custom entities.
 ///
 /// Every video frame's `color_info` method reads it, for example
 /// [`VideoFrame::color_info`](crate::VideoFrame::color_info). That read refuses
@@ -23,6 +26,9 @@ use crate::{Error, Result};
 /// 6.4 SDK, the SDK passes the element through unchanged to receivers in
 /// every color format, YUV and RGB, but does not apply it: it converts
 /// between YUV and RGB with BT.709 coefficients whatever the element says.
+///
+/// Document type declarations are skipped without expanding entities or
+/// loading external definitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ColorInfo {
     primaries: Option<ColorPrimaries>,
@@ -201,8 +207,9 @@ const QUOTED_LIMIT: usize = 40;
 /// Returns `Ok(None)` when there is no metadata or no element, and the color
 /// description when every element in the text gives the same one. The
 /// element may stand anywhere in the text, alone or inside an
-/// `ndi_metadata_group`; comments, CDATA sections and processing instructions
-/// are skipped, and an unterminated one runs to the end of the text, as in XML.
+/// `ndi_metadata_group`. Comments, CDATA sections, processing instructions
+/// and document type declarations are skipped. An unterminated one runs to
+/// the end of the text.
 ///
 /// # Errors
 ///
@@ -210,6 +217,7 @@ const QUOTED_LIMIT: usize = 40;
 /// element is malformed or truncated, gives an attribute twice, gives a value
 /// outside the SDK's list, or differs from an earlier element.
 pub(crate) fn parse(metadata: Option<&str>) -> Result<Option<ColorInfo>> {
+    const DOCTYPE: &[u8] = b"<!DOCTYPE";
     let Some(text) = metadata else {
         return Ok(None);
     };
@@ -234,6 +242,14 @@ pub(crate) fn parse(metadata: Option<&str>) -> Result<Option<ColorInfo>> {
                     Some(end) => 2 + end + 2,
                     None => break,
                 }
+            } else if let Some(body) = tag
+                .strip_prefix(DOCTYPE)
+                .filter(|body| matches!(body.first(), None | Some(b' ' | b'\t' | b'\r' | b'\n')))
+            {
+                match doctype_end(body) {
+                    Some(end) => DOCTYPE.len() + end,
+                    None => break,
+                }
             } else if let Some(attributes) = start_tag(tag) {
                 let (info, len) = element(attributes)?;
                 if let Some(earlier) = found.filter(|&earlier| earlier != info) {
@@ -253,15 +269,46 @@ pub(crate) fn parse(metadata: Option<&str>) -> Result<Option<ColorInfo>> {
     Ok(found)
 }
 
+/// The offset past the declaration's closing `>`, measured from after
+/// `<!DOCTYPE`. End the declaration at a `>` outside the internal subset.
+/// Literals, comments and instructions may contain either delimiter.
+fn doctype_end(text: &[u8]) -> Option<usize> {
+    let mut in_subset = false;
+    let mut at = 0;
+    while let Some(&byte) = text.get(at) {
+        at += 1;
+        match byte {
+            b'\'' | b'"' => at += text[at..].iter().position(|&next| next == byte)? + 1,
+            b'<' if text[at..].starts_with(b"!--") => {
+                at += 3 + find(&text[at + 3..], b"-->")? + 3;
+            }
+            b'<' if text[at..].starts_with(b"?") => {
+                at += 1 + find(&text[at + 1..], b"?>")? + 2;
+            }
+            b'[' => in_subset = true,
+            b']' => in_subset = false,
+            b'>' if !in_subset => return Some(at),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The text after `<ndi_color_info` when `tag` starts that element's start
 /// tag: the name must end there, at whitespace, `/`, `>` or the end of a
 /// truncated text.
 fn start_tag(tag: &[u8]) -> Option<&[u8]> {
     let after = tag.strip_prefix(b"<")?.strip_prefix(ELEMENT)?;
     match after.first() {
-        Some(byte) if !byte.is_ascii_whitespace() && !matches!(byte, b'/' | b'>') => None,
+        Some(&byte) if !name_boundary(byte) => None,
         _ => Some(after),
     }
+}
+
+fn name_boundary(byte: u8) -> bool {
+    // Include invalid control bytes here so `element` can report them as
+    // syntax errors. Only `whitespace` consumes a separator.
+    byte.is_ascii_control() || matches!(byte, b' ' | b'/' | b'>')
 }
 
 /// Read one element's attributes, from just after its name, returning the
@@ -274,7 +321,8 @@ fn element(text: &[u8]) -> Result<(ColorInfo, usize)> {
     };
     let mut at = 0;
     loop {
-        at += whitespace(&text[at..]);
+        let separator = whitespace(&text[at..]);
+        at += separator;
         let rest = &text[at..];
         if rest.starts_with(b"/>") {
             return Ok((info, at + 2));
@@ -290,7 +338,7 @@ fn element(text: &[u8]) -> Result<(ColorInfo, usize)> {
         }
         let name_len = rest
             .iter()
-            .position(|&byte| byte.is_ascii_whitespace() || matches!(byte, b'=' | b'/' | b'>'))
+            .position(|&byte| name_boundary(byte) || byte == b'=')
             .unwrap_or(rest.len());
         if name_len == 0 {
             return Err(malformed(
@@ -299,6 +347,15 @@ fn element(text: &[u8]) -> Result<(ColorInfo, usize)> {
             ));
         }
         let name = &rest[..name_len];
+        if separator == 0 {
+            return Err(malformed(
+                crate::ColorMetadataDefect::AttributeStart,
+                format!(
+                    "gives attribute {} without XML whitespace before it",
+                    quoted(name)
+                ),
+            ));
+        }
         at += name_len;
         at += whitespace(&text[at..]);
         if text.get(at) != Some(&b'=') {
@@ -368,10 +425,78 @@ fn set<T>(
             format!("gives attribute {} twice", quoted(name)),
         ));
     }
-    *slot = Some(read(value).ok_or_else(|| {
+    let decoded = read_color_value(value, read).map_err(|()| {
+        malformed(
+            crate::ColorMetadataDefect::InvalidAttributeValue,
+            format!(
+                "gives attribute {} the invalid XML value {}",
+                quoted(name),
+                quoted(value)
+            ),
+        )
+    })?;
+    *slot = Some(decoded.ok_or_else(|| {
         Error::InvalidFrame(crate::FrameDefect::ColorMetadata { issue: crate::ColorMetadataDefect::UndefinedValue, diagnostic: format!("The frame's ndi_color_info gives attribute {} the value {}, which is not one the NDI SDK defines", quoted(name), quoted(value)).into_boxed_str() })
     })?);
     Ok(())
+}
+
+/// Use the literal bytes directly. For escaped values, keep at most as many
+/// decoded bytes as the longest SDK token and validate the full input.
+fn read_color_value<T>(
+    mut value: &[u8],
+    read: impl FnOnce(&[u8]) -> Option<T>,
+) -> std::result::Result<Option<T>, ()> {
+    let invalid_literal = |byte| byte == b'<' || (byte < b' ' && !is_xml_whitespace(byte));
+    if !value
+        .iter()
+        .any(|&byte| byte == b'&' || invalid_literal(byte))
+    {
+        return Ok(read(value));
+    }
+
+    let mut decoded = [0; b"bt_2100_hlg".len()];
+    let mut len = 0;
+    while let Some((&first, rest)) = value.split_first() {
+        value = rest;
+        let byte = match first {
+            b'&' => {
+                let end = rest.iter().position(|&byte| byte == b';').ok_or(())?;
+                value = &rest[end + 1..];
+                let codepoint = reference_codepoint(&rest[..end]).ok_or(())?;
+                // Every SDK token is ASCII. Any non-ASCII byte makes this
+                // value undefined, so a wider codepoint can use a marker.
+                u8::try_from(codepoint).unwrap_or(u8::MAX)
+            }
+            byte if invalid_literal(byte) => return Err(()),
+            byte => byte,
+        };
+        if let Some(slot) = decoded.get_mut(len) {
+            *slot = byte;
+        }
+        len += 1;
+    }
+    Ok(decoded.get(..len).and_then(read))
+}
+
+fn reference_codepoint(reference: &[u8]) -> Option<u32> {
+    let (digits, radix) = match reference {
+        b"amp" => return Some(u32::from(b'&')),
+        b"apos" => return Some(u32::from(b'\'')),
+        b"gt" => return Some(u32::from(b'>')),
+        b"lt" => return Some(u32::from(b'<')),
+        b"quot" => return Some(u32::from(b'"')),
+        [b'#', b'x', digits @ ..] => (digits, 16),
+        [b'#', digits @ ..] => (digits, 10),
+        _ => return None,
+    };
+    // from_str_radix accepts a leading plus, which XML references forbid.
+    if digits.starts_with(b"+") {
+        return None;
+    }
+    let codepoint = u32::from_str_radix(std::str::from_utf8(digits).ok()?, radix).ok()?;
+    matches!(codepoint, 9 | 10 | 13 | 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff)
+        .then_some(codepoint)
 }
 
 fn malformed(issue: crate::ColorMetadataDefect, problem: impl std::fmt::Display) -> Error {
@@ -387,8 +512,12 @@ fn malformed(issue: crate::ColorMetadataDefect, problem: impl std::fmt::Display)
 /// The length of the XML whitespace at the start of `text`.
 fn whitespace(text: &[u8]) -> usize {
     text.iter()
-        .position(|byte| !byte.is_ascii_whitespace())
+        .position(|&byte| !is_xml_whitespace(byte))
         .unwrap_or(text.len())
+}
+
+fn is_xml_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
 /// The offset of the first `needle` in `haystack`.
@@ -489,6 +618,42 @@ mod tests {
     }
 
     #[test]
+    fn document_type_declarations_are_opaque_to_color_scanning() {
+        let element = "<ndi_color_info transfer='bt_709'/>";
+        for declaration in [
+            r#"<!DOCTYPE ndi_metadata_group [<!ENTITY label "<ndi_color_info transfer='bt_2100_pq'/>">]>"#,
+            r#"<!DOCTYPE ndi_metadata_group [
+                <!-- ] > <ndi_color_info matrix='unknown'/> -->
+                <?camera ] > ' <ndi_color_info/> ?>
+                <!ELEMENT ndi_metadata_group ANY>
+                <!ENTITY label '<ndi_color_info transfer="bt_2100_pq"/>'>
+                <!ENTITY other "text with ] >">
+            ]>"#,
+            r#"<!DOCTYPE ndi_metadata_group SYSTEM "camera]>v1.dtd">"#,
+            "<!DOCTYPE ndi_metadata_group>",
+        ] {
+            let empty = format!("{declaration}<ndi_metadata_group/>");
+            assert_eq!(read(&empty).unwrap(), None, "{declaration}");
+            let content =
+                format!("{declaration}<ndi_metadata_group>{element}</ndi_metadata_group>");
+            assert_eq!(
+                read(&content).unwrap(),
+                read(element).unwrap(),
+                "{declaration}"
+            );
+        }
+
+        for incomplete in [
+            r#"<!DOCTYPE ndi_metadata_group SYSTEM "<ndi_color_info/>"#,
+            r#"<!DOCTYPE ndi_metadata_group [<!ENTITY label "<ndi_color_info/>">"#,
+            "<!DOCTYPE ndi_metadata_group [<!-- ] > <ndi_color_info/>",
+            "<!DOCTYPE ndi_metadata_group [<?camera ] > <ndi_color_info/>",
+        ] {
+            assert_eq!(read(incomplete).unwrap(), None, "{incomplete}");
+        }
+    }
+
+    #[test]
     fn the_sdk_example_reads_in_any_attribute_order_and_quote_style() {
         // As the 6.4 SDK's HDR sender example writes it.
         let sdk = "<ndi_color_info \t transfer=\"bt_2100_hlg\" \t matrix=\"bt_2100\" \t primaries=\"bt_2100\" /> ";
@@ -496,12 +661,106 @@ mod tests {
         for text in [
             "<ndi_color_info primaries='bt_2020' transfer='bt_2100_hlg' matrix='bt_2020'/>",
             "<ndi_color_info matrix=\"bt_2020\" primaries='bt_2100' transfer=\"bt_2100_hlg\">",
-            "<ndi_color_info\nmatrix = \"bt_2020\"\r\n primaries\t=\t'bt_2020'transfer=\"bt_2100_hlg\"></ndi_color_info>",
+            "<ndi_color_info\nmatrix = \"bt_2020\"\r\n primaries\t=\t'bt_2020' transfer=\"bt_2100_hlg\"></ndi_color_info>",
             "<ndi_metadata_group><ndi_color_info primaries=\"bt_2020\" transfer=\"bt_2100_hlg\" matrix=\"bt_2020\"/></ndi_metadata_group>",
             "<!-- <ndi_color_info primaries=\"bt_601\"/> --><ndi_color_info primaries=\"bt_2020\" transfer=\"bt_2100_hlg\" matrix=\"bt_2020\" extra=\"ignored\"/>",
             "<![CDATA[ <ndi_color_info/> ]]><ndi_color_info primaries=\"bt_2020\" transfer=\"bt_2100_hlg\" matrix=\"bt_2020\"/>",
         ] {
             assert_eq!(read(text).unwrap(), Some(HLG_2100), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn color_attributes_decode_xml_character_references_without_allocating() {
+        let expected = Some(info(
+            Some(ColorPrimaries::Bt2020),
+            Some(TransferFunction::Hlg),
+            Some(YuvMatrix::Bt709),
+        ));
+        for text in [
+            "<ndi_color_info primaries='bt_2020' transfer='bt_2100_hlg' matrix='bt_709'/>",
+            "<ndi_color_info\rprimaries='bt_&#50;020'\ntransfer=\"bt_2100_&#104;lg\"\tmatrix='bt_&#55;09'/>",
+            "<ndi_color_info primaries='bt_&#x32;020' transfer=\"bt_2100_&#x68;lg\" matrix='&#x62;&#x74;&#x5F;&#x37;&#x30;&#x39;' cam:label='ignored &quot;extension&quot;'/>",
+            "<ndi_color_info primaries='bt_&#000050;020' transfer='bt_2100_&#x000068;lg' matrix='bt_&#x000037;09'/>",
+        ] {
+            let (parsed, allocations) = crate::test_alloc::allocation_count(|| read(text));
+            assert_eq!(parsed.unwrap(), expected, "{text:?}");
+            assert_eq!(allocations, 0, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn color_attribute_syntax_errors_have_typed_diagnostics() {
+        use crate::ColorMetadataDefect::*;
+
+        for (text, expected) in [
+            (
+                "<ndi_color_info primaries='bt_709'transfer='bt_709'/>",
+                AttributeStart,
+            ),
+            (
+                "<ndi_color_info extension='value'matrix='bt_709'/>",
+                AttributeStart,
+            ),
+            ("<ndi_color_info\x0bmatrix='bt_709'/>", AttributeStart),
+            ("<ndi_color_info\x0cmatrix='bt_709'/>", AttributeStart),
+            ("<ndi_color_info matrix\x0c='bt_709'/>", MissingValue),
+            (
+                "<ndi_color_info matrix='bt_709' matrix='bt_&#55;09'/>",
+                DuplicateAttribute,
+            ),
+        ] {
+            assert!(
+                matches!(unreadable(text), crate::FrameDefect::ColorMetadata { issue, .. } if issue == expected),
+                "{text:?}"
+            );
+        }
+
+        for value in [
+            "bt_&#55",
+            "bt_&#;09",
+            "bt_&#x;09",
+            "bt_&#X37;09",
+            "bt_&#x3G;09",
+            "bt_&#x+37;09",
+            "bt_&#-55;09",
+            "bt_&#0;09",
+            "bt_&#xD800;09",
+            "bt_&#xFFFE;09",
+            "bt_&#x110000;09",
+            "bt_&#4294967296;09",
+            "bt_&digit;09",
+            "bt_&09",
+            "bt_<09",
+            "bt_\x01_09",
+            "greater_than_the_maximum_length&#xG;",
+        ] {
+            let text = format!("<ndi_color_info matrix='{value}'/>");
+            let crate::FrameDefect::ColorMetadata { issue, diagnostic } = unreadable(&text) else {
+                panic!("expected a color metadata diagnostic for {text:?}");
+            };
+            assert_eq!(issue, InvalidAttributeValue, "{text:?}");
+            assert!(diagnostic.contains("\"matrix\""), "{diagnostic}");
+            assert!(diagnostic.contains(value), "{diagnostic}");
+        }
+
+        for value in [
+            "bt_&gt;09",
+            "bt_&#x1F600;09",
+            "bt_&#9;09",
+            "bt_&#55;09123456",
+        ] {
+            let text = format!("<ndi_color_info matrix='{value}'/>");
+            assert!(
+                matches!(
+                    unreadable(&text),
+                    crate::FrameDefect::ColorMetadata {
+                        issue: UndefinedValue,
+                        ..
+                    }
+                ),
+                "{text:?}"
+            );
         }
     }
 
@@ -656,7 +915,12 @@ mod tests {
                 "{filler:?}"
             );
         }
-        for prefix in ["<!--", "<![CDATA[", "<?camera "] {
+        for prefix in [
+            "<!--",
+            "<![CDATA[",
+            "<?camera ",
+            "<!DOCTYPE ndi_metadata_group [",
+        ] {
             let unterminated = format!("{prefix}{}", "<ndi_color_info/>".repeat(limit / 20));
             assert_eq!(read(&unterminated).unwrap(), None);
         }
@@ -669,6 +933,7 @@ mod tests {
             "<ndi_metadata_group><!-- c --><ndi_color_info primaries='bt_709'></ndi_color_info><![CDATA[x]]></ndi_metadata_group>",
             "<ndi_color_info matrix=\"bt_601\" />é<ndi_color_info matrix=\"bt_601\"/>",
             "<?camera <ndi_color_info matrix='unknown'/> ?>é<ndi_color_info matrix='bt_601'/>",
+            r#"<!DOCTYPE ndi_metadata_group [<!ENTITY label "<ndi_color_info transfer='bt_2100_pq'/>">]><ndi_metadata_group/>"#,
         ];
         let alphabet = "<>?/=\"' \t!-[]CDATAndi_color_infobt_2100_pqé";
         let alphabet: Vec<char> = alphabet.chars().collect();

@@ -724,8 +724,13 @@ struct EventWaiter {
     waker: WakerSlot,
 }
 
+struct QueuedEvent<E> {
+    queued_at: Instant,
+    value: Result<E>,
+}
+
 struct Events<E> {
-    queue: VecDeque<Result<E>>,
+    queue: VecDeque<QueuedEvent<E>>,
     capacity: usize,
     dropped: u64,
     end: Option<OwnerExit>,
@@ -752,7 +757,10 @@ impl<E> EventQueue<E> {
                 events.queue.pop_front();
                 events.dropped = events.dropped.saturating_add(1);
             }
-            events.queue.push_back(value);
+            events.queue.push_back(QueuedEvent {
+                queued_at: Instant::now(),
+                value,
+            });
             events.waiter.as_mut().and_then(|w| w.waker.take())
         };
         WakerSlot::wake(wake);
@@ -808,7 +816,10 @@ impl<E: Send> Expire for EventQueue<E> {
 /// The wait starts when the future is first polled, and ends on time even
 /// while the player's or recorder's thread is busy with a command that
 /// blocks: a timer thread shared by every handle in the process keeps the
-/// deadline. One future may wait on a handle at a time; a second fails with
+/// deadline. Events queued by the deadline remain eligible even if the
+/// executor polls later. A zero timeout can take an already queued event.
+/// Events queued after a wait's deadline are available to later waits.
+/// One future may wait on a handle at a time; a second fails with
 /// [`Error::InvalidState`] and [`StateConflict::WaiterPending`]. Once the
 /// handle is closed and every queued event has been taken, the future fails
 /// with [`StateConflict::Closed`], or with [`StateConflict::OwnerFailed`] when the
@@ -937,14 +948,14 @@ impl<E> Future for FileEventFuture<E> {
                     None,
                 );
             }
-            let ready = if let Some(event) = events.queue.pop_front() {
-                Some(event.map(Some))
-            } else if let Some(end) = events.end {
-                Some(Err(stopped(end == OwnerExit::Failed)))
-            } else if deadline.is_expired() {
-                Some(Ok(None))
-            } else {
-                None
+            let ready = match (events.queue.front(), events.end) {
+                // Publication is ordered by the queue lock. A late front
+                // entry ends this wait and remains queued for a later one.
+                (Some(event), _) if event.queued_at > deadline.end() => Some(Ok(None)),
+                (Some(_), _) => events.queue.pop_front().map(|event| event.value.map(Some)),
+                (None, Some(end)) => Some(Err(stopped(end == OwnerExit::Failed))),
+                (None, None) if deadline.is_expired() => Some(Ok(None)),
+                (None, None) => None,
             };
             if let Some(value) = ready {
                 return WakerPoll::Ready(
@@ -2578,6 +2589,19 @@ mod tests {
         (Waker::from(Arc::new(PanickingWake(called))), calls)
     }
 
+    struct ChannelWake(Sender<()>);
+
+    impl Wake for ChannelWake {
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.send(());
+        }
+    }
+
+    fn channel_waker() -> (Waker, Receiver<()>) {
+        let (called, calls) = mpsc::channel();
+        (Waker::from(Arc::new(ChannelWake(called))), calls)
+    }
+
     pub(super) fn block_on<F: Future>(future: F) -> F::Output {
         let signal = Arc::new(Signal(Mutex::new(false), Condvar::new()));
         let waker = Waker::from(Arc::clone(&signal));
@@ -2784,8 +2808,8 @@ mod tests {
         let events = lock(&events.0);
         assert_eq!(events.queue.len(), 20);
         assert_eq!(events.dropped, 20);
-        assert_eq!(events.queue.front().unwrap().as_ref().unwrap(), &21);
-        assert_eq!(events.queue.back().unwrap().as_ref().unwrap(), &40);
+        assert_eq!(events.queue.front().unwrap().value.as_ref().unwrap(), &21);
+        assert_eq!(events.queue.back().unwrap().value.as_ref().unwrap(), &40);
     }
 
     #[test]
@@ -6426,6 +6450,106 @@ mod tests {
         let waited = begun.elapsed();
         assert!(waited >= Duration::from_millis(200), "{waited:?}");
         assert!(waited < Duration::from_secs(2), "the wait took {waited:?}");
+    }
+
+    #[test]
+    fn a_recorder_event_published_after_expiry_is_retained_for_the_next_wait() {
+        let (device, recorder) = mock_recorder(Closing::AtStop);
+        let started = block_on(recorder.next_event(Duration::from_secs(1)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(started.kind(), RecorderEventKind::Started);
+
+        let mut waiting = recorder.next_event(Duration::from_millis(100));
+        let (waker, woken) = channel_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(Pin::new(&mut waiting).poll(&mut context).is_pending());
+        // With no other event in flight, only the timer can wake this wait.
+        woken.recv_timeout(Duration::from_secs(2)).unwrap();
+        device.push(mock::FIRST_FRAME, mock::TAKE);
+        // The first command can wake an idle owner before it pumps events.
+        // It pumps once more before the second command, publishing FirstFrame.
+        block_on(recorder.is_recording()).unwrap();
+        block_on(recorder.is_recording()).unwrap();
+        assert_eq!(lock(&recorder.worker.events.0).queue.len(), 1);
+
+        assert!(matches!(
+            Pin::new(&mut waiting).poll(&mut context),
+            Poll::Ready(Ok(None))
+        ));
+        let next = block_on(recorder.next_event(Duration::ZERO))
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.kind(), RecorderEventKind::FirstFrame);
+        assert_eq!(block_on(recorder.next_event(Duration::ZERO)).unwrap(), None);
+        block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
+    fn an_on_time_player_event_can_be_taken_after_expiry() {
+        use crate::sys::bindings::{
+            NDIlib_file_player_event_t,
+            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_ended,
+        };
+
+        let (_, player) = mock_player();
+        let raw = NDIlib_file_player_event_t {
+            type_: NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_ended,
+            ..Default::default()
+        };
+        let event = PlayerEvent::from_sdk(&raw);
+        let mut waiting = player.next_event(Duration::from_secs(1));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut waiting).poll(&mut context).is_pending());
+        let EventWaitState::Registered { deadline, .. } = waiting.state else {
+            panic!("a pending wait is timed");
+        };
+        player.worker.events.push(Ok(event.clone()));
+        let queued_at = lock(&player.worker.events.0).queue[0].queued_at;
+        assert!(queued_at <= deadline.end());
+        thread::sleep(deadline.remaining());
+        assert!(deadline.is_expired());
+
+        let Poll::Ready(Ok(next)) = Pin::new(&mut waiting).poll(&mut context) else {
+            panic!("the queued event should still be available");
+        };
+        assert_eq!(next, Some(event));
+        assert_eq!(block_on(player.next_event(Duration::ZERO)).unwrap(), None);
+        block_on(player.close()).unwrap();
+    }
+
+    #[test]
+    fn an_expired_wait_leaves_a_late_error_even_when_the_queue_closes() {
+        let events = Arc::new(EventQueue::new(1));
+        let mut waiting = events.wait(Duration::from_millis(50));
+        let (waker, woken) = channel_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(Pin::new(&mut waiting).poll(&mut context).is_pending());
+        woken.recv_timeout(Duration::from_secs(2)).unwrap();
+        events.push(Ok(7));
+        events.push(Err(Error::UnexpectedSdkResult(
+            crate::SdkResultDefect::FileStructureTooLarge {
+                bytes: 100,
+                name: "test event",
+            },
+        )));
+        events.close(OwnerExit::Failed);
+        assert_eq!(lock(&events.0).dropped, 1);
+
+        assert!(matches!(
+            Pin::new(&mut waiting).poll(&mut context),
+            Poll::Ready(Ok(None))
+        ));
+        assert!(matches!(
+            block_on(events.wait(Duration::ZERO)),
+            Err(Error::UnexpectedSdkResult(
+                crate::SdkResultDefect::FileStructureTooLarge {
+                    bytes: 100,
+                    name: "test event"
+                }
+            ))
+        ));
+        owner_failed(block_on(events.wait(Duration::ZERO)));
     }
 
     #[test]

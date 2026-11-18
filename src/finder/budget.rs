@@ -80,16 +80,17 @@ impl SnapshotBudget {
     }
 }
 
-/// Deep-copy one SDK snapshot under the Finder snapshot lock.
-///
+/// Scan and budget one SDK snapshot under the Finder snapshot lock. A
+/// selecting collector spends the full descriptor and result spans even when
+/// it retains fewer entries.
 /// # Safety
 /// `descriptors` is null or points to `count` initialized descriptors that
-/// remain live, along with their strings, for the duration of copying.
-pub(super) unsafe fn copy_snapshot<D, T>(
+/// remain live, along with their strings, for the duration of the scan.
+pub(super) unsafe fn scan_snapshot<D, T>(
     descriptors: *const D,
     count: u32,
-    mut copy: impl FnMut(&D, &mut SnapshotBudget) -> Result<Option<T>>,
-) -> Result<Vec<T>> {
+    mut visit: impl FnMut(&D, &mut SnapshotBudget, usize) -> Result<()>,
+) -> Result<()> {
     descriptor_bytes(count as usize, size_of::<D>())?;
     descriptor_bytes(count as usize, size_of::<T>())?;
     let mut budget = SnapshotBudget::new();
@@ -97,20 +98,27 @@ pub(super) unsafe fn copy_snapshot<D, T>(
     // this array live and excludes snapshot replacement.
     let raw = unsafe { budget.0.slice(descriptors, count) }?;
     budget.0.charge_span::<T>(raw.len())?;
-    let mut copied = Vec::new();
     for (index, entry) in raw.iter().enumerate() {
-        if let Some(value) = copy(entry, &mut budget)? {
-            // Every remaining entry may match. Reserve that tail once, only
-            // after this snapshot has something to store.
-            if copied.is_empty() {
-                copied
-                    .try_reserve_exact(raw.len() - index)
-                    .map_err(|_| allocation_failed())?;
-            }
-            copied.push(value);
-        }
+        visit(entry, &mut budget, raw.len() - index)?;
     }
-    Ok(copied)
+    Ok(())
+}
+
+pub(super) fn push_snapshot_item<T>(
+    copied: &mut Vec<T>,
+    item: Option<T>,
+    remaining: usize,
+) -> Result<()> {
+    if let Some(item) = item {
+        // Full snapshots reserve once, after finding an entry to store.
+        if copied.is_empty() {
+            copied
+                .try_reserve_exact(remaining)
+                .map_err(|_| allocation_failed())?;
+        }
+        copied.push(item);
+    }
+    Ok(())
 }
 
 pub(super) fn copy_string(text: &str) -> Result<String> {
@@ -147,6 +155,21 @@ mod tests {
             p_ndi_name: pointer,
             ..Default::default()
         }
+    }
+
+    unsafe fn copy_snapshot<D, T>(
+        descriptors: *const D,
+        count: u32,
+        mut copy: impl FnMut(&D, &mut SnapshotBudget) -> Result<Option<T>>,
+    ) -> Result<Vec<T>> {
+        let mut copied = Vec::new();
+        // SAFETY: the caller keeps the descriptors and their strings live.
+        unsafe {
+            scan_snapshot::<D, T>(descriptors, count, |entry, budget, remaining| {
+                push_snapshot_item(&mut copied, copy(entry, budget)?, remaining)
+            })?;
+        }
+        Ok(copied)
     }
 
     fn snapshot(entries: &[NDIlib_source_t]) -> Result<Vec<Source>> {

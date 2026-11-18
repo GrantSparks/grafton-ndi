@@ -260,3 +260,57 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
             .run();
     }
 }
+
+#[test]
+fn cache_matches_only_the_outer_endpoint_host() {
+    if let Some(library) = std::env::var_os("GRAFTON_OUTER_ENDPOINT_RUNTIME") {
+        let ndi =
+            Ndi::with_options(&RuntimeOptions::new().library_path(PathBuf::from(library))).unwrap();
+        let cache = SourceCache::new(finder(&ndi, "Studio"));
+
+        assert!(cache
+            .find_sources_by_host("camera-b.local", Duration::ZERO)
+            .unwrap()
+            .is_empty());
+        assert!(cache.is_empty());
+
+        let expected = Source::new("OTHER (Feed)").unwrap().with_address(
+            SourceAddress::new("camera-a.local:5960?next=https://camera-b.local:7443/live")
+                .unwrap(),
+        );
+        let sources = cache
+            .find_sources_by_host("camera-a.local", Duration::ZERO)
+            .unwrap();
+        assert_eq!(sources, vec![expected]);
+        assert_eq!(
+            cache
+                .find_sources_by_host("CAMERA-A.LOCAL.", Duration::ZERO)
+                .unwrap(),
+            sources
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            read_fake_log()
+                .lines()
+                .filter(|line| *line == "finder-snapshot")
+                .count(),
+            2,
+            "the repeated outer-host lookup should hit the cache"
+        );
+        return;
+    }
+
+    let directory = common::FixtureDir::create("outer-endpoint");
+    let library = directory.path().join("finder.so");
+    FakeRuntime {
+        cfgs: vec!["fake_finder"],
+        version: Some("6.4.0.2"),
+        ..Default::default()
+    }
+    .build(&library);
+    TestChild::new("cache_matches_only_the_outer_endpoint_host")
+        .env("GRAFTON_OUTER_ENDPOINT_RUNTIME", &library)
+        .env("GRAFTON_FAKE_FINDER_CASE", "outer-endpoint")
+        .env("GRAFTON_FAKE_NDI_LOG", directory.path().join("calls.log"))
+        .run();
+}

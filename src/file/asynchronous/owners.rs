@@ -607,10 +607,10 @@ mod tests {
             .unwrap();
         let mut notifications = lock(&events.0);
         assert!(matches!(
-            notifications.queue.pop_front().unwrap(),
+            notifications.queue.pop_front().unwrap().value,
             Err(Error::UnexpectedSdkResult(_))
         ));
-        let event = notifications.queue.pop_front().unwrap().unwrap();
+        let event = notifications.queue.pop_front().unwrap().value.unwrap();
         assert_eq!(event.kind(), crate::file::RecorderEventKind::OpenFailed);
         assert_eq!(owner.recorder.report().error_events(), 0);
     }
@@ -820,7 +820,7 @@ mod tests {
             FinishStatus::Ended(SessionEnd::Indeterminate(_))
         ));
         owner.shutdown(Instant::now(), &events, &control, &mut []);
-        let event = lock(&events.0).queue.pop_front().unwrap().unwrap();
+        let event = lock(&events.0).queue.pop_front().unwrap().value.unwrap();
         assert_eq!(event.kind(), crate::file::RecorderEventKind::FileClosed);
     }
 

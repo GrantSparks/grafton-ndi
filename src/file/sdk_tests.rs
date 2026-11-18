@@ -1123,6 +1123,75 @@ fn a_rollover_into_a_missing_directory_is_refused_and_the_session_goes_on() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn an_unrepresentable_rollover_candidate_leaves_the_session_recording() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = FixtureDir::create("long-rollover-name");
+    let source = LiveSource::start(&ndi, "long-rollover-name");
+    let invalid = RecordingTarget::new(scratch.join("x".repeat(256))).unwrap();
+    let live = RecordingTarget::new(scratch.join("take.mkv")).unwrap();
+    for naming in [FileNaming::Exact, FileNaming::Indexed] {
+        let options = exact_video(&source).naming(naming);
+        let mut recorder = FileRecorder::new(&api, &options).unwrap();
+        recorder.start(&live, RecordingTimecode::Preserve).unwrap();
+        await_event(&mut recorder, RecorderEventKind::FirstFrame);
+
+        let Err(Error::Io(error)) = recorder.rollover(&invalid) else {
+            panic!("the filesystem should reject the candidate at preflight");
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::ENAMETOOLONG));
+        assert_eq!(recorder.state(), RecorderState::Recording);
+        assert!(recorder.is_recording());
+        let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap()
+        else {
+            panic!("the recording was not confirmed closed");
+        };
+        assert!(report.closure_confirmed());
+        assert!(!report.stopped_by_sdk());
+        assert_eq!(report.closed_files(), 1);
+        assert_eq!(report.error_events(), 0);
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn an_indexed_rollover_uses_the_next_free_candidate() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = FixtureDir::create("indexed-rollover");
+    let source = LiveSource::start(&ndi, "indexed-rollover");
+    let occupied = scratch.join("second_001.mkv");
+    std::fs::write(&occupied, b"kept").unwrap();
+    let options = exact_video(&source).naming(FileNaming::Indexed);
+    let mut recorder = FileRecorder::new(&api, &options).unwrap();
+    recorder
+        .start(
+            &RecordingTarget::new(scratch.join("first")).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    let mut timeline = Timeline::new();
+    let first = timeline.await_event(&mut recorder, 0, RecorderEventKind::FirstFrame, None);
+    let since = timeline.mark();
+    recorder
+        .rollover(&RecordingTarget::new(scratch.join("second")).unwrap())
+        .unwrap();
+    assert_eq!(
+        timeline.await_change(&mut recorder, since, &first),
+        scratch.join("second_002.mkv")
+    );
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap() else {
+        panic!("the recording was not confirmed closed");
+    };
+    assert_eq!(report.closed_files(), 2);
+    assert_eq!(report.error_events(), 0);
+    assert_eq!(std::fs::read(occupied).unwrap(), b"kept");
+}
+
+#[test]
 fn a_file_that_received_nothing_is_reported_as_empty() {
     let Some((ndi, api)) = file_api() else {
         return;

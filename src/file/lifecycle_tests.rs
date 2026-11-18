@@ -1597,11 +1597,81 @@ fn an_exact_target_that_exists_is_refused_before_the_sdk_sees_it() {
     );
     assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
     assert_eq!(recorder.state(), RecorderState::Recording);
+    #[cfg(unix)]
+    {
+        let dangling = fixture_target(directory.path(), "dangling.mkv");
+        std::os::unix::fs::symlink("absent.mkv", dangling.path()).unwrap();
+        assert_eq!(
+            io_kind(recorder.rollover(&dangling)),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
+    }
     recorder
         .rollover(&fixture_target(directory.path(), "second.mkv"))
         .unwrap();
     assert_eq!(device.rollovers.load(Ordering::Acquire), 1);
     assert_eq!(std::fs::read(directory.join("taken.mkv")).unwrap(), b"kept");
+}
+
+#[test]
+fn existing_indexed_candidates_reach_native_start_and_rollover() {
+    let directory = FixtureDir::create("indexed-exists");
+    for name in ["first_001.mkv", "second_001.mkv"] {
+        std::fs::write(directory.join(name), b"kept").unwrap();
+    }
+    let device = mock::Recorder::new(Closing::AtStop);
+    device.install();
+    let options = exact().naming(FileNaming::Indexed);
+    let mut recorder = FileRecorder::new(&mock::recorder_api(), &options).unwrap();
+
+    recorder
+        .start(
+            &fixture_target(directory.path(), "first"),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    recorder
+        .rollover(&fixture_target(directory.path(), "second"))
+        .unwrap();
+    assert_eq!(device.starts.load(Ordering::Acquire), 1);
+    assert_eq!(device.rollovers.load(Ordering::Acquire), 1);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn an_unrepresentable_candidate_never_reaches_native_start_or_rollover() {
+    let directory = FixtureDir::create("name-too-long");
+    let target = fixture_target(directory.path(), &"x".repeat(256));
+    let assert_name_too_long = |result: Result<()>| match result {
+        Err(Error::Io(error)) => assert_eq!(error.raw_os_error(), Some(libc::ENAMETOOLONG)),
+        other => panic!("expected an unrepresentable candidate: {other:?}"),
+    };
+    for naming in [FileNaming::Exact, FileNaming::Indexed] {
+        let device = mock::Recorder::new(Closing::AtStop);
+        device.install();
+        let options = exact().naming(naming);
+        let mut recorder = FileRecorder::new(&mock::recorder_api(), &options).unwrap();
+
+        assert_name_too_long(
+            recorder
+                .start(&target, RecordingTimecode::Preserve)
+                .map(drop),
+        );
+        assert_eq!(device.starts.load(Ordering::Acquire), 0);
+        assert_eq!(recorder.state(), RecorderState::Idle);
+
+        recorder
+            .start(
+                &fixture_target(directory.path(), "live.mkv"),
+                RecordingTimecode::Preserve,
+            )
+            .unwrap();
+        assert_name_too_long(recorder.rollover(&target));
+        assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
+        assert_eq!(recorder.state(), RecorderState::Recording);
+        assert!(recorder.is_recording());
+    }
 }
 
 #[test]

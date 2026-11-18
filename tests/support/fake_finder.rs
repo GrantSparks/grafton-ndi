@@ -60,6 +60,15 @@ impl Snapshot {
             }
             return;
         }
+        if scenario == "outer-endpoint" {
+            self.plain = vec![NDIlib_source_t {
+                p_ndi_name: c"OTHER (Feed)".as_ptr(),
+                __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                    p_url_address: c"camera-a.local:5960?next=https://camera-b.local:7443/live".as_ptr(),
+                },
+            }];
+            return;
+        }
         if scenario == "deadline" {
             self.plain = vec![NDIlib_source_t {
                 p_ndi_name: c"STUDIO (Camera)".as_ptr(),

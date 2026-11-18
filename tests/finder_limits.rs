@@ -44,9 +44,27 @@ fn finder_enforces_snapshot_and_whole_window_limits() {
         } else if scenario == "many-short" {
             assert_eq!(finder.current_sources().unwrap().len(), 16_384);
             assert_eq!(finder.find_sources(Duration::ZERO).unwrap().len(), 1);
+            assert_eq!(
+                finder
+                    .find_source_by_name("xxxxxxxx", Duration::ZERO)
+                    .unwrap()
+                    .unwrap()
+                    .name(),
+                "xxxxxxxx"
+            );
         } else {
             limited(finder.current_sources());
             limited(finder.find_sources(Duration::ZERO));
+            if scenario == "bytes" {
+                let name = "x".repeat(8_192);
+                assert!(matches!(
+                    finder.find_source_by_name(&name, Duration::ZERO),
+                    Err(Error::ResourceLimit {
+                        resource: ResourceKind::FinderSnapshotBytes,
+                        ..
+                    })
+                ));
+            }
             assert!(matches!(
                 finder.find_source(Duration::ZERO, |_| true),
                 Err(Error::ResourceLimit { .. })
