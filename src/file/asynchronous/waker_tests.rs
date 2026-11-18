@@ -378,7 +378,7 @@ fn ready_and_same_waker_command_polls_do_not_clone() {
 }
 
 #[test]
-fn event_bursts_wake_once_without_cloning_or_releasing_the_waiter_reservation() {
+fn event_bursts_and_close_wake_once_without_cloning_or_releasing_the_waiter_reservation() {
     let events = Arc::new(EventQueue::<u32>::new(2));
     let mut future = events.wait(Duration::from_secs(60));
     let probe = CloneProbe::new(|| {});
@@ -387,6 +387,7 @@ fn event_bursts_wake_once_without_cloning_or_releasing_the_waiter_reservation() 
     assert!(poll(&mut future, &waker).is_pending());
     events.push(Ok(1));
     events.push(Ok(2));
+    events.close(OwnerExit::Closed);
     let mut competing = events.wait(Duration::ZERO);
     assert!(matches!(
         poll(&mut competing, &waker),
@@ -398,6 +399,10 @@ fn event_bursts_wake_once_without_cloning_or_releasing_the_waiter_reservation() 
     ));
     let mut next = events.wait(Duration::ZERO);
     assert!(matches!(poll(&mut next, &waker), Poll::Ready(Ok(Some(2)))));
+    assert!(matches!(
+        poll(&mut events.wait(Duration::ZERO), &waker),
+        Poll::Ready(Err(Error::InvalidState(StateConflict::Closed)))
+    ));
     assert_eq!(probe.clones.load(Ordering::Relaxed), 1);
     assert_eq!(probe.wakes.load(Ordering::Relaxed), 1);
 }

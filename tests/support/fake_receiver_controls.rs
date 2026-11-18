@@ -52,17 +52,29 @@ export! {
         let receiver = unsafe { state(instance).receiver };
         log(&format!("fs-audio:{receiver:p}:{instance:p}:{rate}:{channels}:{samples}"));
         let query = samples == 0;
+        let (rate, channels, samples, stride) = if query {
+            (48_000, 2, 0, 0)
+        } else {
+            match std::env::var("GRAFTON_FAKE_FRAMESYNC_AUDIO").as_deref() {
+                Ok("rate") => (44_100, channels, samples, samples),
+                Ok("channels") => (rate, channels + 1, samples, samples),
+                Ok("samples") => (rate, channels, samples - 1, samples - 1),
+                Ok("invalid-rate") => (-1, channels + 1, samples, samples),
+                Ok("padded") => (rate, channels, samples, samples + 4),
+                _ => (rate, channels, samples, samples),
+            }
+        };
         let data = if query { std::ptr::null_mut() } else {
-            Box::into_raw(vec![0.25f32; (channels * samples) as usize].into_boxed_slice()).cast::<u8>()
+            Box::into_raw(vec![0.25f32; (channels * stride) as usize].into_boxed_slice()).cast::<u8>()
         };
         unsafe { *frame = NDIlib_audio_frame_v3_t {
-            sample_rate: if query { 48_000 } else { rate },
-            no_channels: if query { 2 } else { channels },
+            sample_rate: rate,
+            no_channels: channels,
             no_samples: samples,
             timecode: 4321,
             FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
             p_data: data,
-            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 { channel_stride_in_bytes: samples * 4 },
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 { channel_stride_in_bytes: stride * 4 },
             p_metadata: std::ptr::null(),
             timestamp: 8765,
         }; }
@@ -71,7 +83,8 @@ export! {
         log(&format!("fs-audio-free:{instance:p}"));
         let frame = unsafe { &*frame };
         if !frame.p_data.is_null() {
-            let samples = std::ptr::slice_from_raw_parts_mut(frame.p_data.cast::<f32>(), (frame.no_channels * frame.no_samples) as usize);
+            let stride = unsafe { frame.__bindgen_anon_1.channel_stride_in_bytes } / 4;
+            let samples = std::ptr::slice_from_raw_parts_mut(frame.p_data.cast::<f32>(), (frame.no_channels * stride) as usize);
             drop(unsafe { Box::from_raw(samples) });
         }
     }

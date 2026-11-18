@@ -401,7 +401,7 @@ impl SnapshotGuard<'_> {
             if let Some(source) = unsafe {
                 copy_source(entry, budget, |source| {
                     if retained.is_ok() {
-                        source.selected_by(query, Some(&staged.seen))
+                        source.selected_by(query, &staged.seen)
                     } else {
                         // Preserve the snapshot's error precedence even when
                         // the discovery window has run out of space.
@@ -613,7 +613,11 @@ pub(crate) struct BorrowedSource<'a> {
 }
 
 impl BorrowedSource<'_> {
-    fn with_key<T>(&self, inspect: impl FnOnce((&str, Option<&str>)) -> T) -> Result<T> {
+    fn selected_by(
+        &self,
+        query: Option<HostQuery<'_>>,
+        seen: &HashSet<SeenSource>,
+    ) -> Result<bool> {
         fn text<'a>(value: &LossyText<'a>) -> Result<Cow<'a, str>> {
             value.as_str().map_or_else(
                 || {
@@ -625,30 +629,42 @@ impl BorrowedSource<'_> {
                 |text| Ok(Cow::Borrowed(text)),
             )
         }
-        let name = text(&self.name)?;
-        let address = self.address.as_ref().map(text).transpose()?;
-        Ok(inspect((&name, address.as_deref())))
-    }
 
-    fn selected_by(
-        &self,
-        query: Option<HostQuery<'_>>,
-        seen: Option<&HashSet<SeenSource>>,
-    ) -> Result<bool> {
-        self.with_key(|key @ (name, address)| {
-            query.is_none_or(|query| source_matches_query(name, address, query))
-                && seen.is_none_or(|seen| !seen.contains(&key as &dyn SourceIdentity))
-        })
-    }
-
-    #[cfg(test)]
-    fn matches_query(&self, query: HostQuery<'_>) -> Result<bool> {
-        self.selected_by(Some(query), None)
-    }
-
-    #[cfg(test)]
-    fn seen_in(&self, seen: &HashSet<SeenSource>) -> Result<bool> {
-        Ok(!self.selected_by(None, Some(seen))?)
+        // The decoder already charged both fields. For single-field queries,
+        // match that field before decoding the other for the deduplication key.
+        let name = || text(&self.name);
+        let address = || self.address.as_ref().map(text).transpose();
+        let (name, address) = match query {
+            Some(query @ HostQuery::Machine(_)) => {
+                let name = name()?;
+                if !source_name_matches_query(&name, query) {
+                    return Ok(false);
+                }
+                (name, address()?)
+            }
+            Some(query @ HostQuery::Ip(_)) => {
+                let address = address()?;
+                if !address
+                    .as_deref()
+                    .is_some_and(|address| address_matches_query(address, query))
+                {
+                    return Ok(false);
+                }
+                (name()?, address)
+            }
+            query => {
+                let name = name()?;
+                let address = address()?;
+                if query
+                    .is_some_and(|query| !source_matches_query(&name, address.as_deref(), query))
+                {
+                    return Ok(false);
+                }
+                (name, address)
+            }
+        };
+        let key = (name.as_ref(), address.as_deref());
+        Ok(!seen.contains(&key as &dyn SourceIdentity))
     }
 }
 
@@ -1415,9 +1431,21 @@ fn strip_url_scheme(address: &str) -> Option<&str> {
     address.get(end..)?.strip_prefix("://")
 }
 
+// An outer None rejects the authority, while Some(None) accepts an empty port.
+fn parse_port(text: &str, allow_empty: bool) -> Option<Option<u16>> {
+    match text.as_bytes().first() {
+        None => allow_empty.then_some(None),
+        // The integer parser checks the remaining digits and the range. The
+        // first byte must be a digit to rule out its optional leading '+'.
+        Some(b'0'..=b'9') => text.parse().ok().map(Some),
+        _ => None,
+    }
+}
+
 fn parse_authority(address: &str) -> Option<Authority<'_>> {
-    let address = strip_url_scheme(address).unwrap_or(address);
-    let authority = address.split(['/', '?', '#']).next()?;
+    let url = strip_url_scheme(address);
+    let allow_empty_port = url.is_some();
+    let authority = url.unwrap_or(address).split(['/', '?', '#']).next()?;
     let authority = authority.rsplit('@').next()?;
     if authority.is_empty() {
         return None;
@@ -1430,7 +1458,7 @@ fn parse_authority(address: &str) -> Option<Authority<'_>> {
         let port = if suffix.is_empty() {
             None
         } else {
-            Some(suffix.strip_prefix(':')?.parse().ok()?)
+            parse_port(suffix.strip_prefix(':')?, allow_empty_port)?
         };
         return Some(Authority { host, port });
     }
@@ -1442,7 +1470,7 @@ fn parse_authority(address: &str) -> Option<Authority<'_>> {
         });
     }
     let (host, port) = match authority.split_once(':') {
-        Some((host, port)) => (host, Some(port.parse().ok()?)),
+        Some((host, port)) => (host, parse_port(port, allow_empty_port)?),
         None => (authority, None),
     };
     if host.is_empty() {
@@ -1525,16 +1553,19 @@ fn address_matches_query(address: &str, query: HostQuery<'_>) -> bool {
         && parse_authority(address).is_some_and(|authority| query.matches(authority.host))
 }
 
+fn source_name_matches_query(name: &str, query: HostQuery<'_>) -> bool {
+    name.split_once(" (")
+        .filter(|(_, source)| source.ends_with(')'))
+        .is_some_and(|(machine, _)| query.matches(machine))
+}
+
 fn source_matches_query(name: &str, address: Option<&str>, query: HostQuery<'_>) -> bool {
     if address.is_some_and(|address| address_matches_query(address, query)) {
         return true;
     }
     match query {
         HostQuery::Ip(_) => false,
-        HostQuery::Host(_) | HostQuery::Machine(_) => name
-            .split_once(" (")
-            .filter(|(_, source)| source.ends_with(')'))
-            .is_some_and(|(machine, _)| query.matches(machine)),
+        HostQuery::Host(_) | HostQuery::Machine(_) => source_name_matches_query(name, query),
     }
 }
 
@@ -1795,8 +1826,9 @@ impl SourceAddress {
 
     /// Extract an explicit port from conventional host/port or URL syntax.
     ///
-    /// Reads the authority before any path, query or fragment. SDK address
-    /// strings are opaque and unrecognized syntax returns `None`.
+    /// Reads the authority before any path, query or fragment. Ports use
+    /// ASCII decimal digits and must fit in a `u16`. An empty port field is
+    /// recognized in a URL and returns `None`. Unrecognized syntax returns `None`.
     ///
     /// # Returns
     ///
@@ -2003,8 +2035,9 @@ impl Source {
     /// Extract the host from conventional host/port or URL syntax.
     ///
     /// Reads the authority before any path, query or fragment and removes
-    /// brackets around IPv6 literals. SDK addresses are opaque and
-    /// unrecognized syntax returns `None`.
+    /// brackets around IPv6 literals. A URL with an empty port field still
+    /// has a host. SDK addresses are opaque and unrecognized syntax returns
+    /// `None`.
     ///
     /// For IP-based sources, this returns the IP portion without the port.
     /// For URL-based sources, this extracts the hostname portion, which may be
@@ -3732,6 +3765,78 @@ mod tests {
     }
 
     #[test]
+    fn authority_parsing_requires_an_unsigned_decimal_port() {
+        for (authority, host) in [
+            ("studio.example", "studio.example"),
+            ("192.0.2.1", "192.0.2.1"),
+            ("[::1]", "::1"),
+        ] {
+            for (prefix, tail) in [
+                ("", ""),
+                ("ndi://user:pass@", "/video"),
+                ("ndi://", "?video"),
+                ("ndi://", "#video"),
+            ] {
+                for (suffix, port, valid) in [
+                    ("", None, !prefix.is_empty()),
+                    ("+5960", None, false),
+                    ("-5960", None, false),
+                    (" 5960", None, false),
+                    ("５９６０", None, false),
+                    ("59a0", None, false),
+                    ("5960+", None, false),
+                    ("65536", None, false),
+                    ("0", Some(0), true),
+                    ("05960", Some(5960), true),
+                    ("65535", Some(65535), true),
+                ] {
+                    let text = format!("{prefix}{authority}:{suffix}{tail}");
+                    let source = Source::new("OTHER (Camera)")
+                        .unwrap()
+                        .with_address(SourceAddress::new(&text).unwrap());
+                    let address = source.address().unwrap();
+                    assert_eq!(address.as_str(), text);
+                    assert_eq!(source.host(), valid.then_some(host), "{text}");
+                    assert_eq!(address.port(), port, "{text}");
+                    assert_eq!(address.matches_host(host), valid, "{text}");
+                    assert_eq!(source.matches_host(host), valid, "{text}");
+                    assert!(!address.matches_host("OTHER"), "{text}");
+                    assert!(source.matches_host("OTHER"), "{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_uses_valid_url_authorities_for_host_selection() {
+        let name = c"OTHER (Camera)".as_ptr();
+        let entries = [
+            source_entry(name, c"ndi://studio.example:+5960/video".as_ptr()),
+            source_entry(name, c"ndi://studio.example:/video".as_ptr()),
+            source_entry(name, c"[::1]:+5960".as_ptr()),
+            source_entry(name, c"ndi://[::1]:/video".as_ptr()),
+        ];
+        let mutex = parking_lot::Mutex::new(FindInstance(ptr::null_mut()));
+        let guard = SnapshotGuard {
+            instance: mutex.lock(),
+        };
+        for (host, expected) in [
+            ("studio.example", "ndi://studio.example:/video"),
+            ("::1", "ndi://[::1]:/video"),
+        ] {
+            let query = HostQuery::checked(host).unwrap();
+            let mut window = DiscoveryWindow::default();
+            guard
+                .discover(&SliceSnapshot(&entries), &mut window, Some(query))
+                .unwrap();
+            assert_eq!(window.sources.len(), 1);
+            let selected = &window.sources[0];
+            assert_eq!(selected.address().unwrap().as_str(), expected);
+            assert_eq!(selected.host(), Some(host));
+        }
+    }
+
+    #[test]
     fn url_classification_requires_a_valid_initial_scheme() {
         for text in [
             "://camera.local",
@@ -3746,6 +3851,45 @@ mod tests {
             assert!(parse_authority(text).is_none(), "{text}");
         }
         assert!(SourceAddress::new("a://camera.local").unwrap().is_url());
+    }
+
+    #[test]
+    fn discovery_rejects_before_decoding_unused_lossy_text() {
+        let mutex = parking_lot::Mutex::new(FindInstance(ptr::null_mut()));
+        let guard = SnapshotGuard {
+            instance: mutex.lock(),
+        };
+        let cases = [
+            (
+                "192.0.2.44",
+                [
+                    (c"STUDIO (Camera)", c"192.0.2.1:5960"),
+                    (c"STUDIO (Camera \xff)", c"192.0.2.1:5960"),
+                ],
+            ),
+            (
+                "STUDIO_B",
+                [
+                    (c"STUDIO_A (Camera)", c"ndi://studio.local:5960/feed"),
+                    (c"STUDIO_A (Camera)", c"ndi://studio.local:5960/feed\xff"),
+                ],
+            ),
+        ];
+
+        let allocations = cases.map(|(host, source_text)| {
+            let query = HostQuery::checked(host).unwrap();
+            source_text.map(|(name, address)| {
+                let entries = [source_entry(name.as_ptr(), address.as_ptr()); 128];
+                let mut window = DiscoveryWindow::default();
+                let (result, allocations) = crate::test_alloc::allocation_count(|| {
+                    guard.discover(&SliceSnapshot(&entries), &mut window, Some(query))
+                });
+                result.unwrap();
+                assert!(window.sources.is_empty(), "{host}");
+                allocations
+            })
+        });
+        assert_eq!(allocations, [[0, 0], [0, 0]]);
     }
 
     #[test]
@@ -3788,6 +3932,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first_named, window.sources[0]);
+
+        let mut matched_ip = DiscoveryWindow::default();
+        guard
+            .discover(
+                &SliceSnapshot(&[lossy, same, unrelated]),
+                &mut matched_ip,
+                Some(HostQuery::checked("192.0.2.1").unwrap()),
+            )
+            .unwrap();
+        assert_eq!(matched_ip.sources, window.sources[..1]);
     }
 
     #[test]
@@ -3832,7 +3986,11 @@ mod tests {
         let (_, first_peak) = crate::test_alloc::peak_bytes(|| first(&control));
         let (_, duplicate_peak) = crate::test_alloc::peak_bytes(|| first(&duplicates));
         assert_eq!(duplicate_peak, first_peak);
-        for query in [None, Some(query)] {
+        for query in [
+            None,
+            Some(query),
+            Some(HostQuery::checked("192.0.2.1").unwrap()),
+        ] {
             let (expected, control_allocations) =
                 crate::test_alloc::allocation_count(|| discover(&control, query));
             let (actual, allocations) =

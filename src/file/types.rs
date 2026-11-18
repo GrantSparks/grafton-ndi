@@ -140,8 +140,13 @@ impl std::fmt::Debug for FileText {
 /// occurs while constructing this value; constructors allocate one C string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceSpec {
-    pub(super) name: Option<FileText>,
-    pub(super) url: Option<FileText>,
+    selection: SourceSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SourceSelection {
+    Name(FileText),
+    Url(FileText),
 }
 
 impl SourceSpec {
@@ -154,8 +159,7 @@ impl SourceSpec {
     pub fn new(name: impl AsRef<str>) -> Result<Self> {
         let name = SourceName::checked(name.as_ref())?;
         Ok(Self {
-            name: Some(FileText::from_checked(name.as_str())),
-            url: None,
+            selection: SourceSelection::Name(FileText::from_checked(name.as_str())),
         })
     }
 
@@ -168,19 +172,36 @@ impl SourceSpec {
     /// [`Error::InvalidCString`] when it contains a NUL.
     pub fn from_url(url: impl AsRef<str>) -> Result<Self> {
         Ok(Self {
-            name: None,
-            url: Some(FileText::new(url.as_ref(), "source URL")?),
+            selection: SourceSelection::Url(FileText::new(url.as_ref(), "source URL")?),
         })
     }
 
     /// The requested display name, when selecting by name.
     pub fn name(&self) -> Option<&str> {
-        self.name.as_ref().map(FileText::as_str)
+        match &self.selection {
+            SourceSelection::Name(name) => Some(name.as_str()),
+            SourceSelection::Url(_) => None,
+        }
     }
 
     /// The requested URL/address, when selecting directly.
     pub fn url(&self) -> Option<&str> {
-        self.url.as_ref().map(FileText::as_str)
+        match &self.selection {
+            SourceSelection::Name(_) => None,
+            SourceSelection::Url(url) => Some(url.as_str()),
+        }
+    }
+
+    /// The native descriptor borrows the selected C string from `self`.
+    pub(super) fn raw_source(&self) -> NDIlib_file_recorder_source_t {
+        let (name, url) = match &self.selection {
+            SourceSelection::Name(name) => (name.as_ptr(), std::ptr::null()),
+            SourceSelection::Url(url) => (std::ptr::null(), url.as_ptr()),
+        };
+        NDIlib_file_recorder_source_t {
+            p_ndi_name: name,
+            p_url_address: url,
+        }
     }
 }
 
@@ -969,9 +990,10 @@ fn check_directory(directory: &Path) -> Result<()> {
 
 /// An owned absolute output prefix/path interpreted by the recorder's naming policy.
 ///
-/// Construction freezes the current directory for relative paths. It neither
-/// creates directories nor creates/removes/overwrites a file. The SDK requires
-/// losslessly representable UTF-8 paths.
+/// Construction freezes the current directory for relative paths and preserves
+/// the prefix text used in naming, including trailing separators and `.`
+/// components. It neither creates directories nor creates/removes/overwrites a
+/// file. The SDK requires losslessly representable UTF-8 paths.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RecordingTarget {
     pub(super) prefix: FileText,
@@ -986,7 +1008,7 @@ impl RecordingTarget {
     /// [`Error::InvalidCString`] when it contains a NUL, and [`Error::Io`]
     /// when the operating system cannot resolve a relative path.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
-        let prefix = resolve_path(path.as_ref(), "recording target")?;
+        let prefix = resolve_path(path.as_ref(), "recording target", absolute_recording_prefix)?;
         Ok(Self { prefix })
     }
 
@@ -994,6 +1016,40 @@ impl RecordingTarget {
     pub fn path(&self) -> &Path {
         Path::new(self.prefix.as_str())
     }
+}
+
+fn absolute_recording_prefix(text: &str) -> std::io::Result<PathBuf> {
+    #[cfg(windows)]
+    let (mut anchor, suffix) = {
+        use std::path::{Component, Prefix};
+        match Path::new(text).components().next() {
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_)) => {
+                // `C:.` resolves the current directory for drive C, even if
+                // the process is working on another drive.
+                let drive = Path::new(prefix.as_os_str());
+                let anchor = std::path::absolute(drive.join("."))?;
+                (anchor, &text[prefix.as_os_str().len()..])
+            }
+            Some(Component::Prefix(_)) => return std::path::absolute(text),
+            Some(Component::RootDir) => (std::path::absolute(r"\")?, &text[1..]),
+            _ => (std::env::current_dir()?, text),
+        }
+    };
+    #[cfg(not(windows))]
+    let (mut anchor, suffix) = (std::env::current_dir()?, text);
+
+    // Append text without PathBuf::push, which can normalize components on
+    // a verbatim Windows anchor. The naming pattern may complete a filename.
+    let prefix = anchor.as_mut_os_string();
+    if !prefix
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|&byte| std::path::is_separator(char::from(byte)))
+    {
+        prefix.push(std::path::MAIN_SEPARATOR_STR);
+    }
+    prefix.push(suffix);
+    Ok(anchor)
 }
 
 /// Make `path` absolute against the current directory and convert it for the
@@ -1005,7 +1061,11 @@ impl RecordingTarget {
 /// [`Error::InvalidInput`] naming `what` when the path is empty or is not
 /// UTF-8, [`Error::InvalidCString`] when it contains a NUL, and
 /// [`Error::Io`] when the operating system cannot resolve a relative path.
-pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<FileText> {
+fn resolve_path(
+    path: &Path,
+    what: &'static str,
+    absolutize: impl FnOnce(&str) -> std::io::Result<PathBuf>,
+) -> Result<FileText> {
     if path.as_os_str().is_empty() {
         return Err(Error::InvalidInput(crate::InputDefect::Empty { what }));
     }
@@ -1020,8 +1080,7 @@ pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<FileText> 
     if path.is_absolute() {
         return Ok(checked);
     }
-    // Windows drive-relative paths (C:take.mkv) need their drive resolved too.
-    let absolute = std::path::absolute(path)?;
+    let absolute = absolutize(text)?;
     let text = absolute
         .to_str()
         .ok_or(Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
@@ -1033,7 +1092,7 @@ pub(super) fn resolve_path(path: &Path, what: &'static str) -> Result<FileText> 
 
 /// A path to play or probe, as the SDK takes it.
 pub(super) fn path_string(path: &Path) -> Result<FileText> {
-    resolve_path(path, "file path")
+    resolve_path(path, "file path", |text| std::path::absolute(text))
 }
 
 /// Original SDK event bytes, retaining invalid UTF-8 and truncation evidence.
@@ -2090,7 +2149,7 @@ mod tests {
 
     #[test]
     fn relative_paths_are_made_absolute_once() {
-        let text = resolve_path(Path::new("take.mkv"), "file path").unwrap();
+        let text = path_string(Path::new("take.mkv")).unwrap();
         let absolute = Path::new(text.as_str());
         assert!(absolute.is_absolute());
         assert_eq!(RecordingTarget::new("take.mkv").unwrap().path(), absolute);
@@ -2108,12 +2167,43 @@ mod tests {
     #[test]
     fn windows_drive_relative_paths_are_made_absolute() {
         for path in [r"C:take.mkv", r"C:folder\take.mkv", r"\take.mkv"] {
-            let text = resolve_path(Path::new(path), "file path").unwrap();
+            let text = path_string(Path::new(path)).unwrap();
             let absolute = Path::new(text.as_str());
             assert!(absolute.is_absolute(), "{absolute:?}");
             assert!(absolute.ends_with("take.mkv"));
             assert_eq!(path_string(Path::new(path)).unwrap(), text);
             assert_eq!(RecordingTarget::new(path).unwrap().path(), absolute);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_recording_prefixes_preserve_the_suffix_after_the_drive_or_root() {
+        let drive = std::path::absolute("C:.").unwrap();
+        let root = std::path::absolute(r"\").unwrap();
+        let exact = NamePattern::new(Some(EXACT_PATTERN)).unwrap();
+        let hidden = NamePattern::new(Some("{prefix}hidden.mkv")).unwrap();
+        for (input, anchor, suffix) in [
+            (r"C:folder\.", &drive, r"folder\."),
+            (r"\folder\.", &root, r"folder\."),
+            ("C:", &drive, ""),
+            (r"\", &root, ""),
+        ] {
+            let target = RecordingTarget::new(input).unwrap();
+            let anchor = anchor
+                .to_str()
+                .unwrap()
+                .trim_end_matches(std::path::is_separator);
+            let absolute = format!("{anchor}\\{suffix}");
+            assert_eq!(target.path().to_str().unwrap(), absolute);
+            assert_eq!(
+                invalid_cause(exact.check(&target)),
+                crate::InputDefect::RecordingPathMissingFilename
+            );
+            assert_eq!(
+                hidden.first_file(&target).unwrap().to_str().unwrap(),
+                format!("{absolute}hidden.mkv")
+            );
         }
     }
 
@@ -2164,6 +2254,7 @@ mod tests {
     #[test]
     fn source_selection_is_explicit_and_rejects_nul() {
         assert!(SourceSpec::new("").is_err());
+        assert!(SourceSpec::from_url("").is_err());
         assert!(SourceSpec::from_url("url\0tail").is_err());
         let source = SourceSpec::from_url("ndi://camera").unwrap();
         assert_eq!(source.name(), None);
@@ -2181,22 +2272,31 @@ mod tests {
         let (source, allocations) =
             crate::test_alloc::allocation_count(|| SourceSpec::new("Caméra").unwrap());
         assert_eq!(allocations, 1);
+        let (address, allocations) =
+            crate::test_alloc::allocation_count(|| SourceSpec::from_url("Caméra").unwrap());
+        assert_eq!(allocations, 1);
         let (_, allocations) = crate::test_alloc::allocation_count(|| {
             for _ in 0..100 {
                 assert_eq!(source.name(), Some("Caméra"));
                 assert_eq!(source.url(), None);
+                assert_eq!(address.name(), None);
+                assert_eq!(address.url(), Some("Caméra"));
             }
         });
         assert_eq!(allocations, 0);
         let same = SourceSpec::new("Caméra").unwrap();
         assert_eq!(source, same);
         assert_eq!(hash(&source), hash(&same));
-        assert_ne!(source, SourceSpec::from_url("Caméra").unwrap());
+        let same = SourceSpec::from_url("Caméra").unwrap();
+        assert_eq!(address, same);
+        assert_eq!(hash(&address), hash(&same));
+        assert_ne!(source, address);
         assert_ne!(source, SourceSpec::new("Other camera").unwrap());
-        let text = source.name.as_ref().unwrap();
+        let raw = source.raw_source();
+        assert!(!raw.p_ndi_name.is_null());
         // SAFETY: FileText owns its only trailing NUL and the bytes stay live.
         assert_eq!(
-            unsafe { std::ffi::CStr::from_ptr(text.as_ptr()) }.to_bytes(),
+            unsafe { std::ffi::CStr::from_ptr(raw.p_ndi_name) }.to_bytes(),
             "Caméra".as_bytes()
         );
 
@@ -2656,6 +2756,80 @@ mod tests {
             (EXACT_PATTERN, r"trailing\"),
         ] {
             check(pattern, prefix).unwrap();
+        }
+    }
+
+    #[test]
+    fn relative_recording_prefixes_keep_their_spelling_after_the_directory_changes() {
+        use crate::file::{mock, FileRecorder, RecorderState};
+
+        const CHANGED_DIRECTORY: &str = "GRAFTON_NDI_TEST_RECORDING_PREFIX_CHANGED_DIRECTORY";
+        let Some(changed) = std::env::var_os(CHANGED_DIRECTORY) else {
+            let scratch = crate::test_support::FixtureDir::create("relative-recording-prefixes");
+            let original = scratch.join("original");
+            let changed = scratch.join("changed");
+            std::fs::create_dir_all(original.join("folder")).unwrap();
+            std::fs::create_dir(&changed).unwrap();
+            let output = crate::test_support::TestChild::new(
+                "file::types::tests::relative_recording_prefixes_keep_their_spelling_after_the_directory_changes",
+            )
+            .current_dir(original)
+            .env(CHANGED_DIRECTORY, changed)
+            .run();
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        };
+        let original = std::env::current_dir().unwrap();
+        let targets = |prefix| {
+            let relative = RecordingTarget::new(prefix).unwrap();
+            let absolute = RecordingTarget::new(original.join(prefix)).unwrap();
+            assert_eq!(relative.path().as_os_str(), absolute.path().as_os_str());
+            [relative, absolute]
+        };
+        let directory_only = [".", "..", "missing/", "missing/.", "missing/.."].map(targets);
+        let files = [
+            (EXACT_PATTERN, ".hidden.mkv", ".hidden.mkv"),
+            ("{prefix}hidden.mkv", "folder/.", "folder/.hidden.mkv"),
+            ("{prefix}hidden.mkv", "folder/..", "folder/..hidden.mkv"),
+            ("{prefix}take.mkv", "folder/", "folder/take.mkv"),
+            ("{prefix}{index:03}.mkv", "folder/.", "folder/.001.mkv"),
+            ("{prefix}{index:03}.mkv", "folder/", "folder/001.mkv"),
+        ]
+        .map(|(pattern, prefix, expected)| (pattern, targets(prefix), original.join(expected)));
+        std::env::set_current_dir(changed).unwrap();
+
+        let device = mock::Recorder::new(mock::Closing::AtStop);
+        device.install();
+        let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
+            .naming(FileNaming::Exact);
+        let mut recorder = FileRecorder::new(&mock::recorder_api(), &options).unwrap();
+        for target in directory_only.iter().flatten() {
+            assert_eq!(
+                invalid_cause(recorder.start(target, RecordingTimecode::Preserve)),
+                crate::InputDefect::RecordingPathMissingFilename,
+                "{target:?}"
+            );
+        }
+        assert_eq!(recorder.state(), RecorderState::Idle);
+        let valid = RecordingTarget::new(original.join("valid.mkv")).unwrap();
+        recorder.start(&valid, RecordingTimecode::Preserve).unwrap();
+        for target in directory_only.iter().flatten() {
+            assert_eq!(
+                invalid_cause(recorder.rollover(target)),
+                crate::InputDefect::RecordingPathMissingFilename,
+                "{target:?}"
+            );
+        }
+        assert_eq!(recorder.state(), RecorderState::Recording);
+        for (pattern, targets, expected) in files {
+            let pattern = NamePattern::new(Some(pattern)).unwrap();
+            for target in targets {
+                assert_eq!(
+                    pattern.first_file(&target).unwrap().as_os_str(),
+                    expected.as_os_str()
+                );
+                pattern.check(&target).unwrap();
+            }
         }
     }
 

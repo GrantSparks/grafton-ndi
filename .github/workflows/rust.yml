@@ -261,11 +261,13 @@ jobs:
   hx-pictures:
     name: NDI HX test pictures
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Generate test pictures
         run: |
+          # The runner's mirror list prefers a regional archive that can stall FFmpeg downloads.
+          sudo sed -Ei '/^URIs:/s#(mirror\+file:/etc/apt/apt-mirrors\.txt|https?://[[:alnum:]-]+\.ec2\.archive\.ubuntu\.com/ubuntu/?)([[:space:]]|$)#https://archive.ubuntu.com/ubuntu/\2#' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends ffmpeg
           python3 tests/support/generate_hx.py --output-dir "$RUNNER_TEMP/ndi-hx-pictures"
@@ -502,7 +504,13 @@ jobs:
           components: clippy, rustfmt
       - name: Linux prerequisites
         if: runner.os == 'Linux'
+        env:
+          SDK_MATRIX_NAME: ${{ matrix.name }}
         run: |
+          if [ "$SDK_MATRIX_NAME" = 'linux-x64 standard-6.3.2' ]; then
+            # Use the primary archive for the Valgrind install in the timed Memcheck step.
+            sudo sed -Ei '/^URIs:/s#(mirror\+file:/etc/apt/apt-mirrors\.txt|https?://[[:alnum:]-]+\.ec2\.archive\.ubuntu\.com/ubuntu/?)([[:space:]]|$)#https://archive.ubuntu.com/ubuntu/\2#' /etc/apt/sources.list.d/ubuntu.sources
+          fi
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends bubblewrap libavahi-client3
           # Ubuntu 24.04 denies the unprivileged user namespace that bwrap needs.
