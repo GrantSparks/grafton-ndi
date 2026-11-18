@@ -86,7 +86,7 @@ impl AudioShape {
     /// within the shared payload limit, and exactly `channels * samples`
     /// samples. Nothing is checked again.
     fn from_planar(frame: &(impl AudioSource + ?Sized)) -> Self {
-        Self(frame.layout().packed())
+        Self(*frame.layout().packed().as_layout())
     }
 
     fn check_output(self, length: usize) -> Result<()> {

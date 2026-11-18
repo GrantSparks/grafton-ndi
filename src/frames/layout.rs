@@ -79,6 +79,20 @@ pub(crate) enum RgbOrder {
     Bgr,
 }
 
+/// A video layout with contiguous active pixels and no row or plane padding.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PackedVideoLayout(ValidatedVideoLayout);
+
+impl PackedVideoLayout {
+    pub(crate) fn new(format: PixelFormat, width: u32, height: u32) -> Result<Self> {
+        ValidatedVideoLayout::new_uncompressed(format, width, height, None).map(Self)
+    }
+
+    pub(crate) const fn as_layout(&self) -> &ValidatedVideoLayout {
+        &self.0
+    }
+}
+
 impl ValidatedVideoLayout {
     /// Initialized active payload, excluding padding.
     pub(crate) const fn payload_len_bytes(&self) -> usize {
@@ -222,7 +236,7 @@ impl ValidatedVideoLayout {
     /// [`MAX_VIDEO_BYTES`]. It is the layout [`video_plane_layouts`] gives
     /// the packed stride, `width` times the bytes per pixel, which a test
     /// checks for every format.
-    pub(crate) fn packed(&self) -> Self {
+    pub(crate) fn packed(&self) -> PackedVideoLayout {
         let mut plane_layouts = self.plane_layouts;
         let mut offset = 0;
         for plane in &mut plane_layouts[..self.plane_count()] {
@@ -230,10 +244,10 @@ impl ValidatedVideoLayout {
             plane.row_stride = plane.active_row_bytes;
             offset += plane.active_row_bytes * plane.row_count;
         }
-        Self {
+        PackedVideoLayout(Self {
             plane_layouts,
             ..*self
-        }
+        })
     }
 
     /// The SDK's `xres`.
@@ -843,12 +857,12 @@ impl ValidatedAudioLayout {
     }
 
     /// The same frame with channels stored back to back, without padding.
-    pub(crate) fn packed(self) -> Self {
-        Self {
+    pub(crate) fn packed(self) -> PackedAudioLayout {
+        PackedAudioLayout(Self {
             padded_stride: None,
             sample_count: self.no_channels() * self.no_samples(),
             ..self
-        }
+        })
     }
 
     pub(crate) fn num_channels(self) -> u32 {
@@ -958,8 +972,19 @@ pub(super) fn validate_outbound_audio_layout(
     no_channels: u32,
     no_samples: u32,
     format: AudioFormat,
-) -> Result<ValidatedAudioLayout> {
+) -> Result<PackedAudioLayout> {
     ValidatedAudioLayout::new_uncompressed(format, sample_rate, no_channels, no_samples, None)
+        .map(PackedAudioLayout)
+}
+
+/// An audio layout whose planar channels are stored back to back.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PackedAudioLayout(ValidatedAudioLayout);
+
+impl PackedAudioLayout {
+    pub(crate) const fn as_layout(&self) -> &ValidatedAudioLayout {
+        &self.0
+    }
 }
 
 /// The one sample-rate check for every audio path, for values from the API

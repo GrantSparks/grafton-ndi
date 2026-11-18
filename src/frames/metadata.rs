@@ -338,14 +338,14 @@ pub(crate) struct TerminatedText {
 
 impl TerminatedText {
     pub(crate) fn new<S: Into<String>>(metadata: S) -> std::result::Result<Self, Rejected<String>> {
-        let mut text = metadata.into();
-        if let Err(error) = Self::validate_and_terminate(&mut text) {
+        let text = metadata.into();
+        if let Err(error) = Self::validate(&text) {
             return Err(Rejected::new(error, text));
         }
-        Ok(Self { inner: text })
+        Ok(Self::terminate(text))
     }
 
-    fn validate_and_terminate(text: &mut String) -> Result<()> {
+    fn validate(text: &str) -> Result<()> {
         // A String's length is at most isize::MAX, so adding its terminator
         // cannot overflow usize on any supported target.
         let len_with_nul = text.len() + 1;
@@ -360,18 +360,15 @@ impl TerminatedText {
                     .expect_err("the prefix includes its first NUL"),
             ));
         }
-        text.reserve_exact(1);
-        text.push('\0');
         Ok(())
     }
 
-    /// Failure leaves the builder's text and capacity unchanged.
-    pub(super) fn take_from(metadata: &mut Option<String>) -> Result<Option<Self>> {
-        let Some(text) = metadata.as_mut() else {
-            return Ok(None);
-        };
-        Self::validate_and_terminate(text)?;
-        Ok(metadata.take().map(|inner| Self { inner }))
+    // Only called with validated text owned by this module. Reserving exactly
+    // one byte preserves the builder's allocation when it already has space.
+    fn terminate(mut text: String) -> Self {
+        text.reserve_exact(1);
+        text.push('\0');
+        Self { inner: text }
     }
 
     pub(crate) fn text(&self) -> MetadataText<'_> {
@@ -454,20 +451,28 @@ impl Default for OwnedFrameMetadata {
     }
 }
 
-impl OwnedFrameMetadata {
-    pub(super) fn into_supplied_text(self) -> Option<String> {
-        match self {
-            Self::Text(text) => Some(text.into_string()),
-            Self::Absent(_) | Self::Withheld { .. } => None,
+/// The builder's untouched text after the bounded UTF-8 C string check.
+pub(super) struct CheckedMetadata(Option<String>);
+
+impl CheckedMetadata {
+    /// On refusal, the caller still owns the original text and allocation.
+    pub(super) fn take_from(metadata: &mut Option<String>) -> Result<Self> {
+        if let Some(text) = metadata.as_deref() {
+            TerminatedText::validate(text)?;
         }
+        Ok(Self(metadata.take()))
     }
 
+    pub(super) fn into_owned(self) -> OwnedFrameMetadata {
+        self.0
+            .map(TerminatedText::terminate)
+            .map_or_else(OwnedFrameMetadata::default, OwnedFrameMetadata::Text)
+    }
+}
+
+impl OwnedFrameMetadata {
     pub(crate) fn new(metadata: impl Into<String>) -> std::result::Result<Self, Rejected<String>> {
         Ok(Self::Text(TerminatedText::new(metadata)?))
-    }
-
-    pub(super) fn take_from(metadata: &mut Option<String>) -> Result<Self> {
-        Ok(TerminatedText::take_from(metadata)?.map_or_else(Self::default, Self::Text))
     }
 
     pub(crate) fn view(&self) -> FrameMetadataRef<'_> {

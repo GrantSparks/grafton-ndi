@@ -5,7 +5,7 @@ use std::ffi::CStr;
 
 #[cfg(test)]
 use crate::{
-    frames::{BorrowedVideoFrame, PixelFormat, ScanType},
+    frames::{BorrowedVideoFrame, PixelFormat, ScanType, ValidatedVideoLayout},
     pixels::send_room,
     FrameRate, PictureAspectRatio, Timecode,
 };
@@ -27,11 +27,11 @@ use crate::{
     finder::Source,
     frames::{AudioPartsExt, MetadataPartsExt},
     frames::{
-        AudioSource, MetadataFrame, MetadataFrameRef, MetadataSource, Sendable,
-        ValidatedVideoLayout, VideoFrame, VideoParts, VideoPartsExt, VideoSource,
+        AudioSource, MetadataFrame, MetadataFrameRef, MetadataSource, Sendable, VideoFrame,
+        VideoParts, VideoPartsExt, VideoSource,
     },
     marker::NotSync,
-    pixels::PackedStorage,
+    pixels::VideoStorage,
     receiver::Tally,
     source_retention::RetainedSources,
     sys::{self, bindings::*},
@@ -469,7 +469,7 @@ pub struct Sender<M: SenderMode = RawSend> {
 // reserved tail remains inaccessible until the owning stream releases it.
 unsafe impl in_flight::Lend for Sendable<VideoFrame> {
     fn lend(&mut self) -> in_flight::Lent {
-        in_flight::Lent::Frame(self.owned_video_descriptor())
+        in_flight::Lent::Frame(self.video_descriptor())
     }
 }
 
@@ -1426,27 +1426,26 @@ trait StagingTestAccess {
 #[cfg(test)]
 impl StagingTestAccess for VideoStaging {
     fn as_ptr(&self) -> *const u8 {
-        self.as_ref()
-            .map_or(std::ptr::null(), PackedStorage::as_ptr)
+        self.as_ref().map_or(std::ptr::null(), VideoStorage::as_ptr)
     }
     fn bytes(&self) -> &[u8] {
-        self.as_ref().map_or(&[], PackedStorage::as_slice)
+        self.as_ref().map_or(&[], VideoStorage::as_slice)
     }
     fn len(&self) -> usize {
         self.bytes().len()
     }
     fn room(&self) -> usize {
-        self.as_ref().map_or(0, PackedStorage::room)
+        self.as_ref().map_or(0, VideoStorage::room)
     }
     fn capacity(&self) -> usize {
-        self.as_ref().map_or(0, PackedStorage::capacity)
+        self.as_ref().map_or(0, VideoStorage::capacity)
     }
     fn room_bytes(&self) -> &[u8] {
-        self.as_ref().map_or(&[], PackedStorage::room_bytes)
+        self.as_ref().map_or(&[], VideoStorage::room_bytes)
     }
 }
 
-type VideoStaging = Option<PackedStorage<ValidatedVideoLayout>>;
+type VideoStaging = Option<VideoStorage>;
 
 /// A descriptor borrowing either a proven direct input or initialized packed
 /// staging. Its lifetime keeps both input metadata and staging alive until the
@@ -2557,37 +2556,30 @@ mod tests {
     }
 
     #[test]
-    fn a_short_owned_extent_stages_synchronous_sends_and_is_repaired_before_lending() {
+    fn owned_send_keeps_allocation_and_capacity_when_lending() {
         use crate::frames::descriptor_tests::assert_extent;
-        if PixelFormat::Uyvy.send_tail_room() == 0 {
-            return;
-        }
+        let mut pixels = Vec::with_capacity(18 * 6 * 2 + 1024);
+        pixels.resize(18 * 6 * 2, 128);
+        let capacity = pixels.capacity();
         let frame = VideoFrame::builder()
             .resolution(18, 6)
             .pixel_format(PixelFormat::Uyvy)
             .scan_type(ScanType::Interlaced)
-            .data(vec![128; 18 * 6 * 2])
+            .data(pixels)
             .build()
-            .unwrap()
-            .without_send_room_for_test();
-        assert_eq!(frame.tail_room(), 0);
-        assert!(!frame.sends_in_place());
+            .unwrap();
+        let extent = frame.data().len() + frame.tail_room();
+        let pointer = frame.data().as_ptr();
         let mut staging = VideoStaging::default();
         let raw = PreparedVideo::new(&frame, &mut staging).raw;
-        assert_ne!(raw.p_data.cast_const(), frame.data().as_ptr());
-        assert_extent(&raw, staging.as_ptr(), staging.len() + staging.room());
+        assert_extent(&raw, pointer, extent);
+        assert!(staging.is_none());
         let mut owned = Sendable::for_test(frame);
-        let lent = in_flight::Lend::lend(&mut owned);
-        assert!(owned.frame().can_send_direct());
-        assert_eq!(
-            owned.tail_room(),
-            send_room(owned.layout(), owned.header().scan_type())
-        );
-        assert_extent(
-            lent.descriptor(),
-            owned.data().as_ptr(),
-            owned.data().len() + owned.tail_room(),
-        );
+        let (lent, allocations) =
+            crate::test_alloc::allocation_count(|| in_flight::Lend::lend(&mut owned));
+        assert_eq!(allocations, 0);
+        assert_extent(lent.descriptor(), pointer, extent);
+        assert_eq!(owned.into_frame().into_data().capacity(), capacity);
     }
 
     #[test]
@@ -2630,7 +2622,10 @@ mod tests {
                 assert!(staging.room_bytes().iter().all(|&byte| byte == 0));
                 assert_eq!(
                     staging.room(),
-                    send_room(&source.layout().packed(), source.header().scan_type())
+                    send_room(
+                        source.layout().packed().as_layout(),
+                        source.header().scan_type()
+                    )
                 );
             }
             let pointer = raw.p_data;
@@ -3137,7 +3132,10 @@ mod tests {
                                 } else {
                                     expected = Some(staging.bytes().to_vec());
                                 }
-                                assert_eq!(staging.room(), send_room(&layout.packed(), scan));
+                                assert_eq!(
+                                    staging.room(),
+                                    send_room(layout.packed().as_layout(), scan)
+                                );
                                 assert!(staging.room_bytes().iter().all(|&byte| byte == 0));
                                 let address = staging.as_ptr();
                                 let ((), allocations) = crate::test_alloc::allocation_count(|| {

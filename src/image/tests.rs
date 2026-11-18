@@ -695,6 +695,40 @@ fn any_frame_bytes(format: PixelFormat, width: usize, height: usize, seed: u64) 
     }
 }
 
+struct ImagePixels {
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    stride: usize,
+    bytes: Vec<u8>,
+}
+
+impl ImagePixels {
+    fn builder(&self) -> crate::BorrowedVideoFrameBuilder<'_> {
+        BorrowedVideoFrame::builder(&self.bytes, self.width, self.height, self.format)
+            .line_stride_bytes(self.stride)
+    }
+
+    fn frame(&self) -> BorrowedVideoFrame<'_> {
+        self.builder().build().unwrap()
+    }
+}
+
+// SAFETY: the synthetic guard points into the borrowed frame and releases
+// nothing when dropped. The borrow keeps the descriptor's pixels and metadata alive.
+fn as_test_capture(frame: &impl crate::frames::VideoParts) -> crate::FrameSyncVideoRef<'_> {
+    use crate::capture::{FrameSyncVideoFree, Guard};
+    use crate::frames::VideoPartsExt;
+    unsafe {
+        crate::FrameSyncVideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+            std::ptr::null_mut(),
+            frame.video_descriptor(),
+            |_, _| {},
+        ))
+    }
+    .unwrap()
+}
+
 /// `packed` laid out with `padding` bytes after each row of the first
 /// plane, and the matching padding in the others, as the SDK pads. The
 /// padding bytes are 0xEE.
@@ -704,7 +738,7 @@ fn padded(
     height: u32,
     packed: &[u8],
     padding: usize,
-) -> VideoFrame {
+) -> ImagePixels {
     let packed = VideoFrame::builder()
         .resolution(width, height)
         .pixel_format(format)
@@ -713,10 +747,16 @@ fn padded(
         .unwrap();
     let stride = packed.line_stride_bytes() + padding;
     let len = format.buffer_len(width, height, Some(stride)).unwrap();
-    let mut frame =
-        VideoFrame::with_line_stride(format, width, height, stride, vec![0xEE; len], None);
-    let base = frame.data().as_ptr() as usize;
+    let mut frame = ImagePixels {
+        format,
+        width,
+        height,
+        stride,
+        bytes: vec![0xEE; len],
+    };
+    let base = frame.bytes.as_ptr() as usize;
     let starts: Vec<usize> = frame
+        .frame()
         .planes()
         .flat_map(|plane| plane.rows())
         .map(|row| row.as_ptr() as usize - base)
@@ -725,7 +765,7 @@ fn padded(
         .into_iter()
         .zip(packed.planes().flat_map(|plane| plane.rows()))
     {
-        frame.data_mut()[start..start + row.len()].copy_from_slice(row);
+        frame.bytes[start..start + row.len()].copy_from_slice(row);
     }
     frame
 }
@@ -751,7 +791,8 @@ fn padded_rows_odd_heights_and_the_smallest_frames_encode_like_packed_ones() {
                 .build()
                 .unwrap();
             for padding in [4, 64] {
-                let padded = padded(format, width, height, &packed, padding);
+                let pixels = padded(format, width, height, &packed, padding);
+                let padded = pixels.frame();
                 assert!(padded.line_stride_bytes() > frame.line_stride_bytes());
                 for options in every_output() {
                     assert_eq!(
@@ -778,7 +819,7 @@ fn every_frame_type_encodes_the_same_bytes() {
             .build()
             .unwrap();
         let padded = padded(format, width, height, &packed, 8);
-        let captured = owned.as_test_capture();
+        let captured = as_test_capture(&owned);
         let borrowed = BorrowedVideoFrame::builder(&packed, width, height, format)
             .metadata(c"<ndi_color_info matrix=\"bt_601\"/>")
             .build()
@@ -803,7 +844,9 @@ fn every_frame_type_encodes_the_same_bytes() {
             // the matrix does not touch, agree with it.
             if RGB_FORMATS.contains(&format) {
                 assert_eq!(
-                    padded.as_test_capture().encode_image(&options).unwrap(),
+                    as_test_capture(&padded.frame())
+                        .encode_image(&options)
+                        .unwrap(),
                     expected
                 );
             }
@@ -963,7 +1006,7 @@ const IDENTITY_HASHES: [(PixelFormat, Option<u8>, &str); 28] = [
 ];
 
 /// The inputs the hashes were recorded from, in recording order.
-fn identity_frames(format: PixelFormat) -> Vec<VideoFrame> {
+fn identity_frames(format: PixelFormat) -> Vec<ImagePixels> {
     let mut frames = Vec::new();
     for (width, height) in [(2u32, 1u32), (2, 2), (18, 19), (64, 33), (130, 67)] {
         for padding in [0usize, 12] {
@@ -992,9 +1035,13 @@ fn identity_frames(format: PixelFormat) -> Vec<VideoFrame> {
                         }
                     }
                 }
-                frames.push(VideoFrame::with_line_stride(
-                    format, width, height, stride, data, None,
-                ));
+                frames.push(ImagePixels {
+                    format,
+                    width,
+                    height,
+                    stride,
+                    bytes: data,
+                });
             }
         }
     }
@@ -1026,7 +1073,7 @@ fn png_and_scalar_jpeg_pin_encoded_bytes() {
         .filter(|(_, quality, _)| quality.is_none() || !accelerated)
     {
         let frames = identity_frames(format);
-        let shortcut = identity_hash(frames.iter().map(|frame| {
+        let shortcut = identity_hash(frames.iter().map(ImagePixels::frame).map(|frame| {
             match quality {
                 None => frame
                     .encode_image(&crate::image_encoding::ImageOptions::new(
@@ -1045,8 +1092,7 @@ fn png_and_scalar_jpeg_pin_encoded_bytes() {
         let mut buffer = Vec::new();
         let streamed = identity_hash(frames.iter().map(|frame| {
             buffer.clear();
-            frame
-                .as_test_capture()
+            as_test_capture(&frame.frame())
                 .encode_image_to(&options, &mut buffer)
                 .unwrap();
             buffer.clone()
@@ -1057,16 +1103,13 @@ fn png_and_scalar_jpeg_pin_encoded_bytes() {
         );
         // An SDR tag changes nothing.
         let tagged = identity_hash(frames.iter().map(|frame| {
-            let tagged = VideoFrame::with_line_stride(
-                format,
-                frame.width(),
-                frame.height(),
-                frame.line_stride_bytes(),
-                frame.data().to_vec(),
-                Some(
-                    "<ndi_color_info transfer=\"bt_709\" matrix=\"bt_709\" primaries=\"bt_709\"/>",
-                ),
-            );
+            let tagged = frame
+                .builder()
+                .metadata(
+                    c"<ndi_color_info transfer=\"bt_709\" matrix=\"bt_709\" primaries=\"bt_709\"/>",
+                )
+                .build()
+                .unwrap();
             tagged.encode_image(&options).unwrap()
         }));
         assert_eq!(tagged, expected, "{format:?} {quality:?} SDR-tagged");
@@ -1164,15 +1207,11 @@ fn every_png_level_and_lossless_webp_decode_to_the_converted_pixels() {
     for format in PixelFormat::ALL {
         let (width, height) = (34u32, 10u32);
         let packed = any_frame_bytes(format, width as usize, height as usize, 21);
-        for frame in [
-            VideoFrame::builder()
-                .resolution(width, height)
-                .pixel_format(format)
-                .data(packed.clone())
-                .build()
-                .unwrap(),
-            padded(format, width, height, &packed, 8),
-        ] {
+        let padded = padded(format, width, height, &packed, 8);
+        let packed = BorrowedVideoFrame::builder(&packed, width, height, format)
+            .build()
+            .unwrap();
+        for frame in [packed, padded.frame()] {
             for alpha in [AlphaMode::Keep, AlphaMode::Discard] {
                 let reference = decode_png(
                     &frame
@@ -2434,7 +2473,8 @@ fn workspace_reuses_conversion_capacity_across_formats_sizes_and_failures() {
     for (width, height, seed) in [(34, 18, 7), (18, 6, 89), (2, 2, 42)] {
         for format in PixelFormat::ALL {
             let bytes = any_frame_bytes(format, width, height, seed);
-            let frame = padded(format, width as u32, height as u32, &bytes, 16);
+            let input = padded(format, width as u32, height as u32, &bytes, 16);
+            let frame = input.frame();
             for options in every_output() {
                 let expected = frame.encode_image(&options).unwrap();
                 assert_eq!(workspace.encode(&frame, &options).unwrap(), expected);
@@ -2488,7 +2528,8 @@ fn warm_workspace_conversion_does_not_allocate() {
     for format in PixelFormat::ALL {
         for (width, height) in [(34, 18), (18, 6), (2, 2)] {
             let bytes = any_frame_bytes(format, width, height, 23);
-            let frame = padded(format, width as u32, height as u32, &bytes, 16);
+            let input = padded(format, width as u32, height as u32, &bytes, 16);
+            let frame = input.frame();
             let source = Source::new(&frame);
             for reduction in [
                 Downscale::Off,
@@ -2754,7 +2795,8 @@ fn workspace_resources() {
     };
     for (width, height) in [(1920, 1080), (3840, 2160)] {
         let rgba = content_rgba("photographic", width, height, None);
-        let frame = padded(PixelFormat::Bgra, width as u32, height as u32, &rgba, 16);
+        let input = padded(PixelFormat::Bgra, width as u32, height as u32, &rgba, 16);
+        let frame = input.frame();
         for (name, options) in [
             (
                 "png",
@@ -2786,7 +2828,7 @@ fn workspace_resources() {
                         allocation_count(|| workspace.encode(&frame, &options).unwrap())
                     });
                     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("workspace,{width},{height},{name},{warm},{sample},{elapsed:.6},{allocations},{peak},{retained_before},{},{},{},{rss_before},{}", workspace.retained_bytes(), frame.data().len(), image.len(), rss());
+                    eprintln!("workspace,{width},{height},{name},{warm},{sample},{elapsed:.6},{allocations},{peak},{retained_before},{},{},{},{rss_before},{}", workspace.retained_bytes(), input.bytes.len(), image.len(), rss());
                     black_box(image);
                 }
             }
@@ -2819,7 +2861,8 @@ fn workspace_output_growth_resources() {
     }
     for (width, height) in [(1920, 1080), (3840, 2160)] {
         let rgba = content_rgba("photographic", width, height, None);
-        let frame = padded(PixelFormat::Bgra, width as u32, height as u32, &rgba, 16);
+        let input = padded(PixelFormat::Bgra, width as u32, height as u32, &rgba, 16);
+        let frame = input.frame();
         for format in [
             ImageFormat::Png,
             ImageFormat::Jpeg(85),

@@ -223,8 +223,8 @@ unsafe impl VideoParts for P216Output<'_> {
     fn layout(&self) -> &ValidatedVideoLayout {
         &self.layout
     }
-    fn header(&self) -> &VideoHeader {
-        &self.header
+    fn header(&self) -> VideoHeader {
+        self.header
     }
     fn pixels(&self) -> *const u8 {
         self.pointer.cast_const()

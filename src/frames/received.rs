@@ -603,8 +603,8 @@ unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_video_frame_v2_t>> VideoParts
         &self.validated.0
     }
     #[inline]
-    fn header(&self) -> &VideoHeader {
-        &self.validated.1
+    fn header(&self) -> VideoHeader {
+        self.validated.1
     }
     #[inline]
     fn pixels(&self) -> *const u8 {

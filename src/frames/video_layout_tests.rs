@@ -105,7 +105,7 @@ fn video_layout_quantities_match_sdk_geometry_for_every_format() {
                         "{format:?}, {width}x{height}, padding={padding}"
                     );
                     assert_eq!(
-                        quantities(layout.packed()),
+                        quantities(*layout.packed().as_layout()),
                         (active as i32, payload, payload, geometries.len(), 0),
                         "packed {format:?}, {width}x{height}, padding={padding}"
                     );

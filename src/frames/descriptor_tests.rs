@@ -280,8 +280,8 @@ fn a_growing_video_layout_is_read_once_and_keeps_the_destination_paired() {
                 self.frame.layout()
             }
         }
-        fn header(&self) -> &VideoHeader {
-            &self.frame.header
+        fn header(&self) -> VideoHeader {
+            self.frame.header()
         }
         fn pixels(&self) -> *const u8 {
             self.frame.data.as_ptr()
@@ -394,8 +394,8 @@ fn a_video_accessor_panic_leaves_the_reused_destination_whole() {
         fn layout(&self) -> &ValidatedVideoLayout {
             self.frame.layout()
         }
-        fn header(&self) -> &VideoHeader {
-            &self.frame.header
+        fn header(&self) -> VideoHeader {
+            self.frame.header()
         }
         fn pixels(&self) -> *const u8 {
             self.frame.data.as_ptr()
