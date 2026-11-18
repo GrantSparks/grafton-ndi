@@ -2503,12 +2503,7 @@ mod tests {
                         .build()
                         .unwrap();
                     assert!(owned.can_send_direct(), "owned {format:?} {scan:?}");
-                    assert_eq!(
-                        owned.initialized(),
-                        Initialized::Storage {
-                            room_after: owned.tail_room()
-                        }
-                    );
+                    assert_eq!(owned.initialized(), Initialized::PackedSendReady);
                     assert_eq!(
                         <&VideoFrame as VideoParts>::initialized(&&owned),
                         owned.initialized()

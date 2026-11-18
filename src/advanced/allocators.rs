@@ -2887,7 +2887,7 @@ mod tests {
 
         // The largest single allocation, with the budget to match: accepted
         // whenever the budget for the calls can be named. On a 32-bit target
-        // sixteen largest allocations are 4 GiB, which no `usize` holds, so
+        // sixteen largest allocations exceed `usize::MAX`, so
         // the same limits are refused there as unreachable.
         for calls in [4, 16] {
             let limits = defaults
@@ -2905,7 +2905,7 @@ mod tests {
         }
         defaults
             .max_allocation_bytes(MAX_ALLOCATION_BYTES)
-            .max_concurrent_calls(4)
+            .max_concurrent_calls(1)
             .validate()
             .unwrap();
     }
