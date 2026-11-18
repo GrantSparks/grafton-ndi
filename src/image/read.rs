@@ -10,12 +10,12 @@
 
 use super::{
     color::{Codes, Kernel, Sample},
-    options::YuvRange,
+    options::{Downscale, YuvRange},
     Source,
 };
 use crate::{
-    frames::{PlaneRoles, VideoPlane},
-    PixelFormat, YuvMatrix,
+    frames::{PlaneRoles, RgbOrder, VideoPlane},
+    YuvMatrix,
 };
 
 #[cfg(test)]
@@ -35,7 +35,13 @@ pub(super) fn count_rows<T>(read: impl FnOnce() -> T) -> (T, usize) {
 /// The most pixels a [`Sink`] receives at once. Converting a batch of
 /// fixed size in small arrays keeps the conversion free of allocation and
 /// lets the compiler vectorize it.
-pub(super) const BATCH: usize = 16;
+pub(super) const BATCH: usize = const_assert!(@value {
+    let pixels: usize = 16;
+    // Even batches also keep the start of every chroma span aligned to a pair.
+    assert!(pixels.is_multiple_of(2));
+    assert!(pixels.is_multiple_of(1 << Downscale::MAX_SHIFT));
+    pixels
+});
 
 /// Where converted pixels go, a batch at a time, left to right along a row.
 pub(super) trait Sink<P> {
@@ -108,13 +114,6 @@ enum Chroma420<'a> {
     },
 }
 
-/// RGB byte order is specific to the image conversion.
-#[derive(Clone, Copy)]
-enum RgbOrder {
-    Rgb,
-    Bgr,
-}
-
 /// Where a YUV row's alpha comes from.
 #[derive(Clone, Copy)]
 enum AlphaRow<'r> {
@@ -138,41 +137,23 @@ impl<'a, P: Sample> Reader<'a, P> {
     ) -> Self {
         let info = source.format.info();
         let kernel = || Kernel::new(matrix, range, info.sample_width().bits());
-        // A newly added format must choose its image-local RGB byte order.
-        let rgb_order = match source.format {
-            PixelFormat::Rgba | PixelFormat::Rgbx => Some(RgbOrder::Rgb),
-            PixelFormat::Bgra | PixelFormat::Bgrx => Some(RgbOrder::Bgr),
-            PixelFormat::Uyvy
-            | PixelFormat::Uyva
-            | PixelFormat::P216
-            | PixelFormat::Pa16
-            | PixelFormat::Nv12
-            | PixelFormat::I420
-            | PixelFormat::Yv12
-            | PixelFormat::Na48
-            | PixelFormat::Nb48
-            | PixelFormat::Na4g
-            | PixelFormat::Nb4g => None,
-        };
         let layout = match source.planes {
-            PlaneRoles::Packed { pixels } => match rgb_order {
-                Some(order) => {
-                    let (red, blue) = match order {
-                        RgbOrder::Rgb => (0, 2),
-                        RgbOrder::Bgr => (2, 0),
-                    };
-                    Layout::Rgb {
-                        plane: pixels,
-                        red,
-                        blue,
-                        alpha: alpha && info.has_alpha(),
-                    }
-                }
-                None => Layout::Packed422 {
+            PlaneRoles::PackedRgb { pixels, order } => {
+                let (red, blue) = match order {
+                    RgbOrder::Rgb => (0, 2),
+                    RgbOrder::Bgr => (2, 0),
+                };
+                Layout::Rgb {
                     plane: pixels,
-                    alpha: None,
-                    kernel: kernel(),
-                },
+                    red,
+                    blue,
+                    alpha: alpha && info.has_alpha(),
+                }
+            }
+            PlaneRoles::Packed422 { pixels } => Layout::Packed422 {
+                plane: pixels,
+                alpha: None,
+                kernel: kernel(),
             },
             PlaneRoles::PackedAlpha {
                 pixels,
@@ -434,7 +415,7 @@ impl<'a, P: Sample> Reader<'a, P> {
 /// Row `y` of a plane, which the validated layout guarantees exists.
 #[expect(
     clippy::expect_used,
-    reason = "reader loops and repeated final JPEG rows stay inside the validated plane height"
+    reason = "reader loops use validated heights and JPEG clamps requests to the final output row before conversion"
 )]
 fn row(plane: VideoPlane<'_>, y: usize) -> &[u8] {
     plane

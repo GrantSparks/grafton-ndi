@@ -680,7 +680,22 @@ pub enum Downscale {
     Eighth,
 }
 
+crate::media::decoded_variants!(Downscale: Off, Half, Quarter, Eighth);
+
 impl Downscale {
+    pub(super) const MAX_SHIFT: u32 = {
+        let mut max = 0;
+        let mut index = 0;
+        while index < Self::ALL.len() {
+            let shift = Self::ALL[index].shift();
+            if shift > max {
+                max = shift;
+            }
+            index += 1;
+        }
+        max
+    };
+
     /// log2 of the factor.
     pub(super) const fn shift(self) -> u32 {
         match self {

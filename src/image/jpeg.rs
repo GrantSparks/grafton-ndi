@@ -173,7 +173,9 @@ impl jpeg_encoder::ImageBuffer for Rows<'_, '_> {
     }
 
     fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
-        if y != self.height - 1 {
+        let last = self.height - 1;
+        let y = y.min(last);
+        if y != last {
             self.pixels
                 .borrow_mut()
                 .row(usize::from(y), &mut Components(buffers));
@@ -249,10 +251,52 @@ impl Sink<u8> for CachedComponents<'_> {
 mod tests {
     use super::*;
     use crate::{
-        image_encoding::{ImageFormat, ImageOptions},
+        image_encoding::{Downscale, ImageFormat, ImageOptions},
         image_encoding::{Plan, Source},
         PixelFormat, VideoFrame,
     };
+    use jpeg_encoder::ImageBuffer;
+
+    #[test]
+    fn padding_requests_return_the_final_row_at_every_downscale() {
+        for format in [PixelFormat::Rgba, PixelFormat::Uyvy, PixelFormat::Nv12] {
+            let bytes = format.buffer_len(18, 10, None).unwrap();
+            let frame = VideoFrame::builder()
+                .resolution(18, 10)
+                .pixel_format(format)
+                .data((0..bytes).map(|index| index as u8).collect::<Vec<_>>())
+                .build()
+                .unwrap();
+            let source = Source::new(&frame);
+            for downscale in Downscale::ALL {
+                let options = ImageOptions::new(ImageFormat::Jpeg(85)).downscale(downscale);
+                let plan = Plan::new(&source, &options).unwrap();
+                let shape = plan.shape();
+                let mut pixels = plan.pixels::<u8>();
+                let mut cache = vec![0; shape.row_bytes];
+                let width = shape.width as u16;
+                let height = shape.height as u16;
+                let mut expected = std::array::from_fn(|_| Vec::new());
+                pixels.row(usize::from(height - 1), &mut Components(&mut expected));
+                let read = |rows: &Rows<'_, '_>, y| {
+                    let mut components = std::array::from_fn(|_| Vec::new());
+                    rows.fill_buffers(y, &mut components);
+                    components
+                };
+                // The first out-of-range request fills the cache. Following
+                // requests, including the final row itself, must reuse it.
+                let rows = Rows::new(&mut pixels, width, height, &mut cache);
+                let (first, reads) = super::super::read::count_rows(|| read(&rows, height));
+                assert!(reads > 0);
+                assert_eq!(first, expected);
+                let (repeated, reads) = super::super::read::count_rows(|| {
+                    [read(&rows, height - 1), read(&rows, u16::MAX)]
+                });
+                assert_eq!(reads, 0);
+                assert_eq!(repeated, [first.clone(), first]);
+            }
+        }
+    }
 
     fn decode(bytes: &[u8], size: (u16, u16)) -> Vec<u8> {
         let mut decoder = jpeg_decoder::Decoder::new(bytes);

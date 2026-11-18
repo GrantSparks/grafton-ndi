@@ -38,7 +38,11 @@ const_assert!({
 #[cfg(feature = "image-encoding")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PlaneRoles<'a> {
-    Packed {
+    PackedRgb {
+        pixels: VideoPlane<'a>,
+        order: RgbOrder,
+    },
+    Packed422 {
         pixels: VideoPlane<'a>,
     },
     PackedAlpha {
@@ -65,6 +69,14 @@ pub(crate) enum PlaneRoles<'a> {
         cr: VideoPlane<'a>,
         alpha: Option<VideoPlane<'a>>,
     },
+}
+
+/// Component order in a packed RGB plane.
+#[cfg(feature = "image-encoding")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RgbOrder {
+    Rgb,
+    Bgr,
 }
 
 impl ValidatedVideoLayout {
@@ -291,17 +303,25 @@ impl ValidatedVideoLayout {
         // category; each constant index below names one of its active planes.
         // The caller retains and initializes its storage for the returned borrow.
         let plane = |index| unsafe { VideoPlane::new(data, self.plane_layouts[index]) };
-        match info.category() {
-            FormatCategory::Packed => PlaneRoles::Packed { pixels: plane(0) },
-            FormatCategory::PackedAlpha => PlaneRoles::PackedAlpha {
+        match self.pixel_format {
+            PixelFormat::Rgba | PixelFormat::Rgbx => PlaneRoles::PackedRgb {
+                pixels: plane(0),
+                order: RgbOrder::Rgb,
+            },
+            PixelFormat::Bgra | PixelFormat::Bgrx => PlaneRoles::PackedRgb {
+                pixels: plane(0),
+                order: RgbOrder::Bgr,
+            },
+            PixelFormat::Uyvy => PlaneRoles::Packed422 { pixels: plane(0) },
+            PixelFormat::Uyva => PlaneRoles::PackedAlpha {
                 pixels: plane(0),
                 alpha: plane(1),
             },
-            FormatCategory::SemiPlanar420 => PlaneRoles::SemiPlanar420 {
+            PixelFormat::Nv12 => PlaneRoles::SemiPlanar420 {
                 luma: plane(0),
                 chroma: plane(1),
             },
-            FormatCategory::Planar420 => {
+            PixelFormat::I420 | PixelFormat::Yv12 => {
                 let (cb, cr) = match info.chroma_order() {
                     ChromaOrder::CbCr => (plane(1), plane(2)),
                     ChromaOrder::CrCb => (plane(2), plane(1)),
@@ -312,19 +332,19 @@ impl ValidatedVideoLayout {
                     cr,
                 }
             }
-            FormatCategory::SemiPlanar422 | FormatCategory::SemiPlanar422Alpha => {
-                PlaneRoles::SemiPlanar422 {
+            PixelFormat::P216 | PixelFormat::Pa16 => PlaneRoles::SemiPlanar422 {
+                luma: plane(0),
+                chroma: plane(1),
+                alpha: info.has_alpha().then(|| plane(2)),
+            },
+            PixelFormat::Na48 | PixelFormat::Nb48 | PixelFormat::Na4g | PixelFormat::Nb4g => {
+                PlaneRoles::Planar444 {
                     luma: plane(0),
-                    chroma: plane(1),
-                    alpha: info.has_alpha().then(|| plane(2)),
+                    cb: plane(1),
+                    cr: plane(2),
+                    alpha: info.has_alpha().then(|| plane(3)),
                 }
             }
-            FormatCategory::Planar444 | FormatCategory::Planar444Alpha => PlaneRoles::Planar444 {
-                luma: plane(0),
-                cb: plane(1),
-                cr: plane(2),
-                alpha: info.has_alpha().then(|| plane(3)),
-            },
         }
     }
 

@@ -154,16 +154,30 @@ fn plane_roles_name_the_documented_planes_for_every_format() {
                 }
             };
             match roles {
-                PlaneRoles::Packed { pixels } => equal(pixels, 0),
+                PlaneRoles::PackedRgb { pixels, order } => {
+                    assert!(matches!(
+                        (format, order),
+                        (PixelFormat::Rgba | PixelFormat::Rgbx, RgbOrder::Rgb)
+                            | (PixelFormat::Bgra | PixelFormat::Bgrx, RgbOrder::Bgr)
+                    ));
+                    equal(pixels, 0);
+                }
+                PlaneRoles::Packed422 { pixels } => {
+                    assert_eq!(format, PixelFormat::Uyvy);
+                    equal(pixels, 0);
+                }
                 PlaneRoles::PackedAlpha { pixels, alpha } => {
+                    assert_eq!(format, PixelFormat::Uyva);
                     equal(pixels, 0);
                     equal(alpha, 1);
                 }
                 PlaneRoles::SemiPlanar420 { luma, chroma } => {
+                    assert_eq!(format, PixelFormat::Nv12);
                     equal(luma, 0);
                     equal(chroma, 1);
                 }
                 PlaneRoles::Planar420 { luma, cb, cr } => {
+                    assert!(matches!(format, PixelFormat::Yv12 | PixelFormat::I420));
                     equal(luma, 0);
                     if format == PixelFormat::Yv12 {
                         equal(cr, 1);
@@ -178,6 +192,8 @@ fn plane_roles_name_the_documented_planes_for_every_format() {
                     chroma,
                     alpha,
                 } => {
+                    assert!(matches!(format, PixelFormat::P216 | PixelFormat::Pa16));
+                    assert_eq!(alpha.is_some(), format == PixelFormat::Pa16);
                     equal(luma, 0);
                     equal(chroma, 1);
                     if let Some(alpha) = alpha {
@@ -190,6 +206,17 @@ fn plane_roles_name_the_documented_planes_for_every_format() {
                     cr,
                     alpha,
                 } => {
+                    assert!(matches!(
+                        format,
+                        PixelFormat::Na48
+                            | PixelFormat::Nb48
+                            | PixelFormat::Na4g
+                            | PixelFormat::Nb4g
+                    ));
+                    assert_eq!(
+                        alpha.is_some(),
+                        matches!(format, PixelFormat::Nb48 | PixelFormat::Nb4g)
+                    );
                     equal(luma, 0);
                     equal(cb, 1);
                     equal(cr, 2);
