@@ -2173,12 +2173,18 @@ impl CacheState {
     }
 }
 
+/// Publication eligibility observed under the cache lock when a lookup missed.
+pub(crate) struct CacheMiss(Option<u64>);
+
+pub(crate) enum CacheProbe {
+    Hit(Vec<Source>),
+    Miss(CacheMiss),
+}
+
 impl SourceCache {
     #[cfg(any(feature = "tokio", feature = "smol"))]
-    pub(crate) fn cached_sources(&self, query: HostQuery<'_>) -> Result<Option<Vec<Source>>> {
-        self.entries
-            .probe(query, copy_sources)
-            .map(|(_, sources, _)| sources)
+    pub(crate) fn probe_host(&self, query: HostQuery<'_>) -> Result<CacheProbe> {
+        self.entries.probe(query, copy_sources)
     }
 
     #[cfg(all(test, any(feature = "tokio", feature = "smol")))]
@@ -2255,7 +2261,7 @@ impl SourceCache {
     #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
         let (query, deadline) = checked_host_lookup(host, timeout)?;
-        let Ok(sources) = self.find_sources_by_host_until(query, deadline, NeverStop)?;
+        let Ok(sources) = self.find_sources_by_host_until(query, deadline, None, NeverStop)?;
         Ok(sources)
     }
 
@@ -2263,12 +2269,15 @@ impl SourceCache {
         &self,
         query: HostQuery<'_>,
         deadline: Deadline,
+        previous_miss: Option<CacheMiss>,
         stop: S,
     ) -> StopResult<Vec<Source>, S> {
-        self.entries
-            .find_sources_by_host_with::<S>(query, deadline, |query, deadline| {
-                self.discover_host_until(query, deadline, stop)
-            })
+        self.entries.find_sources_by_host_with::<S>(
+            query,
+            deadline,
+            previous_miss,
+            |query, deadline| self.discover_host_until(query, deadline, stop),
+        )
     }
 
     fn discover_host_until<S: Stop>(
@@ -2319,11 +2328,11 @@ fn copy_sources(sources: &[Source]) -> Result<Vec<Source>> {
 impl CachedSources {
     /// Clone the map entry under the short lock, then copy descriptors outside it.
     /// The miss generation belongs to the same lookup used for publication.
-    fn probe<'a>(
+    fn probe(
         &self,
-        query: HostQuery<'a>,
+        query: HostQuery<'_>,
         copy: impl FnOnce(&[Source]) -> Result<Vec<Source>>,
-    ) -> Result<(HostQuery<'a>, Option<Vec<Source>>, Option<u64>)> {
+    ) -> Result<CacheProbe> {
         let (snapshot, generation) = {
             let cache = self
                 .cache
@@ -2334,30 +2343,42 @@ impl CachedSources {
                 cache.generation,
             )
         };
-        let sources = snapshot.map(|snapshot| copy(&snapshot)).transpose()?;
-        Ok((query, sources, generation))
+        match snapshot {
+            Some(snapshot) => copy(&snapshot).map(CacheProbe::Hit),
+            None => Ok(CacheProbe::Miss(CacheMiss(generation))),
+        }
     }
 
     fn find_sources_by_host_with<S: Stop>(
         &self,
         query: HostQuery<'_>,
         deadline: Deadline,
+        previous_miss: Option<CacheMiss>,
         discover: impl FnOnce(HostQuery<'_>, Deadline) -> StopResult<Vec<Source>, S>,
     ) -> StopResult<Vec<Source>, S> {
-        self.find_sources_by_host_with_copy::<S>(query, deadline, discover, copy_sources)
+        self.find_sources_by_host_with_copy::<S>(
+            query,
+            deadline,
+            previous_miss,
+            discover,
+            copy_sources,
+        )
     }
 
     fn find_sources_by_host_with_copy<S: Stop>(
         &self,
         query: HostQuery<'_>,
         deadline: Deadline,
+        previous_miss: Option<CacheMiss>,
         discover: impl FnOnce(HostQuery<'_>, Deadline) -> StopResult<Vec<Source>, S>,
         mut copy: impl FnMut(&[Source]) -> Result<Vec<Source>>,
     ) -> StopResult<Vec<Source>, S> {
-        let (key, sources, generation) = self.probe(query, &mut copy)?;
-        if let Some(sources) = sources {
-            return Ok(Ok(sources));
-        }
+        // A queued lookup can use a hit published before its worker starts.
+        // It keeps the original generation if discovery is still needed.
+        let CacheMiss(generation) = match self.probe(query, &mut copy)? {
+            CacheProbe::Hit(sources) => return Ok(Ok(sources)),
+            CacheProbe::Miss(miss) => previous_miss.unwrap_or(miss),
+        };
         // SDK waits and user discovery run outside the cache mutex. Invalidation
         // changes the generation, so an old result cannot repopulate the cache.
         let sources = match discover(query, deadline)? {
@@ -2372,7 +2393,7 @@ impl CachedSources {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if generation.is_none()
                     || cache.generation != generation
-                    || cache.entries.contains_key(&key as &dyn HostIdentity)
+                    || cache.entries.contains_key(&query as &dyn HostIdentity)
                 {
                     return Ok(Ok(sources));
                 }
@@ -2383,7 +2404,7 @@ impl CachedSources {
             let Ok(snapshot) = copy(&sources) else {
                 return Ok(Ok(sources));
             };
-            let Ok(key) = HostKey::try_from(key) else {
+            let Ok(key) = HostKey::try_from(query) else {
                 return Ok(Ok(sources));
             };
             self.publish(generation, key, Arc::new(snapshot));
@@ -2474,6 +2495,7 @@ mod tests {
             let Ok(sources) = self.find_sources_by_host_with_copy::<NeverStop>(
                 query,
                 deadline,
+                None,
                 |query, _| discover(query).map(Ok),
                 copy,
             )?;
@@ -2705,6 +2727,7 @@ mod tests {
             .find_sources_by_host_with::<&AtomicBool>(
                 HostQuery::checked("camera").unwrap(),
                 Deadline::after(Duration::ZERO).unwrap(),
+                None,
                 |_, _| Ok(Err(crate::timeout::Stopped)),
             )
             .unwrap();
@@ -2724,6 +2747,7 @@ mod tests {
             .find_sources_by_host_with::<NeverStop>(
                 HostQuery::checked("camera").unwrap(),
                 deadline,
+                None,
                 |query, remaining| {
                     assert!(matches!(query, HostQuery::Host("camera")));
                     assert_eq!(remaining.end(), deadline.end());

@@ -1,7 +1,7 @@
 //! Owned discovery adapters sharing the receivers' blocking-pool stop rule.
 use super::{discovery_result, private, with_deadline_budget, with_timeout_budget, AsyncRuntime};
 use crate::{
-    finder::{checked_host_lookup, checked_name_lookup, SourceCursor},
+    finder::{checked_host_lookup, checked_name_lookup, CacheProbe, SourceCursor},
     Finder, Result, Source, SourceCache,
 };
 use std::{marker::PhantomData, sync::Arc, time::Duration};
@@ -198,8 +198,10 @@ impl<R: AsyncRuntime> AsyncFinder<R, SourceCache> {
     ///
     /// As [`SourceCache::find_sources_by_host`], including best-effort publication.
     /// A cancelled miss does not publish an incomplete discovery window. Cache
-    /// hits are answered on the awaiting task without the blocking pool;
-    /// returned descriptors are owned copies.
+    /// hits return owned descriptor copies on the awaiting task without the
+    /// blocking pool. Invalidation after a miss is observed suppresses its
+    /// publication even while its worker is queued. The lookup can still
+    /// return its discovered feeds.
     ///
     /// # Errors
     ///
@@ -209,13 +211,19 @@ impl<R: AsyncRuntime> AsyncFinder<R, SourceCache> {
     #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub async fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
         let (query, deadline) = checked_host_lookup(host, timeout)?;
-        if let Some(sources) = self.inner.cached_sources(query)? {
-            return Ok(sources);
-        }
+        let miss = match self.inner.probe_host(query)? {
+            CacheProbe::Hit(sources) => return Ok(sources),
+            CacheProbe::Miss(miss) => miss,
+        };
         let query = query.into_owned();
         let inner = Arc::clone(&self.inner);
         with_deadline_budget::<R, _, _>(deadline, move |deadline, stop| {
-            discovery_result(inner.find_sources_by_host_until(query.as_query(), deadline, stop))
+            discovery_result(inner.find_sources_by_host_until(
+                query.as_query(),
+                deadline,
+                Some(miss),
+                stop,
+            ))
         })
         .await
     }
