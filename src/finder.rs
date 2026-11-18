@@ -2676,7 +2676,8 @@ mod tests {
             instance: mutex.lock(),
         };
         let mut window = DiscoveryWindow::default();
-        let snapshot = SliceSnapshot(&[entry, entry]);
+        let entries = [entry, entry];
+        let snapshot = SliceSnapshot(&entries);
         guard.discover(&snapshot, &mut window, None).unwrap();
         let source = &window.sources[0];
         let expected =
