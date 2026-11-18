@@ -3470,6 +3470,10 @@ mod tests {
     /// A blocked destructor makes joining observable without timing how long
     /// normal native destruction takes. Both paths use the same created owner.
     fn check_delivered_creation_drop(claimed: bool) {
+        // These handoffs involve multiple threads waking and can be slow on
+        // a starved runner. Only the held-destructor check tests overlap.
+        const READY: Duration = Duration::from_secs(10);
+
         struct DeliveryWake(Sender<()>);
         impl Wake for DeliveryWake {
             fn wake(self: Arc<Self>) {
@@ -3502,9 +3506,9 @@ mod tests {
         }
         impl Drop for HeldDrop {
             fn drop(&mut self) {
-                self.entered.send(thread::current().id()).unwrap();
-                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
-                self.finished.send(()).unwrap();
+                let _ = self.entered.send(thread::current().id());
+                let _ = self.release.recv();
+                let _ = self.finished.send(());
             }
         }
         let (create_release, create_gate) = mpsc::channel();
@@ -3515,7 +3519,7 @@ mod tests {
         let mut creation = spawn_owner(
             "file-test-creation-handoff",
             move || {
-                create_gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                create_gate.recv_timeout(READY).unwrap();
                 Ok(HeldDrop {
                     entered: drop_entered,
                     release: drop_gate,
@@ -3530,7 +3534,10 @@ mod tests {
             .poll(&mut Context::from_waker(&waker))
             .is_pending());
         create_release.send(()).unwrap();
-        delivery.recv_timeout(Duration::from_secs(1)).unwrap();
+        if let Err(error) = delivery.recv_timeout(READY) {
+            drop(drop_release);
+            panic!("the owner did not deliver its creation: {error}");
+        }
         let (drop_returned, drop_return) = mpsc::channel();
         let dropper = if claimed {
             let worker = block_on(creation).unwrap();
@@ -3544,13 +3551,17 @@ mod tests {
                 drop_returned.send(()).unwrap();
             })
         };
-        let owner_thread = drop_entry.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_ne!(owner_thread, dropper.thread().id());
+        let owner_thread = drop_entry.recv_timeout(READY);
+        let dropper_thread = dropper.thread().id();
         let returned = drop_return.recv_timeout(Duration::from_secs(2));
         // Always release and join before asserting, including on a regression.
         drop_release.send(()).unwrap();
-        drop_finish.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop_finish.recv_timeout(READY).unwrap();
         dropper.join().unwrap();
+        assert_ne!(
+            owner_thread.expect("owner did not begin destruction"),
+            dropper_thread
+        );
         assert_eq!(returned.is_ok(), !claimed);
     }
 
