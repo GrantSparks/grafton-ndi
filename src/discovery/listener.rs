@@ -168,11 +168,11 @@ impl ListenerOptions {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Connect to this endpoint: a host name or IP address, optionally followed
-    /// by a colon and a port (5959 when omitted).
+    /// Use one non-empty endpoint in place of the NDI configuration: a host name
+    /// or IP address, optionally followed by a colon and a port (5959 when
+    /// omitted). Use [`Self::clear_server`] to inherit the configuration.
     ///
-    /// One endpoint only: the listener constructors refuse a comma-separated
-    /// list, of which a listener would use only the first entry.
+    /// The listener constructors refuse a comma-separated list of endpoints.
     #[must_use]
     pub fn server(mut self, server: impl Into<String>) -> Self {
         self.server = Some(server.into());
@@ -841,8 +841,8 @@ impl SendListener {
     /// cannot provide [sender discovery], which needs NDI 6.4.0 or later, or the
     /// options carry an Advanced configuration that the runtime or this build
     /// cannot take; [`Error::InvalidCString`] when the endpoint contains a NUL
-    /// byte; and [`Error::InvalidInput`] when the options name more than one
-    /// endpoint, or the SDK creates no listener. Without an explicit server the
+    /// byte; and [`Error::InvalidInput`] when the endpoint is empty, the options
+    /// name multiple endpoints, or the SDK creates no listener. Without an explicit server the
     /// SDK uses its configuration; creation fails when it names no server or
     /// one the SDK cannot use. An explicit address the SDK cannot parse is also
     /// refused.
@@ -904,8 +904,8 @@ impl RecvListener {
     /// cannot provide [receiver discovery], which needs NDI 6.4.0 or later, or the
     /// options carry an Advanced configuration that the runtime or this build
     /// cannot take; [`Error::InvalidCString`] when the endpoint contains a NUL
-    /// byte; and [`Error::InvalidInput`] when the options name more than one
-    /// endpoint, or the SDK creates no listener. Without an explicit server the
+    /// byte; and [`Error::InvalidInput`] when the endpoint is empty, the options
+    /// name multiple endpoints, or the SDK creates no listener. Without an explicit server the
     /// SDK uses its configuration; creation fails when it names no server or
     /// one the SDK cannot use. An explicit address the SDK cannot parse is also
     /// refused.

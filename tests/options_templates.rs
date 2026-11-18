@@ -47,9 +47,9 @@ fn cloned_templates_can_be_retargeted_without_rebuilding_other_settings() {
 #[test]
 fn clearing_an_override_restores_none_instead_of_an_empty_override() {
     let finder = FinderOptions::new()
-        .groups([] as [&str; 0])
+        .groups(["Studio"])
         .extra_ips(["192.0.2.1"]);
-    assert_eq!(finder.configured_groups(), Some(&[] as &[String]));
+    assert_eq!(finder.configured_groups(), Some(&["Studio".to_owned()][..]));
     let inherited = finder.clone().clear_groups().clear_extra_ips();
     assert_eq!(inherited.configured_groups(), None);
     assert_eq!(inherited.configured_extra_ips(), None);
@@ -60,14 +60,14 @@ fn clearing_an_override_restores_none_instead_of_an_empty_override() {
 
     assert_eq!(
         AdvertiserOptions::new()
-            .servers([] as [&str; 0])
+            .servers(["studio"])
             .clear_servers()
             .configured_servers(),
         None
     );
     assert_eq!(
         ListenerOptions::new()
-            .server("")
+            .server("studio")
             .clear_server()
             .configured_server(),
         None

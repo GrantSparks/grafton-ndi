@@ -91,8 +91,8 @@ impl FilePlayer {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when the player's name is empty or a group
-    /// is empty or contains a comma or NUL. [`Error::InvalidCString`] when
+    /// [`Error::InvalidInput`] when the player's name or group list is empty,
+    /// or a group is empty or contains a comma or NUL. [`Error::InvalidCString`] when
     /// the player's name contains a NUL.
     /// [`Error::NativeOperationFailed`] when the SDK cannot create the player
     /// and [`Error::UnsupportedCapability`] when the library does not provide

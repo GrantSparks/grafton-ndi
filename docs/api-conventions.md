@@ -29,8 +29,10 @@ exactly as stored, including whether it is unset. `clear_<setter>()` restores
 an inherited default. These accessors describe requests, rather than the
 runtime's effective configuration. Lists accept
 `impl IntoIterator<Item = impl Into<String>>` and read back as
-`Option<&[String]>`. Object creation validates settings, including rejecting
-empty, comma-containing or NUL-containing list elements with `InvalidInput`.
+`Option<&[String]>`. An unset list passes NULL so the SDK inherits its
+configuration. An explicit list replaces the configuration and must be non-empty.
+Object creation refuses an empty list and empty, comma-containing or
+NUL-containing list elements with `InvalidInput`.
 
 Every options type implements `Debug + Clone + PartialEq`, and implements
 `Default` when it has no required setting.

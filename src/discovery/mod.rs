@@ -216,7 +216,7 @@ impl ServerOptions for AdvertiserOptions {
         let Some(values) = self.configured_servers() else {
             return Ok(None);
         };
-        crate::finder::list_cstring(Some(values), "servers").map(|url| {
+        crate::list_setting::list_cstring(Some(values), "servers").map(|url| {
             url.map(|url| ServerEndpoint {
                 url,
                 input: EndpointInput::List(values),
@@ -233,15 +233,8 @@ impl ServerOptions for ListenerOptions {
     fn server(&self) -> crate::Result<Option<ServerEndpoint<'_>>> {
         self.configured_server()
             .map(|text| {
-                // Preserve the public refusal order: NUL before a server list.
-                let url = std::ffi::CString::new(text)?;
-                if text.contains(',') {
-                    return Err(crate::Error::InvalidInput(
-                        crate::InputDefect::MultipleDiscoveryServers,
-                    ));
-                }
                 Ok(ServerEndpoint {
-                    url,
+                    url: crate::list_setting::endpoint_cstring(text)?,
                     input: EndpointInput::Single(text),
                 })
             })

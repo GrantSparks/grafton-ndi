@@ -75,6 +75,7 @@ mod connection_metadata;
 mod error;
 #[cfg(any(ndi_has_advanced_keyframe_demand, all(test, feature = "advanced")))]
 mod keyframe_changes;
+mod list_setting;
 mod marker;
 mod media;
 mod pixels;

@@ -1518,7 +1518,7 @@ impl<M: SenderMode> Sender<M> {
         ) -> sys::table::Called<NDIlib_send_instance_t>,
     ) -> Result<Self> {
         let name = CString::new(options.name.as_str())?;
-        let groups = crate::finder::list_cstring(options.groups.as_deref(), "groups")?;
+        let groups = crate::list_setting::list_cstring(options.groups.as_deref(), "groups")?;
         let core = ndi.bind_core();
         let instance = create(
             &core,
@@ -1559,8 +1559,9 @@ impl Sender {
     /// # Errors
     ///
     /// Returns [`Error::InvalidCString`] when the name contains a NUL byte,
-    /// [`Error::InvalidInput`] for a group containing a comma or NUL or an empty group, [`Error::UnsupportedCapability`] when the options carry an
-    /// Advanced configuration that the runtime or this build cannot take, and
+    /// [`Error::InvalidInput`] when the group list is empty or a group is empty
+    /// or contains a comma or NUL, [`Error::UnsupportedCapability`] when the
+    /// options carry an Advanced configuration that the runtime or this build cannot take, and
     /// [`Error::NativeOperationFailed`] when the SDK creates no sender.
     #[doc(alias = "NDIlib_send_create")]
     pub fn new(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
@@ -2305,8 +2306,10 @@ impl SenderOptions {
         }
     }
 
-    /// Set the discovery groups the sender is advertised
-    /// in, instead of those of the NDI configuration.
+    /// Set a non-empty list of discovery groups the sender is advertised in,
+    /// replacing the NDI configuration. Use [`Self::clear_groups`] to inherit
+    /// the configuration. Creation refuses empty elements and elements
+    /// containing a comma or NUL.
     #[must_use]
     pub fn groups(mut self, groups: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.groups = Some(groups.into_iter().map(Into::into).collect());

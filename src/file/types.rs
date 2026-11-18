@@ -255,8 +255,9 @@ impl FilePlayerOptions {
         }
     }
 
-    /// Set the NDI groups the player's source is advertised in, instead of
-    /// those of the NDI configuration. An empty list advertises no groups.
+    /// Set a non-empty list of NDI groups the player's source is advertised in,
+    /// replacing the NDI configuration. Use [`Self::clear_groups`] to inherit
+    /// the configuration.
     /// Each group is checked when the player is created: it must be nonempty
     /// and contain neither a comma nor a NUL.
     #[must_use]
@@ -269,13 +270,13 @@ impl FilePlayerOptions {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when the name is empty or a group is empty
-    /// or contains a comma or NUL. [`Error::InvalidCString`] when the name
+    /// [`Error::InvalidInput`] when the name or group list is empty, or a group
+    /// is empty or contains a comma or NUL. [`Error::InvalidCString`] when the name
     /// contains a NUL.
     pub(super) fn resolve(&self) -> Result<ResolvedPlayerOptions> {
         Ok(ResolvedPlayerOptions {
             name: cstring(&self.name, "player name")?,
-            groups: crate::finder::list_cstring(self.groups.as_deref(), "player groups")?,
+            groups: crate::list_setting::list_cstring(self.groups.as_deref(), "player groups")?,
         })
     }
 }
@@ -2209,12 +2210,16 @@ mod tests {
 
     #[test]
     fn player_options_are_checked_when_they_are_resolved() {
-        let resolved = FilePlayerOptions::new("Replay")
-            .groups([] as [&str; 0])
-            .resolve()
-            .unwrap();
-        assert_eq!(resolved.name.as_bytes(), b"Replay");
-        assert_eq!(resolved.groups.unwrap().as_bytes(), b"");
+        assert_eq!(
+            invalid_cause(
+                FilePlayerOptions::new("Replay")
+                    .groups([] as [&str; 0])
+                    .resolve()
+            ),
+            crate::InputDefect::Empty {
+                what: "player groups"
+            }
+        );
         assert!(FilePlayerOptions::new("Replay")
             .resolve()
             .unwrap()
@@ -2443,8 +2448,12 @@ mod tests {
     #[test]
     fn player_template_clear_groups_restores_the_native_null_default() {
         let template = FilePlayerOptions::new("Replay A").groups([] as [&str; 0]);
-        let override_groups = template.resolve().unwrap();
-        assert!(override_groups.groups.is_some());
+        assert_eq!(
+            invalid_cause(template.resolve()),
+            crate::InputDefect::Empty {
+                what: "player groups"
+            }
+        );
         let inherited = template.name("Replay B").clear_groups().resolve().unwrap();
         assert_eq!(inherited.name.as_bytes(), b"Replay B");
         assert!(inherited.groups.is_none());

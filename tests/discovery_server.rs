@@ -385,11 +385,17 @@ fn creation_does_not_wait_for_the_server() {
             index: 0,
         }))
     ));
-    // A listener's singular endpoint still reaches the native address parser.
+    assert!(matches!(
+        SendAdvertiser::new(&ndi, &AdvertiserOptions::default().servers([] as [&str; 0])),
+        Err(Error::InvalidInput(grafton_ndi::InputDefect::Empty {
+            what: "servers"
+        }))
+    ));
     assert!(matches!(
         SendListener::new(&ndi, &ListenerOptions::default().server("")),
-        Err(Error::InvalidInput(grafton_ndi::InputDefect::DiscoveryAddressRejected(detail)))
-            if detail.address.is_empty()
+        Err(Error::InvalidInput(grafton_ndi::InputDefect::Empty {
+            what: "server"
+        }))
     ));
 
     // An address the SDK cannot parse is refused at creation, and the error

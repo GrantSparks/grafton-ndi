@@ -60,7 +60,8 @@ impl AdvertiserOptions {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Use explicit endpoints instead of the SDK configuration.
+    /// Use a non-empty list of endpoints in place of the SDK configuration.
+    /// Use [`Self::clear_servers`] to inherit the configuration.
     ///
     /// Each endpoint is a host name or IP address, optionally followed by a
     /// colon and a port (5959 when omitted). Several elements register with
@@ -518,9 +519,9 @@ impl SendAdvertiser {
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
     /// cannot provide [sender advertising], which needs NDI 6.4.0 or later, or
     /// the options carry an Advanced configuration that the runtime or this
-    /// build cannot take; [`Error::InvalidInput`] when a server element is
-    /// empty or contains a comma or NUL, or when the SDK creates
-    /// no advertiser. Without an explicit server the SDK uses its configuration;
+    /// build cannot take; [`Error::InvalidInput`] when the server list is empty,
+    /// a server element is empty or contains a comma or NUL, or the SDK
+    /// creates no advertiser. Without an explicit server the SDK uses its configuration;
     /// creation fails when it names no server or one the SDK cannot use. An
     /// explicit address the SDK cannot parse is also refused.
     ///
@@ -598,9 +599,9 @@ impl RecvAdvertiser {
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
     /// cannot provide [receiver advertising], which needs NDI 6.4.0 or later,
     /// or the options carry an Advanced configuration that the runtime or this
-    /// build cannot take; [`Error::InvalidInput`] when a server element is
-    /// empty or contains a comma or NUL, or when the SDK creates
-    /// no advertiser. Without an explicit server the SDK uses its configuration;
+    /// build cannot take; [`Error::InvalidInput`] when the server list is empty,
+    /// a server element is empty or contains a comma or NUL, or the SDK
+    /// creates no advertiser. Without an explicit server the SDK uses its configuration;
     /// creation fails when it names no server or one the SDK cannot use. An
     /// explicit address the SDK cannot parse is also refused.
     ///

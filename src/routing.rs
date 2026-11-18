@@ -90,8 +90,9 @@ impl RouterOptions {
             config: None,
         }
     }
-    /// Set the discovery groups the router is advertised in instead of those
-    /// of the NDI configuration. Creation refuses empty elements and elements
+    /// Set a non-empty list of discovery groups the router is advertised in,
+    /// replacing the NDI configuration. Use [`Self::clear_groups`] to inherit
+    /// the configuration. Creation refuses empty elements and elements
     /// containing a comma or NUL.
     #[must_use]
     pub fn groups(mut self, groups: impl IntoIterator<Item = impl Into<String>>) -> Self {
@@ -161,9 +162,9 @@ impl Router {
     /// [routing support](crate::capabilities::RuntimeFeature::Routing), or the
     /// options carry an Advanced configuration that the runtime or this build
     /// cannot take; [`crate::Error::InvalidCString`] when the name contains a
-    /// NUL byte; [`crate::Error::InvalidInput`] when a group is empty or contains
-    /// a comma or NUL; and [`crate::Error::NativeOperationFailed`] when the SDK creates no
-    /// source.
+    /// NUL byte; [`crate::Error::InvalidInput`] when the group list is empty or
+    /// a group is empty or contains a comma or NUL; and
+    /// [`crate::Error::NativeOperationFailed`] when the SDK creates no source.
     #[doc(alias = "NDIlib_routing_create")]
     #[doc(alias = "NDIlib_routing_create_v2")]
     pub fn new(ndi: &Ndi, options: &RouterOptions) -> Result<Self> {
@@ -206,7 +207,7 @@ impl Router {
         // never refused for `Routing`.
         let routing = ndi.bind::<sys::Routing>()?;
         let name = CString::new(options.name.as_str())?;
-        let groups = crate::finder::list_cstring(options.groups.as_deref(), "groups")?;
+        let groups = crate::list_setting::list_cstring(options.groups.as_deref(), "groups")?;
         let instance = create(
             &routing,
             &NDIlib_routing_create_t {

@@ -26,6 +26,7 @@ use std::{
 
 use crate::{
     change_feed::ChangeFeed,
+    list_setting::list_cstring,
     sdk_copy::LossyText,
     sys::{self, bindings::*},
     timeout::{Deadline, NeverStop, Stop, StopResult, POLL_INTERVAL},
@@ -35,7 +36,7 @@ use crate::{
 /// Configuration for NDI source discovery.
 ///
 /// The defaults find the sources of the groups the NDI configuration names,
-/// including those of this machine, with no extra addresses to query.
+/// including those of this machine, and query the configured `networks.ips`.
 ///
 /// # Examples
 ///
@@ -73,7 +74,7 @@ impl FinderOptions {
         self
     }
 
-    /// Remove the explicitly requested direct IP addresses.
+    /// Inherit direct IP addresses from the NDI configuration.
     #[must_use]
     pub fn clear_extra_ips(mut self) -> Self {
         self.extra_ips = None;
@@ -114,7 +115,7 @@ impl FinderOptions {
     }
 
     /// The default options: local sources included, the groups of the NDI
-    /// configuration, and no extra addresses.
+    /// configuration, and the direct addresses in its `networks.ips`.
     pub fn new() -> Self {
         Self {
             show_local_sources: true,
@@ -132,7 +133,8 @@ impl FinderOptions {
         self
     }
 
-    /// Set the groups to search instead of those of the NDI configuration.
+    /// Set a non-empty list of groups to search in place of the NDI configuration.
+    /// Use [`Self::clear_groups`] to inherit the configuration.
     /// Creation refuses empty elements and elements containing a comma or NUL.
     #[must_use]
     pub fn groups(mut self, groups: impl IntoIterator<Item = impl Into<String>>) -> Self {
@@ -140,8 +142,10 @@ impl FinderOptions {
         self
     }
 
-    /// Set IP addresses to query directly for sources discovery does not reach.
-    /// Creation refuses empty elements and elements containing a comma or NUL.
+    /// Set a non-empty list of IP addresses to query directly, replacing
+    /// `networks.ips` from the NDI configuration. Use [`Self::clear_extra_ips`]
+    /// to inherit the configuration. Creation refuses empty elements and
+    /// elements containing a comma or NUL.
     #[must_use]
     pub fn extra_ips(mut self, ips: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.extra_ips = Some(ips.into_iter().map(Into::into).collect());
@@ -159,40 +163,6 @@ impl FinderOptions {
         self.config = Some(config);
         self
     }
-}
-
-/// Validate and join a configured list only at native-owner construction.
-/// Every element must be representable without changing list boundaries.
-pub(crate) fn list_cstring(
-    values: Option<&[String]>,
-    setting: &'static str,
-) -> Result<Option<CString>> {
-    values
-        .map(|values| {
-            let invalid =
-                |index| Error::InvalidInput(crate::InputDefect::ListElement { setting, index });
-            let boundary = values
-                .iter()
-                .position(|value| value.is_empty() || value.contains(','));
-            // Only earlier elements can take precedence over a boundary error.
-            // CString supplies the sole NUL check; every comma before that NUL
-            // is a separator, so its count is the original element index.
-            let prefix = &values[..boundary.unwrap_or(values.len())];
-            let joined = CString::new(prefix.join(",")).map_err(|error| {
-                let nul = error.nul_position();
-                invalid(
-                    error.into_vec()[..nul]
-                        .iter()
-                        .filter(|&&byte| byte == b',')
-                        .count(),
-                )
-            })?;
-            if let Some(index) = boundary {
-                return Err(invalid(index));
-            }
-            Ok(joined)
-        })
-        .transpose()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -725,8 +695,8 @@ impl Finder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidInput`] when a group or extra address is empty
-    /// or contains a comma or NUL, [`Error::UnsupportedCapability`] when the options
+    /// Returns [`Error::InvalidInput`] when either list is empty or a group or
+    /// extra address is empty or contains a comma or NUL, [`Error::UnsupportedCapability`] when the options
     /// carry an Advanced configuration that the runtime or this build cannot
     /// take, and [`Error::NativeOperationFailed`] when the SDK creates no
     /// finder.
@@ -2773,10 +2743,12 @@ mod tests {
             Some(c"Public,Studio")
         );
         assert_eq!(list_cstring(None, "groups").unwrap(), None);
-        assert_eq!(
-            list_cstring(Some(&[]), "groups").unwrap().as_deref(),
-            Some(c"")
-        );
+        assert!(matches!(
+            list_cstring(Some(&[]), "groups"),
+            Err(Error::InvalidInput(crate::InputDefect::Empty {
+                what: "groups"
+            }))
+        ));
         for invalid in ["", "Studio,Public", "Studio\0Public"] {
             let options = FinderOptions::new().groups(["valid", invalid]);
             assert_eq!(options.configured_groups().unwrap()[1], invalid);

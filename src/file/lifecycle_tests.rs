@@ -952,14 +952,16 @@ fn malformed_player_options_are_refused_before_the_sdk_creates_a_player() {
         Err(Error::InvalidCString(_))
     ));
     assert_eq!(PLAYER_CREATES.get(), 0);
-    drop(
+    assert!(matches!(
         crate::file::FilePlayer::new(
             &api,
             &FilePlayerOptions::new("mock player").groups([] as [&str; 0]),
-        )
-        .unwrap(),
-    );
-    assert_eq!(PLAYER_CREATES.get(), 1);
+        ),
+        Err(Error::InvalidInput(crate::InputDefect::Empty {
+            what: "player groups"
+        }))
+    ));
+    assert_eq!(PLAYER_CREATES.get(), 0);
 }
 
 #[test]
