@@ -4,7 +4,7 @@ use super::{Retained, ServerApi, ServerObject};
 use crate::{
     receiver::{ReceiverCore, ReceiverMode},
     sender::SenderResource,
-    sys, Error, Ndi, Receiver, Rejected, Result, Sender,
+    sys, Error, Ndi, Receiver, Rejected, Result, RuntimeFeature, Sender,
 };
 use std::{
     collections::BTreeMap,
@@ -158,6 +158,10 @@ impl RecvAdvertisement {
     /// They do not update [`Receiver::connection_target`], the latest local
     /// request; [`Receiver::reconnect`] requests that local target again and
     /// replaces any remote routing.
+    ///
+    /// Registering with this enabled requires
+    /// [remote receiver control](RuntimeFeature::RemoteReceiverControl),
+    /// which is unavailable on Standard Windows runtimes.
     #[must_use]
     pub fn allow_controlling(mut self, enabled: bool) -> Self {
         self.controlling = enabled;
@@ -632,13 +636,21 @@ impl RecvAdvertiser {
     /// Returns [`Error::InvalidCString`] when the input-group name contains a
     /// NUL byte, [`Error::InvalidInput`] when this advertiser already
     /// advertises the receiver, and [`Error::NativeOperationFailed`] when the
-    /// SDK refuses the registration.
+    /// SDK refuses the registration. Returns [`Error::UnsupportedCapability`]
+    /// when the options request remote control and the selected runtime
+    /// lacks [remote receiver control](RuntimeFeature::RemoteReceiverControl).
     #[doc(alias = "NDIlib_recv_advertiser_add_receiver")]
     pub fn register<M: ReceiverMode>(
         &mut self,
         receiver: &Receiver<M>,
         options: &RecvAdvertisement,
     ) -> Result<RecvRegistration> {
+        if options.controlling {
+            receiver
+                .core
+                .ndi()
+                .require_feature(RuntimeFeature::RemoteReceiverControl)?;
+        }
         let input_group = options
             .input_group
             .as_deref()

@@ -27,7 +27,14 @@ fn receiver_handles_and_input_dispatch_require_their_proofs() {
         "field `instance`",
         "field `0`",
         "E0308",
-        "&Control",
+        "&MutatingControl",
+        "E0599",
+        "no method named `set_tally`",
+        "no method named `send_metadata`",
+        "no method named `ptz_zoom`",
+        "no method named `add_metadata`",
+        "no method named `kvm_key_press`",
+        "no method named `request_keyframe`",
     ] {
         assert!(
             stderr.contains(diagnostic),

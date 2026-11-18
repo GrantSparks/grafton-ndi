@@ -66,7 +66,10 @@ use crate::{
 };
 
 pub(crate) mod attached;
+pub(crate) mod control;
 mod pending;
+
+use control::ControlPermit;
 
 pub(crate) use pending::PendingEvents;
 
@@ -523,11 +526,7 @@ fn validate_ptz_preset(preset: u8) -> Result<i32> {
 /// the source `$ptz` controls.
 macro_rules! ptz_command {
     ($ptz:expr, $func:ident $(, $arg:expr)*) => {{
-        let connection = $ptz.core.lock_mutating_control()?;
-        // SAFETY: the live core and control permit cover this call; the
-        // RecvInstance inventory records control/capture and remote overlap.
-        // Every argument is a plain value.
-        unsafe { $ptz.core.sdk().named().$func(connection.instance() $(, $arg)*) }.performed()
+        $ptz.core.lock_mutating_control()?.$func($ptz.core.sdk() $(, $arg)*)
     }};
 }
 
@@ -1162,8 +1161,11 @@ impl VideoMode for AvSyncAttached {}
 /// PTZ commands, upstream metadata and connection-metadata additions return
 /// [`Error::NotConnected`] during a local connection change; tally is retained
 /// and applied when that native request returns. These controls do not wait
-/// for the change. Other runtimes synchronize controls through their native
-/// receiver lock. Local
+/// for the change. The Standard Windows SDK does not provide the native
+/// exclusion necessary for SDK-internal changes, so an advertiser refuses
+/// [remote receiver control](crate::RuntimeFeature::RemoteReceiverControl)
+/// there. Other runtimes synchronize controls with local and SDK-internal
+/// changes through their native receiver lock. Local
 /// [`Self::connect_to`], [`Self::disconnect`] and [`Self::reconnect`] requests
 /// serialize with one another and may wait for running allocator policies.
 /// Dropping the last owner destroys the native receiver on the dropping
@@ -1202,135 +1204,16 @@ impl ConnectionChange<'_> {
 
 impl Drop for ConnectionChange<'_> {
     fn drop(&mut self) {
-        if self.core.legacy_controls {
-            let mut control = self.core.lock_control();
-            control.finish_change(self.core.sdk());
+        if self.core.guard_local_connection_changes {
+            self.finish_control_change();
         }
     }
-}
-
-/// Only a receiver's shared-control lock can issue this permit.
-#[derive(Default)]
-struct ControlPermit {
-    registrations: ConnectionMetadata,
-    // Standard Windows controls do not synchronize their connection reads
-    // with native connect. Publish this phase while holding the control lock,
-    // then release the lock before the native connection request begins.
-    changing: bool,
-    pending_tally: Option<Tally>,
-}
-
-impl ControlPermit {
-    fn set_tally(&mut self, tally: Tally, send: impl FnOnce(Tally)) {
-        if self.changing {
-            self.pending_tally = Some(tally);
-        } else {
-            send(tally);
-        }
-    }
-
-    fn finish_change(&mut self, send: impl FnOnce(Tally)) {
-        if let Some(tally) = self.pending_tally.take() {
-            send(tally);
-        }
-        self.changing = false;
-    }
-}
-
-/// Serialized shared controls, independent of local connection changes.
-/// Native receiver locks supply connection exclusion where available. On
-/// Standard Windows this permit also publishes the local changing phase;
-/// connection-reading controls refuse that phase without waiting.
-pub(crate) struct Control<'a> {
-    instance: RecvInstance,
-    _exclusive: MutexGuard<'a, ControlPermit>,
 }
 
 enum ConnectionRequest {
     Connect(RetainedSource),
     Reconnect,
     Disconnect,
-}
-
-/// A control admitted while the receiver's native connection is stable.
-/// Holding its control permit prevents a legacy change from starting.
-struct MutatingControl<'a>(Control<'a>);
-
-impl<'a> std::ops::Deref for MutatingControl<'a> {
-    type Target = Control<'a>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for MutatingControl<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl MutatingControl<'_> {
-    fn add_metadata<S: MetadataSource + ?Sized>(
-        &mut self,
-        table: &sys::ReceiverConnectionMetadata,
-        metadata: &S,
-    ) {
-        let instance = self.instance();
-        self._exclusive.registrations.add(metadata, |raw| {
-            // SAFETY: the control permit owns the descriptor and text until
-            // clear returns or after native destruction, and serializes shared
-            // controls. The native receiver lock synchronizes local changes.
-            unsafe { table.NDIlib_recv_add_connection_metadata(instance, raw) };
-        });
-    }
-}
-
-impl Control<'_> {
-    /// The native identity authorized by this control permit.
-    pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
-        self.instance.0
-    }
-
-    fn set_tally(&mut self, sdk: &sys::Core, tally: Tally) {
-        let instance = self.instance();
-        self._exclusive.set_tally(tally, |tally| {
-            // SAFETY: the control permit excludes native changes on legacy
-            // Standard Windows; other runtimes supply native exclusion.
-            unsafe { sdk.NDIlib_recv_set_tally(instance, &tally.to_sdk()) };
-        });
-    }
-
-    fn finish_change(&mut self, sdk: &sys::Core) {
-        let instance = self.instance();
-        self._exclusive.finish_change(|tally| {
-            // SAFETY: native connect has returned and the change permit still
-            // excludes another request. The control permit excludes writers.
-            unsafe { sdk.NDIlib_recv_set_tally(instance, &tally.to_sdk()) };
-        });
-    }
-
-    fn clear_metadata(&mut self, table: &sys::ReceiverConnectionMetadata) {
-        let instance = self.instance();
-        self._exclusive.registrations.clear(|| {
-            // SAFETY: registrations stay alive through this native clear under
-            // the same control permit; native locking covers local changes.
-            unsafe { table.NDIlib_recv_clear_connection_metadata(instance) };
-        });
-    }
-
-    /// Exercise the real permission-shaped boundary with a synthetic identity.
-    #[cfg(all(test, feature = "advanced"))]
-    pub(crate) fn with_test_instance<T>(
-        instance: NDIlib_recv_instance_t,
-        call: impl FnOnce(&Control<'_>) -> T,
-    ) -> T {
-        let gate = Mutex::new(ControlPermit::default());
-        let permission = Control {
-            instance: RecvInstance(instance),
-            _exclusive: gate.lock(),
-        };
-        call(&permission)
-    }
 }
 
 impl ReceiverCore {
@@ -1473,21 +1356,22 @@ pub(crate) struct RecvInstance(NDIlib_recv_instance_t);
 // capture_v3; free_video_v2, free_audio_v3,           | SDK concurrent-capture/free
 // free_metadata                                     | contract; see CaptureLock
 // connect                                           | Change permit
-// set_tally, send_metadata, get_web_control           | Control permit; native lock against local changes
-// add_connection_metadata, clear_connection_metadata | Control-owned registrations; native receiver lock
-// set/get_video_delay, set/get_audio_delay           | Control permit; native lock against local changes
-// get_performance, get_queue                         | Control permit; native lock against local changes
+// set_tally, send_metadata                          | Connection-use permit
+// add_connection_metadata                          | Connection-use permit and retained registrations
+// clear_connection_metadata                         | Control permit and retained registrations
+// set/get_video_delay, set/get_audio_delay           | Control permit and native delay-state locks
+// get_web_control, get_performance, get_queue        | Control permit
 // get_no_connections                                | Measured native read lock
 // get_source_name                                   | Native report mutex +
 //                                                   | Rust source-query permit
 // free_string                                       | Measured native read lock
-// ptz_is_supported, ptz_recall_preset,               | Control permit; native lock against local changes
-// ptz_store_preset, ptz_zoom, ptz_zoom_speed,         | (each PTZ entry point)
+// ptz_is_supported, ptz_recall_preset,               | Connection-use permit (each PTZ entry point)
+// ptz_store_preset, ptz_zoom, ptz_zoom_speed,         |
 // ptz_pan_tilt, ptz_pan_tilt_speed, ptz_auto_focus,   |
 // ptz_focus, ptz_focus_speed, ptz_white_balance_auto, |
 // ptz_white_balance_indoor/outdoor/oneshot/manual,   |
 // ptz_exposure_auto/manual/manual_v2                 |
-// request_keyframe                                  | Control permit; native lock against local changes
+// request_keyframe                                  | Connection-use permit
 // set_bandwidth, set_enabled_streams                 | Exclusive (&mut Receiver)
 // set_video_allocator, set_audio_allocator           | Owned allocator authority
 //                                                   | Native allocator rwlock
@@ -1495,9 +1379,9 @@ pub(crate) struct RecvInstance(NDIlib_recv_instance_t);
 // destroy                                           | Last owning ReceiverCore
 // recv_advertiser_add_receiver,                      | Immutable creation identity;
 // recv_advertiser_del_receiver (NDIlib_ prefix)       | native observer-registry mutex
-// kvm_is_supported, kvm_send_keyboard_press/release, | Control permit; native lock against local changes
-// kvm_send_left/middle/right_mouse_click/release,    | (including held-input
-// kvm_send_vertical/horizontal_mouse_wheel,         | cleanup and Drop)
+// kvm_is_supported, kvm_send_keyboard_press/release, | Connection-use permit (including held-input
+// kvm_send_left/middle/right_mouse_click/release,    | cleanup and Drop)
+// kvm_send_vertical/horizontal_mouse_wheel,         |
 // kvm_send_mouse_position/clipboard_contents,       |
 // kvm_send_touch_positions, kvm_send_touch_finish    |
 //
@@ -1539,16 +1423,19 @@ pub(crate) struct RecvInstance(NDIlib_recv_instance_t);
 // commands dereference those pointers without that lock. Their Rust control
 // permit therefore publishes a changing phase before local connect, then is
 // released. Connection-reading controls refuse that phase; tally is retained
-// and replayed after native connect. Receiver-owned getters, source queries,
-// delay state, and metadata clearing stay independent. Advanced Windows
+// and replayed after native connect. SDK-internal Discovery Server requests
+// cannot enter the Rust phase, so controlling registrations are refused on
+// that edition. Receiver-owned getters, source queries, delay state and
+// metadata clearing stay independent. Advanced Windows
 // 6.3.2/6.4 instead use the +0x108 shared/exclusive connection lock; connect
 // releases it before destroying retired connections. Allocators require that
 // Advanced edition, so their callbacks retain the independent-control basis.
 //
 // A Rust control permit serializes the listed controls with one another.
 // The native connection-lock basis above applies to measured Linux and
-// Advanced Windows runtimes. Standard Windows local changes use the explicit
-// changing phase instead. No Rust control permit is held during native connect,
+// Advanced Windows runtimes and covers both local and SDK-internal changes.
+// Standard Windows local changes use the explicit changing phase.
+// No Rust control permit is held during native connect,
 // so Advanced allocator callbacks can capture and use shared controls.
 // tests/receiver_connect_overlap_sdk.rs exercises every available
 // shared control against captures, local changes and 6.4 remote changes.
@@ -1578,7 +1465,7 @@ pub(crate) struct ReceiverCore {
     /// Standard Windows uses a native implementation without the Advanced
     /// receiver's connection read lock. Its unsafe controls refuse the brief
     /// transition instead of waiting for native connect.
-    legacy_controls: bool,
+    guard_local_connection_changes: bool,
     /// The latest requested target. The change permit serializes its writers;
     /// snapshots never take it and therefore never wait for a capture or a queued
     /// connection change. Writers hold this lock only to replace the value.
@@ -1710,8 +1597,9 @@ impl<M: CreatableMode> Receiver<M> {
                 test_sdk: None,
                 change_guard: Mutex::new(ChangePermit),
                 control_guard: Mutex::new(ControlPermit::default()),
-                legacy_controls: cfg!(windows)
-                    && ndi.info().edition() == crate::capabilities::SdkEdition::Standard,
+                guard_local_connection_changes: !ndi
+                    .capabilities()
+                    .has_native_receiver_connection_exclusion(),
                 target: RwLock::new(target),
                 pending: PendingEvents::default(),
                 source_query_guard: Mutex::new(SourceQueryPermit),
@@ -1886,10 +1774,7 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn set_video_delay(&self, delay: Duration) -> Result<SettingChange> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
-        let connection = self.core.lock_control();
-        // SAFETY: the live core and control permit cover this call; see
-        // the RecvInstance concurrency inventory.
-        let changed = unsafe { table.NDIlib_recv_set_video_delay(connection.instance(), millis) };
+        let changed = self.core.lock_control().set_video_delay(table, millis);
         Ok(SettingChange::from_sdk(changed))
     }
 
@@ -1903,10 +1788,7 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_get_video_delay")]
     pub fn video_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
-        let connection = self.core.lock_control();
-        // SAFETY: the live core and control permit cover this call; see
-        // the RecvInstance concurrency inventory.
-        receiver_delay(unsafe { table.NDIlib_recv_get_video_delay(connection.instance()) })
+        receiver_delay(self.core.lock_control().video_delay(table))
     }
 
     /// Set native audio buffering with the same rounding/range as [`Self::set_video_delay`].
@@ -1921,10 +1803,7 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn set_audio_delay(&self, delay: Duration) -> Result<SettingChange> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
-        let connection = self.core.lock_control();
-        // SAFETY: the live core and control permit cover this call; see
-        // the RecvInstance concurrency inventory.
-        let changed = unsafe { table.NDIlib_recv_set_audio_delay(connection.instance(), millis) };
+        let changed = self.core.lock_control().set_audio_delay(table, millis);
         Ok(SettingChange::from_sdk(changed))
     }
 
@@ -1936,10 +1815,7 @@ impl<M: ReceiverMode> Receiver<M> {
     #[doc(alias = "NDIlib_recv_get_audio_delay")]
     pub fn audio_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
-        let connection = self.core.lock_control();
-        // SAFETY: the live core and control permit cover this call; see
-        // the RecvInstance concurrency inventory.
-        receiver_delay(unsafe { table.NDIlib_recv_get_audio_delay(connection.instance()) })
+        receiver_delay(self.core.lock_control().audio_delay(table))
     }
 
     /// Add validated metadata sent immediately and again on each connection.
@@ -1994,13 +1870,7 @@ impl<M: ReceiverMode> Receiver<M> {
         let connection = self.core.lock_control();
         let guard = RecvStringGuard {
             core: &self.core,
-            // SAFETY: the live core and control permit cover this call; see
-            // the RecvInstance concurrency inventory.
-            string: unsafe {
-                web_control
-                    .named()
-                    .NDIlib_recv_get_web_control(connection.instance())
-            },
+            string: connection.web_control(web_control),
             strings,
         };
         guard.copy()
@@ -2067,7 +1937,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// connection request is retained and sent as that request finishes.
     #[doc(alias = "NDIlib_recv_set_tally")]
     pub fn set_tally(&self, tally: Tally) {
-        self.core.lock_control().set_tally(self.core.sdk(), tally);
+        self.core.set_tally(tally);
     }
 
     /// Send metadata upstream, to the source this receiver is connected to.
@@ -2082,22 +1952,9 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Windows. See the [waiting contract](Receiver#waiting).
     #[doc(alias = "NDIlib_recv_send_metadata")]
     pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
-        let raw = metadata.metadata_raw();
-        let connection = self.core.lock_mutating_control()?;
-        // SAFETY: the receiver instance is live for this borrow, and the
-        // borrowed C string outlives the synchronous call. The control permit
-        // supplies the control exclusion in the RecvInstance inventory.
-        let sent = unsafe {
-            self.core
-                .sdk()
-                .NDIlib_recv_send_metadata(connection.instance(), &raw)
-        };
-        // `Processing.NDI.Recv.h`: false means nothing is connected.
-        if sent {
-            Ok(())
-        } else {
-            Err(Error::NotConnected)
-        }
+        self.core
+            .lock_mutating_control()?
+            .send_metadata(self.core.sdk(), metadata)
     }
 
     /// Control the pan, tilt, zoom, focus, white balance and exposure of the
@@ -2260,27 +2117,9 @@ impl<M: ReceiverMode> Receiver<M> {
 
         let mut total = NDIlib_recv_performance_t::default();
         let mut dropped = NDIlib_recv_performance_t::default();
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call. The control permit supplies
-        // the control exclusion in the RecvInstance inventory.
-        let performance = unsafe {
-            self.core.sdk().named().NDIlib_recv_get_performance(
-                connection.instance(),
-                &mut total,
-                &mut dropped,
-            )
-        };
-
+        let performance = connection.performance(self.core.sdk(), &mut total, &mut dropped);
         let mut queue = NDIlib_recv_queue_t::default();
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call. The control permit supplies
-        // the control exclusion in the RecvInstance inventory.
-        let queued = unsafe {
-            self.core
-                .sdk()
-                .named()
-                .NDIlib_recv_get_queue(connection.instance(), &mut queue)
-        };
+        let queued = connection.queue(self.core.sdk(), &mut queue);
 
         Ok(ConnectionStats {
             connections,
@@ -2355,32 +2194,12 @@ impl ReceiverCore {
 
     fn lock_change(&self) -> ConnectionChange<'_> {
         let exclusive = self.change_guard.lock();
-        if self.legacy_controls {
-            self.control_guard.lock().changing = true;
+        if self.guard_local_connection_changes {
+            self.begin_control_change();
         }
         ConnectionChange {
             core: self,
             _exclusive: exclusive,
-        }
-    }
-
-    /// Issue a permit tied to this receiver's shared-control lock.
-    pub(crate) fn lock_control(&self) -> Control<'_> {
-        Control {
-            instance: self.instance,
-            _exclusive: self.control_guard.lock(),
-        }
-    }
-
-    /// Connection-reading controls must not enter a legacy Windows native
-    /// receiver while its connection is being replaced. Refusal is immediate:
-    /// no Rust control lock is held while native connect waits.
-    fn lock_mutating_control(&self) -> Result<MutatingControl<'_>> {
-        let control = self.lock_control();
-        if control._exclusive.changing {
-            Err(Error::NotConnected)
-        } else {
-            Ok(MutatingControl(control))
         }
     }
 
@@ -2794,17 +2613,14 @@ impl std::fmt::Debug for Ptz<'_> {
 
 impl Ptz<'_> {
     /// Whether the connected source accepts PTZ commands.
+    ///
+    /// Returns `false` while Standard Windows is changing the connection.
     #[must_use]
     #[doc(alias = "NDIlib_recv_ptz_is_supported")]
     pub fn is_supported(&self) -> bool {
-        let connection = self.core.lock_control();
-        // SAFETY: the live core and control permit cover this call; see
-        // the RecvInstance concurrency inventory.
-        unsafe {
-            self.core
-                .sdk()
-                .NDIlib_recv_ptz_is_supported(connection.instance())
-        }
+        self.core
+            .lock_mutating_control()
+            .is_ok_and(|connection| connection.ptz_is_supported(self.core.sdk()))
     }
 
     /// Recall preset `0..=99`, moving at `speed` within `0.0..=1.0`.
@@ -2816,7 +2632,7 @@ impl Ptz<'_> {
     pub fn recall_preset(&self, preset: u8, speed: f32) -> Result<()> {
         let preset = validate_ptz_preset(preset)?;
         validate_ptz_value("speed", speed, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_recall_preset, preset, speed)
+        ptz_command!(self, ptz_recall_preset, preset, speed)
     }
 
     /// Store the current camera settings as preset `0..=99`.
@@ -2827,7 +2643,7 @@ impl Ptz<'_> {
     #[doc(alias = "NDIlib_recv_ptz_store_preset")]
     pub fn store_preset(&self, preset: u8) -> Result<()> {
         let preset = validate_ptz_preset(preset)?;
-        ptz_command!(self, NDIlib_recv_ptz_store_preset, preset)
+        ptz_command!(self, ptz_store_preset, preset)
     }
 
     /// Set the absolute zoom within `0.0..=1.0`: zero is zoomed in, one is
@@ -2839,7 +2655,7 @@ impl Ptz<'_> {
     #[doc(alias = "NDIlib_recv_ptz_zoom")]
     pub fn zoom(&self, zoom: f32) -> Result<()> {
         validate_ptz_value("zoom", zoom, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_zoom, zoom)
+        ptz_command!(self, ptz_zoom, zoom)
     }
 
     /// Set the zoom speed within `-1.0..=1.0`: negative zooms out, positive
@@ -2851,7 +2667,7 @@ impl Ptz<'_> {
     #[doc(alias = "NDIlib_recv_ptz_zoom_speed")]
     pub fn zoom_speed(&self, speed: f32) -> Result<()> {
         validate_ptz_value("zoom speed", speed, -1.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_zoom_speed, speed)
+        ptz_command!(self, ptz_zoom_speed, speed)
     }
 
     /// Set the absolute pan and tilt within `-1.0..=1.0`: pan increases from
@@ -2864,7 +2680,7 @@ impl Ptz<'_> {
     pub fn pan_tilt(&self, pan: f32, tilt: f32) -> Result<()> {
         validate_ptz_value("pan", pan, -1.0, 1.0)?;
         validate_ptz_value("tilt", tilt, -1.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_pan_tilt, pan, tilt)
+        ptz_command!(self, ptz_pan_tilt, pan, tilt)
     }
 
     /// Set the pan and tilt speeds within `-1.0..=1.0`: positive pans left
@@ -2877,7 +2693,7 @@ impl Ptz<'_> {
     pub fn pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> Result<()> {
         validate_ptz_value("pan speed", pan_speed, -1.0, 1.0)?;
         validate_ptz_value("tilt speed", tilt_speed, -1.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_pan_tilt_speed, pan_speed, tilt_speed)
+        ptz_command!(self, ptz_pan_tilt_speed, pan_speed, tilt_speed)
     }
 
     /// Focus automatically.
@@ -2887,7 +2703,7 @@ impl Ptz<'_> {
     /// See [`Ptz`].
     #[doc(alias = "NDIlib_recv_ptz_auto_focus")]
     pub fn auto_focus(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_auto_focus)
+        ptz_command!(self, ptz_auto_focus)
     }
 
     /// Set the absolute focus within `0.0..=1.0`: zero focuses at infinity,
@@ -2899,7 +2715,7 @@ impl Ptz<'_> {
     #[doc(alias = "NDIlib_recv_ptz_focus")]
     pub fn focus(&self, focus: f32) -> Result<()> {
         validate_ptz_value("focus", focus, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_focus, focus)
+        ptz_command!(self, ptz_focus, focus)
     }
 
     /// Set the focus speed within `-1.0..=1.0`: negative focuses farther,
@@ -2911,7 +2727,7 @@ impl Ptz<'_> {
     #[doc(alias = "NDIlib_recv_ptz_focus_speed")]
     pub fn focus_speed(&self, speed: f32) -> Result<()> {
         validate_ptz_value("focus speed", speed, -1.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_focus_speed, speed)
+        ptz_command!(self, ptz_focus_speed, speed)
     }
 
     /// Balance white automatically.
@@ -2921,7 +2737,7 @@ impl Ptz<'_> {
     /// See [`Ptz`].
     #[doc(alias = "NDIlib_recv_ptz_white_balance_auto")]
     pub fn white_balance_auto(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_auto)
+        ptz_command!(self, ptz_white_balance_auto)
     }
 
     /// Select the indoor white-balance preset.
@@ -2931,7 +2747,7 @@ impl Ptz<'_> {
     /// See [`Ptz`].
     #[doc(alias = "NDIlib_recv_ptz_white_balance_indoor")]
     pub fn white_balance_indoor(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_indoor)
+        ptz_command!(self, ptz_white_balance_indoor)
     }
 
     /// Select the outdoor white-balance preset.
@@ -2941,7 +2757,7 @@ impl Ptz<'_> {
     /// See [`Ptz`].
     #[doc(alias = "NDIlib_recv_ptz_white_balance_outdoor")]
     pub fn white_balance_outdoor(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_outdoor)
+        ptz_command!(self, ptz_white_balance_outdoor)
     }
 
     /// Balance white once, from the current image.
@@ -2951,7 +2767,7 @@ impl Ptz<'_> {
     /// See [`Ptz`].
     #[doc(alias = "NDIlib_recv_ptz_white_balance_oneshot")]
     pub fn white_balance_oneshot(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_oneshot)
+        ptz_command!(self, ptz_white_balance_oneshot)
     }
 
     /// Set the red and blue white-balance levels within `0.0..=1.0`.
@@ -2963,7 +2779,7 @@ impl Ptz<'_> {
     pub fn white_balance_manual(&self, red: f32, blue: f32) -> Result<()> {
         validate_ptz_value("red", red, 0.0, 1.0)?;
         validate_ptz_value("blue", blue, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_manual, red, blue)
+        ptz_command!(self, ptz_white_balance_manual, red, blue)
     }
 
     /// Set the exposure automatically.
@@ -2973,7 +2789,7 @@ impl Ptz<'_> {
     /// See [`Ptz`].
     #[doc(alias = "NDIlib_recv_ptz_exposure_auto")]
     pub fn exposure_auto(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_exposure_auto)
+        ptz_command!(self, ptz_exposure_auto)
     }
 
     /// Set the exposure level within `0.0..=1.0`, from dark to light.
@@ -2984,7 +2800,7 @@ impl Ptz<'_> {
     #[doc(alias = "NDIlib_recv_ptz_exposure_manual")]
     pub fn exposure_manual(&self, level: f32) -> Result<()> {
         validate_ptz_value("exposure level", level, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_exposure_manual, level)
+        ptz_command!(self, ptz_exposure_manual, level)
     }
 
     /// Set the iris, gain and shutter speed within `0.0..=1.0`: iris and gain
@@ -2998,13 +2814,7 @@ impl Ptz<'_> {
         validate_ptz_value("iris", iris, 0.0, 1.0)?;
         validate_ptz_value("gain", gain, 0.0, 1.0)?;
         validate_ptz_value("shutter speed", shutter_speed, 0.0, 1.0)?;
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_exposure_manual_v2,
-            iris,
-            gain,
-            shutter_speed
-        )
+        ptz_command!(self, ptz_exposure_manual_v2, iris, gain, shutter_speed)
     }
 }
 
@@ -4187,7 +3997,7 @@ mod tests {
     #[test]
     fn receiver_permissions_do_not_add_pointer_storage() {
         assert_eq!(
-            std::mem::size_of::<Control<'_>>(),
+            std::mem::size_of::<control::Control<'_>>(),
             2 * std::mem::size_of::<usize>()
         );
         for bytes in [
@@ -4548,7 +4358,9 @@ mod tests {
             return;
         };
         let mut receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        Arc::get_mut(&mut receiver.core).unwrap().legacy_controls = true;
+        Arc::get_mut(&mut receiver.core)
+            .unwrap()
+            .guard_local_connection_changes = true;
         let change = receiver.core.lock_change();
         assert!(matches!(
             receiver.core.lock_mutating_control(),
@@ -4557,7 +4369,7 @@ mod tests {
         receiver.set_tally(Tally::new(true, false));
         receiver.set_tally(Tally::new(false, true));
         assert_eq!(
-            receiver.core.lock_control()._exclusive.pending_tally,
+            receiver.core.lock_control().pending_tally(),
             Some(Tally::new(false, true))
         );
         let metadata = MetadataFrame::new("<during-change/>").unwrap();
@@ -4566,34 +4378,14 @@ mod tests {
             Err(Error::NotConnected)
         ));
         assert!(matches!(receiver.ptz().zoom(0.5), Err(Error::NotConnected)));
-        // These receiver-owned observations never consult a replaced connection.
+        assert!(!receiver.ptz().is_supported());
+        // Receiver-owned observations never consult a replaced connection.
         receiver.connection_stats().unwrap();
-        let _ = receiver.ptz().is_supported();
         drop(change);
         let control = receiver.core.lock_control();
-        assert!(!control._exclusive.changing);
-        assert_eq!(control._exclusive.pending_tally, None);
+        assert_eq!(control.pending_tally(), None);
         drop(control);
         assert!(receiver.core.lock_mutating_control().is_ok());
-    }
-
-    #[test]
-    fn changing_control_state_replays_only_the_latest_tally() {
-        let mut permit = ControlPermit {
-            changing: true,
-            ..ControlPermit::default()
-        };
-        permit.set_tally(Tally::new(true, false), |_| {
-            panic!("native tally entered during change")
-        });
-        permit.set_tally(Tally::new(false, true), |_| {
-            panic!("native tally entered during change")
-        });
-        let mut sent = Vec::new();
-        permit.finish_change(|tally| sent.push(tally));
-        assert_eq!(sent, [Tally::new(false, true)]);
-        assert!(!permit.changing);
-        assert_eq!(permit.pending_tally, None);
     }
 
     #[test]

@@ -128,8 +128,11 @@ one. `UnsupportedCapability` identifies `Capability::Runtime(feature)` and a typ
 [`CapabilityUnavailable`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/capabilities/enum.CapabilityUnavailable.html).
 Availability does not establish hardware support or license entitlement.
 
-Discovery Server advertisers and listeners require NDI 6.4 or later. Other
-operations may depend on exported entry points, version, edition and build
+Discovery Server advertisers and listeners require NDI 6.4 or later.
+`RuntimeFeature::RemoteReceiverControl` permits Discovery Server clients to
+change an advertised receiver's source. On Windows this requires an Advanced
+runtime. Standard Windows receivers can still be advertised for monitoring
+and input-group membership. Other operations may depend on exported entry points, version, edition and build
 headers. Query the selected runtime instead of inferring support from a version
 matrix. The separate File library reports its families through `FileApi::status`
 and `supports`, or validates them with `require_family`. Missing families use

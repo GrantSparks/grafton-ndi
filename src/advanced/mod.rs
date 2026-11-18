@@ -56,6 +56,8 @@ mod controls;
 mod descriptors;
 mod finder;
 mod kvm;
+#[cfg(ndi_has_advanced_kvm)]
+pub(crate) use kvm::TouchPoints;
 mod kvm_receiver;
 mod packets;
 mod queued;

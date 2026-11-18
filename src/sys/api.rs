@@ -599,3 +599,58 @@ mod tests {
         assert_eq!(api.missing(RuntimeFeature::ConnectedSourceName), None);
     }
 }
+
+#[cfg(test)]
+mod receiver_control_tests {
+    use super::*;
+    use crate::capabilities::CapabilityStatus;
+
+    #[test]
+    fn remote_receiver_control_requires_safe_advertising() {
+        let feature = RuntimeFeature::RemoteReceiverControl;
+        for windows in [false, true] {
+            for edition in [SdkEdition::Standard, SdkEdition::Advanced] {
+                for (version, available) in [
+                    (None, false),
+                    (Some("6.3.2"), false),
+                    (Some("6.4.0.2"), true),
+                ] {
+                    for exports in [false, true] {
+                        let tables = Resolved::load(&super::super::table::ExportsWhere(|name| {
+                            exports || name != "NDIlib_recv_advertiser_add_receiver"
+                        }))
+                        .unwrap();
+                        let capabilities = Capabilities::detect_on(
+                            &tables.api,
+                            &tables.advanced,
+                            version.and_then(SdkVersion::parse),
+                            edition,
+                            windows,
+                        );
+                        let native_exclusion = !windows || edition == SdkEdition::Advanced;
+                        assert_eq!(
+                            capabilities.has_native_receiver_connection_exclusion(),
+                            native_exclusion
+                        );
+                        let status = capabilities.status(feature);
+                        if !available || !exports {
+                            let advertising =
+                                capabilities.status(RuntimeFeature::ReceiverAdvertising);
+                            assert_ne!(advertising, CapabilityStatus::Available);
+                            assert_eq!(status, advertising);
+                        } else if native_exclusion {
+                            assert_eq!(status, CapabilityStatus::Available);
+                        } else {
+                            assert_eq!(
+                                status,
+                                CapabilityStatus::Unavailable(CapabilityRefusal::WrongEdition(
+                                    None
+                                ))
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

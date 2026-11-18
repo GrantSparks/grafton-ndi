@@ -391,6 +391,10 @@ runtime_features! {
     /// Discovery Server receiver registration and removal. Needs NDI 6.4.0 or
     /// later: earlier runtimes can crash when an advertiser is destroyed.
     core ReceiverAdvertising as "receiver advertising" since NDI_6_4;
+    /// Letting Discovery Server clients change an advertised receiver's source.
+    /// On Windows this requires an Advanced runtime, whose connection lock
+    /// also protects controls from SDK-internal connection changes.
+    core RemoteReceiverControl as "remote receiver control" requires ReceiverAdvertising;
     /// Sender snapshots, subscriptions and owned event batches. Needs NDI
     /// 6.4.0 or later: earlier runtimes can crash when a listener is destroyed.
     core SenderDiscovery as "sender discovery" since NDI_6_4;
@@ -599,6 +603,7 @@ impl CapabilityStatus {
 /// one recorded decision for every [`RuntimeFeature`].
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Capabilities {
+    native_receiver_connection_exclusion: bool,
     decisions: [std::result::Result<(), CapabilityRefusal>; RuntimeFeature::UNIT.len()],
     #[cfg(feature = "advanced")]
     presets:
@@ -622,6 +627,17 @@ impl Capabilities {
         version: Option<SdkVersion>,
         edition: SdkEdition,
     ) -> Self {
+        Self::detect_on(api, advanced, version, edition, cfg!(windows))
+    }
+
+    pub(crate) fn detect_on(
+        api: &ResolvedApi,
+        advanced: &ResolvedAdvancedApi,
+        version: Option<SdkVersion>,
+        edition: SdkEdition,
+        windows: bool,
+    ) -> Self {
+        let native_receiver_connection_exclusion = !windows || edition == SdkEdition::Advanced;
         let versioned = |feature: RuntimeFeature| match (feature.minimum_version(), version) {
             (None, _) => Ok(()),
             (Some(required), Some(version)) if version >= *required => Ok(()),
@@ -648,6 +664,7 @@ impl Capabilities {
             missing.map_or_else(|| versioned(feature), Err)
         };
         let mut capabilities = Self {
+            native_receiver_connection_exclusion,
             decisions: [Ok(()); RuntimeFeature::UNIT.len()],
             #[cfg(feature = "advanced")]
             presets: [Ok(0); PassthroughPreset::ALL.len()],
@@ -657,7 +674,13 @@ impl Capabilities {
                 feature
                     .requirements()
                     .iter()
-                    .try_for_each(|&required| capabilities.decision(required))
+                    .try_for_each(|&required| capabilities.decision(required))?;
+                if feature == RuntimeFeature::RemoteReceiverControl
+                    && !native_receiver_connection_exclusion
+                {
+                    return Err(CapabilityRefusal::WrongEdition(None));
+                }
+                Ok(())
             });
         }
         #[cfg(feature = "advanced")]
@@ -672,6 +695,12 @@ impl Capabilities {
             });
         }
         capabilities
+    }
+
+    /// Whether the runtime excludes connection replacement inside its controls.
+    /// This basis is independent of advertising's version and export gates.
+    pub(crate) fn has_native_receiver_connection_exclusion(&self) -> bool {
+        self.native_receiver_connection_exclusion
     }
 
     pub(crate) fn decision(

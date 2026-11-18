@@ -1086,7 +1086,7 @@ mod tests {
         let mut sync = FrameSync::new(receiver).unwrap();
         let original = (
             sync.inner.resource().instance,
-            sync.receiver().core.lock_control().instance(),
+            std::sync::Arc::as_ptr(&sync.receiver().core),
         );
         let (results, allocations) = crate::test_alloc::allocation_count(|| {
             let tier = sync.controls().set_stream_tier(crate::StreamTier::Preview);
@@ -1100,7 +1100,7 @@ mod tests {
         assert_eq!(
             (
                 sync.inner.resource().instance,
-                sync.receiver().core.lock_control().instance()
+                std::sync::Arc::as_ptr(&sync.receiver().core)
             ),
             original
         );
@@ -1149,13 +1149,13 @@ mod tests {
                     &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
                 )
                 .unwrap();
-                let original = receiver.core.lock_control().instance();
+                let original = std::sync::Arc::as_ptr(&receiver.core);
                 drop(ndi);
                 for _ in 0..3 {
                     let fs = FrameSync::new(receiver).unwrap();
-                    assert_eq!(fs.receiver().core.lock_control().instance(), original);
+                    assert_eq!(std::sync::Arc::as_ptr(&fs.receiver().core), original);
                     receiver = fs.into_receiver();
-                    assert_eq!(receiver.core.lock_control().instance(), original);
+                    assert_eq!(std::sync::Arc::as_ptr(&receiver.core), original);
                     assert!(receiver.capture_video(std::time::Duration::ZERO).is_ok());
                 }
                 let fs = FrameSync::new(receiver).unwrap();

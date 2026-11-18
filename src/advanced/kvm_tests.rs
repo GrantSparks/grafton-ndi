@@ -130,54 +130,60 @@ struct TestSender;
 
 #[cfg(not(ndi_has_advanced_kvm))]
 impl InputSender for TestSender {
-    fn key(&self, connection: &Control<'_>, value: i32, down: bool) -> Result<()> {
+    fn key(&self, connection: &MutatingControl<'_>, value: i32, down: bool) -> Result<()> {
         let (accepted, operation) = if down {
             // SAFETY: these synthetic callbacks only record their arguments.
             (
-                unsafe { key(connection.instance(), value) },
+                unsafe { key(connection.test_instance(), value) },
                 c"NDIlib_recv_kvm_send_keyboard_press",
             )
         } else {
             (
-                unsafe { release(connection.instance(), value) },
+                unsafe { release(connection.test_instance(), value) },
                 c"NDIlib_recv_kvm_send_keyboard_release",
             )
         };
         crate::sys::table::for_test(accepted, operation).performed()
     }
 
-    fn mouse(&self, connection: &Control<'_>, button: MouseButton, down: bool) -> Result<()> {
+    fn mouse(
+        &self,
+        connection: &MutatingControl<'_>,
+        button: MouseButton,
+        down: bool,
+    ) -> Result<()> {
         if down {
-            record(connection.instance());
+            record(connection.test_instance());
             return Ok(());
         }
         let (accepted, operation) = match button {
             // SAFETY: these synthetic callbacks only record their arguments.
             MouseButton::Left => (
-                unsafe { left_release(connection.instance()) },
+                unsafe { left_release(connection.test_instance()) },
                 c"NDIlib_recv_kvm_send_left_mouse_release",
             ),
             MouseButton::Middle => (
-                unsafe { middle_release(connection.instance()) },
+                unsafe { middle_release(connection.test_instance()) },
                 c"NDIlib_recv_kvm_send_middle_mouse_release",
             ),
             MouseButton::Right => (
-                unsafe { right_release(connection.instance()) },
+                unsafe { right_release(connection.test_instance()) },
                 c"NDIlib_recv_kvm_send_right_mouse_release",
             ),
         };
         crate::sys::table::for_test(accepted, operation).performed()
     }
 
-    fn touch(&self, connection: &Control<'_>, points: TouchPoints<'_>) -> Result<()> {
+    fn touch(&self, connection: &MutatingControl<'_>, points: TouchPoints<'_>) -> Result<()> {
         // SAFETY: TouchPoints lends its exact validated count of initialized pairs.
-        let accepted = unsafe { touch(connection.instance(), points.count(), points.as_ptr()) };
+        let accepted =
+            unsafe { touch(connection.test_instance(), points.count(), points.as_ptr()) };
         crate::sys::table::for_test(accepted, c"NDIlib_recv_kvm_send_touch_positions").performed()
     }
 
-    fn finish_touch(&self, connection: &Control<'_>) -> Result<()> {
+    fn finish_touch(&self, connection: &MutatingControl<'_>) -> Result<()> {
         // SAFETY: the synthetic callback only records its instance argument.
-        let accepted = unsafe { finish_touch(connection.instance()) };
+        let accepted = unsafe { finish_touch(connection.test_instance()) };
         crate::sys::table::for_test(accepted, c"NDIlib_recv_kvm_send_touch_finish").performed()
     }
 }
@@ -209,26 +215,26 @@ impl TestSession {
     }
 
     fn key_down(&mut self, keysym: u32) -> Result<()> {
-        Control::with_test_instance(self.instance, |connection| {
+        MutatingControl::with_test_instance(self.instance, |connection| {
             self.held
                 .key(connection, sender(), key_symbol(keysym)?, true)
         })
     }
 
     fn mouse_down(&mut self, button: MouseButton) -> Result<()> {
-        Control::with_test_instance(self.instance, |connection| {
+        MutatingControl::with_test_instance(self.instance, |connection| {
             self.held.mouse(connection, sender(), button, true)
         })
     }
 
     fn touch(&mut self, points: &[[f32; 2]]) -> Result<()> {
-        Control::with_test_instance(self.instance, |connection| {
+        MutatingControl::with_test_instance(self.instance, |connection| {
             self.held.touch(connection, sender(), points)
         })
     }
 
     fn release_all(&mut self) -> Result<()> {
-        Control::with_test_instance(self.instance, |connection| {
+        MutatingControl::with_test_instance(self.instance, |connection| {
             self.held.release_all(connection, sender())
         })
     }
@@ -236,7 +242,7 @@ impl TestSession {
 
 impl Drop for TestSession {
     fn drop(&mut self) {
-        Control::with_test_instance(self.instance, |connection| {
+        MutatingControl::with_test_instance(self.instance, |connection| {
             self.held.release_on_drop(connection, sender());
         });
     }

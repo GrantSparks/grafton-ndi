@@ -99,7 +99,7 @@ fn native_change_refuses_unsafe_controls_and_replays_tally_without_blocking_gett
     let mut receiver =
         Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
     let core = Arc::get_mut(&mut receiver.core).unwrap();
-    core.legacy_controls = true;
+    core.guard_local_connection_changes = true;
     let table = core.sdk().with_test_overrides(|table| {
         table.NDIlib_recv_connect = connect;
         table.NDIlib_recv_set_tally = tally;
