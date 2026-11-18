@@ -18,6 +18,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import sdk  # noqa: E402
+import sdk_test_scope  # noqa: E402
 import workflows  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -432,69 +433,6 @@ def implementation_coverage_violations(rust):
     return found
 
 
-# Keep this contract independent of the workflow parser: batching cannot drop a selector or add a skip.
-MIRI_BATCHES = {
-    'reads': [
-        'sdk_copy::tests::',
-        'source_retention::tests::',
-        'connection_metadata::tests::',
-        'finder::budget::tests::',
-        'file::out_param::tests::',
-    ],
-    'media': [
-        'frames::descriptor_tests::',
-        'pixels::tests::',
-        'frames::tests::video_padding_all_formats',
-        'frames::tests::video_padding_single_rows',
-        'frames::tests::video_padding_encoders',
-        'frames::metadata_tests::metadata_constructors',
-        'frames::metadata_tests::owned_metadata_states',
-        'frames::metadata_tests::audio_timestamp',
-        'receiver::mixed_tests',
-        'receiver::latest_report_tests::',
-        'receiver::pending::tests::',
-        'asynchronous::receiver_tests::receiver_delivery_replays_only_while_armed',
-        'asynchronous::scoped_tests',
-        'framesync::tests::test_framesync_video_ref_uses',
-        'framesync::tests::test_framesync_audio_ref_supports',
-        'advanced::sync::tests::returned_audio_is_released',
-        'advanced::sync::tests::borrowed_avsync_audio',
-    ],
-    'ownership': [
-        'finder::cache_retirement_tests::retirement_',
-        'finder::cache_retirement_tests::snapshot_remains_live_',
-        'finder::tests::invalidation_prevents_pending_lookup_',
-        'advanced::kvm::ownership_tests::',
-        'advanced::reserved_map::tests::',
-        'advanced::send_slots::tests::',
-        'advanced::aliasable::tests::',
-        'advanced::packets::payload::tests::',
-        'advanced::packets::received::tests::',
-        'advanced::queued::boundary_tests::',
-        'sender::in_flight::tests::',
-        'advanced::send::tests::',
-        'advanced::queued::tests::',
-        'sender::tests::',
-    ],
-}
-MIRI_SKIPS = [
-    'descriptor_admission_and_collection_stay_allocation_free_under_churn',
-    'exact_copies_match_standard_utf8_replacement',
-    'sdk_copy::tests::expanded_text_cannot_allocate_past_the_snapshot_limit',
-    'sdk_copy::tests::omitting_malformed_entries_keeps_their_scan_cost_and_fatal_errors',
-    'sdk_copy::tests::rejected_scans_stay_charged_and_short_budgets_are_fatal',
-    'finder::budget::tests::aggregate_bytes_are_checked_before_string_allocation',
-    'finder::budget::tests::count_and_span_are_checked_before_dereferencing_or_reserving',
-    'finder::budget::tests::lossy_expansion_is_charged_before_allocating_the_output',
-    'finder::budget::tests::rejected_entries_still_consume_the_scan_budget',
-]
-
-
-def miri_batches(script):
-    return [(name, shlex.split(body)) for name, body in
-            re.findall(r'^\s*(\w+)\) filters=\((.*?)\);;', script, re.DOTALL | re.MULTILINE)]
-
-
 def memory_checker_violations(rust):
     """Both interpreters and live padding checks must fail required jobs."""
     jobs = rust['jobs']
@@ -511,29 +449,16 @@ def memory_checker_violations(rust):
         if command not in setup:
             found.append('rust.yml: Miri setup does not pin the checked nightly and components')
     command = 'cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio'
-    for selection in ('-- --exact "${batch_tests[@]}"', '-- --list'):
+    for selection in ('-- --exact "${tests[@]}" --test-threads=1', '-- --list > "$inventory"'):
         if f'{command} {selection}' not in run:
-            found.append('rust.yml: Miri does not build and execute the selected synthetic fixtures with file-io')
-    if run.count('-- --list') != 1 or f'inventory=$({command} -- --list)' not in run:
+            found.append('rust.yml: Miri does not list fixtures and execute exact serial selections')
+    if run.count('-- --list') != 1:
         found.append('rust.yml: Miri must read one interpreted test inventory')
-    skips = re.search(r'skips=\((.*?)\)', run, re.DOTALL)
-    found += differs('rust.yml: Miri skip policy', shlex.split(skips.group(1)) if skips else [], MIRI_SKIPS)
-    batches = miri_batches(run)
-    found += differs('rust.yml: Miri audited batches', batches, list(MIRI_BATCHES.items()))
-    order = re.search(r'batches=\((.*?)\)', run, re.DOTALL)
-    found += differs('rust.yml: Miri batch order', shlex.split(order.group(1)) if order else [], list(MIRI_BATCHES))
-    filters = [fixture for _, batch in batches for fixture in batch]
-    for fixture in [fixture for batch in MIRI_BATCHES.values() for fixture in batch]:
-        if fixture not in filters:
-            found.append(f'rust.yml: Miri omits {fixture}')
-    for required in ('batch_tests+=("${selected[@]}")', '-- --exact "${batch_tests[@]}"'):
-        if required not in run:
-            found.append('rust.yml: Miri does not run exact inventory selections')
-    if '--test-threads=1' not in run:
-        found.append('rust.yml: Miri batching increases inter-test concurrency')
-    for required in ('selected_names=()', '"$test" = "$previous"', 'Ambiguous test selection:'):
-        if required not in run:
-            found.append('rust.yml: Miri lacks the overlapping-selection guard')
+    group_loop = 'for group in ' + ' '.join(sdk_test_scope.MIRI_GROUPS) + '; do'
+    if group_loop not in run:
+        found.append('rust.yml: Miri must run each audited selection group')
+    if 'python3 ci/sdk_test_scope.py select --group "$group" --inventory "$inventory" --output "$selection"' not in run:
+        found.append('rust.yml: Miri lacks the inventory selection guard')
 
     test = next((step for step in jobs['test']['steps']
                  if step.get('name') == 'Memcheck over scripted capture and encoder padding'), {})
@@ -550,19 +475,13 @@ def memory_checker_violations(rust):
         if owner not in jobs['required-ci'].get('needs', []):
             found.append(f'rust.yml: {owner} Memcheck is not required')
     for required in ('--trace-children=yes', '--trace-children-skip=', '--test mixed_capture_boundary',
-                     '--test frame_metadata_boundary', 'filters=(frames::tests::video_padding_encoders)'):
+                     '--test frame_metadata_boundary'):
         if required not in test.get('run', ''):
             found.append('rust.yml: scripted Memcheck omits active SDK-free fixtures or their child processes')
-    for required in ('-- --list "$filter"', "if ! grep -q ': test$'", 'No tests selected for filter: $filter', 'exit 1'):
-        if required not in test.get('run', ''):
-            found.append('rust.yml: scripted Memcheck lacks the empty-selection guard')
-    for required in ('select_tests "$filter" true', 'No tests selected for filter: $filter', 'exit 1'):
-        if required not in run:
-            found.append('rust.yml: Miri lacks the empty-selection guard')
-    for required in ('select_tests "$skip" false', 'No tests selected for skip: $skip',
-                     'Ambiguous skip selection:', 'skip_args+=(--skip "$skip")'):
-        if required not in run:
-            found.append('rust.yml: Miri lacks the skip-selection guard')
+    for owner, step, group in (('test', test, 'encoder-padding'), ('sdk', sdk, 'sdk-padding')):
+        if (f'python3 ci/sdk_test_scope.py select --group {group} --inventory "$inventory" --output "$selection"' not in step.get('run', '')
+                or '-- --exact "${tests[@]}" --test-threads=1' not in step.get('run', '')):
+            found.append(f'rust.yml: {owner} Memcheck lacks guarded exact selections')
     for required in ('ci/offline/linux.sh', '--test video_padding_sdk', '--features image-encoding'):
         if required not in sdk.get('run', ''):
             found.append('rust.yml: live Memcheck omits SDK padding or loopback isolation')
@@ -1081,91 +1000,6 @@ class MemoryCheckers(unittest.TestCase):
             self.assertNotIn('obj:', block)
             self.assertIn('Memcheck:Addr8', block)
 
-    def test_empty_filter_and_skip_names_fail_the_checker_scripts(self):
-        rust = workflows.load(read_workflows()['rust.yml'])
-        cases = [
-            ('miri', 'Initialized rows, metadata and synthetic native guards', 'frames::tests::video_padding_all_formats'),
-            ('miri', 'Initialized rows, metadata and synthetic native guards',
-             'descriptor_admission_and_collection_stay_allocation_free_under_churn'),
-            ('miri', 'Initialized rows, metadata and synthetic native guards', 'sdk_copy::tests::fixture'),
-            ('test', 'Memcheck over scripted capture and encoder padding', 'frames::tests::video_padding_encoders'),
-            ('test', 'Manual measurement fixtures', '--ignored'),
-        ]
-        miri_script = rust['jobs']['miri']['steps'][2]['run']
-        skips = shlex.split(re.search(r'skips=\((.*?)\)', miri_script, re.DOTALL).group(1))
-        batches = miri_batches(miri_script)
-        filters = [fixture for _, batch in batches for fixture in batch]
-        inventory = '\n'.join(f'{name}: test' for name in [*skips, *(name + 'fixture' for name in filters)])
-        with tempfile.TemporaryDirectory() as directory:
-            cargo = Path(directory) / 'cargo'
-            cargo.write_text('''#!/bin/bash
-empty=0
-for argument in "$@"; do
-  if [ "$argument" = "$EMPTY_SELECTION" ]; then empty=1; fi
-done
-printf '%s\n' "$*" >> "$CARGO_CALLS"
-case " $* " in
-  *" --list "*)
-    if [ -n "$MIRI_INVENTORY" ]; then
-      while IFS= read -r line; do
-        if [ -z "$EMPTY_SELECTION" ] || [[ "$line" != *"$EMPTY_SELECTION"* ]]; then
-          printf '%s\n' "$line"
-        fi
-      done <<< "$MIRI_INVENTORY"
-    elif [ "$empty" = 0 ]; then
-      echo 'fixture: test'
-    fi ;;
-esac
-''')
-            cargo.chmod(0o755)
-            for job, name, missing in cases:
-                script = next(step['run'] for step in rust['jobs'][job]['steps'] if step.get('name') == name)
-                script = '\n'.join(line for line in script.splitlines() if not line.startswith('sudo '))
-                for selection, expected in (('', 0), (missing, 1)):
-                    with self.subTest(job=job, missing=selection):
-                        calls_file = Path(directory) / 'calls'
-                        calls_file.write_text('')
-                        result = subprocess.run(['bash', '-eo', 'pipefail', '-c', script],
-                                                env={**os.environ, 'PATH': directory + os.pathsep + os.environ['PATH'],
-                                                     'EMPTY_SELECTION': selection, 'CARGO_CALLS': str(calls_file),
-                                                     'MIRI_INVENTORY': inventory if job == 'miri' else ''}, text=True, capture_output=True)
-                        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
-                        if selection:
-                            self.assertIn(selection.removesuffix('fixture'), result.stdout)
-                            self.assertIn('No tests selected', result.stdout)
-                        if job == 'miri':
-                            calls = calls_file.read_text().splitlines()
-                            self.assertEqual(sum(' --list' in call for call in calls), 1)
-                            if not selection:
-                                self.assertEqual(sum(' --list' not in call for call in calls), len(batches))
-                                self.assertTrue(all('--test-threads=1' in call and ' --exact ' in call
-                                                    for call in calls if ' --list' not in call))
-
-    def test_miri_inventory_rejects_ambiguous_filters_and_skips(self):
-        rust = workflows.load(read_workflows()['rust.yml'])
-        script = rust['jobs']['miri']['steps'][2]['run']
-        filters = [fixture for batch in MIRI_BATCHES.values() for fixture in batch]
-        inventory = '\n'.join(f'{name}: test' for name in [*MIRI_SKIPS, *(name + 'fixture' for name in filters)])
-        cases = (
-            (inventory + '\n' + MIRI_SKIPS[0] + '_duplicate: test', 'Ambiguous skip selection:'),
-            (inventory + '\n' + filters[0] + filters[1] + 'overlap: test', 'Ambiguous test selection:'),
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            cargo = Path(directory) / 'cargo'
-            cargo.write_text("""#!/bin/bash
-case " $* " in
-  *" --list "*) printf '%s\\n' "$MIRI_INVENTORY" ;;
-esac
-""")
-            cargo.chmod(0o755)
-            for changed, expected in cases:
-                with self.subTest(expected=expected):
-                    result = subprocess.run(['bash', '-eo', 'pipefail', '-c', script],
-                                            env={**os.environ, 'PATH': directory + os.pathsep + os.environ['PATH'],
-                                                 'MIRI_INVENTORY': changed}, text=True, capture_output=True)
-                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                    self.assertIn(expected, result.stdout)
-
     def test_missing_detector_configuration_is_reported(self):
         rust = workflows.load(read_workflows()['rust.yml'])
         self.assertEqual(memory_checker_violations(rust), [])
@@ -1182,53 +1016,22 @@ esac
                         if step.get('name', '').startswith('Memcheck over '))
             step['run'] = step['run'].replace('--error-exitcode=99', '')
             variants.append((ineffective, 'fail on detector errors'))
-        for job, name in (('miri', 'Initialized rows, metadata and synthetic native guards'),
-                          ('test', 'Memcheck over scripted capture and encoder padding')):
+        for job, name, group in (
+            ('miri', 'Initialized rows, metadata and synthetic native guards', '"$group"'),
+            ('test', 'Memcheck over scripted capture and encoder padding', 'encoder-padding'),
+            ('sdk', 'Memcheck over SDK padding', 'sdk-padding'),
+        ):
             missing_guard = copy.deepcopy(rust)
             step = next(step for step in missing_guard['jobs'][job]['steps'] if step.get('name') == name)
-            guard = 'select_tests "$filter" true' if job == 'miri' else '-- --list "$filter"'
-            step['run'] = step['run'].replace(guard, '')
-            variants.append((missing_guard, 'empty-selection guard'))
-        missing_skip_guard = copy.deepcopy(rust)
-        missing_skip_guard['jobs']['miri']['steps'][2]['run'] = rust['jobs']['miri']['steps'][2]['run'].replace('select_tests "$skip" false', '')
-        variants.append((missing_skip_guard, 'skip-selection guard'))
+            step['run'] = step['run'].replace(f'select --group {group}', 'select')
+            variants.append((missing_guard, 'selection guard' if job == 'miri' else 'guarded exact selections'))
         for change in ('remove', 'repeat'):
             broken_inventory = copy.deepcopy(rust)
             step = broken_inventory['jobs']['miri']['steps'][2]
-            inventory = next(line for line in step['run'].splitlines() if line.startswith('inventory='))
+            inventory = next(line for line in step['run'].splitlines() if '-- --list' in line)
             step['run'] = step['run'].replace(inventory, '' if change == 'remove' else inventory + '\n' + inventory)
-            variants.append((broken_inventory, 'one interpreted test inventory'))
-        missing_send_module = copy.deepcopy(rust)
-        missing_send_module['jobs']['miri']['steps'][2]['run'] = rust['jobs']['miri']['steps'][2]['run'].replace('advanced::aliasable::tests::', '')
-        variants.append((missing_send_module, 'Miri omits advanced::aliasable'))
-        for fixture in ('sdk_copy::tests::', 'source_retention::tests::',
-                        'finder::budget::tests::', 'file::out_param::tests::',
-                        'receiver::latest_report_tests::', 'advanced::kvm::ownership_tests::',
-                        'advanced::reserved_map::tests::'):
-            missing_reads = copy.deepcopy(rust)
-            step = missing_reads['jobs']['miri']['steps'][2]
-            step['run'] = step['run'].replace(fixture + '\n', '')
-            variants.append((missing_reads, f'Miri omits {fixture}'))
-        for selection in ('-- --exact "${batch_tests[@]}"', '-- --list'):
-            missing_file = copy.deepcopy(rust)
-            step = missing_file['jobs']['miri']['steps'][2]
-            step['run'] = step['run'].replace(
-                f'--features advanced,file-io,image-encoding,tokio {selection}',
-                f'--features advanced,image-encoding,tokio {selection}')
-            variants.append((missing_file, 'synthetic fixtures with file-io'))
-        for old, new, expected in (
-            ('--test-threads=1', '', 'inter-test concurrency'),
-            ('--exact', '', 'exact inventory selections'),
-            ('skips=(', 'skips=(new_test ', 'Miri skip policy'),
-            ('"$test" = "$previous"', '', 'overlapping-selection guard'),
-            ('batches=(reads media ownership)', 'batches=(reads ownership)', 'Miri batch order'),
-            ('              reads) filters=(', '              unknown) filters=(', 'Miri audited batches'),
-        ):
-            broken_batch = copy.deepcopy(rust)
-            step = broken_batch['jobs']['miri']['steps'][2]
-            # Parsed YAML run bodies have no workflow-level indentation.
-            step['run'] = step['run'].replace(old.lstrip(), new.lstrip())
-            variants.append((broken_batch, expected))
+            message = 'list fixtures' if change == 'remove' else 'one interpreted test inventory'
+            variants.append((broken_inventory, message))
         ungated = copy.deepcopy(rust)
         ungated['jobs']['required-ci']['needs'].remove('miri')
         variants.append((ungated, 'Miri is not required'))
@@ -1249,9 +1052,9 @@ class Repository(unittest.TestCase):
             'GRAFTON_NDI_CONTENTS': 'photographic', 'GRAFTON_NDI_OUTPUTS': 'jpeg85',
         })
         self.assertIn('cargo test --locked --release --all-features --lib -- --ignored --list', step['run'])
-        self.assertIn("if ! grep -q ': test$'", step['run'])
-        self.assertIn('exit 1', step['run'])
-        self.assertIn('cargo test --locked --release --all-features --lib -- --ignored --test-threads=1', step['run'])
+        self.assertIn('python3 ci/sdk_test_scope.py select --group measurements', step['run'])
+        self.assertIn('cargo test --locked --release --all-features --lib -- --ignored --exact "${tests[@]}" --test-threads=1',
+                      step['run'])
 
     def test_vendored_bindings_cover_exactly_the_supported_platform_targets(self):
         setup = (ROOT / 'docs/setup.md').read_text(encoding='utf-8')

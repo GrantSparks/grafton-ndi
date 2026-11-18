@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guard three explicit groups of repeated compiler and fixed Rust tests.
+"""Select CI test inventories or guard exact skips for repeated Rust tests.
 
 The default runtime scope skips audited cases in all-feature compatibility
 runs, whose header/target/feature build has a full primary SDK owner. The
@@ -10,9 +10,15 @@ than repeating them in its default and File-only passes.
 
 Workflow guards verify those owners. This helper guards the actual libtest
 inventory. New tests stay included, even in an audited source file.
+
+`select --group NAME` writes exact test arguments for Miri, Memcheck or the
+measurement run. Groups reject empty filters, overlapping selections and
+unknown inventory lines. Miri applies its exact audited skips to all batches.
+Run the selected names with libtest's `--exact` argument.
 """
 import argparse
 from pathlib import Path
+import re
 import sys
 
 # Exact audited functions, never module/file prefixes. These lists describe
@@ -176,6 +182,86 @@ FIXED_GRAPH = (
 )
 SCOPES = ('runtime', 'synthetic-headers', 'fixed-graph')
 
+# Prefixes retain libtest's original literal substring selection. Miri has
+# three independent processes, with no overlap between them.
+FILTER_SELECTIONS = {
+    'miri-reads': (
+        'sdk_copy::tests::',
+        'source_retention::tests::',
+        'connection_metadata::tests::',
+        'finder::budget::tests::',
+        'file::out_param::tests::',
+    ),
+    'miri-media': (
+        'frames::descriptor_tests::',
+        'pixels::tests::',
+        'frames::tests::video_padding_all_formats',
+        'frames::tests::video_padding_single_rows',
+        'frames::tests::video_padding_encoders',
+        'frames::metadata_tests::metadata_constructors',
+        'frames::metadata_tests::owned_metadata_states',
+        'frames::metadata_tests::audio_timestamp',
+        'receiver::mixed_tests',
+        'receiver::latest_report_tests::',
+        'receiver::pending::tests::',
+        'asynchronous::receiver_tests::receiver_delivery_replays_only_while_armed',
+        'asynchronous::scoped_tests',
+        'framesync::tests::test_framesync_video_ref_uses',
+        'framesync::tests::test_framesync_audio_ref_supports',
+        'advanced::sync::tests::returned_audio_is_released',
+        'advanced::sync::tests::borrowed_avsync_audio',
+    ),
+    'miri-ownership': (
+        'finder::cache_retirement_tests::retirement_',
+        'finder::cache_retirement_tests::snapshot_remains_live_',
+        'finder::tests::invalidation_prevents_pending_lookup_',
+        'advanced::kvm::ownership_tests::',
+        'advanced::reserved_map::tests::',
+        'advanced::send_slots::tests::',
+        'advanced::aliasable::tests::',
+        'advanced::packets::payload::tests::',
+        'advanced::packets::received::tests::',
+        'advanced::queued::boundary_tests::',
+        'sender::in_flight::tests::',
+        'advanced::send::tests::',
+        'advanced::queued::tests::',
+        'sender::tests::',
+    ),
+    'encoder-padding': (
+        'frames::tests::video_padding_encoders',
+    ),
+}
+
+# Each complete inventory (ignored measures or one SDK binary) has an owner.
+EXACT_SELECTIONS = {
+    'measurements': (
+        'advanced::allocators::tests::custom_allocation_cycle_cost',
+        'file::asynchronous::tests::finish_wait_saturation_measurement',
+        'finder::cache_retirement_tests::measure_cache_retirement_contention',
+        'image_encoding::tests::image_encoding_compatibility_fingerprints',
+        'image_encoding::tests::image_encoding_resources',
+        'image_encoding::tests::workspace_output_growth_resources',
+        'image_encoding::tests::workspace_resources',
+    ),
+    'sdk-padding': (
+        'live_receiver_framesync_and_owned_send_skip_padding',
+        'live_yuv_frames_encode_from_sdk_rows',
+    ),
+}
+
+MIRI_SKIPS = (
+    'advanced::queued::tests::descriptor_admission_and_collection_stay_allocation_free_under_churn',
+    'sdk_copy::tests::exact_copies_match_standard_utf8_replacement',
+    'sdk_copy::tests::expanded_text_cannot_allocate_past_the_snapshot_limit',
+    'sdk_copy::tests::omitting_malformed_entries_keeps_their_scan_cost_and_fatal_errors',
+    'sdk_copy::tests::rejected_scans_stay_charged_and_short_budgets_are_fatal',
+    'finder::budget::tests::aggregate_bytes_are_checked_before_string_allocation',
+    'finder::budget::tests::count_and_span_are_checked_before_dereferencing_or_reserving',
+    'finder::budget::tests::lossy_expansion_is_charged_before_allocating_the_output',
+    'finder::budget::tests::rejected_entries_still_consume_the_scan_budget',
+)
+MIRI_GROUPS = tuple(group for group in FILTER_SELECTIONS if group.startswith('miri-'))
+
 
 def expected_tests(target=None, headers=None, scope='runtime'):
     """Exact cases with a retained owner for this specific repeated invocation."""
@@ -220,7 +306,85 @@ def skip_arguments(inventory, target=None, headers=None, scope='runtime'):
     return [argument for name in expected for argument in ('--skip', name)]
 
 
+def test_names(inventory):
+    """Read a single libtest inventory, rejecting unrecognized lines."""
+    names = []
+    for line in inventory.splitlines():
+        if not line or re.fullmatch(r'\d+ tests?, \d+ benchmarks?', line):
+            continue
+        name, _, kind = line.rpartition(': ')
+        if not name or name.startswith('-') or kind not in {'test', 'benchmark'}:
+            raise ValueError(f'unrecognized libtest inventory line: {line!r}')
+        if kind == 'test':
+            names.append(name)
+    if len(names) != len(set(names)):
+        raise ValueError('duplicate test in libtest inventory')
+    return names
+
+
+def filter_groups(names, groups, skips=()):
+    """Match literal filters in declaration order and keep each test in one group."""
+    for skip in skips:
+        if skip not in names:
+            raise ValueError(f'skip {skip!r} does not name an inventory test')
+    available = [name for name in names if name not in skips]
+    selected = {}
+    owners = {}
+    for group, filters in groups.items():
+        selected[group] = []
+        if not filters:
+            raise ValueError(f'test selection group {group!r} is empty')
+        for query in filters:
+            matches = [name for name in available if query in name] if query else []
+            if not matches:
+                raise ValueError(f'test filter {query!r} in group {group!r} selects no tests')
+            for name in matches:
+                if name in owners:
+                    raise ValueError(f'test {name!r} matches both {owners[name]!r} and {(group, query)!r}')
+                owners[name] = (group, query)
+                selected[group].append(name)
+    return selected
+
+
+def selection_arguments(inventory, group):
+    names = test_names(inventory)
+    if group in EXACT_SELECTIONS:
+        expected = EXACT_SELECTIONS[group]
+        if not expected:
+            raise ValueError(f'test selection group {group!r} is empty')
+        missing = set(expected) - set(names)
+        extra = set(names) - set(expected)
+        if missing or extra:
+            raise ValueError(f'test selection group {group!r} inventory differs: '
+                             f'missing {sorted(missing)!r}, unexpected {sorted(extra)!r}')
+        return names
+    groups = MIRI_GROUPS if group in MIRI_GROUPS else (group,)
+    return filter_groups(names, {name: FILTER_SELECTIONS[name] for name in groups},
+                         MIRI_SKIPS if group in MIRI_GROUPS else ())[group]
+
+
+def write_arguments(path, arguments):
+    path.write_bytes(''.join(argument + '\n' for argument in arguments).encode('utf-8'))
+
+
+def select_main(argv):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--inventory', type=Path, required=True)
+    parser.add_argument('--group', choices=(*FILTER_SELECTIONS, *EXACT_SELECTIONS), required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args(argv)
+    try:
+        selected = selection_arguments(args.inventory.read_text(encoding='utf-8'), args.group)
+        write_arguments(args.output, selected)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    print(f'CI {args.group}: selected {len(selected)} exact tests', file=sys.stderr)
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['select']:
+        return select_main(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--inventory', type=Path, required=True)
     parser.add_argument('--scope', choices=SCOPES, default='runtime')
@@ -233,7 +397,7 @@ def main(argv=None):
     try:
         inventory = args.inventory.read_text(encoding='utf-8')
         arguments = skip_arguments(inventory, args.target, args.headers, args.scope)
-        args.output.write_bytes(''.join(argument + '\n' for argument in arguments).encode('utf-8'))
+        write_arguments(args.output, arguments)
     except (OSError, ValueError) as error:
         parser.error(str(error))
     print(f'CI {args.scope} scope: skipping {len(arguments) // 2} audited fixed-graph tests '

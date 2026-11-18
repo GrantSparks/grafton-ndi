@@ -72,9 +72,11 @@ SDK files, generated bindings and SDK-derived binaries stay on their runner.
 
 When adding or changing a test, leave it included unless its inputs prove that
 an existing owner covers it. Add exact names and the source rationale to
-`sdk_test_scope.py` only after that audit. The helper rejects missing, duplicate,
-colliding or mismatched inventory entries; workflow guards require the owner.
-SDK-private caches and artifacts are not part of this design.
+[`sdk_test_scope.py`](sdk_test_scope.py) only after that audit. The helper
+rejects missing, duplicate, colliding or mismatched inventory entries. Its
+`select` mode validates named Miri, Memcheck and measurement groups against an
+inventory before returning exact test names. Workflow guards require the owner.
+SDK-private caches and artifacts are excluded.
 
 The Linux test job also runs the manual measurement fixtures with `--ignored`
 in release mode. Its configurable image sweep uses one 64×64 BGRA input and
@@ -109,12 +111,11 @@ descriptor retention, guards and send-path aliasing with `nightly-2026-11-10`,
 using both Stacked Borrows and Tree Borrows. Native tests report visible skips
 under Miri; source-parsing and subprocess tests are outside its filters. The
 long descriptor churn, exhaustive UTF-8 pairs and multi-megabyte copy-budget
-fixtures are explicitly skipped; smaller synthetic tests retain their exact
-charges, malformed-entry handling and scan bounds. Both memory-checker steps
-check every filter and skip against one interpreted inventory per model. Filters
-use libtest's literal substring rules; missing or overlapping selections fail.
-After applying skips, the job passes concrete names with `--exact` to three
-fixed batches: bounded reads, media frames, and ownership. Serial test cases
+fixtures are explicitly skipped. Smaller synthetic tests retain their exact
+charges, malformed-entry handling and scan bounds. The
+[`sdk_test_scope.py` selector](sdk_test_scope.py) applies the audited skips and
+filters to one interpreted inventory per model. The job runs three batches
+with `--exact` for bounded reads, media frames and ownership. Serial test cases
 preserve the audited local and thread-local state boundaries; explicit worker
 threads in the tests still run. Both borrowing models execute the same selected
 cases, with a fresh process per batch. This avoids repeating interpreter startup
