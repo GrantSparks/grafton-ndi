@@ -140,8 +140,13 @@ impl std::fmt::Debug for FileText {
 /// occurs while constructing this value; constructors allocate one C string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceSpec {
-    pub(super) name: Option<FileText>,
-    pub(super) url: Option<FileText>,
+    selection: SourceSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SourceSelection {
+    Name(FileText),
+    Url(FileText),
 }
 
 impl SourceSpec {
@@ -154,8 +159,7 @@ impl SourceSpec {
     pub fn new(name: impl AsRef<str>) -> Result<Self> {
         let name = SourceName::checked(name.as_ref())?;
         Ok(Self {
-            name: Some(FileText::from_checked(name.as_str())),
-            url: None,
+            selection: SourceSelection::Name(FileText::from_checked(name.as_str())),
         })
     }
 
@@ -168,19 +172,36 @@ impl SourceSpec {
     /// [`Error::InvalidCString`] when it contains a NUL.
     pub fn from_url(url: impl AsRef<str>) -> Result<Self> {
         Ok(Self {
-            name: None,
-            url: Some(FileText::new(url.as_ref(), "source URL")?),
+            selection: SourceSelection::Url(FileText::new(url.as_ref(), "source URL")?),
         })
     }
 
     /// The requested display name, when selecting by name.
     pub fn name(&self) -> Option<&str> {
-        self.name.as_ref().map(FileText::as_str)
+        match &self.selection {
+            SourceSelection::Name(name) => Some(name.as_str()),
+            SourceSelection::Url(_) => None,
+        }
     }
 
     /// The requested URL/address, when selecting directly.
     pub fn url(&self) -> Option<&str> {
-        self.url.as_ref().map(FileText::as_str)
+        match &self.selection {
+            SourceSelection::Name(_) => None,
+            SourceSelection::Url(url) => Some(url.as_str()),
+        }
+    }
+
+    /// The native descriptor borrows the selected C string from `self`.
+    pub(super) fn raw_source(&self) -> NDIlib_file_recorder_source_t {
+        let (name, url) = match &self.selection {
+            SourceSelection::Name(name) => (name.as_ptr(), std::ptr::null()),
+            SourceSelection::Url(url) => (std::ptr::null(), url.as_ptr()),
+        };
+        NDIlib_file_recorder_source_t {
+            p_ndi_name: name,
+            p_url_address: url,
+        }
     }
 }
 
@@ -2164,6 +2185,7 @@ mod tests {
     #[test]
     fn source_selection_is_explicit_and_rejects_nul() {
         assert!(SourceSpec::new("").is_err());
+        assert!(SourceSpec::from_url("").is_err());
         assert!(SourceSpec::from_url("url\0tail").is_err());
         let source = SourceSpec::from_url("ndi://camera").unwrap();
         assert_eq!(source.name(), None);
@@ -2181,22 +2203,31 @@ mod tests {
         let (source, allocations) =
             crate::test_alloc::allocation_count(|| SourceSpec::new("Caméra").unwrap());
         assert_eq!(allocations, 1);
+        let (address, allocations) =
+            crate::test_alloc::allocation_count(|| SourceSpec::from_url("Caméra").unwrap());
+        assert_eq!(allocations, 1);
         let (_, allocations) = crate::test_alloc::allocation_count(|| {
             for _ in 0..100 {
                 assert_eq!(source.name(), Some("Caméra"));
                 assert_eq!(source.url(), None);
+                assert_eq!(address.name(), None);
+                assert_eq!(address.url(), Some("Caméra"));
             }
         });
         assert_eq!(allocations, 0);
         let same = SourceSpec::new("Caméra").unwrap();
         assert_eq!(source, same);
         assert_eq!(hash(&source), hash(&same));
-        assert_ne!(source, SourceSpec::from_url("Caméra").unwrap());
+        let same = SourceSpec::from_url("Caméra").unwrap();
+        assert_eq!(address, same);
+        assert_eq!(hash(&address), hash(&same));
+        assert_ne!(source, address);
         assert_ne!(source, SourceSpec::new("Other camera").unwrap());
-        let text = source.name.as_ref().unwrap();
+        let raw = source.raw_source();
+        assert!(!raw.p_ndi_name.is_null());
         // SAFETY: FileText owns its only trailing NUL and the bytes stay live.
         assert_eq!(
-            unsafe { std::ffi::CStr::from_ptr(text.as_ptr()) }.to_bytes(),
+            unsafe { std::ffi::CStr::from_ptr(raw.p_ndi_name) }.to_bytes(),
             "Caméra".as_bytes()
         );
 
