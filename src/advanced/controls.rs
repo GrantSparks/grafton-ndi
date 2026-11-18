@@ -427,7 +427,7 @@ impl<M: ReceiverMode> Receiver<M> {
 impl<M: ReceiverMode> std::fmt::Debug for ReceiverControls<'_, M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReceiverControls")
-            .field("mode", &std::any::type_name::<M>())
+            .field("receiver", self.receiver())
             .finish_non_exhaustive()
     }
 }

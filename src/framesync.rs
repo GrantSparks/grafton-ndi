@@ -978,7 +978,7 @@ impl FrameSync {
 impl fmt::Debug for FrameSync {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrameSync")
-            .field("mode", &"FrameSyncAttached")
+            .field("receiver", self.receiver())
             .finish_non_exhaustive()
     }
 }
@@ -1068,12 +1068,12 @@ mod tests {
         audio_test_calls::take_queries();
         assert_eq!(
             format!("{sync:?}"),
-            "FrameSync { mode: \"FrameSyncAttached\", .. }"
+            format!("FrameSync {{ receiver: {:?}, .. }}", sync.receiver())
         );
         let capture = sync.inner.capture();
         assert_eq!(
             format!("{capture:?}"),
-            "FrameSyncCapture { mode: \"FrameSyncAttached\", .. }"
+            format!("FrameSyncCapture {{ receiver: {:?}, .. }}", sync.receiver())
         );
         assert_eq!(audio_test_calls::take_queries(), 0);
     }

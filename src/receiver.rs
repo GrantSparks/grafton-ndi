@@ -1202,12 +1202,34 @@ pub struct Receiver<M: ReceiverMode = RawCapture> {
 
 impl<M: ReceiverMode> std::fmt::Debug for Receiver<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        ReceiverIdentity::new::<M>(&self.core).fmt(f)
+    }
+}
+
+/// The same receiver identity is available both to owners and to split views.
+pub(crate) struct ReceiverIdentity<'a> {
+    core: &'a ReceiverCore,
+    mode: &'static str,
+}
+
+impl<'a> ReceiverIdentity<'a> {
+    pub(crate) fn new<M: ReceiverMode>(core: &'a ReceiverCore) -> Self {
+        Self {
+            core,
+            mode: std::any::type_name::<M>(),
+        }
+    }
+
+    fn name(core: &ReceiverCore) -> Option<std::borrow::Cow<'_, str>> {
+        core._name.as_ref().map(|name| name.to_string_lossy())
+    }
+}
+
+impl std::fmt::Debug for ReceiverIdentity<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Receiver")
-            .field(
-                "name",
-                &self.core._name.as_ref().map(|name| name.to_string_lossy()),
-            )
-            .field("mode", &std::any::type_name::<M>())
+            .field("name", &Self::name(self.core))
+            .field("mode", &self.mode)
             .finish_non_exhaustive()
     }
 }
@@ -2614,10 +2636,7 @@ pub struct Ptz<'rx> {
 impl std::fmt::Debug for Ptz<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ptz")
-            .field(
-                "receiver_name",
-                &self.core._name.as_ref().map(|name| name.to_string_lossy()),
-            )
+            .field("receiver_name", &ReceiverIdentity::name(self.core))
             .finish_non_exhaustive()
     }
 }

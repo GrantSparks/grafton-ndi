@@ -395,7 +395,7 @@ pub struct AvSync {
 impl std::fmt::Debug for AvSync {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AvSync")
-            .field("mode", &std::any::type_name::<AvSyncAttached>())
+            .field("receiver", self.receiver())
             .finish_non_exhaustive()
     }
 }
@@ -586,8 +586,10 @@ pub struct AvSyncCapture<'a> {
 
 impl std::fmt::Debug for AvSyncCapture<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let receiver =
+            crate::receiver::ReceiverIdentity::new::<AvSyncAttached>(self.resource.receiver());
         f.debug_struct("AvSyncCapture")
-            .field("mode", &std::any::type_name::<AvSyncAttached>())
+            .field("receiver", &receiver)
             .finish_non_exhaustive()
     }
 }

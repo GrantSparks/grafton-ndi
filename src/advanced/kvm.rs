@@ -213,7 +213,7 @@ pub struct KvmSession<'a, M: ReceiverMode> {
 impl<M: ReceiverMode> std::fmt::Debug for KvmSession<'_, M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KvmSession")
-            .field("mode", &std::any::type_name::<M>())
+            .field("receiver", self.receiver)
             .field("pressed_keys", &self.held.keys.len())
             .field("pressed_buttons", &self.held.buttons.len())
             .field("touching", &self.held.touching)

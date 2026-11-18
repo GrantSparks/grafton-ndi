@@ -1370,7 +1370,7 @@ pub struct AllocatedReceiver<M: ReceiverMode = RawCapture> {
 impl<M: ReceiverMode> std::fmt::Debug for AllocatedReceiver<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AllocatedReceiver")
-            .field("mode", &std::any::type_name::<M>())
+            .field("receiver", &self.receiver)
             .finish_non_exhaustive()
     }
 }

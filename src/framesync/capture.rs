@@ -8,7 +8,7 @@ use super::{
 };
 #[cfg(feature = "advanced")]
 use crate::frames::{AudioFrame, VideoFrame};
-use crate::{frames::ScanType, Result};
+use crate::{frames::ScanType, receiver::ReceiverIdentity, FrameSyncAttached, Result};
 use std::fmt;
 
 /// Clocked capture access lent by [`FrameSync::split`](super::FrameSync::split).
@@ -32,8 +32,9 @@ pub struct FrameSyncCapture<'a> {
 
 impl fmt::Debug for FrameSyncCapture<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let receiver = ReceiverIdentity::new::<FrameSyncAttached>(self.resource.receiver());
         f.debug_struct("FrameSyncCapture")
-            .field("mode", &"FrameSyncAttached")
+            .field("receiver", &receiver)
             .finish_non_exhaustive()
     }
 }
