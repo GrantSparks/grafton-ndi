@@ -519,9 +519,17 @@ def obligations(msrv, features, miri_groups):
         $process = Start-Process -Wait -PassThru -FilePath $installer -ArgumentList "/S /D=$directory"
         if ($process.ExitCode -ne 0) { throw "LLVM installer exited $($process.ExitCode)" }
         $env:LIBCLANG_PATH = Join-Path $directory 'bin'
+        $clang = Join-Path $env:LIBCLANG_PATH 'clang.exe'
+        $resource = & $clang -print-resource-dir
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        if (!(Test-Path -LiteralPath (Join-Path $resource 'include/stdbool.h') -PathType Leaf)) { throw "LLVM builtin headers are missing from $resource" }
         python ci/libclang_version.py
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $bindgenArgs = 'BINDGEN_EXTRA_CLANG_ARGS="-resource-dir={0}"' -f $resource.Replace('\', '/')
+        Write-Host "LLVM resource directory: $resource"
         "LIBCLANG_PATH=$env:LIBCLANG_PATH" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+        "CLANG_PATH=$clang" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+        $bindgenArgs | Out-File $env:GITHUB_ENV -Append -Encoding utf8
         ''',
         condition="runner.os == 'Windows' && contains(matrix.package, 'advanced')",
         shell='pwsh',

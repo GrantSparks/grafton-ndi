@@ -210,8 +210,8 @@ not establish compatibility with every third-party stream or hardware codec.
 CI generates the synthetic H.264 and HEVC pictures in a separate job and
 passes the downloaded directory to the Advanced rows as
 `GRAFTON_NDI_HX_PICTURES`. Each row logs the SHA-256 of both files.
-The Windows Advanced rows also log the version of the hash-verified libclang
-DLL from the pinned LLVM release.
+The Windows Advanced rows use the builtin headers and libclang DLL from the
+same hash-verified LLVM release and log the resource path and compiler version.
 
 For local native NDI|HX tests, leave `GRAFTON_NDI_HX_PICTURES` unset to
 generate the pictures on demand with Python 3 and FFmpeg's `libx264` and
