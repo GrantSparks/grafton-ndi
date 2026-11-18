@@ -4,7 +4,8 @@
 use std::io::Write;
 
 use super::{
-    color::Sample, options::PngCompression, Channels, ImageShape, PixelDensity, Pixels, SampleDepth,
+    color::Sample, options::PngCompression, Channels, Cicp, ImageShape, PixelDensity, Pixels,
+    SampleDepth,
 };
 use crate::{Error, Result};
 
@@ -17,7 +18,7 @@ pub(super) fn encode<P: Sample>(
     pixels: &mut Pixels<'_, P>,
     shape: ImageShape,
     compression: PngCompression,
-    cicp: Option<[u8; 4]>,
+    cicp: Option<Cicp>,
     density: Option<PixelDensity>,
     out: &mut dyn Write,
     row: &mut Vec<u8>,
@@ -53,7 +54,7 @@ pub(super) fn encode<P: Sample>(
         // `png` reads `cICP` but does not write it, so the chunk is written
         // here: after the header and before the image data, as PNG requires.
         writer
-            .write_chunk(::png::chunk::cICP, &cicp)
+            .write_chunk(::png::chunk::cICP, &cicp.bytes())
             .map_err(png_error)?;
     }
     {

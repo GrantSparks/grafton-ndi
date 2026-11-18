@@ -32,15 +32,18 @@ pub enum ImageFormat {
     Png,
     /// JPEG at a quality from 1, the lowest, to 100, the highest; 8 bits a
     /// channel and no alpha. Below 90 chroma is halved in both directions
-    /// (4:2:0); from 90 it is kept whole (4:4:4).
+    /// (4:2:0). From 90 it is kept whole (4:4:4). Frames that need a color
+    /// tag require PNG. See [`HdrPolicy`].
     Jpeg(u8),
-    /// Lossless WebP: 8 bits a channel, with or without alpha.
+    /// Lossless WebP: 8 bits a channel, with or without alpha. Frames that
+    /// need a color tag require PNG. See [`HdrPolicy`].
     WebpLossless,
     /// Lossy WebP at a quality from 0, the lowest, to 100, the highest;
     /// 8 bits a channel, with or without alpha. Alpha is preserved exactly.
     /// Color uses 4:2:0 chroma sampling and, by default, SharpYUV conversion;
     /// even quality 100 can change RGB values. Use [`Self::WebpLossless`]
-    /// for exact pixels.
+    /// for exact pixels. Frames that need a color tag require PNG. See
+    /// [`HdrPolicy`].
     WebpLossy(u8),
 }
 
@@ -52,7 +55,7 @@ pub(super) struct ImageFormatInfo {
     pub(super) quality: Option<std::ops::RangeInclusive<u8>>,
     pub(super) alpha: AlphaChannel,
     pub(super) sixteen_bit: bool,
-    pub(super) hdr_code_values: bool,
+    pub(super) carries_color_tag: bool,
     pub(super) aspect_tag: bool,
 }
 
@@ -72,7 +75,7 @@ impl ImageFormat {
                 quality: None,
                 alpha: AlphaChannel::Optional,
                 sixteen_bit: true,
-                hdr_code_values: true,
+                carries_color_tag: true,
                 aspect_tag: true,
             },
             Self::Jpeg(_) => ImageFormatInfo {
@@ -81,7 +84,7 @@ impl ImageFormat {
                 quality: Some(1..=100),
                 alpha: AlphaChannel::None,
                 sixteen_bit: false,
-                hdr_code_values: false,
+                carries_color_tag: false,
                 aspect_tag: true,
             },
             Self::WebpLossless => ImageFormatInfo {
@@ -90,7 +93,7 @@ impl ImageFormat {
                 quality: None,
                 alpha: AlphaChannel::Optional,
                 sixteen_bit: false,
-                hdr_code_values: false,
+                carries_color_tag: false,
                 aspect_tag: false,
             },
             Self::WebpLossy(_) => ImageFormatInfo {
@@ -99,7 +102,7 @@ impl ImageFormat {
                 quality: Some(0..=100),
                 alpha: AlphaChannel::AlwaysRgba,
                 sixteen_bit: false,
-                hdr_code_values: false,
+                carries_color_tag: false,
                 aspect_tag: false,
             },
         }
@@ -218,7 +221,7 @@ image_format_variants!(
 /// The SDK's own YUV-to-RGB conversion always uses BT.709 limited range,
 /// whatever the tag says. RGB-received frames already carry that conversion:
 /// encoding keeps their RGB pixels, so the tag's matrix can no longer be
-/// applied. Readable tags still decide HDR refusal and the PNG `cICP` chunk.
+/// applied. Readable tags still govern color admission and the PNG `cICP` chunk.
 /// [`ReceiverColorFormat::UyvyBgra`](crate::ReceiverColorFormat::UyvyBgra) and
 /// [`UyvyRgba`](crate::ReceiverColorFormat::UyvyRgba) keep opaque sources in
 /// YUV, but deliver BGRA or RGBA for sources with alpha. When a tagged source
@@ -238,8 +241,9 @@ image_format_variants!(
 /// [`ReceiverColorFormat::Best`](crate::ReceiverColorFormat::Best) to retain
 /// high bit depth and HDR code values: an RGB-received frame already holds
 /// the SDK's BT.709 limited-range conversion, which encoding at 16 bits cannot
-/// undo. The passed-through tag still controls HDR refusal and the PNG `cICP`
-/// chunk. See [`HdrPolicy`].
+/// undo. The passed-through tag still governs color admission and the PNG
+/// `cICP` chunk. Frames with BT.2020 primaries also require tagged PNG output.
+/// See [`HdrPolicy`].
 ///
 /// # Performance
 ///
@@ -286,7 +290,7 @@ image_format_variants!(
 /// | A lossy WebP quality outside 0 to 100 | [`Error::InvalidInput`] |
 /// | A lossy WebP effort outside 0 to 6 | [`Error::InvalidInput`] |
 /// | JPEG or WebP with [`SampleDepth::Sixteen`] | [`Error::InvalidInput`] |
-/// | JPEG or WebP with [`HdrPolicy::CodeValues`] for a PQ or HLG frame | [`Error::InvalidInput`] |
+/// | JPEG or WebP for a frame that needs a color tag (BT.2020 primaries, or PQ or HLG with [`HdrPolicy::CodeValues`]) | [`Error::InvalidInput`] |
 /// | A PQ or HLG frame with [`HdrPolicy::Refuse`] | [`Error::InvalidFrame`] |
 /// | Unreadable `ndi_color_info` with [`ColorPolicy::Sdk`] | [`Error::InvalidFrame`] |
 /// | An image wider or taller than JPEG's 65,535, lossless WebP's 16,384 or lossy WebP's 16,383 pixels | [`Error::InvalidFrame`] |
@@ -491,7 +495,7 @@ pub enum ColorPolicy {
     ///
     /// RGB-received frames already hold the SDK's BT.709 limited-range
     /// conversion, which ignores the tag; this policy cannot apply its matrix
-    /// afterward. Tags still decide HDR refusal and the PNG `cICP` chunk.
+    /// afterward. Tags still govern color admission and the PNG `cICP` chunk.
     /// See [the color guidance](ImageOptions#color) for receiving YUV when the
     /// tag's matrix matters, including sources with alpha.
     ///
@@ -592,13 +596,17 @@ impl AlphaMode {
 }
 
 /// What happens to a frame whose `ndi_color_info` gives the PQ or HLG
-/// transfer function.
+/// transfer function. Frames with BT.2020 primaries or either HDR transfer
+/// need a color tag, which the encoder can write only in PNG.
 ///
-/// | The frame's transfer | [`HdrPolicy::Refuse`] | [`HdrPolicy::CodeValues`] |
-/// |---|---|---|
-/// | None, `bt_601`, `bt_709` or `bt_2020` | Encoded | Encoded |
-/// | `bt_2100_pq` | [`Error::InvalidFrame`] | PNG of the PQ code values, tagged |
-/// | `bt_2100_hlg` | [`Error::InvalidFrame`] | PNG of the HLG code values, tagged |
+/// | The frame's primaries | The frame's transfer | [`HdrPolicy::Refuse`] | [`HdrPolicy::CodeValues`] |
+/// |---|---|---|---|
+/// | Unspecified, BT.601 or BT.709 | Unspecified or SDR | Every format, untagged | Every format, untagged |
+/// | BT.2020 | Unspecified or SDR | PNG, tagged | PNG, tagged |
+/// | Any | PQ or HLG | [`Error::InvalidFrame`] | PNG of the code values, tagged |
+///
+/// When PNG is required, JPEG and WebP return [`Error::InvalidInput`]
+/// with [`InputDefect::ColorTagNeedsPng`](crate::InputDefect::ColorTagNeedsPng).
 ///
 /// The check applies to every pixel format, RGB as well as YUV. The encoder
 /// does not tone-map. A program that wants an SDR rendering of HDR video
@@ -610,6 +618,7 @@ impl AlphaMode {
 /// without a breaking change.
 ///
 /// [`Error::InvalidFrame`]: crate::Error::InvalidFrame
+/// [`Error::InvalidInput`]: crate::Error::InvalidInput
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum HdrPolicy {
@@ -628,9 +637,7 @@ pub enum HdrPolicy {
     /// [`ReceiverColorFormat::Best`](crate::ReceiverColorFormat::Best) to keep
     /// them. The tag still decides HDR refusal and the PNG `cICP` chunk.
     ///
-    /// JPEG and WebP refuse such a frame with
-    /// [`Error::InvalidInput`](crate::Error::InvalidInput): this encoder only
-    /// writes the required HDR color tag in PNG.
+    /// JPEG and WebP refuse such a frame with [`Error::InvalidInput`].
     CodeValues,
 }
 

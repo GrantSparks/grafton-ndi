@@ -106,7 +106,7 @@ The SDK's own YUV-to-RGB conversion always uses BT.709 limited range, whatever
 `ndi_color_info` says. RGB-received frames, including those from
 `ReceiverOptions::snapshot_preset` and `ReceiverOptions::high_quality_preset`,
 already carry that conversion. Encoding keeps those RGB pixels; it cannot
-apply the tag's matrix afterward. The tag still controls HDR refusal and a
+apply the tag's matrix afterward. The tag still governs color admission and a
 PNG's `cICP` chunk.
 
 `ReceiverColorFormat::UyvyBgra` and `ReceiverColorFormat::UyvyRgba` keep
@@ -126,7 +126,7 @@ so encoding on a blocking thread has the same behavior as encoding a capture.
 The default encoding policy refuses these frames before writing output; an
 explicit `ColorPolicy::Override` ignores unreadable color metadata and treats
 it as SDR with unknown primaries. Readable metadata still
-controls the HDR check and PNG tagging. See
+governs color admission and PNG tagging. See
 [`ColorInfo`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/struct.ColorInfo.html)
 for accepted metadata values.
 
@@ -147,7 +147,8 @@ HDR refusal and the PNG `cICP` chunk for RGB as well as YUV.
 ### Tagging a PNG
 
 The encoder writes a `cICP` color tag for BT.2020 primaries or PQ/HLG transfer
-metadata. It leaves BT.601/BT.709 SDR and untagged inputs without that chunk.
+metadata. Encode those frames as PNG. JPEG and WebP cannot carry the tag.
+BT.601/BT.709 SDR and untagged inputs do not require it.
 See [`HdrPolicy`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/image_encoding/enum.HdrPolicy.html)
 for the code-value contract.
 
@@ -175,8 +176,9 @@ for application planning.
 
 ## Errors
 
-Inspect the method's `Result`: invalid quality, effort or depth settings, and
-`HdrPolicy::CodeValues` with JPEG or WebP for an HDR frame, return `InvalidInput`.
+Invalid quality, effort or depth settings return `InvalidInput`. JPEG and
+WebP also return `InvalidInput` with `InputDefect::ColorTagNeedsPng` for frames
+with BT.2020 primaries or with PQ or HLG under `HdrPolicy::CodeValues`.
 Malformed color descriptions, HDR refusal, excessive dimensions
 or codec failures return `InvalidFrame`. Conversion scratch allocation failures
 return `AllocationFailed`. The lossy WebP encoder's own allocation failures are

@@ -1,6 +1,6 @@
 //! Allocation-free causes and the rare diagnostic payloads errors retain.
 use crate::frames::{MAX_AUDIO_BYTES, MAX_METADATA_BYTES, MAX_VIDEO_BYTES};
-use crate::{ColorInfo, FrameMetadataStatus, PixelFormat, TransferFunction};
+use crate::{ColorInfo, ColorPrimaries, FrameMetadataStatus, PixelFormat, TransferFunction};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -738,13 +738,19 @@ pub enum InputDefect {
         /// The codec.
         codec: ImageCodecKind,
     },
-    /// {codec} cannot say that its values are {transfer} code values; HdrPolicy::CodeValues needs ImageFormat::Png.
-    #[error("{codec} cannot say that its values are {transfer} code values; HdrPolicy::CodeValues needs ImageFormat::Png")]
-    HdrNeedsPng {
+    /// The image needs a color tag and only PNG can write it.
+    #[error(
+        "{codec} cannot carry the required color tag for {} primaries and {} transfer. Use ImageFormat::Png",
+        primaries.map_or("unspecified", ColorPrimaries::name),
+        transfer.map_or("SDR", TransferFunction::name)
+    )]
+    ColorTagNeedsPng {
         /// The codec.
         codec: ImageCodecKind,
-        /// The transfer.
-        transfer: TransferFunction,
+        /// The frame's primaries, if known.
+        primaries: Option<ColorPrimaries>,
+        /// The frame's transfer, if given.
+        transfer: Option<TransferFunction>,
     },
     /// recording file path may reach {longest_bytes} UTF-8 bytes, exceeding the {maximum_bytes}-byte event path limit ({index_digits_reserved} digits reserved for index growth).
     #[error("recording file path may reach {longest_bytes} UTF-8 bytes, exceeding the {maximum_bytes}-byte event path limit ({index_digits_reserved} digits reserved for index growth)")]

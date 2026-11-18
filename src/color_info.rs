@@ -78,6 +78,14 @@ pub enum ColorPrimaries {
 }
 
 impl ColorPrimaries {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Bt601 => "BT.601",
+            Self::Bt709 => "BT.709",
+            Self::Bt2020 => "BT.2020",
+        }
+    }
+
     #[cfg(feature = "image-encoding")]
     pub(crate) const fn h273_code(self) -> u8 {
         match self {

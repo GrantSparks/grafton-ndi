@@ -230,7 +230,7 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("ImageQuality", InputDefect::ImageQuality { codec: ImageCodecKind::Jpeg, quality: 101, minimum: 1, maximum: 100 }, "JPEG quality must be in 1..=100, got 101"),
         ("WebpEffort", InputDefect::WebpEffort { effort: 7 }, "WebP effort must be in 0..=6, got 7"),
         ("SixteenBitNeedsPng", InputDefect::SixteenBitNeedsPng { codec: ImageCodecKind::Jpeg }, "JPEG images are 8 bits a channel; SampleDepth::Sixteen needs ImageFormat::Png"),
-        ("HdrNeedsPng", InputDefect::HdrNeedsPng { codec: ImageCodecKind::Jpeg, transfer: TransferFunction::Pq }, "JPEG cannot say that its values are PQ code values; HdrPolicy::CodeValues needs ImageFormat::Png"),
+        ("ColorTagNeedsPng", InputDefect::ColorTagNeedsPng { codec: ImageCodecKind::Jpeg, primaries: Some(crate::ColorPrimaries::Bt2020), transfer: Some(TransferFunction::Pq) }, "JPEG cannot carry the required color tag for BT.2020 primaries and PQ transfer. Use ImageFormat::Png"),
         ("RecordingPathTooLong", InputDefect::RecordingPathTooLong { maximum_bytes: 4094, longest_bytes: 4095, index_digits_reserved: 17 }, "recording file path may reach 4095 UTF-8 bytes, exceeding the 4094-byte event path limit (17 digits reserved for index growth)"),
         ("DiscoveryAddressRejected", InputDefect::DiscoveryAddressRejected(Box::new(DiscoveryAddressFailure { object: "advertiser", address: "server:5960".into() })), "the SDK created no advertiser: it does not accept \"server:5960\" as a Discovery Server address"),
         ("DiscoveryConfigurationRejected", InputDefect::DiscoveryConfigurationRejected { object: "advertiser" }, "the SDK created no advertiser: no Discovery Server was named, and the configuration names none it accepts"),

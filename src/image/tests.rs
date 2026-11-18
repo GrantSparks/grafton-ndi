@@ -1514,26 +1514,88 @@ fn every_transfer_agrees_on_hdr_refusal_and_png_color_code() {
             .unwrap();
         let color = frame.color_info().unwrap().unwrap();
         assert_eq!(color.is_hdr(), transfer.is_hdr());
-        assert_eq!(super::hdr_transfer(&color).is_some(), transfer.is_hdr());
         assert_eq!(matches!(transfer.h273_code(), 16 | 18), transfer.is_hdr());
-        for format in [
-            ImageFormat::Png,
-            ImageFormat::Jpeg(85),
-            ImageFormat::WebpLossless,
-            ImageFormat::WebpLossy(75),
-        ] {
-            assert_eq!(
-                Plan::new(&Source::new(&frame), &options(format)).is_err(),
-                transfer.is_hdr(),
-                "{transfer:?} {format:?}"
-            );
-        }
         let png = frame
             .encode_image(&options(ImageFormat::Png).hdr(HdrPolicy::CodeValues))
             .unwrap();
         let chunks = png_chunks(&png);
         let (_, tag) = chunks.iter().find(|(kind, _)| kind == b"cICP").unwrap();
         assert_eq!(tag, &[9, transfer.h273_code(), 0, 1]);
+    }
+}
+
+#[test]
+fn codecs_admit_colors_only_when_they_can_write_the_required_tag() {
+    use crate::{ColorPrimaries, FrameDefect, InputDefect, TransferFunction};
+
+    for (metadata, primaries, transfer, tag) in [
+        ("", None, None, None),
+        (
+            r#"<ndi_color_info primaries="bt_709" transfer="bt_709"/>"#,
+            Some(ColorPrimaries::Bt709),
+            Some(TransferFunction::Bt709),
+            None,
+        ),
+        (
+            r#"<ndi_color_info primaries="bt_2020" transfer="bt_2020"/>"#,
+            Some(ColorPrimaries::Bt2020),
+            Some(TransferFunction::Bt2020),
+            Some([9, 1, 0, 1]),
+        ),
+        (
+            r#"<ndi_color_info primaries="bt_2020"/>"#,
+            Some(ColorPrimaries::Bt2020),
+            None,
+            Some([9, 1, 0, 1]),
+        ),
+        (
+            r#"<ndi_color_info primaries="bt_2020" transfer="bt_2100_pq"/>"#,
+            Some(ColorPrimaries::Bt2020),
+            Some(TransferFunction::Pq),
+            Some([9, 16, 0, 1]),
+        ),
+        (
+            r#"<ndi_color_info transfer="bt_2100_hlg"/>"#,
+            None,
+            Some(TransferFunction::Hlg),
+            Some([2, 18, 0, 1]),
+        ),
+    ] {
+        let frame = VideoFrame::builder()
+            .resolution(4, 2)
+            .pixel_format(PixelFormat::Uyvy)
+            .metadata(metadata)
+            .build()
+            .unwrap();
+        let hdr = transfer.filter(|transfer| transfer.is_hdr());
+        for policy in [HdrPolicy::Refuse, HdrPolicy::CodeValues] {
+            for format in ImageFormat::ALL {
+                let image = frame.encode_image(&options(format).hdr(policy));
+                if let Some(expected) = hdr.filter(|_| policy == HdrPolicy::Refuse) {
+                    assert!(matches!(
+                        image,
+                        Err(Error::InvalidFrame(FrameDefect::HdrRefused { transfer }))
+                            if transfer == expected
+                    ));
+                } else if format == ImageFormat::Png {
+                    let image = image.unwrap();
+                    let actual = png_chunks(&image)
+                        .into_iter()
+                        .find_map(|(kind, payload)| (kind == *b"cICP").then_some(payload));
+                    assert_eq!(actual.as_deref(), tag.as_ref().map(<[_; 4]>::as_slice));
+                } else if tag.is_some() {
+                    assert!(matches!(
+                        image,
+                        Err(Error::InvalidInput(InputDefect::ColorTagNeedsPng {
+                            codec, primaries: actual_primaries, transfer: actual_transfer,
+                        })) if codec == format.info().codec
+                            && actual_primaries == primaries && actual_transfer == transfer
+                    ));
+                } else {
+                    assert!(image.is_ok(), "{format:?} {policy:?} {metadata}");
+                }
+            }
+        }
     }
 }
 
@@ -1584,7 +1646,7 @@ fn hdr_frames_are_refused_by_default_in_every_format() {
             ] {
                 let message = invalid_input(frame.encode_image(&hdr(refused)));
                 assert!(
-                    matches!(message, crate::InputDefect::HdrNeedsPng {codec, transfer} if codec == refused.info().codec && transfer == if name=="PQ" {crate::TransferFunction::Pq} else {crate::TransferFunction::Hlg}),
+                    matches!(message, crate::InputDefect::ColorTagNeedsPng {codec, primaries: Some(crate::ColorPrimaries::Bt2020), transfer: Some(transfer)} if codec == refused.info().codec && transfer == if name=="PQ" {crate::TransferFunction::Pq} else {crate::TransferFunction::Hlg}),
                     "{message}"
                 );
             }
@@ -3609,7 +3671,7 @@ fn every_image_format_states_its_capabilities_once() {
                 info.quality.clone(),
                 info.alpha,
                 info.sixteen_bit,
-                info.hdr_code_values,
+                info.carries_color_tag,
                 info.aspect_tag
             ),
             expected
@@ -3673,12 +3735,12 @@ fn every_image_format_states_its_capabilities_once() {
             Err(Error::InvalidFrame(crate::FrameDefect::HdrRefused { .. }))
         ));
         let options = options(format).hdr(HdrPolicy::CodeValues);
-        if info.hdr_code_values {
+        if info.carries_color_tag {
             let image = hdr.encode_image(&options).unwrap();
             assert!(png_chunks(&image).iter().any(|(kind, _)| kind == b"cICP"));
         } else {
             assert!(
-                matches!(Plan::new(&source, &options), Err(Error::InvalidInput(crate::InputDefect::HdrNeedsPng { codec, .. })) if codec == info.codec)
+                matches!(Plan::new(&source, &options), Err(Error::InvalidInput(crate::InputDefect::ColorTagNeedsPng { codec, .. })) if codec == info.codec)
             );
         }
     }
