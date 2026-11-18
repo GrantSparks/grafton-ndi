@@ -210,8 +210,6 @@ not establish compatibility with every third-party stream or hardware codec.
 CI generates the synthetic H.264 and HEVC pictures in a separate job and
 passes the downloaded directory to the Advanced rows as
 `GRAFTON_NDI_HX_PICTURES`. Each row logs the SHA-256 of both files.
-The current Advanced SDK rows on Linux build hash-pinned FFmpeg 7 shared
-libraries for the H.264 and HEVC 4:4:4 checks.
 The Windows Advanced rows use the builtin headers and libclang DLL from the
 same hash-verified LLVM release and log the resource path and compiler version.
 

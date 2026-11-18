@@ -310,7 +310,8 @@ jobs:
       #   file              a File library the selected runtime can drive
       #   discovery-server  the SDK's Discovery Server program (Linux, 6.4)
       #   h264-decoder      an NDI|HX decoder for H.264 (built into the runtime
-      #                     on macOS; FFmpeg 7 shared libraries on Linux)
+      #                     on macOS; on Linux, the driver package a row names
+      #                     in `hx-driver`, copied beside its runtime)
       #   hevc-444-decoder  the same for HEVC 4:4:4, with a 6.4 runtime
       # Windows Advanced rows require an H.264 decoder; no Windows row requires
       # HEVC 4:4:4 decoding. These requirements configure checks, not past results.
@@ -352,6 +353,7 @@ jobs:
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             package: current-advanced-linux
+            hx-driver: current-hx-driver-linux
             require: advanced,file,discovery-server,h264-decoder,hevc-444-decoder
             require-no-default: 1,discovery-server
           - role: primary
@@ -441,6 +443,7 @@ jobs:
             compatibility: 6.1.1-standard-linux
             compatibility-advanced: 6.3.2-advanced-linux
             require: advanced,file,discovery-server,h264-decoder,hevc-444-decoder
+            hx-driver: current-hx-driver-linux
           - role: baseline-headers
             name: linux-x64 baseline-headers
             runner: ubuntu-24.04
@@ -449,6 +452,7 @@ jobs:
             compatibility: 6.1.1-standard-linux
             compatibility-advanced: 6.3.2-advanced-linux
             require: advanced,file,discovery-server,h264-decoder,hevc-444-decoder
+            hx-driver: current-hx-driver-linux
           - role: current-headers
             name: windows-x64 current-headers
             runner: windows-2025
@@ -561,14 +565,11 @@ jobs:
             sha256sum "$pictures/quadrants-420.h264" "$pictures/chroma-444.hevc"
           fi
           echo "GRAFTON_NDI_HX_PICTURES=$pictures" >> "$GITHUB_ENV"
-      - name: Build the Linux HX decoder
-        if: matrix.package == 'current-advanced-linux'
-        timeout-minutes: 10
-        run: |
-          bash ci/build-hx-decoder.sh "$RUNNER_TEMP/ndi-hx-decoder"
-          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/ndi-hx-decoder/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
       # The only step that is given the acquisition secrets. It exports
-      # NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 for the steps that follow.
+      # NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 for the steps that follow, and copies
+      # a row's `hx-driver` beside that runtime. The compatibility runs' baseline
+      # runtimes get none: those runs promise no decoder, and a driver is pinned
+      # together with the SDK release of its own build.
       - name: Provision the SDK
         id: sdk
         env:
@@ -576,6 +577,9 @@ jobs:
           NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}
         run: |
           python ci/sdk.py install "$PACKAGE" --dest "$RUNNER_TEMP/ndi-sdk" --target "$TARGET" --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT"
+          if [ -n "${{ matrix.hx-driver }}" ]; then
+            python ci/sdk.py install-driver "${{ matrix.hx-driver }}" --sdk "$RUNNER_TEMP/ndi-sdk" --target "$TARGET"
+          fi
           if [ "${{ matrix.role }}" != primary ]; then
             python ci/sdk.py install "${{ matrix.compatibility }}" --dest "$RUNNER_TEMP/ndi-compat" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-standard.env"
             python ci/sdk.py install "${{ matrix.compatibility-advanced }}" --dest "$RUNNER_TEMP/ndi-compat-advanced" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-advanced.env"
