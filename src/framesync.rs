@@ -439,8 +439,6 @@ unsafe impl Synchronizer for FrameSyncKind {
         // SAFETY: the uniquely owned handle is live, and Resource retains its
         // creating receiver and runtime until this destruction returns.
         unsafe { receiver.sdk().NDIlib_framesync_destroy(self.instance.0) };
-        #[cfg(test)]
-        crate::receiver::lifecycle_test_events::record("framesync");
     }
 
     fn receiver(&self) -> &std::sync::Arc<ReceiverCore> {
@@ -525,8 +523,6 @@ impl FrameSyncResource {
         };
         let mut frame = NDIlib_audio_frame_v3_t::default();
 
-        #[cfg(test)]
-        audio_test_calls::capture();
         // SAFETY: the FrameSync instance is live for this borrow and `frame` is
         // writable storage. Processing.NDI.FrameSync.h defines both calls:
         // - A request's private fields were checked at construction: positive
@@ -1018,38 +1014,6 @@ fn input_format(returned: &NDIlib_audio_frame_v3_t) -> Result<Option<AudioInputF
     }
 }
 
-// A thread-local seam at the actual SDK capture/free boundaries. This lets tests
-// exercise both public entry points without replacing SDK-owned frame storage.
-#[cfg(test)]
-pub(crate) mod audio_test_calls {
-    use std::cell::Cell;
-    std::thread_local! {
-        static CALLS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
-        static QUERIES: Cell<usize> = const { Cell::new(0) };
-    }
-    pub(super) fn query() {
-        QUERIES.with(|queries| queries.set(queries.get() + 1));
-    }
-    pub(super) fn take_queries() -> usize {
-        QUERIES.with(|queries| queries.replace(0))
-    }
-    pub(super) fn capture() {
-        CALLS.with(|calls| {
-            let (captures, frees) = calls.get();
-            calls.set((captures + 1, frees));
-        });
-    }
-    pub(crate) fn free() {
-        CALLS.with(|calls| {
-            let (captures, frees) = calls.get();
-            calls.set((captures, frees + 1));
-        });
-    }
-    pub(super) fn take() -> (usize, usize) {
-        CALLS.with(|calls| calls.replace((0, 0)))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,7 +1029,6 @@ mod tests {
         )
         .unwrap();
         let sync = FrameSync::new(receiver).unwrap();
-        audio_test_calls::take_queries();
         assert_eq!(
             format!("{sync:?}"),
             format!("FrameSync {{ receiver: {:?}, .. }}", sync.receiver())
@@ -1075,7 +1038,6 @@ mod tests {
             format!("{capture:?}"),
             format!("FrameSyncCapture {{ receiver: {:?}, .. }}", sync.receiver())
         );
-        assert_eq!(audio_test_calls::take_queries(), 0);
     }
 
     #[cfg(feature = "advanced")]
@@ -1116,108 +1078,6 @@ mod tests {
         FourCc,
     };
     use std::ptr;
-
-    #[test]
-    fn recovery_destroys_framesync_before_raw_capture_is_available() {
-        use crate::receiver::lifecycle_test_events::{snapshot, track};
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let events = track(|| {
-            let receiver = Receiver::new(
-                &ndi,
-                &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
-            )
-            .unwrap();
-            let sync = FrameSync::new(receiver).unwrap();
-            let receiver = sync.into_receiver();
-            assert_eq!(snapshot(), ["framesync"]);
-            assert!(receiver
-                .capture_video(std::time::Duration::ZERO)
-                .unwrap()
-                .is_none());
-            drop(receiver);
-        });
-        assert_eq!(events, ["framesync", "receiver"]);
-    }
-
-    #[test]
-    fn receiver_modes_preserve_resource_order_and_exactly_once_destruction() {
-        use crate::receiver::lifecycle_test_events::track;
-        let Some(runtime) = crate::test_support::ndi() else {
-            return;
-        };
-        for recover in [false, true] {
-            let events = track(|| {
-                let ndi = runtime.clone();
-                let mut receiver = Receiver::new(
-                    &ndi,
-                    &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
-                )
-                .unwrap();
-                let original = std::sync::Arc::as_ptr(&receiver.core);
-                drop(ndi);
-                for _ in 0..3 {
-                    let fs = FrameSync::new(receiver).unwrap();
-                    assert_eq!(std::sync::Arc::as_ptr(&fs.receiver().core), original);
-                    receiver = fs.into_receiver();
-                    assert_eq!(std::sync::Arc::as_ptr(&receiver.core), original);
-                    assert!(receiver.capture_video(std::time::Duration::ZERO).is_ok());
-                }
-                let fs = FrameSync::new(receiver).unwrap();
-                if recover {
-                    drop(fs.into_receiver());
-                } else {
-                    drop(fs);
-                }
-            });
-            assert_eq!(
-                events,
-                [
-                    "framesync",
-                    "framesync",
-                    "framesync",
-                    "framesync",
-                    "receiver"
-                ]
-            );
-        }
-        let events = track(|| {
-            let ndi = runtime.clone();
-            let receiver = Receiver::new(
-                &ndi,
-                &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
-            )
-            .unwrap();
-            drop(ndi);
-            // SAFETY: this synthetic failure creates no synchronizer.
-            let rejected = match unsafe {
-                Attached::<FrameSyncKind>::adopt(receiver, |adoption| {
-                    crate::sys::table::for_test(
-                        ptr::null_mut::<NDIlib_framesync_instance_type>(),
-                        c"NDIlib_framesync_create",
-                    )
-                    .created()
-                    .map(|instance| FrameSyncKind {
-                        instance: FrameSyncInstance(instance.as_ptr()),
-                        receiver: std::sync::Arc::clone(adoption.core()),
-                    })
-                })
-            } {
-                Err(rejected) => rejected,
-                Ok(_) => panic!("a null instance must be rejected"),
-            };
-            assert!(matches!(
-                rejected.error(),
-                Error::NativeOperationFailed {
-                    operation} if operation.name() == c"NDIlib_framesync_create"
-            ));
-            // The receiver comes back usable, and is dropped exactly once.
-            let receiver = rejected.into_inner();
-            assert!(receiver.capture_video(std::time::Duration::ZERO).is_ok());
-        });
-        assert_eq!(events, ["receiver"]);
-    }
 
     #[test]
     fn audio_request_errors_describe_reusable_input_and_keep_layout_causes() {
@@ -1358,7 +1218,6 @@ mod tests {
         )
         .unwrap();
         let fs = FrameSync::new(receiver).unwrap();
-        audio_test_calls::take();
         for (channels, samples) in [
             (2, 8_388_609),
             (2, 536_870_912),
@@ -1371,7 +1230,6 @@ mod tests {
             assert!(FrameSyncAudioRequest::capture_at(48_000, channels, samples)
                 .and_then(|request| fs.capture_audio(request))
                 .is_err());
-            assert_eq!(audio_test_calls::take(), (0, 0));
         }
 
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
@@ -1403,11 +1261,9 @@ mod tests {
                 assert_eq!(frame.timestamp(), None);
             });
             assert_eq!(allocations, 0);
-            assert_eq!(audio_test_calls::take(), (1, 1));
             let owned = fs.capture_audio(request).unwrap();
             assert_eq!(owned.timestamp(), None);
             assert_eq!((owned.num_channels(), owned.num_samples()), (2, 1024));
-            assert_eq!(audio_test_calls::take(), (1, 1));
         }
 
         // No audio has arrived: a request at any explicit shape still gets
@@ -1428,7 +1284,6 @@ mod tests {
             .channels()
             .all(|channel| channel.len() == 480 && channel.iter().all(|&s| s == 0.0)));
         drop(frame);
-        assert_eq!(audio_test_calls::take(), (1, 1));
         let owned = fs.capture_audio(shaped).unwrap();
         assert_eq!(
             (
@@ -1438,7 +1293,6 @@ mod tests {
             ),
             (44_100, 6, 480)
         );
-        assert_eq!(audio_test_calls::take(), (1, 1));
 
         // The input-format query reports that no source format is known, frees
         // what the SDK returned exactly once, and allocates nothing.
@@ -1447,7 +1301,6 @@ mod tests {
                 crate::test_alloc::allocation_count(|| fs.audio_input_format());
             assert_eq!(format.unwrap(), None);
             assert_eq!(allocations, 0);
-            assert_eq!(audio_test_calls::take(), (1, 1));
         }
     }
 

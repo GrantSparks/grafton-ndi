@@ -1,5 +1,5 @@
 //! Receiver control forwarding and held-input clocked capture without an SDK.
-#![cfg(all(feature = "advanced", target_os = "linux", not(ndi_link_static)))]
+#![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
 #[macro_use]
 #[path = "common/mod.rs"]
@@ -11,12 +11,16 @@ use common::TestChild;
 mod runtime_fixture;
 use runtime_fixture::read_fake_log;
 
+#[cfg(feature = "advanced")]
 use grafton_ndi::{
-    advanced::MouseButton, Error, FrameSync, FrameSyncAudioRequest, MediaTypes, Ndi, Receiver,
-    ReceiverOptions, RuntimeFeature, RuntimeOptions, ScanType, SettingChange, Source, StreamTier,
+    advanced::MouseButton, Error, MediaTypes, RuntimeFeature, ScanType, SettingChange, StreamTier,
+};
+use grafton_ndi::{
+    FrameSync, FrameSyncAudioRequest, Ndi, Receiver, ReceiverOptions, RuntimeOptions, Source,
 };
 use std::time::Duration;
 
+#[cfg(feature = "advanced")]
 #[test]
 fn kvm_release_precedes_connection_changes_on_the_same_receiver() {
     if let Some(library) = std::env::var_os("GRAFTON_KVM_CHILD") {
@@ -41,6 +45,7 @@ fn kvm_release_precedes_connection_changes_on_the_same_receiver() {
         .run();
 }
 
+#[cfg(feature = "advanced")]
 fn exercise_kvm(library: std::path::PathBuf) {
     let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
     let first = Source::new("STUDIO (A)").unwrap();
@@ -213,6 +218,7 @@ fn exercise_kvm(library: std::path::PathBuf) {
     );
 }
 
+#[cfg(feature = "advanced")]
 #[test]
 fn controls_keep_the_same_receiver_and_synchronizer() {
     if let Some(library) = std::env::var_os("GRAFTON_CONTROLS_CHILD") {
@@ -240,6 +246,7 @@ fn controls_keep_the_same_receiver_and_synchronizer() {
     }
 }
 
+#[cfg(feature = "advanced")]
 fn exercise(library: std::path::PathBuf) {
     let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
     let source = Source::new("STUDIO (Clocked)").unwrap();
@@ -417,4 +424,186 @@ fn exercise(library: std::path::PathBuf) {
             "{log}"
         );
     }
+}
+
+#[path = "../src/test_alloc.rs"]
+#[allow(dead_code)]
+mod test_alloc;
+
+fn unconnected(ndi: &Ndi) -> Receiver {
+    Receiver::new(ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap()
+}
+
+fn count(calls: &str, prefix: &str) -> usize {
+    calls
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .count()
+}
+
+#[test]
+fn framesync_recovery_and_audio_use_the_original_native_owners() {
+    if let Some(library) = std::env::var_os("GRAFTON_FRAMESYNC_BOUNDARIES") {
+        let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
+        for recover in [false, true] {
+            let begin = read_fake_log().len();
+            let mut receiver = unconnected(&ndi);
+            for destroyed in 1..=3 {
+                receiver = FrameSync::new(receiver).unwrap().into_receiver();
+                let log = read_fake_log();
+                assert_eq!(count(&log[begin..], "fs-destroy:"), destroyed);
+                assert_eq!(count(&log[begin..], "receiver-destroy"), 0);
+                // Recovery restores raw capture, only after disposing of the
+                // synchronizer. The fake records the receiver handle used.
+                assert!(receiver.capture_video(Duration::ZERO).unwrap().is_none());
+            }
+            let sync = FrameSync::new(receiver).unwrap();
+            let before = read_fake_log();
+            let _ = format!("{sync:?}");
+            #[cfg(feature = "advanced")]
+            let sync = {
+                let mut sync = sync;
+                let (capture, _) = sync.split();
+                let _ = format!("{capture:?}");
+                sync
+            };
+            assert_eq!(read_fake_log(), before, "Debug queried the synchronizer");
+            assert_eq!(sync.audio_queue_depth().unwrap(), 42);
+            assert_eq!(
+                count(&read_fake_log()[before.len()..], "fs-audio-queue:"),
+                1
+            );
+
+            for (channels, samples) in [(2, 8_388_609), (2, 536_870_912), (1, 1_073_741_825)] {
+                let before = read_fake_log();
+                assert!(FrameSyncAudioRequest::capture_at(48_000, channels, samples)
+                    .and_then(|request| sync.capture_audio_ref(request).map(drop))
+                    .is_err());
+                assert!(FrameSyncAudioRequest::capture_at(48_000, channels, samples)
+                    .and_then(|request| sync.capture_audio(request))
+                    .is_err());
+                assert_eq!(
+                    read_fake_log(),
+                    before,
+                    "an invalid request made a native call"
+                );
+            }
+            for (rate, channels, samples) in [(48_000, 2, 1024), (44_100, 6, 480)] {
+                let before = read_fake_log().len();
+                let request = FrameSyncAudioRequest::capture_at(rate, channels, samples).unwrap();
+                let (frame, allocations) =
+                    test_alloc::allocation_count(|| sync.capture_audio_ref(request).unwrap());
+                assert_eq!(allocations, 0);
+                assert!(frame.channels().flatten().all(|&sample| sample == 0.25));
+                assert_eq!(frame.channels().count(), channels as usize);
+                assert_eq!(count(&read_fake_log()[before..], "fs-audio-free:"), 0);
+                drop(frame);
+                assert_eq!(count(&read_fake_log()[before..], "fs-audio-free:"), 1);
+                let frame = sync.capture_audio(request).unwrap();
+                assert_eq!(
+                    (
+                        frame.sample_rate(),
+                        frame.num_channels(),
+                        frame.num_samples()
+                    ),
+                    (rate, channels, samples)
+                );
+                let log = read_fake_log();
+                assert_eq!(count(&log[before..], "fs-audio:"), 2);
+                assert_eq!(count(&log[before..], "fs-audio-free:"), 2);
+            }
+
+            let before = read_fake_log().len();
+            let (format, allocations) = test_alloc::allocation_count(|| sync.audio_input_format());
+            assert_eq!(format.unwrap().unwrap().sample_rate(), 48_000);
+            assert_eq!(allocations, 0);
+            let log = read_fake_log();
+            assert_eq!(count(&log[before..], "fs-audio:"), 1);
+            assert_eq!(count(&log[before..], "fs-audio-free:"), 1);
+
+            if recover {
+                drop(sync.into_receiver());
+            } else {
+                drop(sync);
+            }
+            let log = read_fake_log();
+            let log = &log[begin..];
+            assert_eq!(count(log, "fs-create:"), 4);
+            assert_eq!(count(log, "fs-destroy:"), 4);
+            assert_eq!(count(log, "receiver-destroy"), 1);
+            let receiver = log
+                .lines()
+                .find_map(|line| line.strip_prefix("fs-create:"))
+                .unwrap()
+                .split(':')
+                .next()
+                .unwrap();
+            assert!(log
+                .lines()
+                .filter(|line| line.starts_with("fs-create:"))
+                .all(|line| line.split(':').nth(1) == Some(receiver)));
+            assert_eq!(
+                log.lines()
+                    .filter(|line| *line == format!("capture-instance:{receiver}"))
+                    .count(),
+                3
+            );
+            assert!(log.rfind("fs-destroy:").unwrap() < log.find("receiver-destroy").unwrap());
+        }
+        return;
+    }
+    let directory = common::FixtureDir::create("framesync-native-boundaries");
+    let library = runtime_fixture::FakeRuntime {
+        cfgs: vec!["fake_objects", "fake_receiver_controls", "fake_capture"],
+        ..Default::default()
+    }
+    .build(&directory.join("libframesync.so"));
+    TestChild::new("framesync_recovery_and_audio_use_the_original_native_owners")
+        .env("GRAFTON_FRAMESYNC_BOUNDARIES", library)
+        .env("GRAFTON_FAKE_NDI_LOG", directory.join("framesync.log"))
+        .run();
+}
+
+#[cfg(all(feature = "advanced", ndi_has_advanced_av_sync))]
+#[test]
+fn avsync_destroys_before_raw_capture_or_receiver_drop() {
+    use grafton_ndi::advanced::AvSync;
+    if let Some(library) = std::env::var_os("GRAFTON_AVSYNC_BOUNDARIES") {
+        let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
+        for recover in [false, true] {
+            let begin = read_fake_log().len();
+            let sync = AvSync::new(unconnected(&ndi)).unwrap();
+            if recover {
+                let receiver = sync.into_receiver();
+                let log = read_fake_log();
+                assert_eq!(count(&log[begin..], "avsync-destroy"), 1);
+                assert_eq!(count(&log[begin..], "receiver-destroy"), 0);
+                assert!(receiver.capture_audio(Duration::ZERO).unwrap().is_none());
+            } else {
+                drop(sync);
+            }
+            let log = read_fake_log();
+            let log = &log[begin..];
+            assert_eq!(count(log, "avsync-destroy"), 1);
+            assert_eq!(count(log, "receiver-destroy"), 1);
+            assert!(log.find("avsync-destroy").unwrap() < log.find("receiver-destroy").unwrap());
+        }
+        return;
+    }
+    let directory = common::FixtureDir::create("avsync-native-boundaries");
+    let library = runtime_fixture::FakeRuntime {
+        cfgs: vec![
+            "fake_objects",
+            "fake_receiver_controls",
+            "fake_capture",
+            "fake_advanced",
+        ],
+        version: Some("6.4.0.2"),
+        ..Default::default()
+    }
+    .build(&directory.join("libavsync.so"));
+    TestChild::new("avsync_destroys_before_raw_capture_or_receiver_drop")
+        .env("GRAFTON_AVSYNC_BOUNDARIES", library)
+        .env("GRAFTON_FAKE_NDI_LOG", directory.join("avsync.log"))
+        .run();
 }

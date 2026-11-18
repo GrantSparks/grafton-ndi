@@ -54,6 +54,10 @@ export! {
         if let Ok(delay) = std::env::var("GRAFTON_FAKE_CAPTURE_DELAY_MS").unwrap_or_default().parse::<u64>() {
             std::thread::sleep(std::time::Duration::from_millis(delay.min(timeout_in_ms.into())));
         }
+        if kind == "hold" {
+            wait_at_gate("GRAFTON_FAKE_CAPTURE_GATE");
+            return NDIlib_frame_type_e_NDIlib_frame_type_none;
+        }
         match kind.as_str() {
             gate if gate.starts_with("gate-") && !p_video_data.is_null() => {
                 // One full-resolution row per plane fits the same allocation

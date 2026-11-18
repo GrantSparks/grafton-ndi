@@ -342,8 +342,6 @@ unsafe impl FrameFree for FrameSyncAudioFree {
     const TIMESTAMP_UNDEFINED: i64 = 0;
 
     unsafe fn free(core: &sys::Core, instance: Self::Instance, frame: &mut Self::RawFrame) {
-        #[cfg(test)]
-        crate::framesync::audio_test_calls::free();
         core.NDIlib_framesync_free_audio_v2(instance, frame);
     }
 }

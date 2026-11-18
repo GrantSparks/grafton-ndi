@@ -1,7 +1,5 @@
 //! The borrowed clocked capture view, publicly named only by `advanced`.
 
-#[cfg(test)]
-use super::audio_test_calls;
 use super::{
     input_format, AudioCall, AudioInputFormat, FrameSyncAudioRef, FrameSyncAudioRequest,
     FrameSyncResource, FrameSyncVideoRef,
@@ -120,8 +118,6 @@ impl<'a> FrameSyncCapture<'a> {
     /// [`Error::UnexpectedSdkResult`](crate::Error::UnexpectedSdkResult) when the native queue depth is negative.
     #[doc(alias = "NDIlib_framesync_audio_queue_depth")]
     pub fn audio_queue_depth(&self) -> Result<u32> {
-        #[cfg(test)]
-        audio_test_calls::query();
         // SAFETY: the view borrows a live synchronizer for the call.
         let depth = unsafe {
             self.resource

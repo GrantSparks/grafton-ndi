@@ -423,3 +423,196 @@ fn a_source_name_worker_keeps_its_runtime_until_its_binding_drops() {
             .run();
     }
 }
+
+async fn capture_queue_delay<R: AsyncRuntime>(ndi: &Ndi, gates: &std::path::Path) {
+    use runtime_fixture::NativeGate;
+
+    const BUDGET: Duration = Duration::from_millis(30);
+    let runtime = std::any::type_name::<R>().rsplit("::").next().unwrap();
+    for (operation, slots) in [("event", "000"), ("mixed", "111"), ("scoped", "100")] {
+        for cancelled in [false, true] {
+            let gate = gates.join(format!("{runtime}-{operation}-{cancelled}"));
+            fs::create_dir(&gate).unwrap();
+            std::env::set_var("GRAFTON_FAKE_CAPTURE_GATE", &gate);
+            std::env::set_var(
+                "GRAFTON_FAKE_CAPTURE_SCRIPT",
+                format!("{runtime}-{operation}-{cancelled}:hold"),
+            );
+            let release = NativeGate(&gate);
+            let receiver = AsyncReceiver::<R>::new(
+                Receiver::new(ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
+            );
+            let before = read_fake_log().len();
+            let before_destroyed = destroyed();
+            let mut occupied = Box::pin(receiver.capture_video(Duration::ZERO));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(
+                occupied.as_mut().poll(&mut context),
+                Poll::Pending
+            ));
+            release.wait_for_entry();
+            let mut request = Box::pin(async {
+                match operation {
+                    "event" => assert!(receiver.next_event(BUDGET).await.unwrap().is_none()),
+                    "mixed" => assert!(receiver.capture_any(BUDGET).await.unwrap().is_none()),
+                    "scoped" => assert!(receiver
+                        .capture_video_with(BUDGET, |_| panic!("unexpected callback"))
+                        .await
+                        .unwrap()
+                        .is_none()),
+                    _ => unreachable!(),
+                }
+            });
+            assert!(matches!(request.as_mut().poll(&mut context), Poll::Pending));
+            if cancelled {
+                drop(request);
+                drop(release);
+            } else {
+                // The one blocking worker is still inside the fake SDK call.
+                // Let the new operation's budget expire in the queue.
+                std::thread::sleep(BUDGET + Duration::from_millis(10));
+                let log = read_fake_log();
+                assert_eq!(
+                    log[before..]
+                        .lines()
+                        .filter(|line| line.starts_with("capture:"))
+                        .count(),
+                    1,
+                    "the queued operation ran before the blocker was released",
+                );
+                drop(release);
+                request.await;
+            }
+            assert!(occupied.await.unwrap().is_none());
+            drop(receiver);
+            await_condition(
+                || destroyed() == before_destroyed + 1,
+                "queued worker retained the receiver",
+            );
+            let log = read_fake_log();
+            let native_waits: Vec<_> = log[before..]
+                .lines()
+                .filter(|line| line.starts_with("capture:"))
+                .collect();
+            if cancelled {
+                assert_eq!(native_waits, ["capture:hold:100:0"]);
+            } else {
+                assert_eq!(
+                    native_waits,
+                    ["capture:hold:100:0", &format!("capture:none:{slots}:0")]
+                );
+            }
+        }
+    }
+}
+
+async fn combined_capture_during_gated_connect<R: AsyncRuntime>(receiver: &AsyncReceiver<R>) {
+    let before = read_fake_log().len();
+    assert!(receiver
+        .capture_any(Duration::ZERO)
+        .await
+        .unwrap()
+        .is_none());
+    let log = read_fake_log();
+    assert_eq!(
+        log[before..]
+            .lines()
+            .filter(|line| line.starts_with("capture:"))
+            .collect::<Vec<_>>(),
+        ["capture:none:111:0"],
+    );
+    let budget = Duration::from_millis(25);
+    let began = Instant::now();
+    assert!(receiver
+        .capture_any_with(budget, |_| panic!("unexpected callback"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(began.elapsed() >= budget);
+    assert!(read_fake_log()[log.len()..]
+        .lines()
+        .any(|line| line.starts_with("capture:none:111:")));
+}
+
+fn async_capture_while_connect_is_gated<R: AsyncRuntime>(
+    ndi: &Ndi,
+    gates: &std::path::Path,
+    run: impl FnOnce(&AsyncReceiver<R>) + Send,
+) {
+    let runtime = std::any::type_name::<R>().rsplit("::").next().unwrap();
+    let gate = gates.join(format!("{runtime}-connect"));
+    fs::create_dir(&gate).unwrap();
+    std::env::set_var("GRAFTON_FAKE_CONNECT_GATE", &gate);
+    let receiver = AsyncReceiver::<R>::new(
+        Receiver::new(ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
+    );
+    std::thread::scope(|scope| {
+        let receiver = &receiver;
+        let release = runtime_fixture::NativeGate(&gate);
+        scope.spawn(|| {
+            receiver
+                .receiver()
+                .connect_to(&Source::new("Blocked").unwrap())
+        });
+        release.wait_for_entry();
+        let (send, done) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            run(receiver);
+            send.send(()).unwrap();
+        });
+        let completed = done.recv_timeout(Duration::from_secs(2));
+        drop(release);
+        completed.expect("async capture waited for native connect");
+    });
+}
+
+#[test]
+fn queued_captures_spend_their_budget_and_skipped_jobs_never_reach_the_sdk() {
+    if let Some(library) = std::env::var_os("GRAFTON_QUEUE_DELAY_CHILD") {
+        let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
+        let gates = std::path::PathBuf::from(std::env::var_os("GRAFTON_FAKE_GATE_DIR").unwrap());
+        #[cfg(feature = "tokio")]
+        {
+            let runtime = ::tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap();
+            runtime.block_on(capture_queue_delay::<grafton_ndi::asynchronous::Tokio>(
+                &ndi, &gates,
+            ));
+            async_capture_while_connect_is_gated(
+                &ndi,
+                &gates,
+                |receiver: &AsyncReceiver<grafton_ndi::asynchronous::Tokio>| {
+                    runtime.block_on(combined_capture_during_gated_connect(receiver));
+                },
+            );
+        }
+        #[cfg(feature = "smol")]
+        {
+            ::smol::block_on(capture_queue_delay::<grafton_ndi::asynchronous::Smol>(
+                &ndi, &gates,
+            ));
+            async_capture_while_connect_is_gated(
+                &ndi,
+                &gates,
+                |receiver: &AsyncReceiver<grafton_ndi::asynchronous::Smol>| {
+                    ::smol::block_on(combined_capture_during_gated_connect(receiver));
+                },
+            );
+        }
+        return;
+    }
+    let directory = common::FixtureDir::create("async-queue-delay");
+    let library = runtime_fixture::FakeRuntime {
+        cfgs: vec!["fake_objects", "fake_capture", "fake_blocking_connect"],
+        ..Default::default()
+    }
+    .build(&directory.join("libndi-queue-delay.so"));
+    TestChild::new("queued_captures_spend_their_budget_and_skipped_jobs_never_reach_the_sdk")
+        .env("GRAFTON_QUEUE_DELAY_CHILD", library)
+        .env("GRAFTON_FAKE_NDI_LOG", directory.join("queue.log"))
+        .env("GRAFTON_FAKE_GATE_DIR", directory.path())
+        .env("BLOCKING_MAX_THREADS", "1")
+        .run_with_timeout(Duration::from_secs(30));
+}

@@ -208,15 +208,6 @@ macro_rules! native_table {
                 $($crate::sys::table::native_name!($name),)+
             ];
 
-            /// Make a native test double without allowing table copies in production.
-            #[cfg(test)]
-            #[allow(dead_code, reason = "native test doubles override selected entries")]
-            pub(crate) fn with_test_overrides(&self, replace: impl FnOnce(&mut Self)) -> Self {
-                let mut table = Self { $($name: self.$name,)+ };
-                replace(&mut table);
-                table
-            }
-
             /// Resolve every entry point, or name the first one `resolver` lacks.
             pub(crate) fn load(
                 resolver: &dyn $crate::sys::table::Resolver,

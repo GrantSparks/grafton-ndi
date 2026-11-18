@@ -62,3 +62,30 @@ pub fn fake_log_path() -> PathBuf {
         std::env::var_os("GRAFTON_FAKE_NDI_LOG").expect("the test must set GRAFTON_FAKE_NDI_LOG"),
     )
 }
+
+/// A file gate shared with an SDK call in the fake library. Open it even if
+/// the assertion waiting for entry unwinds, so the test can join its worker.
+#[allow(dead_code)]
+pub struct NativeGate<'a>(pub &'a Path);
+
+#[allow(dead_code)]
+impl NativeGate<'_> {
+    pub fn wait_for_entry(&self) {
+        let entered = self.0.join("entered");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !entered.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "SDK call did not enter {}",
+                self.0.display()
+            );
+            std::thread::yield_now();
+        }
+    }
+}
+
+impl Drop for NativeGate<'_> {
+    fn drop(&mut self) {
+        std::fs::write(self.0.join("release"), []).expect("release the gated SDK call");
+    }
+}

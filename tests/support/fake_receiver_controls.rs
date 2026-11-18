@@ -75,7 +75,10 @@ export! {
             drop(unsafe { Box::from_raw(samples) });
         }
     }
-    fn NDIlib_framesync_audio_queue_depth(_instance: NDIlib_framesync_instance_t) -> i32 { if negative_count() == "queue-depth" { -1 } else { 42 } }
+    fn NDIlib_framesync_audio_queue_depth(instance: NDIlib_framesync_instance_t) -> i32 {
+        log(&format!("fs-audio-queue:{instance:p}"));
+        if negative_count() == "queue-depth" { -1 } else { 42 }
+    }
 }
 
 // These functions are declared only by installed Advanced headers. The crate's
@@ -135,4 +138,19 @@ button! {
     NDIlib_recv_kvm_send_middle_mouse_release => "middle-up";
     NDIlib_recv_kvm_send_right_mouse_release => "right-up";
     NDIlib_recv_kvm_send_touch_finish => "touch-up";
+}
+
+#[cfg(fake_advanced)]
+advanced! {
+    fn NDIlib_avsync_create(receiver: NDIlib_recv_instance_t) -> *mut std::ffi::c_void {
+        Box::into_raw(Box::new(SyncState { receiver })).cast()
+    }
+    fn NDIlib_avsync_destroy(instance: *mut std::ffi::c_void) -> () {
+        log("avsync-destroy");
+        drop(unsafe { Box::from_raw(instance.cast::<SyncState>()) });
+    }
+    fn NDIlib_avsync_synchronize(_instance: *mut std::ffi::c_void, _video: *const NDIlib_video_frame_v2_t, _audio: *mut NDIlib_audio_frame_v3_t) -> i32 {
+        -1 // No audio stream received (Processing.NDI.AVSync.h).
+    }
+    fn NDIlib_avsync_free_audio(_instance: *mut std::ffi::c_void, _audio: *mut NDIlib_audio_frame_v3_t) -> () {}
 }

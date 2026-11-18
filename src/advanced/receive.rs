@@ -443,7 +443,6 @@ mod tests {
         advanced::{EnvelopeCodec, PacketEnvelope, VideoPacketFormat},
         capture::{Delivered, Notification},
         frames::{AudioPartsExt, MetadataPartsExt, PixelFormat},
-        receiver::native_capture_calls,
         Error, Timecode,
     };
 
@@ -654,53 +653,6 @@ mod tests {
         let (event, releases) = deliver::<MetadataKind>(bad_text, metadata_event);
         assert!(matches!(event, Err(Error::InvalidUtf8(_))));
         assert_eq!(releases, 1);
-    }
-
-    #[test]
-    fn packet_capture_reaches_the_sdk_while_connection_changes_are_locked() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver: Receiver<PacketAttached> =
-            Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap()))
-                .unwrap()
-                .into_packet_for_test();
-        native_capture_calls::take();
-        assert!(matches!(
-            PacketReceiver::capture_from(&receiver, Duration::MAX),
-            Err(Error::InvalidInput(_))
-        ));
-        let reconnect = receiver.core.reconnect_lock();
-        std::thread::scope(|scope| {
-            let (done, completed) = std::sync::mpsc::channel();
-            let receiver = &receiver;
-            let worker = scope.spawn(move || {
-                for timeout in [Duration::ZERO, Duration::from_millis(5)] {
-                    assert!(PacketReceiver::capture_from(receiver, timeout)
-                        .unwrap()
-                        .is_none());
-                }
-                done.send(native_capture_calls::take()).unwrap();
-            });
-            // The connection lock stays held until capture returns. A capture
-            // that took it would stall instead of reaching the SDK.
-            let calls = completed.recv_timeout(Duration::from_secs(2));
-            drop(reconnect);
-            worker.join().unwrap();
-            assert!(calls.unwrap() >= 2);
-        });
-        PacketReceiver::capture_from(&receiver, Duration::ZERO).unwrap();
-        assert_eq!(native_capture_calls::take(), 1);
-
-        // Nothing is connected, so nothing arrives: the capture waits out its
-        // whole budget, capturing again as often as the SDK returns early.
-        let budget = Duration::from_millis(250);
-        let began = std::time::Instant::now();
-        assert!(PacketReceiver::capture_from(&receiver, budget)
-            .unwrap()
-            .is_none());
-        assert!(began.elapsed() >= budget);
-        assert!(native_capture_calls::take() >= 1);
     }
 
     /// A packet receiver is created from the preset's color format, so that is

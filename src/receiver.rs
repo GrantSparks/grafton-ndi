@@ -1502,8 +1502,6 @@ unsafe impl Sync for RecvInstance {}
 pub(crate) struct ReceiverCore {
     instance: RecvInstance,
     pub(crate) sdk: crate::runtime::Bound<sys::Core>,
-    #[cfg(test)]
-    test_sdk: Option<&'static sys::Core>,
     /// Serializes local connection changes; callbacks may take the independent
     /// control permit while a native connection change waits for them.
     change_guard: Mutex<ChangePermit>,
@@ -1642,8 +1640,6 @@ impl<M: CreatableMode> Receiver<M> {
             core: Arc::new(ReceiverCore {
                 instance: RecvInstance(instance),
                 sdk,
-                #[cfg(test)]
-                test_sdk: None,
                 change_guard: Mutex::new(ChangePermit),
                 control_guard: Mutex::new(ControlPermit::default()),
                 guard_local_connection_changes: !ndi
@@ -2216,10 +2212,6 @@ impl ReceiverCore {
 
     /// The entry points of the runtime this receiver was created through.
     pub(crate) fn sdk(&self) -> &sys::Core {
-        #[cfg(test)]
-        if let Some(table) = self.test_sdk {
-            return table;
-        }
         &self.sdk
     }
 
@@ -2572,9 +2564,6 @@ impl<'rx> CaptureLock<'rx> {
         audio: Option<&mut NDIlib_audio_frame_v3_t>,
         metadata: Option<&mut NDIlib_metadata_frame_t>,
     ) -> NDIlib_frame_type_e {
-        // Read before the call below, so it is at least the wait the SDK gets.
-        #[cfg(test)]
-        native_capture_calls::record(self.attempt.0.remaining_ms());
         // SAFETY: the receiver instance is live for 'rx, which this lock
         // borrows it for. Each descriptor is null or exclusively borrowed,
         // writable storage that outlives the synchronous call. The proof fixes
@@ -2589,36 +2578,6 @@ impl<'rx> CaptureLock<'rx> {
                 self.attempt.0.remaining_ms(),
             )
         }
-    }
-}
-
-/// Counts native capture calls on the calling thread, so that tests can tell
-/// a capture that was skipped from one that found nothing, and keeps the
-/// longest wait any of them was given, so that they can tell how long the SDK
-/// was allowed to block whatever it then took.
-#[cfg(test)]
-pub(crate) mod native_capture_calls {
-    use std::cell::Cell;
-    std::thread_local! {
-        static CALLS: Cell<usize> = const { Cell::new(0) };
-        static LONGEST_WAIT_MS: Cell<u32> = const { Cell::new(0) };
-    }
-    /// Count a call that the SDK is allowed to block for `wait_ms` at most.
-    pub(crate) fn record(wait_ms: u32) {
-        CALLS.with(|calls| calls.set(calls.get() + 1));
-        LONGEST_WAIT_MS.with(|longest| longest.set(longest.get().max(wait_ms)));
-    }
-    /// The calls made since the last take.
-    pub(crate) fn take() -> usize {
-        take_with_longest_wait().0
-    }
-    /// The calls made since the last take, and the longest wait, in
-    /// milliseconds, that any of them was given.
-    pub(crate) fn take_with_longest_wait() -> (usize, u32) {
-        (
-            CALLS.with(|calls| calls.replace(0)),
-            LONGEST_WAIT_MS.with(|longest| longest.replace(0)),
-        )
     }
 }
 
@@ -2858,8 +2817,6 @@ impl Drop for ReceiverCore {
         unsafe {
             self.sdk().NDIlib_recv_destroy(self.instance.0);
         }
-        #[cfg(test)]
-        lifecycle_test_events::record("receiver");
     }
 }
 
@@ -3171,29 +3128,6 @@ fn drop_percentage(received: u64, dropped: u64) -> f64 {
 }
 
 #[cfg(test)]
-pub(crate) mod lifecycle_test_events {
-    use std::cell::RefCell;
-    std::thread_local! {
-        static EVENTS: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
-    }
-    pub(crate) fn record(event: &'static str) {
-        EVENTS.with(|events| {
-            if let Some(events) = &mut *events.borrow_mut() {
-                events.push(event);
-            }
-        });
-    }
-    pub(crate) fn snapshot() -> Vec<&'static str> {
-        EVENTS.with(|events| events.borrow().as_ref().unwrap().clone())
-    }
-    pub(crate) fn track(action: impl FnOnce()) -> Vec<&'static str> {
-        EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
-        action();
-        EVENTS.with(|events| events.borrow_mut().take().unwrap())
-    }
-}
-
-#[cfg(test)]
 #[path = "receiver_mixed_tests.rs"]
 mod mixed_tests;
 
@@ -3202,39 +3136,6 @@ mod tests {
     use super::*;
 
     use std::cell::Cell;
-
-    #[cfg(feature = "advanced")]
-    #[test]
-    fn packet_capture_consumes_the_same_pending_events_as_raw_capture() {
-        use crate::advanced::{PacketItem, PacketReceiver};
-
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected())
-            .unwrap()
-            .into_packet_for_test();
-        // Model notifications retained before a mode transition. Packet capture
-        // must consume them once without spending its timeout in native capture.
-        receiver.core.retain(Notification::StatusChanged);
-        receiver.core.retain(Notification::SourceChanged);
-        receiver.core.retain(Notification::Unknown(987));
-        native_capture_calls::take();
-        for expected in [
-            ReceiverEvent::StatusChanged(ReceiverStatus { connections: 0 }),
-            ReceiverEvent::SourceChanged,
-            ReceiverEvent::Unknown(987),
-        ] {
-            let Some(PacketItem::Event(actual)) =
-                PacketReceiver::capture_from(&receiver, Duration::from_secs(1)).unwrap()
-            else {
-                panic!("expected receiver event {expected:?}");
-            };
-            assert_eq!(actual, expected);
-        }
-        assert_eq!(native_capture_calls::take(), 0);
-        assert!(receiver.core.take_pending_event_report().unwrap().is_none());
-    }
 
     #[test]
     fn receive_delay_rounds_up_and_rejects_out_of_range_values() {
@@ -4210,31 +4111,6 @@ mod tests {
     }
 
     #[test]
-    fn combined_capture_consumes_pending_events_once_even_during_reconnect() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        receiver.core.retain(Notification::SourceChanged);
-        let _exclusive = receiver.core.lock_change();
-        native_capture_calls::take();
-        assert!(matches!(
-            receiver.capture_any_ref(Duration::ZERO).unwrap(),
-            Some(ReceiverItemRef::Event(ReceiverEvent::SourceChanged))
-        ));
-        assert_eq!(native_capture_calls::take(), 0);
-        assert!(receiver.capture_any_ref(Duration::ZERO).unwrap().is_none());
-        assert_eq!(native_capture_calls::take(), 1);
-        let began = Instant::now();
-        assert!(receiver
-            .capture_any(Duration::from_millis(20))
-            .unwrap()
-            .is_none());
-        assert!(began.elapsed() >= Duration::from_millis(20));
-        assert!(native_capture_calls::take() >= 1);
-    }
-
-    #[test]
     fn combined_and_event_consumers_compete_for_one_retained_invalidation() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
@@ -4502,141 +4378,6 @@ mod tests {
                 completed.recv_timeout(Duration::from_secs(2)).unwrap();
             });
         }
-    }
-
-    #[test]
-    fn captures_keep_their_budgets_while_local_connection_changes_are_locked() {
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        let exclusive = receiver.core.lock_change();
-        std::thread::scope(|scope| {
-            let (done, completed) = std::sync::mpsc::channel();
-            let receiver = &receiver;
-            let worker = scope.spawn(move || {
-                native_capture_calls::take();
-                assert!(receiver.capture_video(Duration::ZERO).unwrap().is_none());
-                assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
-                assert!(receiver
-                    .capture_audio(Duration::from_millis(5))
-                    .unwrap()
-                    .is_none());
-                assert!(receiver
-                    .capture_metadata_ref(Duration::from_millis(5))
-                    .unwrap()
-                    .is_none());
-                done.send(native_capture_calls::take()).unwrap();
-            });
-            // The connection lock remains held until capture returns. Taking
-            // it in a capture would stall instead of reaching the SDK.
-            let result = completed.recv_timeout(Duration::from_secs(2));
-            drop(exclusive);
-            worker.join().unwrap();
-            assert!(result.unwrap() >= 4);
-        });
-    }
-
-    /// A long `next_event` uses bounded attempts alongside connection changes
-    /// and other captures. An event retained by another capture ends that poll
-    /// at its next attempt.
-    #[test]
-    fn a_long_next_event_allows_reconnect_and_observes_a_retained_event() {
-        use std::{sync::mpsc, time::Instant};
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = &Receiver::new(&ndi, &unconnected()).unwrap();
-        let stop = &AtomicBool::new(false);
-        let budget = Duration::from_secs(1);
-        std::thread::scope(|scope| {
-            let (polling, started_polling) = mpsc::channel();
-            let poller = scope.spawn(move || {
-                polling.send(()).unwrap();
-                loop {
-                    // Nothing is connected, so only the event published
-                    // below ends a poll before its timeout.
-                    let event = receiver.next_event(Duration::from_secs(5)).unwrap();
-                    if stop.load(Ordering::Acquire) {
-                        return event;
-                    }
-                }
-            });
-            started_polling.recv().unwrap();
-            // Let the poller settle into a native wait.
-            std::thread::sleep(Duration::from_millis(250));
-
-            let capture = scope.spawn(move || {
-                native_capture_calls::take();
-                let began = Instant::now();
-                let frame = receiver.capture_metadata(budget).unwrap();
-                (
-                    frame.is_none(),
-                    began.elapsed(),
-                    native_capture_calls::take(),
-                )
-            });
-            let began = Instant::now();
-            receiver.reconnect();
-            let reconnected = began.elapsed();
-            let (nothing_arrived, captured_for, sdk_calls) = capture.join().unwrap();
-
-            stop.store(true, Ordering::Release);
-            let published = Instant::now();
-            receiver.core.retain(Notification::StatusChanged);
-            let ended = poller.join().unwrap();
-            let poll_ended_after = published.elapsed();
-
-            assert!(reconnected < Duration::from_secs(1), "{reconnected:?}");
-            assert!(nothing_arrived);
-            // The concurrent capture reached the SDK and spent its budget
-            // there, regardless of the local connection change.
-            assert!(sdk_calls >= 1, "{sdk_calls} SDK calls");
-            assert!(captured_for >= budget, "{captured_for:?}");
-            assert!(
-                captured_for < budget + Duration::from_millis(500),
-                "{captured_for:?}"
-            );
-            assert!(ended.is_some());
-            assert!(
-                poll_ended_after < Duration::from_secs(1),
-                "{poll_ended_after:?}"
-            );
-        });
-    }
-
-    /// `next_event` gives each SDK call one poll interval of its timeout at
-    /// most.
-    ///
-    /// What each call is given, and that the poll ends only once the budget
-    /// is spent, hold however long the SDK then takes. How many calls fit in
-    /// the budget does not: on a loaded runner the SDK can overrun its waits,
-    /// so that only two fit. The count is the capture loop's, which the
-    /// clock-driven tests below check, such as
-    /// `retry_follows_a_full_wait_at_once`.
-    #[test]
-    fn next_event_spends_its_timeout_in_bounded_attempts() {
-        use std::time::Instant;
-        let Some(ndi) = crate::test_support::ndi() else {
-            return;
-        };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
-        // A zero timeout makes exactly one attempt, with a zero SDK wait.
-        native_capture_calls::take();
-        assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
-        assert_eq!(native_capture_calls::take_with_longest_wait(), (1, 0));
-        // Nothing is connected: the whole budget is spent, in attempts of at
-        // most one poll interval each.
-        let budget = Duration::from_millis(450);
-        let began = Instant::now();
-        assert!(receiver.next_event(budget).unwrap().is_none());
-        assert!(began.elapsed() >= budget, "{:?}", began.elapsed());
-        let (calls, longest_wait) = native_capture_calls::take_with_longest_wait();
-        assert!(calls >= 1, "{calls} SDK calls");
-        assert!(
-            u128::from(longest_wait) <= POLL_INTERVAL.as_millis(),
-            "an SDK call was given {longest_wait} ms"
-        );
     }
 
     #[test]

@@ -65,7 +65,7 @@ fn fake_standard_runtime_refuses_remote_control_before_native_add() {
     .build(&fixture.path().join("fake-ndi.dll"));
     common::TestChild::new("fake_standard_runtime_refuses_remote_control_before_native_add")
         .env("GRAFTON_FAKE_REMOTE_CONTROL_RUNTIME", library)
-        .env("GRAFTON_FAKE_NDI_LOG", fixture.path().join("native.log"))
+        .env("GRAFTON_FAKE_NDI_LOG", fixture.join("native.log"))
         .run();
 }
 

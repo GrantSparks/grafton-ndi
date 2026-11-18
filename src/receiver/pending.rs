@@ -187,6 +187,42 @@ mod tests {
     }
 
     #[test]
+    fn competing_consumers_remove_each_retained_event_once() {
+        let pending = PendingEvents::default();
+        pending.publish(Notification::StatusChanged);
+        pending.publish(Notification::SourceChanged);
+        pending.publish(Notification::Unknown(987));
+        let ready = std::sync::Barrier::new(5);
+        let delivered = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        ready.wait();
+                        take(&pending)
+                    })
+                })
+                .collect();
+            ready.wait();
+            workers
+                .into_iter()
+                .filter_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(delivered.len(), 3);
+        for expected in [
+            ReceiverEvent::StatusChanged(snapshot().unwrap()),
+            ReceiverEvent::SourceChanged,
+            ReceiverEvent::Unknown(987),
+        ] {
+            assert_eq!(
+                delivered.iter().filter(|&&event| event == expected).count(),
+                1
+            );
+        }
+        assert_eq!(take(&pending), None);
+    }
+
+    #[test]
     fn combined_native_notifications_coalesce_with_events_retained_during_the_wait() {
         let pending = PendingEvents::default();
         let deliver = |notification| {

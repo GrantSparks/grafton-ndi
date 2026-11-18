@@ -263,16 +263,21 @@ export! {
         log(&format!("receiver-connect:{name}"));
         #[cfg(fake_blocking_connect)]
         if name == "Blocked" {
-            let gate = std::path::PathBuf::from(std::env::var_os("GRAFTON_FAKE_CONNECT_GATE").unwrap());
-            std::fs::write(gate.join("entered"), b"").unwrap();
-            while !gate.join("release").exists() {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+            wait_at_gate("GRAFTON_FAKE_CONNECT_GATE");
         }
         #[cfg(fake_objects)]
         unsafe { objects::connect_source(_p_instance, p_src) };
         #[cfg(fake_receiver_controls)]
         log(&format!("connect-instance:{_p_instance:p}"));
+    }
+}
+
+#[cfg(any(fake_blocking_connect, fake_capture))]
+fn wait_at_gate(variable: &str) {
+    let gate = std::path::PathBuf::from(std::env::var_os(variable).unwrap());
+    std::fs::write(gate.join("entered"), []).unwrap();
+    while !gate.join("release").exists() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 

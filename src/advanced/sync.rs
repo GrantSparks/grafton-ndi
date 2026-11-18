@@ -314,8 +314,6 @@ unsafe impl Synchronizer for AvSyncKind {
             // SAFETY: Resource retains the creating receiver and runtime, and
             // invokes this destruction once for the uniquely owned handle.
             unsafe { self.table.NDIlib_avsync_destroy(self.handle.0) };
-            #[cfg(test)]
-            crate::receiver::lifecycle_test_events::record("avsync");
         });
     }
 
@@ -1353,50 +1351,6 @@ mod tests {
             )
         };
         outcome(status, guard).map(|outcome| outcome.to_owned())
-    }
-
-    #[test]
-    fn recovery_destroys_avsync_before_raw_capture_is_available() {
-        use crate::receiver::lifecycle_test_events::{snapshot, track};
-        let Some(ndi) = crate::test_support::advanced_ndi() else {
-            return;
-        };
-        let events = track(|| {
-            let receiver =
-                Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new("").unwrap()))
-                    .unwrap();
-            let sync = AvSync::new(receiver).unwrap();
-            let receiver = sync.into_receiver();
-            assert_eq!(snapshot(), ["avsync"]);
-            assert!(receiver
-                .capture_audio(std::time::Duration::ZERO)
-                .unwrap()
-                .is_none());
-            drop(receiver);
-        });
-        assert_eq!(events, ["avsync", "receiver"]);
-    }
-
-    #[test]
-    fn avsync_destroys_before_its_receiver_on_drop_and_recovery() {
-        use crate::receiver::lifecycle_test_events::track;
-        let Some(ndi) = crate::test_support::advanced_ndi() else {
-            return;
-        };
-        for recover in [false, true] {
-            let events = track(|| {
-                let receiver =
-                    Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new("").unwrap()))
-                        .unwrap();
-                let sync = AvSync::new(receiver).unwrap();
-                if recover {
-                    drop(sync.into_receiver());
-                } else {
-                    drop(sync);
-                }
-            });
-            assert_eq!(events, ["avsync", "receiver"]);
-        }
     }
 
     fn descriptor() -> NDIlib_audio_frame_v3_t {

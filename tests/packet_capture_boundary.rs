@@ -17,7 +17,7 @@ use grafton_ndi::{
     advanced::*, Error, Ndi, ReceiverEvent, ReceiverOptions, RuntimeOptions, SdkResultDefect,
     Source,
 };
-use runtime_fixture::read_fake_log;
+use runtime_fixture::{read_fake_log, NativeGate};
 use std::time::Duration;
 
 #[test]
@@ -91,38 +91,44 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
             Err(Error::InvalidInput(_))
         ));
 
-        // A reconnect waits only for the attempt already holding the shared
-        // capture guard. The following capture retains the original deadline.
+        // The connection-change permit stays held during both captures.
+        // The fake log proves both entry points still reached the SDK.
+        let gate = std::path::PathBuf::from(std::env::var_os("GRAFTON_FAKE_CONNECT_GATE").unwrap());
         std::env::set_var("GRAFTON_FAKE_CAPTURE_SCRIPT", "26:none");
-        std::env::set_var("GRAFTON_FAKE_CAPTURE_DELAY_MS", "40");
-        let calls = read_fake_log()
-            .lines()
-            .filter(|line| line.starts_with("capture:"))
-            .count();
         std::thread::scope(|scope| {
-            let capture = scope.spawn(|| {
-                assert!(packets
-                    .capture_any_ref(Duration::from_millis(110))
-                    .unwrap()
-                    .is_none());
+            let release = NativeGate(&gate);
+            scope.spawn(|| {
+                packets
+                    .receiver()
+                    .connect_to(&Source::new("Blocked").unwrap())
             });
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while read_fake_log()
-                .lines()
-                .filter(|line| line.starts_with("capture:"))
-                .count()
-                == calls
-            {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "capture did not enter native code"
+            release.wait_for_entry();
+            let (send, completed) = std::sync::mpsc::channel();
+            let packets = &packets;
+            scope.spawn(move || {
+                let before = read_fake_log().len();
+                assert!(packets.capture_any_ref(Duration::ZERO).unwrap().is_none());
+                let first = read_fake_log();
+                assert_eq!(
+                    first[before..]
+                        .lines()
+                        .filter(|line| line.starts_with("capture:"))
+                        .collect::<Vec<_>>(),
+                    ["capture:none:111:0"]
                 );
-                std::thread::yield_now();
-            }
-            packets.receiver().reconnect();
-            capture.join().unwrap();
+                let budget = Duration::from_millis(110);
+                let start = std::time::Instant::now();
+                assert!(packets.capture_any(budget).unwrap().is_none());
+                assert!(start.elapsed() >= budget);
+                assert!(read_fake_log()[first.len()..]
+                    .lines()
+                    .any(|line| line.starts_with("capture:none:111:")));
+                send.send(()).unwrap();
+            });
+            let captured = completed.recv_timeout(Duration::from_secs(2));
+            drop(release);
+            captured.expect("packet capture waited for native connect");
         });
-        std::env::remove_var("GRAFTON_FAKE_CAPTURE_DELAY_MS");
 
         // A malformed status snapshot must not pin the shared AllSlots kernel
         // ahead of source notifications or either compressed media family.
@@ -175,13 +181,19 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
     let dir = common::FixtureDir::create("packet-capture");
     let library = dir.path().join("libndi_packet.so");
     runtime_fixture::FakeRuntime {
-        cfgs: vec!["fake_objects", "fake_advanced", "fake_capture"],
+        cfgs: vec![
+            "fake_objects",
+            "fake_advanced",
+            "fake_capture",
+            "fake_blocking_connect",
+        ],
         version: Some("6.4.0.2"),
         ..Default::default()
     }
     .build(&library);
     TestChild::new("borrowed_packet_capture_retains_native_buffers_and_preserves_events")
         .env("GRAFTON_PACKET_CAPTURE_CHILD", library)
+        .env("GRAFTON_FAKE_CONNECT_GATE", dir.path())
         .env("GRAFTON_FAKE_NDI_LOG", dir.path().join("capture.log"))
         .run();
 }
