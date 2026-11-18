@@ -741,10 +741,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             let attempt = &reason.attempts()[0];
             assert_eq!(attempt.location(), absent);
             assert_eq!(attempt.origin(), LoadOrigin::Explicit);
-            assert!(matches!(
-                attempt.refusal(),
-                LoadRefusal::PlatformLoader { .. }
-            ));
+            assert_eq!(attempt.refusal(), &LoadRefusal::Absent);
             assert!(matches!(
                 Ndi::with_options(&standard().library_path("libndi.so.6")),
                 Err(Error::InvalidInput(_))

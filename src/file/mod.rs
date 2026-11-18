@@ -21,8 +21,9 @@
 //!
 //! # Where the File library is loaded from
 //!
-//! Unless [`FileApiOptions::library_path`] names an exact file, the first
-//! usable library in this order is selected:
+//! An explicit [`FileApiOptions::library_path`] must name an existing file.
+//! The crate refuses a missing file before calling the platform loader.
+//! With no explicit path, the first usable library in this order is selected:
 //!
 //! 1. the directory of the selected NDI runtime library, where the SDK installs it;
 //! 2. the directory containing the running executable;
@@ -39,9 +40,8 @@
 //! `DYLD_FALLBACK_LIBRARY_PATH` refuses the entire default search before opening
 //! a library. The check reads the process environment at search time; dyld uses
 //! its launch-time values, so changing `DYLD_*` after launch is unsupported.
-//! Explicit paths retain dyld's own policy.
-//! In unrestricted macOS processes dyld can substitute `DYLD_LIBRARY_PATH`
-//! even for an absolute path; the crate refuses a substitute with
+//! In unrestricted macOS processes dyld can use `DYLD_LIBRARY_PATH` to
+//! substitute an existing explicit file. The crate refuses a substitute with
 //! [`crate::LoadRefusal::ResolvedToAnotherFile`]. Native dependencies still
 //! follow platform loader rules.
 //!
@@ -288,8 +288,9 @@ impl FileApiOptions {
 
     /// Load exactly this absolute File library path.
     ///
-    /// No other location is tried, so a failure to load it is reported rather
-    /// than hidden by a fallback. A relative path is rejected by
+    /// A path that does not name an existing file is refused before native
+    /// loading. A failure to load the file is reported without a fallback.
+    /// A relative path is rejected by
     /// [`FileApi::new`] with [`Error::InvalidInput`] on every target, before
     /// selection. A target that links the SDK statically refuses an absolute
     /// path with [`Error::RuntimeConflict`].

@@ -689,6 +689,21 @@ mod shared {
         }
     }
 
+    impl Origin {
+        /// Whether the candidate can be opened only at its exact path.
+        fn names_exact_file(self) -> bool {
+            matches!(
+                self,
+                Self::Explicit
+                    | Self::Companion
+                    | Self::Executable
+                    | Self::RuntimeDirectory
+                    | Self::PathDirectory
+                    | Self::DyldLibraryDirectory
+            )
+        }
+    }
+
     impl Candidate {
         fn open(&self, search: &Search<'_>) -> std::result::Result<Module, Refusal> {
             // Environment directories name exact absolute files. Refuse
@@ -707,17 +722,9 @@ mod shared {
             {
                 return Err(Refusal::unloaded(LoadRefusal::RelativeSearchDirectory));
             }
-            // A directory candidate names one exact file. Skipping an absent
-            // one keeps the loader from searching elsewhere for that path.
-            if matches!(
-                self.origin,
-                Origin::Companion
-                    | Origin::Executable
-                    | Origin::RuntimeDirectory
-                    | Origin::PathDirectory
-                    | Origin::DyldLibraryDirectory
-            ) && !self.location.is_file()
-            {
+            // Skip absent exact files before the native loader can search
+            // elsewhere for their leaf names.
+            if self.origin.names_exact_file() && !self.location.is_file() {
                 return Err(Refusal::unloaded(LoadRefusal::Absent));
             }
             #[cfg(all(unix, not(target_vendor = "apple")))]

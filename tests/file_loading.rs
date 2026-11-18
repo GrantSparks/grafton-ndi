@@ -171,6 +171,7 @@ const fn scenario(name: &'static str) -> Scenario {
 
 const SCENARIOS: &[Scenario] = &[
     scenario("relative_path_selects_nothing"),
+    scenario("explicit_path_is_exclusive"),
     Scenario {
         runtime_directory: Some("runtime"),
         ..scenario("beside_the_runtime_first_and_pinned")
@@ -290,6 +291,21 @@ fn child(name: &str, fixtures: &Fixtures) {
                 Err(Error::InvalidInput(_))
             ));
             assert!(!is_loaded("libndifile.so.6"));
+            let api = FileApi::new(&ndi, &defaults).unwrap();
+            assert_eq!(bound_runtime(&api), PAIRED.build);
+        }
+        "explicit_path_is_exclusive" => {
+            let ndi = select(fixtures, &PAIRED);
+            let absent = fixtures.root.join("missing").join(FILE_LIBRARY);
+            let refusal = unavailable(FileApi::new(&ndi, &explicit(absent.clone())));
+            assert!(!refusal.loaded_any());
+            let [attempt] = refusal.attempts() else {
+                panic!("expected only the explicit attempt, got {refusal}");
+            };
+            assert_eq!(attempt.location(), absent);
+            assert_eq!(attempt.origin(), LoadOrigin::Explicit);
+            assert_eq!(attempt.refusal(), &LoadRefusal::Absent);
+            assert!(!is_loaded(FILE_LIBRARY));
             let api = FileApi::new(&ndi, &defaults).unwrap();
             assert_eq!(bound_runtime(&api), PAIRED.build);
         }

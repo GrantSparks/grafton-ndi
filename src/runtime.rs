@@ -58,8 +58,10 @@
 //! # }
 //! ```
 //!
-//! An explicit path tries only that file and never falls back to executable,
-//! environment or platform search paths. A later explicit selection cannot
+//! An explicit path must name an existing file. If it does not, the crate
+//! refuses it without calling the platform loader. The crate makes no
+//! executable, environment or platform search for an explicit path. A later
+//! explicit selection cannot
 //! undo code already run by an earlier load. Native dependencies still use
 //! platform loader rules and must also come from trusted locations. With the
 //! File API, explicitly select `FileApiOptions::library_path`
@@ -83,9 +85,8 @@
 //! `DYLD_FALLBACK_LIBRARY_PATH` refuses the entire default search before opening
 //! a library. The check reads the process environment at search time; dyld uses
 //! its launch-time values, so changing `DYLD_*` after launch is unsupported.
-//! Explicit paths retain dyld's own policy.
-//! On unrestricted macOS processes dyld can substitute `DYLD_LIBRARY_PATH`
-//! even for an absolute path; such substitutions are refused with
+//! On unrestricted macOS processes dyld can use `DYLD_LIBRARY_PATH` to
+//! substitute an existing explicit file. Such substitutions are refused with
 //! [`crate::LoadRefusal::ResolvedToAnotherFile`]. Native dependencies still
 //! follow platform loader rules.
 //!
@@ -202,8 +203,8 @@ impl RuntimeOptions {
 
     /// Load exactly this absolute shared-library path.
     ///
-    /// No other location is tried, so a failure to load it is reported rather
-    /// than hidden by a fallback. A statically linked target has no library to
+    /// A path that does not name an existing file is refused before native
+    /// loading. A failure to load the file is reported without a fallback. A statically linked target has no library to
     /// load and rejects an absolute path with [`Error::RuntimeConflict`].
     /// A relative path returns [`Error::InvalidInput`] on every target,
     /// before an implementation is selected.

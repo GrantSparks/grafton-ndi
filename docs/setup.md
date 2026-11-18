@@ -40,9 +40,9 @@ On Windows and macOS, the working directory is never added to this search.
 Relative or empty `PATH`/`DYLD_LIBRARY_PATH` entries are recorded as refused
 locations and never opened. On macOS, a relative or empty entry in either
 `DYLD_LIBRARY_PATH` or `DYLD_FALLBACK_LIBRARY_PATH` refuses the entire default
-search before opening a library, including executable and companion candidates. Explicit paths retain dyld's own policy. In unrestricted
-macOS processes dyld consults `DYLD_LIBRARY_PATH` even for an absolute path;
-the crate refuses a substitute
+search before opening a library, including executable and companion candidates.
+In unrestricted macOS processes dyld can use `DYLD_LIBRARY_PATH` to substitute
+an existing explicit file. The crate refuses a substitute
 with `LoadRefusal::ResolvedToAnotherFile`. This identity check follows the native
 load and cannot undo a substitute's initializers. Configure trusted absolute
 `DYLD_LIBRARY_PATH` and `DYLD_FALLBACK_LIBRARY_PATH` entries before launching.
@@ -64,8 +64,9 @@ the search.
 | Linux | `libndi.so.6` | `libndi_advanced.so.6` |
 | Android | `libndi.so` | `libndi_advanced.so` |
 
-An absolute `RuntimeOptions::library_path` tries only that file. Relative paths
-return `Error::InvalidInput`. `RuntimeLoadFailed` lists attempted paths and errors;
+An absolute `RuntimeOptions::library_path` or `FileApiOptions::library_path`
+must name an existing file. The crate refuses a missing file before calling
+the platform loader. Relative paths return `Error::InvalidInput`. `RuntimeLoadFailed` lists attempted paths and errors;
 failed selection can be retried. A successful selection lasts for the process.
 A different path or incompatible edition then returns `RuntimeConflict`.
 
