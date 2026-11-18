@@ -19,6 +19,7 @@ use std::{
     fmt::{self, Display, Formatter},
     hash::{Hash, Hasher},
     net::IpAddr,
+    num::NonZeroU16,
     ptr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -1592,18 +1593,6 @@ impl SourceText {
         }))
     }
 
-    pub(crate) fn with_port(&self, port: u16) -> Self {
-        let address = self.as_str();
-        let endpoint = if address.parse::<std::net::Ipv6Addr>().is_ok() {
-            format!("[{address}]:{port}")
-        } else {
-            format!("{address}:{port}")
-        };
-        // SAFETY: SourceText contains no interior NUL, and formatting adds
-        // only brackets, a colon and decimal digits.
-        unsafe { Self::from_nul_free_string(endpoint) }
-    }
-
     pub(crate) fn new(text: String) -> Result<Self> {
         Ok(Self(Arc::new(CString::new(text)?)))
     }
@@ -1630,8 +1619,28 @@ impl fmt::Debug for SourceText {
 }
 
 impl SourceAddress {
-    pub(crate) fn from_text(text: SourceText) -> Self {
-        Self(text)
+    pub(crate) fn from_advertised_host(text: &str, port: NonZeroU16) -> Option<Self> {
+        let host = HostQuery::parse(text)?;
+        let endpoint = match host {
+            HostQuery::Ip(IpAddr::V6(_)) => {
+                let literal = text
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .unwrap_or(text);
+                format!("[{literal}]:{port}")
+            }
+            HostQuery::Ip(IpAddr::V4(ip)) => format!("{ip}:{port}"),
+            // Preserve a final DNS dot, which marks an absolute host name.
+            HostQuery::Host(_) => format!("{text}:{port}"),
+            HostQuery::Machine(_) => return None,
+        };
+        let authority = parse_authority(&endpoint)?;
+        if authority.port != Some(port.get()) || !host.matches(authority.host) {
+            return None;
+        }
+        // SAFETY: an IP literal or DNS host name contains no NUL, and
+        // formatting adds only brackets, a colon and decimal digits.
+        Some(Self(unsafe { SourceText::from_nul_free_string(endpoint) }))
     }
 
     /// Keep the opaque address text unchanged after checking its native form.
@@ -2680,6 +2689,33 @@ mod tests {
                 (0, HostQuery::Ip(_)) | (1, HostQuery::Host(_)) | (2, HostQuery::Machine(_)),
             ));
             assert_eq!(HostKey::try_from(query).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn advertised_hosts_round_trip_through_authority() {
+        for host in [
+            "192.0.2.10",
+            "[192.0.2.10]",
+            "::1",
+            "2001:db8:0000::0010",
+            "[2001:db8:0000::0010]",
+            "::ffff:192.0.2.10",
+            "a",
+            "camera-1.local",
+            "CAMERA.Local.",
+        ] {
+            let query = HostQuery::parse(host).unwrap();
+            for port in [
+                NonZeroU16::MIN,
+                NonZeroU16::new(5960).unwrap(),
+                NonZeroU16::MAX,
+            ] {
+                let endpoint = SourceAddress::from_advertised_host(host, port).unwrap();
+                let authority = parse_authority(endpoint.as_str()).unwrap();
+                assert!(query.matches(authority.host), "{host}: {endpoint:?}");
+                assert_eq!(authority.port, Some(port.get()));
+            }
         }
     }
 

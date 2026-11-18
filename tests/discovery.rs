@@ -434,7 +434,7 @@ fn child(scenario: &str) {
             assert_eq!(malformed.name(), Some("STUDIO (Caf\u{fffd})"));
             assert_eq!(malformed.metadata(), Some("<ndi_product/>"));
             assert_eq!(malformed.address(), Some("192.0.2.10"));
-            assert_eq!(malformed.port(), Some(5961));
+            assert_eq!(malformed.port().map(std::num::NonZeroU16::get), Some(5961));
             assert_eq!(malformed.groups(), ["public", "gro\u{fffd}up"]);
             assert!(!malformed.events_subscribed());
             assert_eq!(plain.id().unwrap().as_bytes(), b"sender-plain");
