@@ -2257,7 +2257,7 @@ impl ReceiverCore {
 
     /// Hold the local connection lock, so tests can verify captures and target
     /// snapshots proceed while another connection change is queued.
-    #[cfg(all(test, any(feature = "advanced", feature = "tokio", feature = "smol")))]
+    #[cfg(all(test, any(feature = "tokio", feature = "smol")))]
     pub(crate) fn reconnect_lock(&self) -> impl Drop + '_ {
         self.lock_change()
     }
