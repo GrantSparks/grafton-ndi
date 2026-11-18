@@ -11,8 +11,9 @@ in its cached lint job. Pushes to `main` upload that HTML for GitHub Pages;
 the deployment job publishes it only after `required-ci` succeeds. Pull
 requests, manual CI runs and release-tag runs validate docs without publishing.
 Pages write permissions are confined to the deployment job, which runs no
-repository scripts. The release caller forwards those permissions for reusable
-workflow validation; its tag ref keeps the Pages job disabled.
+repository scripts. A run skips deployment when its commit is no longer the
+tip of `main`. The release caller forwards those permissions for reusable
+workflow validation. Its tag ref keeps the Pages job disabled.
 
 Use the pinned Rust toolchain with Clippy and rustfmt:
 
@@ -30,21 +31,21 @@ done
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 python ci/docs.py --compile --rustdoc target/doc
 cargo build --locked --examples --all-features
-cargo test --locked --all-features
+cargo test --locked --no-fail-fast --all-features
 scope_dir="${RUNNER_TEMP:-target/ci}"
 mkdir -p "$scope_dir"
-cargo test --locked -- --list > "$scope_dir/default-tests.txt"
+cargo test --locked --no-fail-fast -- --list > "$scope_dir/default-tests.txt"
 python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/default-tests.txt" --output "$scope_dir/default-skips.txt"
 scope_args=()
 while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/default-skips.txt"
-cargo test --locked -- "${scope_args[@]}"
+cargo test --locked --no-fail-fast -- "${scope_args[@]}"
 scope_dir="${RUNNER_TEMP:-target/ci}"
 mkdir -p "$scope_dir"
-cargo test --locked --no-default-features --features file-io -- --list > "$scope_dir/file-tests.txt"
+cargo test --locked --no-fail-fast --no-default-features --features file-io -- --list > "$scope_dir/file-tests.txt"
 python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/file-tests.txt" --output "$scope_dir/file-skips.txt"
 scope_args=()
 while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/file-skips.txt"
-cargo test --locked --no-default-features --features file-io -- "${scope_args[@]}"
+cargo test --locked --no-fail-fast --no-default-features --features file-io -- "${scope_args[@]}"
 ```
 
 Tests that require an unavailable NDI runtime report a skip. Runtime
@@ -141,13 +142,39 @@ MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly-2026-11-10 miri test --locked --l
 The Ubuntu `test` job runs the scripted capture fixtures and full encoder padding
 matrix under Valgrind Memcheck. It traces child test processes, skips compiler
 children and fails on errors. The Standard 6.3.2 Linux SDK row also checks live
-padding through the loopback runner. A narrowly scoped suppression covers only
-glibc loader token comparisons reported by Valgrind 3.19:
+padding through the loopback runner. Install Valgrind before running either recipe.
+
+SDK-free capture and encoder padding:
 
 ```sh
-cargo test --locked --all-features --config 'target.x86_64-unknown-linux-gnu.runner=["valgrind","--tool=memcheck","--error-exitcode=99","--trace-children=yes","--trace-children-skip=*/rustc,*/rustc-*"]' --test mixed_capture_boundary --test frame_metadata_boundary
-GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --locked --features image-encoding --config ci/offline.toml --config 'target.x86_64-unknown-linux-gnu.runner=["ci/offline/linux.sh","valgrind","--tool=memcheck","--error-exitcode=99","--suppressions=ci/valgrind.supp"]' --test video_padding_sdk -- --test-threads=1
+runner='target.x86_64-unknown-linux-gnu.runner=["valgrind","--tool=memcheck","--error-exitcode=99","--trace-children=yes","--trace-children-skip=*/rustc,*/rustc-*"]'
+cargo test --locked --no-fail-fast --all-features --config "$runner" --test mixed_capture_boundary --test frame_metadata_boundary -- --test-threads=1
+memcheck_dir="${RUNNER_TEMP:-target/ci}"
+mkdir -p "$memcheck_dir"
+inventory="$memcheck_dir/ndi-encoder-padding-tests.txt"
+selection="$memcheck_dir/ndi-encoder-padding-selected.txt"
+cargo test --locked --no-fail-fast --all-features --lib -- --list > "$inventory"
+python3 ci/sdk_test_scope.py select --group encoder-padding --inventory "$inventory" --output "$selection"
+mapfile -t tests < "$selection"
+cargo test --locked --no-fail-fast --all-features --config "$runner" --lib -- --exact "${tests[@]}" --test-threads=1
 ```
+
+Live SDK padding on Linux x64:
+
+```sh
+memcheck_dir="${RUNNER_TEMP:-target/ci}"
+mkdir -p "$memcheck_dir"
+inventory="$memcheck_dir/ndi-sdk-padding-tests.txt"
+selection="$memcheck_dir/ndi-sdk-padding-selected.txt"
+GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --locked --config ci/offline.toml --target x86_64-unknown-linux-gnu --no-fail-fast --features image-encoding --test video_padding_sdk -- --list > "$inventory"
+python3 ci/sdk_test_scope.py select --group sdk-padding --inventory "$inventory" --output "$selection"
+mapfile -t tests < "$selection"
+GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --locked --config ci/offline.toml --config 'target.x86_64-unknown-linux-gnu.runner=["ci/offline/linux.sh","valgrind","--tool=memcheck","--track-origins=yes","--error-exitcode=99"]' --target x86_64-unknown-linux-gnu --no-fail-fast --features image-encoding --test video_padding_sdk -- --exact "${tests[@]}" --test-threads=1
+```
+
+On Debian 12 with Valgrind 3.19 and glibc 2.36, the live SDK recipe may report
+reads from glibc's loader token comparisons. Add
+`"--suppressions=ci/valgrind.supp"` to its runner array on that host.
 
 ## Test against an installed runtime
 

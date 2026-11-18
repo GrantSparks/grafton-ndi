@@ -139,6 +139,7 @@ def violations(texts):
     return (found + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
             + docs_violations(parsed['rust.yml']) + memory_checker_violations(parsed['rust.yml'])
             + repeated_feature_violations(parsed['rust.yml'])
+            + test_failure_reporting_violations(parsed['rust.yml'])
             + sdk_input_violations(parsed['rust.yml'])
             + source_consistency_violations(parsed, cargo_manifest(), sdk.load_pins(),
                                             (ROOT / 'docs/setup.md').read_text(encoding='utf-8')))
@@ -245,12 +246,17 @@ def docs_violations(docs):
     jobs = docs['jobs']
     deploy = jobs['deploy-docs']
     upload = next(step for step in jobs['lint']['steps'] if step.get('name') == 'Upload Pages artifact')
+    steps = {step.get('id'): step for step in deploy['steps']}
+    tip, deployment = steps.get('latest', {}), steps.get('deployment', {})
     return (differs('rust.yml: job order', deploy.get('needs'), 'required-ci')
             + differs('rust.yml: artifact condition', upload.get('if'), "github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main'")
             + differs('rust.yml: artifact source', upload.get('with'), {'path': 'target/doc'})
             + differs('rust.yml: deployment environment', deploy.get('environment'),
                       {'name': 'github-pages', 'url': '${{ steps.deployment.outputs.page_url }}'})
-            + differs('rust.yml: deployment scripts', [step for step in deploy['steps'] if 'run' in step], [])
+            + differs('rust.yml: deployment scripts', [step.get('id') for step in deploy['steps'] if 'run' in step],
+                      ['latest'])
+            + differs('rust.yml: Pages tip check token', tip.get('env'), {'GH_TOKEN': '${{ github.token }}'})
+            + differs('rust.yml: Pages deployment tip guard', deployment.get('if'), "steps.latest.outputs.deploy == 'true'")
             + rustdoc_feature_violations(jobs['lint']['steps']) + implementation_coverage_violations(docs))
 
 
@@ -271,9 +277,9 @@ def rustdoc_feature_violations(steps):
 
 
 REPEATED_FEATURE_TESTS = (
-    ('Tests, default features', 'cargo test --locked', 'default'),
+    ('Tests, default features', 'cargo test --locked --no-fail-fast', 'default'),
     ('Tests, File API without Advanced wrappers',
-     'cargo test --locked --no-default-features --features file-io', 'file'),
+     'cargo test --locked --no-fail-fast --no-default-features --features file-io', 'file'),
 )
 
 
@@ -290,7 +296,7 @@ def repeated_feature_violations(rust):
     steps = rust['jobs']['test']['steps']
     names = [step.get('name') for step in steps]
     owner = next((step for step in steps if step.get('name') == 'Tests, all features'), {})
-    found = differs('rust.yml: fixed compiler owner', owner.get('run'), 'cargo test --locked --all-features')
+    found = differs('rust.yml: fixed compiler owner', owner.get('run'), 'cargo test --locked --no-fail-fast --all-features')
     if 'if' in owner:
         found.append('rust.yml: fixed compiler owner must run on every test host')
     for name, command, stem in REPEATED_FEATURE_TESTS:
@@ -329,7 +335,7 @@ def local_recipe_violations(rust, readme):
         ('lint', 'Rustdoc feature combinations', 'cargo doc --locked --no-deps --no-default-features ${features:+--features "$features"}'),
         ('lint', 'Rustdoc', 'cargo doc --locked --no-deps --all-features'),
         ('lint', 'Documentation links and examples', 'python ci/docs.py --compile --rustdoc target/doc'),
-        ('test', 'Tests, all features', 'cargo test --locked --all-features'),
+        ('test', 'Tests, all features', 'cargo test --locked --no-fail-fast --all-features'),
     ) + tuple(('test', name, scoped)
               for name, command, stem in REPEATED_FEATURE_TESTS
               for scoped in scoped_commands(command, stem))
@@ -355,6 +361,43 @@ def local_recipe_violations(rust, readme):
         expected.extend(feature_loops(step))
     actual = [shlex.split(loop) for loop in re.findall(r'for features in ([^;]+); do', recipe)]
     found += differs('ci/README.md: local recipe feature combinations', actual, expected)
+    return found
+
+
+MEMCHECK_RECIPES = (
+    ('test', 'Memcheck over scripted capture and encoder padding', 'SDK-free capture and encoder padding:'),
+    ('sdk', 'Memcheck over SDK padding', 'Live SDK padding on Linux x64:'),
+)
+
+
+def memcheck_recipe_violations(rust, readme):
+    found = []
+    for job, name, heading in MEMCHECK_RECIPES:
+        step = next((step for step in rust['jobs'][job]['steps'] if step.get('name') == name), {})
+        recipe = readme.partition(heading)[2].partition('```sh\n')[2].partition('```')[0]
+        actual = [shlex.split(line) for line in recipe.splitlines() if line.strip()]
+        expected = []
+        for line in step.get('run', '').splitlines():
+            if not line or line.startswith('sudo apt-get '):
+                continue
+            if job == 'sdk' and line.startswith('cargo test '):
+                required = step.get('env', {}).get('GRAFTON_NDI_REQUIRE_RUNTIME')
+                line = f'GRAFTON_NDI_REQUIRE_RUNTIME={required} ' + line.replace('"$TARGET"', 'x86_64-unknown-linux-gnu')
+            expected.append(shlex.split(line))
+        if not actual or actual != expected:
+            found.append(f'ci/README.md: {name} recipe differs from the workflow')
+    return found
+
+
+def test_failure_reporting_violations(rust):
+    found = []
+    for job in ('test', 'sdk'):
+        for step in rust['jobs'][job]['steps']:
+            for command in step.get('run', '').splitlines():
+                if command.strip().startswith('cargo test '):
+                    args = shlex.split(command)
+                    if '--no-fail-fast' not in args[:args.index('--') if '--' in args else len(args)]:
+                        found.append(f'rust.yml: {job} step {step.get("name")} must report all test binaries')
     return found
 
 
@@ -578,6 +621,8 @@ def memory_checker_violations(rust):
                      when("matrix.name == 'linux-x64 standard-6.3.2'"))
     for owner, step in (('test', test), ('sdk', sdk)):
         command = step.get('run', '')
+        if '--suppressions=' in command:
+            found.append(f'rust.yml: {owner} Memcheck must report unsuppressed errors')
         for required in ('valgrind', '--tool=memcheck', '--error-exitcode=99'):
             if required not in command:
                 found.append(f'rust.yml: {owner} Memcheck does not fail on detector errors')
@@ -1092,6 +1137,25 @@ class SdkJob(unittest.TestCase):
                                   for edition, pin in baselines.items()})
 
 class MemoryCheckers(unittest.TestCase):
+    def test_memcheck_recipes_match_the_workflow(self):
+        rust = workflows.load(read_workflows()['rust.yml'])
+        readme = (ROOT / 'ci/README.md').read_text(encoding='utf-8')
+        self.assertEqual(memcheck_recipe_violations(rust, readme), [])
+        for job, step_name, missing in (
+            ('test', 'Memcheck over scripted capture and encoder padding', '--test mixed_capture_boundary'),
+            ('test', 'Memcheck over scripted capture and encoder padding', '--test-threads=1'),
+            ('sdk', 'Memcheck over SDK padding', '--track-origins=yes'),
+            ('sdk', 'Memcheck over SDK padding', '--no-fail-fast'),
+        ):
+            with self.subTest(job=job, missing=missing):
+                altered = copy.deepcopy(rust)
+                step = next(step for step in altered['jobs'][job]['steps'] if step.get('name') == step_name)
+                step['run'] = step['run'].replace(missing, '')
+                self.assertTrue(any(step_name in error for error in memcheck_recipe_violations(altered, readme)))
+                parts = readme.split('### Memory checkers', 1)
+                broken_docs = '### Memory checkers'.join((parts[0], parts[1].replace(missing, '')))
+                self.assertTrue(any(step_name in error for error in memcheck_recipe_violations(rust, broken_docs)))
+
     def test_suppressions_match_only_the_observed_glibc_loader_stack(self):
         text = (ROOT / 'ci/valgrind.supp').read_text(encoding='utf-8')
         blocks = re.findall(r'\{(.*?)\}', text, re.DOTALL)
@@ -1148,6 +1212,25 @@ class MemoryCheckers(unittest.TestCase):
 
 
 class Repository(unittest.TestCase):
+    def test_pages_deploys_only_the_current_tip(self):
+        rust = workflows.load(read_workflows()['rust.yml'])
+        tip, deployment = rust['jobs']['deploy-docs']['steps']
+        self.assertEqual(deployment.get('if'), "steps.latest.outputs.deploy == 'true'")
+        script = 'gh() { printf "%s\\n" "$REMOTE_TIP"; }\n' + tip['run']
+        sha = 'a' * 40
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'output'
+            for remote, status, expected in ((sha, 0, 'deploy=true\n'), ('b' * 40, 0, ''), ('', 1, '')):
+                with self.subTest(remote=remote):
+                    output.write_text('')
+                    result = subprocess.run(['bash', '-eo', 'pipefail', '-c', script], text=True, capture_output=True,
+                                            env={**os.environ, 'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_SHA': sha,
+                                                 'GITHUB_OUTPUT': str(output), 'REMOTE_TIP': remote})
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    self.assertEqual(output.read_text(), expected)
+                    if remote and remote != sha:
+                        self.assertIn('::notice::Skipping Pages deployment', result.stdout)
+
     def test_ci_detects_drift_from_manifest_packages_and_platform_table(self):
         parsed = {name: workflows.load(text) for name, text in read_workflows().items()}
         manifest = cargo_manifest()
@@ -1206,9 +1289,9 @@ class Repository(unittest.TestCase):
             'GRAFTON_NDI_SIZES': '64x64', 'GRAFTON_NDI_FORMATS': 'Bgra',
             'GRAFTON_NDI_CONTENTS': 'photographic', 'GRAFTON_NDI_OUTPUTS': 'jpeg85',
         })
-        self.assertIn('cargo test --locked --release --all-features --lib -- --ignored --list', step['run'])
+        self.assertIn('cargo test --locked --no-fail-fast --release --all-features --lib -- --ignored --list', step['run'])
         self.assertIn('python3 ci/sdk_test_scope.py select --group measurements', step['run'])
-        self.assertIn('cargo test --locked --release --all-features --lib -- --ignored --exact "${tests[@]}" --test-threads=1',
+        self.assertIn('cargo test --locked --no-fail-fast --release --all-features --lib -- --ignored --exact "${tests[@]}" --test-threads=1',
                       step['run'])
 
     def test_vendored_bindings_cover_exactly_the_supported_platform_targets(self):
@@ -1305,7 +1388,7 @@ class Repository(unittest.TestCase):
         directory = ROOT / '.cargo'
         self.assertEqual(sorted(path.name for path in directory.iterdir()), ['config.toml'])
         self.assertEqual(tomllib.loads((directory / 'config.toml').read_text(encoding='utf-8')),
-                         {'alias': {'xtask': 'run --package xtask --'}})
+                         {'alias': {'xtask': 'run --locked --package xtask --'}})
 
     def test_code_owners_cover_what_ci_obeys(self):
         lines = (ROOT / '.github' / 'CODEOWNERS').read_text(encoding='utf-8').splitlines()

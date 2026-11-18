@@ -22,6 +22,7 @@ concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# The test and SDK jobs run every test binary with --no-fail-fast.
 defaults:
   run:
     shell: bash
@@ -143,25 +144,25 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # No NDI runtime is installed here: tests that need one report a skip.
       - name: Tests, all features
-        run: cargo test --locked --all-features
+        run: cargo test --locked --no-fail-fast --all-features
       - name: Tests, default features
         run: |
           scope_dir="${RUNNER_TEMP:-target/ci}"
           mkdir -p "$scope_dir"
-          cargo test --locked -- --list > "$scope_dir/default-tests.txt"
+          cargo test --locked --no-fail-fast -- --list > "$scope_dir/default-tests.txt"
           python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/default-tests.txt" --output "$scope_dir/default-skips.txt"
           scope_args=()
           while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/default-skips.txt"
-          cargo test --locked -- "${scope_args[@]}"
+          cargo test --locked --no-fail-fast -- "${scope_args[@]}"
       - name: Tests, File API without Advanced wrappers
         run: |
           scope_dir="${RUNNER_TEMP:-target/ci}"
           mkdir -p "$scope_dir"
-          cargo test --locked --no-default-features --features file-io -- --list > "$scope_dir/file-tests.txt"
+          cargo test --locked --no-fail-fast --no-default-features --features file-io -- --list > "$scope_dir/file-tests.txt"
           python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/file-tests.txt" --output "$scope_dir/file-skips.txt"
           scope_args=()
           while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/file-skips.txt"
-          cargo test --locked --no-default-features --features file-io -- "${scope_args[@]}"
+          cargo test --locked --no-fail-fast --no-default-features --features file-io -- "${scope_args[@]}"
       - name: Manual measurement fixtures
         if: runner.os == 'Linux'
         timeout-minutes: 5
@@ -173,10 +174,10 @@ jobs:
         run: |
           inventory="$RUNNER_TEMP/ndi-measurement-tests.txt"
           selection="$RUNNER_TEMP/ndi-measurement-selected.txt"
-          cargo test --locked --release --all-features --lib -- --ignored --list > "$inventory"
+          cargo test --locked --no-fail-fast --release --all-features --lib -- --ignored --list > "$inventory"
           python3 ci/sdk_test_scope.py select --group measurements --inventory "$inventory" --output "$selection"
           mapfile -t tests < "$selection"
-          cargo test --locked --release --all-features --lib -- --ignored --exact "${tests[@]}" --test-threads=1
+          cargo test --locked --no-fail-fast --release --all-features --lib -- --ignored --exact "${tests[@]}" --test-threads=1
       - name: Memcheck over scripted capture and encoder padding
         if: runner.os == 'Linux'
         timeout-minutes: 10
@@ -184,13 +185,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends valgrind
           runner='target.x86_64-unknown-linux-gnu.runner=["valgrind","--tool=memcheck","--error-exitcode=99","--trace-children=yes","--trace-children-skip=*/rustc,*/rustc-*"]'
-          cargo test --locked --all-features --config "$runner" --test mixed_capture_boundary --test frame_metadata_boundary -- --test-threads=1
-          inventory="$RUNNER_TEMP/ndi-encoder-padding-tests.txt"
-          selection="$RUNNER_TEMP/ndi-encoder-padding-selected.txt"
-          cargo test --locked --all-features --lib -- --list > "$inventory"
+          cargo test --locked --no-fail-fast --all-features --config "$runner" --test mixed_capture_boundary --test frame_metadata_boundary -- --test-threads=1
+          memcheck_dir="${RUNNER_TEMP:-target/ci}"
+          mkdir -p "$memcheck_dir"
+          inventory="$memcheck_dir/ndi-encoder-padding-tests.txt"
+          selection="$memcheck_dir/ndi-encoder-padding-selected.txt"
+          cargo test --locked --no-fail-fast --all-features --lib -- --list > "$inventory"
           python3 ci/sdk_test_scope.py select --group encoder-padding --inventory "$inventory" --output "$selection"
           mapfile -t tests < "$selection"
-          cargo test --locked --all-features --config "$runner" --lib -- --exact "${tests[@]}" --test-threads=1
+          cargo test --locked --no-fail-fast --all-features --config "$runner" --lib -- --exact "${tests[@]}" --test-threads=1
 
   miri:
     name: miri (${{ matrix.model }})
@@ -580,8 +583,7 @@ jobs:
             Windows) echo 'Windows runs the runtime tests without a loopback-only runner.' ;;
           esac
       # Each runtime step is bounded inside the job's limit, so a test that
-      # never returns fails its step. Every test binary runs, so one failing
-      # does not hide the rest. Every step from here on runs
+      # never returns fails its step. Every step from here on runs
       # whatever the steps before it did, once the runner was shown to isolate:
       # a run then reports everything that is wrong with a row, not the first
       # thing.
@@ -615,12 +617,14 @@ jobs:
           GRAFTON_NDI_REQUIRE_RUNTIME: '1'
         run: |
           sudo apt-get install --yes --no-install-recommends valgrind
-          inventory="$RUNNER_TEMP/ndi-sdk-padding-tests.txt"
-          selection="$RUNNER_TEMP/ndi-sdk-padding-selected.txt"
+          memcheck_dir="${RUNNER_TEMP:-target/ci}"
+          mkdir -p "$memcheck_dir"
+          inventory="$memcheck_dir/ndi-sdk-padding-tests.txt"
+          selection="$memcheck_dir/ndi-sdk-padding-selected.txt"
           cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --features image-encoding --test video_padding_sdk -- --list > "$inventory"
           python3 ci/sdk_test_scope.py select --group sdk-padding --inventory "$inventory" --output "$selection"
           mapfile -t tests < "$selection"
-          cargo test --locked --config ci/offline.toml --config 'target.x86_64-unknown-linux-gnu.runner=["ci/offline/linux.sh","valgrind","--tool=memcheck","--track-origins=yes","--error-exitcode=99","--suppressions=ci/valgrind.supp"]' --target "$TARGET" --no-fail-fast --features image-encoding --test video_padding_sdk -- --exact "${tests[@]}" --test-threads=1
+          cargo test --locked --config ci/offline.toml --config 'target.x86_64-unknown-linux-gnu.runner=["ci/offline/linux.sh","valgrind","--tool=memcheck","--track-origins=yes","--error-exitcode=99"]' --target "$TARGET" --no-fail-fast --features image-encoding --test video_padding_sdk -- --exact "${tests[@]}" --test-threads=1
       # Without the Advanced headers the advanced feature compiles to stubs, so
       # only a build that has them lints and documents the real implementation.
       - name: Lint and document the Advanced implementation
@@ -729,6 +733,22 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Confirm this commit is still the tip of main
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tip=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          if [[ ! "$tip" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Could not determine the current tip of main'
+            exit 1
+          fi
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice::Skipping Pages deployment for $GITHUB_SHA because main is now $tip"
+            exit 0
+          fi
+          echo 'deploy=true' >> "$GITHUB_OUTPUT"
       - name: Deploy to GitHub Pages
         id: deployment
+        if: steps.latest.outputs.deploy == 'true'
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
