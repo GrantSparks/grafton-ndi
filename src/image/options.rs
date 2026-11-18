@@ -138,13 +138,13 @@ macro_rules! image_format_variants {
                 match self { $(Self::$variant $(($argument))? => Index::$variant as usize),+ }
             }
         }
-        const _: () = {
+        const_assert!({
             let mut index = 0;
             while index < ImageFormat::ALL.len() {
                 assert!(ImageFormat::ALL[index].variant_index() == index);
                 index += 1;
             }
-        };
+        });
     };
 }
 #[cfg(test)]

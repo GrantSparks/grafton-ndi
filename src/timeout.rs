@@ -67,7 +67,7 @@ pub(crate) type StopResult<T, S> = Result<std::result::Result<T, <S as Stop>::St
 
 /// [`MAX_TIMEOUT`] in the SDK's milliseconds.
 const MAX_MILLIS: u32 = u32::MAX - 1;
-const _: () = assert!(MAX_TIMEOUT.as_millis() == MAX_MILLIS as u128);
+const_assert!(MAX_TIMEOUT.as_millis() == MAX_MILLIS as u128);
 
 /// The SDK's millisecond count for a finite wait, rounded up, or `None` when
 /// the wait exceeds [`MAX_TIMEOUT`].

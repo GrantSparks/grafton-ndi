@@ -672,7 +672,7 @@ pub(crate) mod in_flight {
     }
 
     #[cfg(feature = "advanced")]
-    const _: () = assert!(std::mem::size_of::<Destroyed>() == 0);
+    const_assert!(std::mem::size_of::<Destroyed>() == 0);
 
     /// The loan storage attached to one exclusive native sender.
     #[cfg(feature = "advanced")]

@@ -357,11 +357,11 @@ pub struct FrameSync {
     inner: Attached<FrameSyncKind>,
 }
 
-const _: () = {
+const_assert!({
     const fn send_and_sync<T: Send + Sync>() {}
     send_and_sync::<FrameSync>();
     send_and_sync::<FrameSyncResource>();
-};
+});
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FrameSyncInstance(NDIlib_framesync_instance_t);
@@ -414,7 +414,7 @@ pub(crate) struct FrameSyncKind {
 type FrameSyncResource = Resource<FrameSyncKind>;
 
 // Moving the receiver lease into the kind adds no storage to the resource.
-const _: () = assert!(
+const_assert!(
     std::mem::size_of::<FrameSyncResource>()
         == std::mem::size_of::<FrameSyncInstance>()
             + std::mem::size_of::<std::sync::Arc<ReceiverCore>>()

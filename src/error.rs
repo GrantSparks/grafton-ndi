@@ -443,7 +443,7 @@ impl From<NulError> for Error {
 
 // The existing largest payload is NulError. Selection diagnostics must not
 // enlarge the error returned by hot capture/send paths (40 bytes on x86-64).
-const _: () = assert!(
+const_assert!(
     std::mem::size_of::<Error>()
         <= std::mem::size_of::<NulError>() + std::mem::align_of::<NulError>()
 );
@@ -451,7 +451,7 @@ const _: () = assert!(
 // Preserve the compact nested causes on every 32-bit and 64-bit target,
 // including SDK allocator paths that return a LayoutDefect without allocating.
 #[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
-const _: () = {
+const_assert!({
     use std::mem::size_of;
     assert!(size_of::<FrameDefect>() == 4 * size_of::<usize>());
     assert!(size_of::<InputDefect>() == 4 * size_of::<usize>());
@@ -463,7 +463,7 @@ const _: () = {
                 16
             }
     );
-};
+});
 
 /// The resource budget exhausted by a discovery operation.
 ///

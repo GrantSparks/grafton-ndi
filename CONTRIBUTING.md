@@ -21,8 +21,9 @@ platform and native runtime version/edition. For fixes, add a regression test
 and explain the change in behavior. Keep native ownership and synchronization
 arguments beside unsafe operations.
 
-Production code may not panic except through an `#[expect]` whose reason states
-the invariant that justifies the site.
+Production code may panic only through an `#[expect]` whose reason states the
+invariant that justifies the site. Use `const_assert!` for compile-time assertions
+and reserve `assert!`, `assert_eq!` and `assert_ne!` for tests.
 
 Update API documentation and examples when behavior changes, and add migration
 notes when callers must change. Follow the [public API conventions](docs/api-conventions.md)

@@ -394,11 +394,13 @@ fn refill<T: Copy>(
     };
     restore.data.clear();
     write(restore.data);
-    assert_eq!(
-        restore.data.len(),
-        expected_len,
-        "packed copy must initialize its complete layout"
-    );
+    #[expect(
+        clippy::panic,
+        reason = "sealed PackedSource implementations write their exact packed layout, which PackedVideo's VideoParts rely on"
+    )]
+    if restore.data.len() != expected_len {
+        panic!("packed copy must initialize its complete layout");
+    }
     restore.complete = true;
 }
 

@@ -491,11 +491,11 @@ enum Release<'owner, #[cfg(test)] S: FrameFree> {
 // Outside unit tests the release state is the runtime reference alone, as
 // large as the `Option<&Ndi>` it replaced, so a guard is no larger.
 #[cfg(not(test))]
-const _: () = {
+const_assert!({
     use std::mem::{align_of, size_of};
     assert!(size_of::<Release<'static>>() == size_of::<Option<&'static Ndi>>());
     assert!(align_of::<Release<'static>>() == align_of::<Option<&'static Ndi>>());
-};
+});
 
 impl<'owner, S: FrameFree> Guard<'owner, S> {
     /// Create a new frame guard.

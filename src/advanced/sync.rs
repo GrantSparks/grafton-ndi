@@ -274,7 +274,7 @@ unsafe impl<'owner> crate::capture::FrameSource<'owner, AvSyncAudioFree> for &'o
 // The bound table uses the receiver lease the resource already retained:
 // one handle, one table pointer and one receiver Arc, with no separate Ndi.
 #[cfg(ndi_has_advanced_av_sync)]
-const _: () = assert!(
+const_assert!(
     std::mem::size_of::<AvResource>()
         == std::mem::size_of::<AvSyncInstance>()
             + std::mem::size_of::<&AvSyncTable>()
@@ -296,10 +296,10 @@ struct AvSyncInstance(AvSyncHandle);
 #[cfg(ndi_has_advanced_av_sync)]
 unsafe impl Send for AvSyncInstance {}
 
-const _: () = {
+const_assert!({
     const fn send<T: Send>() {}
     send::<AvResource>();
-};
+});
 
 impl sealed::Sealed for AvSyncKind {}
 
@@ -954,10 +954,10 @@ unsafe impl Send for GenlockInstance {}
 #[cfg(ndi_has_advanced_genlock)]
 unsafe impl Sync for GenlockInstance {}
 
-const _: () = {
+const_assert!({
     const fn send_and_sync<T: Send + Sync>() {}
     send_and_sync::<GenResource>();
-};
+});
 
 impl Drop for GenResource {
     fn drop(&mut self) {

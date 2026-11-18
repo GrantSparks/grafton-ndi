@@ -87,12 +87,12 @@ unsafe impl Send for BlockPointers {}
 #[cfg(any(test, ndi_has_advanced_scatter_send))]
 unsafe impl Sync for BlockPointers {}
 
-const _: () = {
+const_assert!({
     assert!(size_of::<Option<PacketLen>>() == size_of::<i32>());
     assert!(std::mem::align_of::<Option<PacketLen>>() == std::mem::align_of::<i32>());
     const fn send_and_sync<T: Send + Sync>() {}
     send_and_sync::<ScatterStorage>();
-};
+});
 
 impl Clone for ScatterStorage {
     /// Copies of the blocks, with arrays that describe the copies.
@@ -510,7 +510,7 @@ pub(crate) struct ScatterDispatch {
 }
 
 #[cfg(ndi_has_advanced_scatter_send)]
-const _: () = assert!(size_of::<ScatterDispatch>() == size_of::<&ScatterSend>());
+const_assert!(size_of::<ScatterDispatch>() == size_of::<&ScatterSend>());
 
 impl ScatterDispatch {
     #[cfg(ndi_has_advanced_scatter_send)]
@@ -687,10 +687,10 @@ pub(crate) enum PendingVideo {
     Scatter(ScatterSendable<ScatterVideoFrame>),
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<PendingVideo>();
-};
+});
 
 impl PendingVideo {
     /// The stream the frame is sent on.

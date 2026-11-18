@@ -3021,10 +3021,10 @@ impl Drop for ReceiverCore {
     }
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ReceiverCore>();
-};
+});
 
 // A panic cannot leave a receiver's shared state half-changed: of its locks,
 // the target and pending unknown event are replaced whole; the string-query

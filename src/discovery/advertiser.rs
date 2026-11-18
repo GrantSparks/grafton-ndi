@@ -304,11 +304,11 @@ struct Advertiser<A: AdvertiserApi> {
     server: ServerObject<A, Members<A>>,
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send<T: Send>() {}
     assert_send::<Advertiser<sys::SenderAdvertising>>();
     assert_send::<Advertiser<sys::ReceiverAdvertising>>();
-};
+});
 
 impl<A: AdvertiserApi> Advertiser<A>
 where
@@ -467,11 +467,11 @@ pub struct RecvAdvertiser {
     inner: Advertiser<sys::ReceiverAdvertising>,
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send<T: Send>() {}
     assert_send::<SendAdvertiser>();
     assert_send::<RecvAdvertiser>();
-};
+});
 
 /// Names one sender registration for [`SendAdvertiser::unregister`].
 ///

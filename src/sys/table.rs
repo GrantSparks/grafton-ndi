@@ -189,10 +189,10 @@ macro_rules! native_table {
             $(pub(crate) $name: unsafe extern "C" fn($($type),*) $(-> $return)?,)+
         }
 
-        const _: () = {
+        const_assert!({
             use $($declarations)::+ as declarations;
             $(const _: unsafe extern "C" fn($($type),*) $(-> $return)? = declarations::$name;)+
-        };
+        });
 
         #[allow(non_snake_case, clippy::too_many_arguments)]
         impl $Table {

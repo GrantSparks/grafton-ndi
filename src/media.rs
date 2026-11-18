@@ -23,13 +23,13 @@ macro_rules! decoded_variants {
             }
         }
 
-        const _: () = {
+        const_assert!({
             let mut index = 0;
             while index < $name::ALL.len() {
                 assert!($name::ALL[index].index() == index);
                 index += 1;
             }
-        };
+        });
     };
 }
 pub(crate) use decoded_variants;
@@ -73,7 +73,7 @@ impl SdkQuantity {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<Option<SdkQuantity>>() == 4);
+const_assert!(std::mem::size_of::<Option<SdkQuantity>>() == 4);
 
 /// A frame rate in frames per second, as the fraction
 /// `numerator / denominator`.

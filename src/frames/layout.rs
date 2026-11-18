@@ -23,7 +23,7 @@ pub(crate) struct ValidatedVideoLayout {
 
 // The width, height and line stride of a valid layout are each at most its
 // storage extent, so every one of them fits the SDK's signed 32-bit fields.
-const _: () = {
+const_assert!({
     assert!(usize::BITS >= 32);
     assert!(MAX_VIDEO_BYTES <= i32::MAX as usize);
     // An image row has at most eight bytes per validated source pixel.
@@ -32,7 +32,7 @@ const _: () = {
     // at most the complete data size, even for a one-row frame.
     assert!(3 * MAX_VIDEO_BYTES + 64 < usize::MAX);
     assert!(MAX_METADATA_BYTES < i32::MAX as usize);
-};
+});
 
 /// Plane views whose names carry the format's component ordering.
 #[cfg(feature = "image-encoding")]
@@ -578,7 +578,7 @@ pub(crate) struct ValidatedAudioLayout {
 }
 
 // Keep the layout no larger than the previous representation on every target.
-const _: () = {
+const_assert!({
     #[allow(dead_code)]
     struct PreviousLayout {
         format: AudioFormat,
@@ -589,7 +589,7 @@ const _: () = {
         sample_count: usize,
     }
     assert!(size_of::<ValidatedAudioLayout>() <= size_of::<PreviousLayout>());
-};
+});
 
 /// Initialized audio channel slices in channel order, without allocation.
 ///
@@ -653,7 +653,7 @@ impl std::iter::FusedIterator for AudioChannels<'_> {}
 // Packed channel strides are bounded by the audio byte cap. Explicit padded
 // strides retain their own SDK-range proof, including for a single channel
 // whose stride does not contribute to its byte extent.
-const _: () = assert!(MAX_AUDIO_BYTES <= i32::MAX as usize);
+const_assert!(MAX_AUDIO_BYTES <= i32::MAX as usize);
 
 impl ValidatedAudioLayout {
     /// The validated `format` value.

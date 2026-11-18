@@ -68,6 +68,16 @@
     )
 )]
 
+macro_rules! const_assert {
+    ($body:block) => {
+        #[allow(clippy::disallowed_macros, reason = "checks evaluated only at compile time")]
+        const _: () = $body;
+    };
+    ($($assertion:tt)+) => {
+        const_assert!({ assert!($($assertion)+) });
+    };
+}
+
 mod capture;
 mod change_feed;
 mod color_info;

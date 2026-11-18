@@ -438,7 +438,7 @@ struct OwnedStorage {
 
 // Rounding a valid request up to its 64-byte alignment remains representable
 // in Layout's signed allocation-size bound on every supported target.
-const _: () = assert!(MAX_ALLOCATION <= isize::MAX as usize - 63);
+const_assert!(MAX_ALLOCATION <= isize::MAX as usize - 63);
 
 impl OwnedStorage {
     /// Allocate this validated, non-zero request aligned to 64.

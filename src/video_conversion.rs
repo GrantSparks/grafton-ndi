@@ -59,7 +59,7 @@ impl V210Layout {
         // Validate the corresponding two full-height, 16-bit P216 planes
         // before arithmetic. Their extent bounds width to MAX_VIDEO_BYTES / 4.
         ValidatedVideoLayout::new_uncompressed(PixelFormat::P216, width, height, None)?;
-        const _: () = assert!(MAX_VIDEO_BYTES / 4 <= usize::MAX / 16);
+        const_assert!(MAX_VIDEO_BYTES / 4 <= usize::MAX / 16);
         let active_words = width as usize / 6 * 4;
         let stride_bytes = stride.unwrap_or(active_words * 4);
         if stride_bytes == 0 || !stride_bytes.is_multiple_of(4) || stride_bytes / 4 < active_words {

@@ -563,11 +563,11 @@ struct Listener<A: ListenerApi>(ServerObject<A, BTreeSet<A::Id>>);
 // its own listener unsubscribes or is destroyed; no pre-destroy calls are needed.
 unsafe impl<A: ListenerApi> Retained<A> for BTreeSet<A::Id> {}
 
-const _: () = {
+const_assert!({
     const fn assert_send<T: Send>() {}
     assert_send::<Listener<sys::SenderDiscovery>>();
     assert_send::<Listener<sys::ReceiverDiscovery>>();
-};
+});
 
 impl<A: ListenerApi> Listener<A>
 where
@@ -724,11 +724,11 @@ pub struct RecvListener {
     inner: Listener<sys::ReceiverDiscovery>,
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send<T: Send>() {}
     assert_send::<SendListener>();
     assert_send::<RecvListener>();
-};
+});
 
 impl fmt::Debug for SendListener {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -1,0 +1,5 @@
+disallowed-macros = [
+    { path = "std::assert", reason = "CONTRIBUTING.md requires production panics to be audited" },
+    { path = "std::assert_eq", reason = "CONTRIBUTING.md requires production panics to be audited" },
+    { path = "std::assert_ne", reason = "CONTRIBUTING.md requires production panics to be audited" },
+]

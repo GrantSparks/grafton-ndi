@@ -316,17 +316,17 @@ pub(super) struct Completion {
     _private: (),
 }
 
-const _: () = assert!(std::mem::size_of::<Completion>() == 0);
+const_assert!(std::mem::size_of::<Completion>() == 0);
 
 struct ReadyEntry {
     entry: Entry,
     completion: Completion,
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Entry>();
-};
+});
 
 pub(crate) struct Admitted {
     pub(crate) id: SubmissionId,
@@ -729,10 +729,10 @@ impl Loans for AliasableBox<CallbackState> {
 // and atomic, and every operation that changes the queue takes `&mut self`.
 // The runtime test `a_queued_sender_moves_between_threads` sends, completes,
 // reads and drops one on threads other than the one that created it.
-const _: () = {
+const_assert!({
     const fn send_and_sync<T: Send + Sync>() {}
     send_and_sync::<QueuedSender>();
-};
+});
 
 impl QueuedSender {
     /// Create a sender, with the options' Advanced SDK

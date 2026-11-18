@@ -19,7 +19,7 @@ pub(crate) use payload::{PacketBytes, PacketSlice};
 /// Maximum compressed frame size, in bytes, that this module sends or accepts.
 pub const MAX_PACKET_BYTES: usize = 256 * 1024 * 1024;
 
-const _: () = assert!(MAX_PACKET_BYTES <= i32::MAX as usize);
+const_assert!(MAX_PACKET_BYTES <= i32::MAX as usize);
 
 /// A nonempty packet extent, retained until its SDK descriptor is built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1566,7 +1566,7 @@ pub(crate) unsafe fn copy_audio_packet(
 // implement in every build. Where the build has the Advanced SDK declarations,
 // each value is checked against them.
 #[cfg(ndi_has_advanced_header)]
-const _: () = {
+const_assert!({
     // Enum constants of the Advanced-only headers take the target's C enum
     // type, which is signed on some targets; compare bit patterns.
     macro_rules! same_bits {
@@ -1742,7 +1742,7 @@ const _: () = {
     assert!(offset_of!(NDIlib_compressed_packet_t, data_size) == DATA_SIZE_OFFSET);
     assert!(offset_of!(NDIlib_compressed_packet_t, extra_data_size) == EXTRA_DATA_SIZE_OFFSET);
     } else {} }
-};
+});
 
 /// Frames for this module's unit tests.
 #[cfg(test)]

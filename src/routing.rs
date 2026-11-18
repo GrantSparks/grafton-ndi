@@ -140,10 +140,10 @@ pub struct Router {
     _config: Option<crate::advanced::AdvancedConfig>,
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send<T: Send>() {}
     assert_send::<Router>();
-};
+});
 
 impl fmt::Debug for Router {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

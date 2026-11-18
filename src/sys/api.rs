@@ -352,7 +352,7 @@ macro_rules! optional_tables {
                 // requirement would be reported available on every runtime.
                 // The crate does not compile unless each such feature says it
                 // is `ungated`, and no other one does.
-                const _: () = {
+                const_assert!({
                     let mut index = 0;
                     while index < RuntimeFeature::UNIT.len() {
                         let feature = RuntimeFeature::UNIT[index];
@@ -366,7 +366,7 @@ macro_rules! optional_tables {
                         );
                         index += 1;
                     }
-                };
+                });
                 match feature {
                     $(RuntimeFeature::$feature => self.$field.as_ref().err().copied(),)+
                     _ => None,

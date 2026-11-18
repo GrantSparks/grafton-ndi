@@ -1181,10 +1181,10 @@ impl Drop for Finder {
     }
 }
 
-const _: () = {
+const_assert!({
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Finder>();
-};
+});
 
 /// An exact, nonempty NDI source name with no interior NUL. Ownership can
 /// change without checking the same text again.
@@ -1750,7 +1750,7 @@ pub struct Source {
 #[derive(Clone, PartialEq, Eq)]
 struct SeenSource(Source);
 
-const _: () = assert!(std::mem::size_of::<SeenSource>() == std::mem::size_of::<Source>());
+const_assert!(std::mem::size_of::<SeenSource>() == std::mem::size_of::<Source>());
 
 /// Owned and borrowed source keys use the same complete textual identity.
 /// Trait-object borrowing permits a HashSet lookup without allocating a Source.

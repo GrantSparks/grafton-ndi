@@ -252,7 +252,7 @@ macro_rules! runtime_features {
         // requirement is circular and `Capabilities::detect` finds each
         // requirement's status already derived.
         $($($(
-            const _: () = assert!(
+            const_assert!(
                 (Index::$required as usize) < (Index::$Variant as usize),
                 concat!(
                     stringify!($Variant), " requires ", stringify!($required),
