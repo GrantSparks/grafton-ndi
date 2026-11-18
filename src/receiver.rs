@@ -4097,27 +4097,43 @@ mod tests {
 
     #[test]
     fn reconnect_returns_while_a_capture_attempt_is_in_flight() {
+        let diagnostics = std::env::var("GRAFTON_NDI_RECEIVER_DIAGNOSTICS").as_deref() == Ok("1");
+        let trace = |phase| {
+            if diagnostics {
+                eprintln!("receiver-watchdog: reconnect {phase}");
+            }
+        };
+        trace("case started");
         let Some(ndi) = crate::test_support::ndi() else {
+            trace("case finished");
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        trace("receiver created");
         std::thread::scope(|scope| {
             let (done, completed) = std::sync::mpsc::channel();
             let result = {
                 let _attempt = receiver
                     .core
                     .capture_lock(Attempt(Deadline::after(Duration::from_secs(1)).unwrap()));
+                trace("capture attempt acquired");
                 let receiver = &receiver;
                 scope.spawn(move || {
+                    trace("entering Receiver::reconnect");
                     receiver.reconnect();
+                    trace("returned from Receiver::reconnect");
                     done.send(()).unwrap();
                 });
                 // Keep the attempt live across this wait. An accidental Rust
                 // exclusion would hold the reconnect off until this block ends.
                 completed.recv_timeout(Duration::from_secs(2))
             };
+            trace("capture attempt released");
             result.expect("reconnect waited for the capture attempt");
         });
+        trace("destroying receiver");
+        drop(receiver);
+        trace("case finished");
     }
 
     #[test]

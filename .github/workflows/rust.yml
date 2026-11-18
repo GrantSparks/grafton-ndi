@@ -267,7 +267,7 @@ jobs:
       - name: Generate test pictures
         run: |
           # The runner's mirror list prefers a regional archive that can stall FFmpeg downloads.
-          sudo sed -Ei '/^URIs:/s#(mirror\+file:/etc/apt/apt-mirrors\.txt|https?://[[:alnum:]-]+\.ec2\.archive\.ubuntu\.com/ubuntu/?)([[:space:]]|$)#https://archive.ubuntu.com/ubuntu/\2#' /etc/apt/sources.list.d/ubuntu.sources
+          ci/ubuntu-primary-archive.sh
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends ffmpeg
           python3 tests/support/generate_hx.py --output-dir "$RUNNER_TEMP/ndi-hx-pictures"
@@ -492,6 +492,7 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       PACKAGE: ${{ matrix.package }}
+      GRAFTON_NDI_RECEIVER_DIAGNOSTICS: ${{ contains(fromJSON('["linux-x86 standard-6.4","linux-x64 standard-6.4","macos-arm64 standard-6.3.2"]'), matrix.name) && '1' || '0' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
@@ -507,12 +508,15 @@ jobs:
         env:
           SDK_MATRIX_NAME: ${{ matrix.name }}
         run: |
-          if [ "$SDK_MATRIX_NAME" = 'linux-x64 standard-6.3.2' ]; then
-            # Use the primary archive for the Valgrind install in the timed Memcheck step.
-            sudo sed -Ei '/^URIs:/s#(mirror\+file:/etc/apt/apt-mirrors\.txt|https?://[[:alnum:]-]+\.ec2\.archive\.ubuntu\.com/ubuntu/?)([[:space:]]|$)#https://archive.ubuntu.com/ubuntu/\2#' /etc/apt/sources.list.d/ubuntu.sources
+          if [ "$SDK_MATRIX_NAME" = 'linux-x64 standard-6.3.2' ] || [ "$GRAFTON_NDI_RECEIVER_DIAGNOSTICS" = 1 ]; then
+            # The SDK padding and receiver diagnostics need additional packages.
+            ci/ubuntu-primary-archive.sh
           fi
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends bubblewrap libavahi-client3
+          if [ "$GRAFTON_NDI_RECEIVER_DIAGNOSTICS" = 1 ]; then
+            sudo apt-get install --yes --no-install-recommends gdb
+          fi
           # Ubuntu 24.04 denies the unprivileged user namespace that bwrap needs.
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0

@@ -1,0 +1,115 @@
+name: Receiver diagnostics
+
+on:
+  push:
+    branches:
+      - receiver-diagnostic-macos
+      - receiver-diagnostic-linux-x86
+      - receiver-diagnostic-linux-x64
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: SDK configuration to exercise
+        required: true
+        type: choice
+        options:
+          - receiver-diagnostic-macos
+          - receiver-diagnostic-linux-x86
+          - receiver-diagnostic-linux-x64
+
+permissions:
+  contents: read
+
+concurrency:
+  group: receiver-diagnostics-${{ inputs.configuration || github.ref_name }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  probe:
+    if: github.repository == 'GrantSparks/grafton-ndi' && vars.NDI_CI_RELEASED == 'true' && github.actor != 'dependabot[bot]'
+    runs-on: ${{ (inputs.configuration || github.ref_name) == 'receiver-diagnostic-macos' && 'macos-15' || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    env:
+      CONFIGURATION: ${{ inputs.configuration || github.ref_name }}
+      GRAFTON_NDI_RECEIVER_DIAGNOSTICS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.13'
+      - name: Select the diagnostic target
+        id: target
+        run: |
+          case "$CONFIGURATION" in
+            receiver-diagnostic-macos)
+              target=aarch64-apple-darwin
+              package=6.3.2-standard-apple
+              require=1
+              ;;
+            receiver-diagnostic-linux-x86)
+              target=i686-unknown-linux-gnu
+              package=current-standard-linux
+              require=1,discovery-server
+              ;;
+            receiver-diagnostic-linux-x64)
+              target=x86_64-unknown-linux-gnu
+              package=current-standard-linux
+              require=1,discovery-server
+              ;;
+            *) exit 1 ;;
+          esac
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          {
+            echo "TARGET=$target"
+            echo "PACKAGE=$package"
+            echo "GRAFTON_NDI_REQUIRE_RUNTIME=$require"
+          } >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.100.0
+          targets: ${{ steps.target.outputs.target }}
+      - name: Linux diagnostic prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          ci/ubuntu-primary-archive.sh
+          if [ "$TARGET" = i686-unknown-linux-gnu ]; then
+            sudo dpkg --add-architecture i386
+          fi
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap gdb libavahi-client3
+          if [ "$TARGET" = i686-unknown-linux-gnu ]; then
+            sudo apt-get install --yes --no-install-recommends gcc-multilib libc6-dev:i386 libavahi-client3:i386
+          fi
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Provision the diagnostic SDK
+        env:
+          NDI_SDK_SOURCES_JSON: ${{ secrets.NDI_SDK_SOURCES_JSON }}
+          NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}
+        run: python ci/sdk.py install "$PACKAGE" --dest "$RUNNER_TEMP/ndi-sdk" --target "$TARGET" --github-env "$GITHUB_ENV"
+      - name: Verify loopback isolation
+        id: isolation
+        run: |
+          python ci/offline/check.py --online
+          case "$RUNNER_OS" in
+            Linux) ci/offline/linux.sh python3 ci/offline/check.py ;;
+            macOS) ci/offline/macos.sh python3 ci/offline/check.py ;;
+            *) exit 1 ;;
+          esac
+      - name: Repeat the reconnect case
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features --lib -- --exact receiver::tests::reconnect_returns_while_a_capture_attempt_is_in_flight
+          done
+      - name: Repeat receiver overlap cases
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' }}
+        run: |
+          for attempt in 1 2 3; do
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features --test receiver_connect_overlap_sdk
+          done

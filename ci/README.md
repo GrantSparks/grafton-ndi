@@ -176,6 +176,19 @@ On Debian 12 with Valgrind 3.19 and glibc 2.36, the live SDK recipe may report
 reads from glibc's loader token comparisons. Add
 `"--suppressions=ci/valgrind.supp"` to its runner array on that host.
 
+## Receiver stall diagnostics
+
+The Standard SDK rows for Linux x86 and x64 and macOS ARM64 with SDK 6.3.2
+supervise the receiver reconnect unit case and the native connect/capture
+overlap executable. The watchdog prints the test phases and collects thread
+stacks before stopping a stalled test group. Linux uses GDB and macOS uses
+`sample`. A timeout fails the test step.
+
+Run the **Receiver diagnostics** workflow on the ref with the SDK pins to
+investigate. Select the Linux x86, Linux x64 or macOS configuration. Each job
+repeats only the reconnect and overlap tests under the loopback runner. The
+matching `receiver-diagnostic-*` branch names can also start these jobs on push.
+
 ## Test against an installed runtime
 
 Set `NDI_RUNTIME_DIR_V6` to the native library directory. An Advanced build also

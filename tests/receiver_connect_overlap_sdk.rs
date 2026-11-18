@@ -54,11 +54,22 @@ use std::{
 const SLICE: Duration = Duration::from_millis(100);
 const PATIENCE: Duration = Duration::from_secs(15);
 
+fn trace(phase: &str) {
+    if std::env::var("GRAFTON_NDI_RECEIVER_DIAGNOSTICS").as_deref() == Ok("1") {
+        let thread = thread::current();
+        let name = thread.name().unwrap_or("worker");
+        eprintln!("receiver-watchdog: {name}: {phase}");
+    }
+}
+
 fn sockets() -> MutexGuard<'static, ()> {
     static SOCKETS: Mutex<()> = Mutex::new(());
-    SOCKETS
+    trace("waiting for the socket test lock");
+    let turn = SOCKETS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    trace("acquired the socket test lock");
+    turn
 }
 
 fn duration() -> Duration {
@@ -78,12 +89,18 @@ fn margin() -> Duration {
 }
 
 fn timed<T>(operation: &str, budget: Duration, call: impl FnOnce() -> T) -> T {
+    if operation.contains("connect") {
+        trace(&format!("entering {operation}"));
+    }
     let began = Instant::now();
     let result = call();
+    let elapsed = began.elapsed();
+    if operation.contains("connect") {
+        trace(&format!("returned from {operation}"));
+    }
     assert!(
-        began.elapsed() <= budget + margin(),
-        "{operation} exceeded its budget: {:?}",
-        began.elapsed()
+        elapsed <= budget + margin(),
+        "{operation} exceeded its budget: {elapsed:?}"
     );
     result
 }

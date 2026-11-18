@@ -31,9 +31,12 @@ JOB_PERMISSIONS = {
     ('publish.yml', 'publish'): {'contents': 'read', 'id-token': 'write'},
     ('rust.yml', 'deploy-docs'): {'contents': 'read', 'pages': 'write', 'id-token': 'write'},
 }
+RECEIVER_CONFIGURATIONS = [f'receiver-diagnostic-{target}' for target in ('macos', 'linux-x86', 'linux-x64')]
+RECEIVER_TRUST = "github.repository == 'GrantSparks/grafton-ndi' && vars.NDI_CI_RELEASED == 'true' && github.actor != 'dependabot[bot]'"
 PASSED_SECRETS = {name: f'${{{{ secrets.{name} }}}}' for name in ('NDI_SDK_SOURCES_JSON', 'NDI_SDK_ARCHIVE_TOKEN')}
 # Every place where the word `secrets` may occur, as a key or inside any scalar.
 SECRET_USES = {
+    'receiver-diagnostics.yml': {f'jobs.probe.steps[Provision the diagnostic SDK].env.{name}' for name in PASSED_SECRETS},
     'rust.yml': {'on.workflow_call.secrets (key)', *(f'jobs.sdk.steps[Provision the SDK].env.{name}'
                                                     for name in PASSED_SECRETS)},
     'publish.yml': {'jobs.ci.secrets (key)', *(f'jobs.ci.secrets.{name}' for name in PASSED_SECRETS)},
@@ -42,10 +45,18 @@ SECRET_USES = {
 SECRETS_AVAILABLE = ("github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || "
                      "github.event.pull_request.head.repo.full_name == github.repository)")
 JOB_CONDITIONS = {
+    'receiver-diagnostics.yml': {'probe': RECEIVER_TRUST},
     'rust.yml': {'sdk': f"vars.NDI_CI_RELEASED == 'true' && {SECRETS_AVAILABLE}", 'required-ci': 'always()', 'deploy-docs': "${{ !cancelled() && needs.required-ci.result == 'success' && github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' }}"},
     'publish.yml': {'release': "github.repository == 'GrantSparks/grafton-ndi'"},
 }
 TRIGGERS = {
+    'receiver-diagnostics.yml': {
+        'push': {'branches': RECEIVER_CONFIGURATIONS},
+        'workflow_dispatch': {'inputs': {'configuration': {
+            'description': 'SDK configuration to exercise',
+            'required': 'true', 'type': 'choice', 'options': RECEIVER_CONFIGURATIONS,
+        }}},
+    },
     'rust.yml': {'push': {'branches': ['main']}, 'pull_request': {'branches': ['main']}, 'workflow_dispatch': None,
                  'workflow_call': {'secrets': {name: {'required': 'false'} for name in PASSED_SECRETS}}},
     'publish.yml': {'push': {'tags': ['v*']}},
@@ -53,6 +64,7 @@ TRIGGERS = {
 # The actions each job uses, in order. The sdk job has SDK files on disk, so it has no
 # cache and only downloads the test pictures; the publish job holds the registry identity.
 ACTIONS = {
+    'receiver-diagnostics.yml': {'probe': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain']},
     'rust.yml': {
         'lint': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache', 'actions/upload-pages-artifact'],
         'test': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],

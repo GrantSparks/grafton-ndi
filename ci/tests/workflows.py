@@ -293,6 +293,82 @@ def command_mutations(script, shell=None):
 # literals here so changed arguments or disabled error checks fail together.
 def obligations(msrv, features, miri_groups):
     table = {}
+    # receiver-diagnostics.yml, probe
+    table['receiver-diagnostics.yml', 'probe', 'Select the diagnostic target'] = Obligation(
+        r'''
+        case "$CONFIGURATION" in
+          receiver-diagnostic-macos)
+            target=aarch64-apple-darwin
+            package=6.3.2-standard-apple
+            require=1
+            ;;
+          receiver-diagnostic-linux-x86)
+            target=i686-unknown-linux-gnu
+            package=current-standard-linux
+            require=1,discovery-server
+            ;;
+          receiver-diagnostic-linux-x64)
+            target=x86_64-unknown-linux-gnu
+            package=current-standard-linux
+            require=1,discovery-server
+            ;;
+          *) exit 1 ;;
+        esac
+        echo "target=$target" >> "$GITHUB_OUTPUT"
+        {
+          echo "TARGET=$target"
+          echo "PACKAGE=$package"
+          echo "GRAFTON_NDI_REQUIRE_RUNTIME=$require"
+        } >> "$GITHUB_ENV"
+        ''',
+    )
+    table['receiver-diagnostics.yml', 'probe', 'Linux diagnostic prerequisites'] = Obligation(
+        r'''
+        ci/ubuntu-primary-archive.sh
+        if [ "$TARGET" = i686-unknown-linux-gnu ]; then
+          sudo dpkg --add-architecture i386
+        fi
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends bubblewrap gdb libavahi-client3
+        if [ "$TARGET" = i686-unknown-linux-gnu ]; then
+          sudo apt-get install --yes --no-install-recommends gcc-multilib libc6-dev:i386 libavahi-client3:i386
+        fi
+        if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+        ''',
+        condition="runner.os == 'Linux'",
+    )
+    table['receiver-diagnostics.yml', 'probe', 'Provision the diagnostic SDK'] = Obligation(
+        'python ci/sdk.py install "$PACKAGE" --dest "$RUNNER_TEMP/ndi-sdk" --target "$TARGET" --github-env "$GITHUB_ENV"',
+    )
+    table['receiver-diagnostics.yml', 'probe', 'Verify loopback isolation'] = Obligation(
+        r'''
+        python ci/offline/check.py --online
+        case "$RUNNER_OS" in
+          Linux) ci/offline/linux.sh python3 ci/offline/check.py ;;
+          macOS) ci/offline/macos.sh python3 ci/offline/check.py ;;
+          *) exit 1 ;;
+        esac
+        ''',
+    )
+    table['receiver-diagnostics.yml', 'probe', 'Repeat the reconnect case'] = Obligation(
+        r'''
+        for attempt in 1 2 3 4 5; do
+          cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features --lib -- --exact receiver::tests::reconnect_returns_while_a_capture_attempt_is_in_flight
+        done
+        ''',
+        condition="${{ !cancelled() && steps.isolation.outcome == 'success' }}",
+    )
+    table['receiver-diagnostics.yml', 'probe', 'Repeat receiver overlap cases'] = Obligation(
+        r'''
+        for attempt in 1 2 3; do
+          cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features --test receiver_connect_overlap_sdk
+        done
+        ''',
+        condition="${{ !cancelled() && steps.isolation.outcome == 'success' }}",
+    )
+
     # rust.yml, lint
     table['rust.yml', 'lint', 'CI scripts and workflows'] = Obligation(
         r'''
@@ -475,7 +551,7 @@ def obligations(msrv, features, miri_groups):
     # rust.yml, hx-pictures
     table['rust.yml', 'hx-pictures', 'Generate test pictures'] = Obligation(
         r'''
-        sudo sed -Ei '/^URIs:/s#(mirror\+file:/etc/apt/apt-mirrors\.txt|https?://[[:alnum:]-]+\.ec2\.archive\.ubuntu\.com/ubuntu/?)([[:space:]]|$)#https://archive.ubuntu.com/ubuntu/\2#' /etc/apt/sources.list.d/ubuntu.sources
+        ci/ubuntu-primary-archive.sh
         sudo apt-get update
         sudo apt-get install --yes --no-install-recommends ffmpeg
         python3 tests/support/generate_hx.py --output-dir "$RUNNER_TEMP/ndi-hx-pictures"
@@ -485,11 +561,14 @@ def obligations(msrv, features, miri_groups):
     # rust.yml, sdk
     table['rust.yml', 'sdk', 'Linux prerequisites'] = Obligation(
         r'''
-        if [ "$SDK_MATRIX_NAME" = 'linux-x64 standard-6.3.2' ]; then
-          sudo sed -Ei '/^URIs:/s#(mirror\+file:/etc/apt/apt-mirrors\.txt|https?://[[:alnum:]-]+\.ec2\.archive\.ubuntu\.com/ubuntu/?)([[:space:]]|$)#https://archive.ubuntu.com/ubuntu/\2#' /etc/apt/sources.list.d/ubuntu.sources
+        if [ "$SDK_MATRIX_NAME" = 'linux-x64 standard-6.3.2' ] || [ "$GRAFTON_NDI_RECEIVER_DIAGNOSTICS" = 1 ]; then
+          ci/ubuntu-primary-archive.sh
         fi
         sudo apt-get update
         sudo apt-get install --yes --no-install-recommends bubblewrap libavahi-client3
+        if [ "$GRAFTON_NDI_RECEIVER_DIAGNOSTICS" = 1 ]; then
+          sudo apt-get install --yes --no-install-recommends gdb
+        fi
         if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         fi

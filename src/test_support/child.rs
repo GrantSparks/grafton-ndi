@@ -20,7 +20,16 @@ impl TestChild {
 
     /// Select a copy of the test binary for tests of loader search paths.
     pub fn at(executable: impl AsRef<OsStr>, name: &str) -> Self {
-        let mut command = Command::new(executable);
+        let mut command = match std::env::var_os("GRAFTON_NDI_WATCHDOG_SCRIPT") {
+            Some(script) => {
+                // Exec keeps the child PID while allowing the watchdog to
+                // collect stacks from a re-executed overlap test on Linux.
+                let mut command = Command::new("python3");
+                command.arg(script).arg("--exec-child").arg(executable);
+                command
+            }
+            None => Command::new(executable),
+        };
         command.args(["--exact", name, "--nocapture"]);
         Self { command }
     }
