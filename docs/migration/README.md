@@ -1,12 +1,12 @@
 # Upgrade grafton-ndi
 
 Use [Migrate from 2.x to 3.0](2.0-to-3.0.md) for the current release. It covers
-API edits, silent behavior changes and deployment from released 2.x versions.
+API edits, behavior changes and deployment from the 2.1.0 release.
 
 Older guides are preserved at an immutable historical revision. They describe
 their named versions; they are not instructions for the current API. For an
 earlier application, follow the relevant historical upgrades before the 3.0
-guide. The [changelog](../../CHANGELOG.md) retains the release history.
+guide.
 
 | Upgrade | Historical instructions |
 | --- | --- |

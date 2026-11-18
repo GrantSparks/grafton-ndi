@@ -12,572 +12,142 @@ API, see the [README](https://github.com/GrantSparks/grafton-ndi/blob/main/READM
 
 Version 3.0 loads the NDI runtime explicitly and expands the library with
 mixed-media capture, Advanced SDK operations, recording, playback and image
-encoding. Upgrading from 2.x requires API and deployment changes; follow the
-[2.x to 3.0 migration guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/migration/2.0-to-3.0.md).
-
-### Added
-
-- `AsyncFileRecorder::abandon` destroys the recorder without spending its
-  finalization wait and returns the last session report after destruction.
-  It bypasses command queue limits, as `close` does.
-- `Sender::split` lends asynchronous video to a scoped thread alongside shared
-  audio, metadata and controls, without an application mutex. Video submission
-  docs describe the SDK's default clock pacing.
-
-### Fixed
-
-- Standard Windows receiver controls no longer read a connection being replaced
-  by a local connect, disconnect or reconnect. Connection-reading commands
-  report `NotConnected` during that transition; tally changes are retained and
-  replayed afterward, and getters remain independent of the native connect.
-
-- Queued senders publish unknown-completion failures in the admission lock,
-  so a racing submission cannot enter after failure is detected.
-- Receiver shared controls use a separate permit from local connection changes,
-  allowing allocator callbacks to use controls without deadlocking a connect,
-  disconnect or reconnect. Getters no longer wait for the connection permit.
-- Single-source descriptor allocation failures identify `SourceDescriptor`
-  storage and its requested byte count; sender, router and File player getters
-  document that failure.
-- Recorder reports count only files confirmed empty under complete tracking;
-  after lost lifecycle evidence, `empty_files` is a lower bound.
-
-- Owned video and audio keep validated layouts with their storage and copy from
-  one layout observation, preserving valid frames when a copy unwinds.
-- Recorder file tracking stays bounded after native event loss and preserves
-  unknown cleanup obligations even after all known files close. Drop and async
-  close consume the remaining original cleanup budget; final reports stay fixed.
-- PNG and JPEG preserve display aspect when partial downscale blocks change
-  the output shape, including square-pixel inputs. Required density metadata
-  changes encoded bytes without changing pixel dimensions or samples.
-- Async recorder finalization waits have a separate budget equal to
-  `AsyncFileOptions::command_capacity`. Excess waits return
-  `QueueFull(QueueLimit::FileFinishWaits)` while ordinary commands and shutdown
-  retain independent admission.
-- Source-cache invalidation and clearing release retired keys, snapshots and
-  map storage after unlocking, keeping descriptor reclamation outside the
-  shared mutex. Clearing releases map capacity; later fills allocate again.
-- Async File handles wait for native cleanup on last drop after a submitted
-  close future is discarded; live closes still report cleanup without blocking
-  handle drops.
-- Abandoned async source-name and unknown-event reports are redelivered only
-  while no newer report has superseded them. Replaying a source-name result
-  never waits for another poller's native query.
+encoding. Follow the [2.x to 3.0 migration guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/migration/2.0-to-3.0.md)
+when upgrading from the released 2.1.0 API.
 
 ### Breaking changes
 
-- Discovery Server creation from SDK configuration reports
-  `InputDefect::DiscoveryConfigurationRejected` when no usable server was
-  resolved, covering both absent and unusable configured servers.
-- `BorrowedVideoFrame` and `BorrowedVideoFrameBuilder` now live alongside
-  borrowed audio in `frames`; their crate-root imports remain available.
-
-- Starting another recording after incomplete file tracking now requires a
-  successful `reset`, even after all known files close; otherwise `start`
-  returns `InvalidState(StateConflict::IncompleteFileTracking)`. See the
-  [migration notes](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/migration/unreleased.md#restarting-a-recorder-after-incomplete-file-tracking).
-- `FrameSyncAudioRequest` rejects invalid rates, counts and payload extents with
-  `InvalidInput(InputDefect::Layout(..))`, matching reusable audio requests.
-  Frame construction continues to report `InvalidFrame(FrameDefect::Layout(..))`.
-- Exact source-name inputs share `InvalidInput(Empty { what: "source name" })`
-  for empty names and `InvalidCString` for NUL bytes. Discovery lookups check
-  names and hosts before timeouts in both synchronous and async APIs;
-  listener connect requests refuse empty names.
-
-- All relative environment library directories use `LoadRefusal::RelativeSearchDirectory`;
-  `LoadAttempt::origin()` identifies the variable that supplied the directory.
-- Allocator strides use the frame layout's causes for every uncompressed
-  format; compressed strides must equal the packet size. Replacing a padded
-  stride may narrow it to any valid layout. Remove the allocator-only short
-  stride and unreachable allocation-layout error leaves.
-
-- Advanced audio formats, AV sync and clock requests share frame audio rate
-  and count causes. API formats now report `InvalidInput(Layout)`. Construct
-  `AudioClockRequest` once and pass it to `AudioClock::wait`, which returns
-  `ClockSource` directly.
-
-- Oversized video and audio layouts report `VideoBytes` or `AudioBytes` on
-  every target. Their payload is `DiagnosticSize`, an unsigned 64-bit count;
-  arithmetic overflow leaves are removed. Packed line strides share the
-  video byte cap.
-
-- `AudioFormat` converts through `FourCc`; audio descriptors use their validated
-  format. `PictureAspectRatio` normalizes negative zero and implements `Eq` and
-  `Hash`, as do video packet formats and File track, format and event values.
-
-- Interleaved floating-point input uses `AudioFrame::from_interleaved` with
-  validated `InterleavedAudioF32`; `AudioLayout` and the audio builder's `layout`
-  setter are removed. Audio builders accept packed planar samples.
-- Compressed audio frames and packets share `advanced::AudioPacketFormat`.
-  Contiguous and scatter constructors take this validated format, and packet
-  accessors read it through `format()`; stream protection uses `with_protected`.
-
-- Packet KVM sessions capture through `session.receiver()`, allowing capture on
-  a worker thread alongside input. Their direct capture methods are removed.
-
-- Audio allocator padding uses the same validated layout and error causes as
-  captured audio, including the 64 MiB active extent limit. Allocator-only audio
-  stride and extent error leaves are removed.
-- Remove unreachable image dimension, image scratch and V210 row overflow
-  error leaves. V210 constructors validate their shared P216 geometry first.
-
-- Image option refusals carry `codec: ImageCodecKind` in `ImageQuality`,
-  `SixteenBitNeedsPng` and `HdrNeedsPng`, replacing their string `format` field.
-  Encoding validates each codec quality, effort and dimension setting once.
-
-- Lossy WebP encoder storage failures remain `InvalidFrame(EncodingFailed)`
-  because its supported dependency API cannot classify allocation failures;
-  conversion scratch continues to report `AllocationFailed(ImageScratch)`.
-- Load refusals distinguish a missing identification anchor from a missing
-  required API entry point. Unreadable version text carries `VersionTextDefect`;
-  `InvalidCString` reports its cause once in error chains.
-- Async source-cache hits return on the awaiting task without a blocking-pool
-  handoff; misses retain their timeout, cancellation and publication behavior.
-
-- Discovery snapshots build source strings once from bounded SDK bytes.
-  Discovery windows charge shared name and address storage once while counting
-  both descriptor containers against their retained byte budget.
-
-- Custom allocator receivers use `advanced::AllocatedReceiver<M = RawCapture>`.
-  Replace `AllocatedPacketReceiver` with `AllocatedReceiver<PacketAttached>`;
-  allocator methods are shared, while capture and recovery follow the mode.
-
-- Explicit zero video strides are refused consistently by sizing and borrowed
-  builders. Use `None` or `clear_line_stride_bytes()` for packed rows; received
-  SDK descriptors retain their documented zero-stride sentinel.
-- Allocation failures use `Error::AllocationFailed(AllocationFailure)` across
-  discovery, image scratch, receive buffers and Advanced bookkeeping. Error
-  payload names follow the public conventions, unreachable error leaves are
-  removed, and spawn/queue errors exist only with their producing features.
-- Default Windows and macOS runtime and File searches no longer implicitly
-  load a library from the working directory. Windows expands absolute `PATH`
-  entries; macOS retains `@rpath` and expands absolute `DYLD_LIBRARY_PATH`
-  entries. Relative and empty directory entries are recorded as refused;
-  unsafe entries in either `DYLD_LIBRARY_PATH` or `DYLD_FALLBACK_LIBRARY_PATH`
-  refuse the entire default search before any native open.
-
-- Public APIs follow one [set of conventions](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/api-conventions.md)
-  for construction, options, capture, events, waits and paths. Receiver and async
-  typed capture use `capture_video`, `capture_audio`, `capture_metadata` and
-  `_ref`/`_with` forms; capture handles and kind types become private.
-  `CaptureMode` becomes `AudioMode`.
-- SDK video submission uses `submit_video`, `submit_video_copy`, `reclaim_video`
-  and `flush_video`. Connection counts are immediate getters; use
-  `wait_for_connection` to wait. Events use `next_event`, batch events
-  `next_events`, and queue completions `next_completed`/`try_next_completed`.
-- `Source` and `SourceAddress` validate NUL at construction; source connection,
-  route and failover updates no longer repeat text validation. List options
-  accept iterables and read back slices. `PictureAspectRatio` appears in every
-  aspect signature, and stride-aware sizing uses
-  `PixelFormat::buffer_len(width, height, Option<usize>)`.
-- Borrowed frame aliases become named structs with generated accessors. Image
-  encoding belongs to `image_encoding` and the shared `VideoSource` surface;
-  use `encode_image`/`encode_image_data_url` instead of PNG/JPEG/data URL shortcuts.
-  Discovery Server APIs move to `discovery_server`. Advanced markers have only
-  their `advanced` paths, and examples use snake_case names.
-- File constructors belong to their object types with matching options names;
-  File options and Advanced queue/allocator limits are borrowed. Genlock uses
-  `GenlockOptions`. Compressed sender splitting lends the shared sender for
-  audio instead of a separate `CompressedAudio` wrapper. All public types have
-  `Debug`, all options have `PartialEq`, and SDK entry points have search aliases.
-- Recorder `wait_for_finish` follows the wait convention: an expired wait
-  returns `None`, and final `Closed`/`Indeterminate` outcomes are `Some`.
-  Inspect `report()` after a timeout. The separate bounded `finish` operation
-  retains `FinishStatus::TimedOut(report)`.
-
-- `BorrowedVideoFrame::data()` returns contiguous active bytes as `Option<&[u8]>`.
-  Use `storage()` for validated storage including row padding. Video and audio
-  inherent accessors and source traits share one implementation; owned frames
-  gain inherent `copy_into` and video `sends_in_place`, and borrowed video gains
-  `timestamp()` returning `None`.
-- Owned received compressed packets use `ReceivedVideoPacket` and
-  `ReceivedAudioPacket`. Checked conversions make sendable compressed frames
-  without copying their storage; contiguous compressed sends are infallible.
-
-- Compressed packet-envelope refusals use the same typed cause for contiguous,
-  scatter and received packets; codec mismatches use `PacketCodecMismatch`,
-  and empty AAC payloads use `EmptyCodecPayload`.
-
-- Scatter frames own their stable scatter lists. `CompressedSender::new`
-  no longer reserves descriptor slots or fails to reserve that storage;
-  scatter submission continues to allocate nothing.
-
-- Owned metadata constructors and setters return refused text in
-  `Rejected<String>`; owned frame builders expose metadata recovery accessors.
-
-- Native operation failures and SDK-result causes identify their entry point
-  with `NativeFunction`. Compare it with a C string or inspect `name()`; File
-  failures now name the actual SDK function, including timecoded starts.
-
-- Reject negative receiver statistics, status-event connection counts and
-  FrameSync audio queue depths with typed `NegativeCount` evidence. Numeric
-  getters now return `Result`; boolean connection predicates remain total.
-
-- `InvalidFrame`, `InvalidInput` and `UnexpectedSdkResult` carry typed
-  `FrameDefect`, `InputDefect` and `SdkResultDefect` causes. Shared layout
-  refusals use one nested `LayoutDefect` in both frame and input causes. Receiver capture
-  failures use `ConnectionLost`; initialization retains `InitializationFailure`
-  and invalid UTF-8 retains `Utf8Error`. Load-refusal symbol names borrow static
-  `CStr` values. Update matches as described in the migration guide.
-- Recorder start and rollover refuse output paths that cannot be reported
-  exactly in native events (currently 4094 UTF-8 bytes), reserving at least
-  20 digits per index token so later rollovers remain reportable.
-  Custom filename patterns also refuse indexes in directories, keeping every
-  rollover in the directory checked at preflight.
-
-- `Finder::watch` replaces `Finder::wait_for_sources`. Keep one `SourceWatch`
-  per consumer and take snapshots and wait through that cursor, so concurrent
-  lookups cannot hide reports between a snapshot and its next wait.
-- `SourceAddress::new(text)` replaces the `Url` and `Ip` variants. Equality and
-  hashing use address text; `is_url()` derives the classification from it.
-- Runtime selection conflicts carry a boxed `SelectionFailure` with a typed
-  cause, library kind and selected, requested and foreign-module paths.
-  `RuntimeLoadFailed` carries a boxed `LoadFailure` with typed candidate
-  locations, origins and refusals, including whether native code was loaded.
-- Capability statuses and `Error::UnsupportedCapability { capability, refusal }`
-  carry the same typed `CapabilityRefusal`. Its `reason()` returns the broad
-  category; its fields retain the missing symbol, declaration or required version.
-- Runtime and File-family refusals share `UnsupportedCapability`, identifying
-  `Capability::Runtime(feature)` or `Capability::File(family)` and retaining a
-  missing entry point as a static `CStr`. Use `FileApi::status`, `supports` or
-  `require_family` for File availability. The unused `NoSourcesFound` error is
-  removed; File state conflicts use `StateConflict`.
-- Runtime and File library selection require absolute explicit paths on every
-  target. Relative `NDI_RUNTIME_DIR_V6` directories are refused and skipped,
-  with the reason retained in load-failure diagnostics.
-- On dynamically loaded non-Apple ELF targets, a runtime already linked or
-  preloaded into the global symbol scope must be the selected module. Other
-  candidates are refused before loading; diagnostics name the runtime in scope.
-- `submit_video_copy` returns `Result<()>` and reuses released video and
-  metadata storage instead of returning the displaced frame. After warm-up,
-  repeated copies of one layout allocate nothing; `reclaim_video` returns
-  the final frame and releases the spare.
-- Remove `Sender::on_async_video_done` and `clear_async_video_done`. Observe
-  asynchronous video completion through frames returned by `submit_video`
-  and `reclaim_video`. Ordinary senders now implement `UnwindSafe` and
-  `RefUnwindSafe`.
-- Received video and audio survive unreadable optional per-frame metadata.
-  `metadata_status()` reports why text was withheld; forwarding omits the text.
-  Owned copies preserve the withheld status, including compressed packet copies.
-  Default image
-  encoding and `color_info()` refuse withheld video metadata; an explicit
-  color-policy override permits encoding. Standalone metadata capture remains
-  strict.
-- FrameSync- and AvSync-attached receivers, including KVM views, no longer expose
-  event polling because native synchronization can consume status notifications.
-  `EventMode` separates this capability from typed metadata capture; query
-  capabilities, source names and connection state on attached receivers.
-- Async receiver callback and blocking-operation panics resume on the awaiting
-  task with their original payload after native frame cleanup. `SpawnFailed`
-  now carries `SpawnFailure`, distinguishing a missing runtime from cancellation.
-- `KvmSession::receiver()` returns a restricted `KvmReceiver<'_, M>` instead
-  of `&Receiver<M>`. Compatible capture and shared controls remain available;
-  connection changes require successful input release and session termination.
-  The unrestricted accessor is removed across raw and attached KVM entry paths.
-- `AvSync::synchronize` takes an `AvSyncVideo`, which only a frame carrying
-  its sender's timestamp can become, because audio is matched to that
-  timestamp. Frames the application builds have none and are refused when the
-  `AvSyncVideo` is made. `queued_audio` replaces `synchronize(None, ..)`.
-- `NDI` becomes `Ndi`. Pixel formats, color formats and other enum variants use
-  Rust casing. Options have private fields, chainable setters and `new`
-  constructors in place of separate options builders.
-- Default Windows, macOS, Linux and Android builds load a runtime dynamically
-  instead of linking it at build time. Missing libraries produce
-  `Error::RuntimeLoadFailed` when selecting a runtime. Package the native
-  library explicitly; executable dependency scanners cannot discover it.
-- Runtime search tries the executable directory, `NDI_RUNTIME_DIR_V6` and the
-  platform loader. Build headers do not select the runtime edition. Use
-  `RuntimeOptions` to require an edition or an absolute library path; successful
-  selection persists for the process. See [setup](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/setup.md).
-- No Cargo features are enabled by default. Enable `image-encoding` explicitly
-  for image methods. The ineffective 2.x `advanced_sdk` feature is removed;
-  use `advanced` for the Advanced SDK APIs.
-- Tokio integration enables only Tokio's `rt` feature. Applications using
-  `#[tokio::main]` or its multithreaded runtime must enable their corresponding
-  Tokio features. Async adapters move under `grafton_ndi::asynchronous`.
-- Dimensions, frame-rate components and sample counts use `u32`; strides use
-  `usize`. `FrameRate`, `Timecode`, `SdkTimestamp` and `FourCc` replace raw
-  values. Frames and sources have validated constructors and private fields.
-- Video builders default to 60 fps and square pixels. Set explicit timing and
-  picture aspect for other output. Captured timing and aspect are preserved.
-- Capture returns `Result<Option<Frame>>`; a timeout is `Ok(None)`. Remove
-  the kind-view `try_capture` methods and use `capture_video_ref`,
-  `capture_audio_ref` or `capture_metadata_ref` to borrow. Borrowed capture
-  retries transient results within the caller's deadline.
-- `next_event` replaces `poll_status_change` and returns `ReceiverEvent`.
-  Combined capture and polling consume notifications once; notifications
-  coalesce rather than forming a broadcast or ordered history.
-- Receiver modes restrict media capture while attached to synchronizers or
-  Advanced owners. FrameSync's attached receiver retains metadata and controls,
-  while synchronized video and audio are captured through FrameSync.
-- FrameSync's short `capture_video` and `capture_audio` names return owned
-  copies. Use `_ref` to borrow. `audio_input_format()` replaces the empty audio
-  query; audio capture requests require a positive rate and return a frame.
-- `SourceCache::new(finder)` owns a configured finder. `find_sources_by_host`
-  replaces the first-feed lookup and returns all matching feeds over the full
-  discovery window. Entries remain stale until invalidated.
-- `connection_target()` replaces `Receiver::source()` and reports the latest
-  requested target. Disconnect retains it; synchronous `reconnect()` returns
-  `()` and retries the retained native target without allocating. Async
-  reconnect remains fallible for task submission.
-- Synchronous video sends return `Result<()>`; failed owned submissions return
-  their input through `Rejected<T>`. `Sender::tally()` reports the current
-  value; use `wait_for_tally_change` to wait for changes.
-- PTZ operations move under `receiver.ptz()`. Source, option and status fields
-  are read through getters. See the migration guide for individual renames.
-- Image methods use `ImageOptions`, validate quality and color metadata, and
-  reject HDR by default. Explicit code-value output writes tagged PNGs;
-  color-policy and encoder changes can alter output bytes.
-- Errors distinguish invalid input, native failures, unsupported capabilities,
-  runtime loading and resource limits. `FrameTimeout` is replaced by capture's
-  `None`; removed error variants and ownership recovery are covered in the
-  migration guide. `Error::Io` requires `image-encoding` or `file-io`.
-- `MAX_TIMEOUT` is one millisecond smaller: `u32::MAX - 1` milliseconds. Use
-  the constant and `Duration::ZERO` for polling. Positive-wait rounding and
-  protection against the SDK's infinite sentinel were already in 2.1.0.
+- `NDI` becomes `Ndi`. Pixel, receiver color and audio format names use Rust
+  casing. No Cargo features are enabled by default, so enable
+  `image-encoding` for image methods. The 2.x `advanced_sdk` feature is
+  removed. Async adapters move under `grafton_ndi::asynchronous`, and
+  applications using Tokio macros or its multithreaded runtime enable those
+  features on their own Tokio dependency.
+- Desktop and Android builds load NDI dynamically. Package the runtime
+  explicitly and handle load failures during selection. See
+  [setup](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/setup.md)
+  for the search order and static Apple mobile requirements.
+- Options use constructor and setter methods with private fields. List
+  overrides use non-empty iterables of valid elements. Unset options inherit
+  the SDK configuration. The receiver constructor allows video fields, so
+  use `allow_video_fields(false)` to retain the old default policy.
+- Construct sources from a checked name and an optional address. Address
+  variants become a validated string type. `Finder::watch` replaces
+  `wait_for_sources`. `SourceCache::new(finder)` owns the specified finder and
+  host lookups return every matching feed over the discovery window.
+- Dimensions and counts use `u32`, strides use `usize`, and checked
+  `FrameRate`, `PictureAspectRatio`, `Timecode` and `FourCc` replace raw
+  quantities in media APIs. Aspect setters take `PictureAspectRatio`.
+  Video builders default to square pixels and 60 fps. Audio builders take
+  planar input, and `AudioFrame::from_interleaved` converts checked interleaved
+  input.
+- `BorrowedVideoFrame` and `BorrowedVideoFrameBuilder` move from `sender` to
+  `frames`, with crate-root imports still available. `data()` returns
+  optional contiguous active bytes, and `storage()` includes validated row
+  padding. The existing `timestamp()` changes from `i64` to
+  `Option<SdkTimestamp>`; application-built frames have no received timestamp.
+- Capture returns `Result<Option<Frame>>` and a timeout is `Ok(None)`. Owned
+  methods name the media kind and the `_ref` methods borrow. FrameSync's short
+  audio and video capture names return owned frames. Its separate audio input
+  format query replaces empty audio captures. Poll receiver events after
+  recovering a FrameSync-attached receiver.
+- `Receiver::next_event` replaces `poll_status_change`, connection queries
+  use getters, and PTZ methods are grouped under `receiver.ptz()`.
+  `connection_target()` replaces `Receiver::source()` and reports the latest
+  requested source. Synchronous reconnect reuses that target and returns
+  `()`.
+- `send_video` returns `Result<()>`. Asynchronous video uses `submit_video`,
+  `submit_video_copy`, `reclaim_video` and `flush_video`. Use returned frames
+  to observe completion. Connection counts and tally are immediate getters,
+  with separate operations to wait.
+- Image methods take `ImageOptions` and use `encode_image` and
+  `encode_image_data_url`. Default encoding checks color metadata and refuses
+  HDR. Extended color code values can be explicitly encoded in tagged PNG.
+- Errors carry structured evidence for invalid input, SDK results, runtime
+  selection, unsupported operations and allocation failures. Owned builders,
+  replacement operations and submissions return recoverable input through
+  `Rejected` where applicable. Async panics unwind on the awaiting task
+  after the worker releases its native frames. See the migration guide for
+  changed variants and signatures.
+- The maximum wait is one millisecond shorter at `u32::MAX - 1` milliseconds.
+  Positive-wait rounding and protection from the SDK's infinite sentinel
+  were already in 2.1.0.
 
 ### Added
 
-- Validated contiguous compressed frames and borrowed/received packets expose
-  `envelope()` without repeating fallible envelope parsing.
+- `Runtime::select`, runtime information and capability queries that include
+  version, edition, native symbols and declarations. Load and selection
+  diagnostics include typed causes, attempts and available paths.
+- Mixed video, audio, metadata and event capture, exact-name and predicate
+  source selection, reception monitoring and concurrent controls alongside
+  synchronized capture. See the [usage guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md).
+- Shared validated video, audio and metadata inputs for synchronous
+  operations, reusable copies, application-borrowed audio and frame plane
+  and channel views. `Sender::split` lends asynchronous video alongside
+  shared audio, metadata and controls to scoped threads.
+- Tokio and smol discovery adapters and scoped async capture callbacks for
+  borrowed media. Dropped discovery and capture waits stop between bounded
+  native attempts.
+- [Routing](https://grantsparks.github.io/grafton-ndi/grafton_ndi/routing/)
+  and [Discovery Server](https://grantsparks.github.io/grafton-ndi/grafton_ndi/discovery_server/)
+  APIs. Discovery Server advertisers and listeners require NDI 6.4 or later.
+  Advertised senders can become connection targets, using name lookup when
+  the address or port is unusable.
+- Optional [Advanced SDK integration](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/advanced.md)
+  covers compressed and scatter packets, queued sending, custom receive
+  allocation, AV sync, Genlock, per-instance configuration, encoder controls
+  and KVM. Missing native declarations or symbols disable the affected
+  capabilities.
+- The optional [File API](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/file-io.md)
+  supports recording, playback, inspection and executor-independent async
+  owners. Finalization reports track file closure and recording outcomes.
+  An incomplete file ledger requires a successful reset before another
+  recording can start.
+- Expanded [image encoding](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/image-encoding.md)
+  supports every uncompressed video format and frame type, lossless and
+  lossy WebP, writers, data URLs, reusable workspaces, downscaling, alpha,
+  HDR code values and color policy.
+- Runtime-gated NDI 6.4 planar 4:4:4 formats, corresponding receiver options,
+  and V210/P216 conversion. The video extent limit supports DCI 8K in the
+  widest format. Advanced receive allocation publishes the largest admissible
+  request extent.
+- Setup and [platform coverage](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/setup.md#platforms)
+  document dynamic builds, static Apple mobile targets and native SDK CI
+  coverage. Core declarations from NDI 6.4.0.2 ship with the crate, which is
+  licensed `Apache-2.0 AND MIT`.
 
-- `ExternalPool`, `PoolBlock` and unsafe `AllocationBuffer::from_pool` lend
-  preallocated receive buffers without boxing a handle on SDK threads.
+### Changed
 
-- `CompressedSender::reclaim_video` and its split video view drain both
-  asynchronous streams and return their frames while keeping the source live.
+- PNG and JPEG store the relative pixel density when display aspect differs
+  from stored shape. Non-square-pixel sources can produce different encoded
+  bytes at the same dimensions. The tags also cover downscaled output with
+  partial blocks.
+- JPEG can select a SIMD path at runtime. Encoded bytes and reconstructed
+  pixels can vary with CPU capabilities. The
+  [image performance guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/image-encoding-performance.md)
+  describes the conversion and links to measurement records.
+- Validated layouts and storage travel together. Synchronous operations can
+  send captured and borrowed frames without making a preliminary owned copy.
+  Video that requires staging uses reusable storage and initialized tail room.
+- Finder uses bounded snapshots and change-aware waits. It copies only
+  selected entries and skips result allocation when nothing matches.
+  Cache invalidation reclaims retired storage outside the shared mutex.
 
-- Queued senders support AAC and Opus through shared
-  `send_compressed_audio` and `send_scatter_audio` operations, alongside their
-  existing uncompressed audio sends.
+### Fixed
 
-- Image encoding preserves non-square picture aspect in PNG pHYs and JPEG JFIF
-  relative density tags, including corrections for partial downscale blocks
-  from square-pixel sources. WebP remains untagged.
-
-- `AvSync::synchronize_ref` and `queued_audio_ref` lend matched SDK audio
-  through `AvSyncOutcomeRef` and `AvSyncAudioRef`. Send and convert it in place,
-  retain it with `to_owned`, or reuse owned storage with `copy_into`; owned
-  synchronization keeps the same API and shares the borrowed capture path.
-- `PictureAspectRatio` validates finite, nonnegative display ratios, including
-  the SDK's square-pixel request. Existing `f32` convenience setters remain.
-- `QueuedSender::close` returns every retained frame with its submission id,
-  including frames left after a native completion-protocol failure. Explicit
-  and implicit teardown release storage only after native destruction.
-- `QueuedVideoFrame::Scatter` queues separate encoder blocks without joining
-  them and returns their original allocations after native completion.
-- Packet receivers, allocator-backed packet receivers and packet KVM sessions
-  support borrowed capture, including compressed payloads in application memory.
-  Borrowed packets can copy into reusable owned frames for relaying.
-
-- `QueuedSender::split` and `CompressedSender::split` lend video and audio
-  operations to separate scoped threads without an external lock.
-- `AllocationDecline` and process-wide custom receive allocation decline
-  counters in `AllocatorUsage`, distinguishing limits, invalid requests,
-  unavailable generations, policy errors/panics and refused buffers.
-- `Runtime::select`, runtime information and capability queries. Optional
-  operations report availability by entry points, runtime edition, version
-  and build declarations instead of assuming support from a version number.
-- Mixed video/audio/metadata/event capture, exact-name and predicate source
-  selection, per-media reception monitoring, and restricted controls that can
-  be used alongside synchronized capture. See [usage](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md).
-- Shared `VideoSource`, `AudioSource` and `MetadataSource` inputs for synchronous
-  operations, reusable `copy_into` buffers, application-borrowed audio, frame
-  plane/channel views and allocation-preserving owned-buffer recovery.
-- Tokio and smol `AsyncFinder`, `AsyncSourceCache` and owned `AsyncSourceWatch`
-  adapters. Dropped discovery waits release their workers between bounded native
-  attempts; synchronous discovery retains whole-budget waits.
-- Tokio and smol scoped capture callbacks that process borrowed media on the
-  blocking worker and return a `Send + 'static` result. Owned and combined
-  async capture share the deadline and cancellation rules of that path.
-- Routing and Discovery Server APIs; advertisers, listeners, owned snapshots
-  and events require NDI 6.4 or later. Audio conversion supports planar and
-  interleaved samples, and video conversion supports V210/P216.
-- The optional `advanced` feature: compressed/scatter packets, queued sending
-  with completion and frame/byte limits, custom receive allocators, AV sync,
-  genlock, JSON configuration, encoder controls and KVM. APIs retain their
-  types without Advanced headers and report unavailable native operations.
-  See [Advanced SDK integration](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/advanced.md).
-- The optional `file-io` feature: source recording, file playback, probing,
-  thumbnails and executor-independent async handles. Recording reports expose
-  finalization; async operations submit on first poll or through `submit()`.
-  Events and probe results survive an unreadable optional format;
-  `source_format()` returns its typed refusal while preserving the other fields.
-  Submitted stop/finish/close operations retain their cancellation guarantees.
-  The feature is independent of `advanced`; native library requirements are
-  platform-specific. See [File API](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/file-io.md).
-- Image encoding from every uncompressed video format and frame type: PNG,
-  JPEG, lossless/lossy WebP, data URLs and writer output. Options include PNG
-  compression, 16-bit samples, alpha policy, HDR code values, YUV color policy,
-  downscaling and lossy WebP effort/SharpYUV controls. See
-  [image encoding](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/image-encoding.md).
-- `ImageWorkspace` retains conversion scratch across encodes and exposes
-  retained-byte accounting and explicit release. Convenience image methods
-  remain available.
-- NDI 6.4 planar 4:4:4 formats and corresponding receiver color/bandwidth
-  choices, subject to runtime capability checks.
-- Runnable examples for relaying mixed media, reusable buffers, reception
-  monitoring, async capture, routing, Discovery Servers, Advanced operations,
-  recording and playback. See the [examples index](https://github.com/GrantSparks/grafton-ndi/blob/main/examples/README.md).
-
-### Performance and correctness
-
-- Submitted async recorder completion waits, including queued waits, receive
-  the finalization evidence gathered by concurrent close or last-handle drop.
-- Async probes retain their runtime initialization lease through queued work
-  and native completion. File playback paths are validated once at submission,
-  and Windows recorder preflight checks directory write permission.
-- Abandoned async receiver waits retain their events and source-name changes
-  for the next consumer. Failed status snapshots report once per publication
-  while other notifications and subsequent media capture remain available.
-- Descriptor slots initialize through interior mutability, completion failures
-  wake collectors under the queue lock, and sender metadata frees before its
-  capture gate is released. Discovery subscriptions retain identifier storage
-  until native unsubscription or destruction.
-- Interleaved audio uses the shared zero-count errors and allocates conversion
-  destinations from their validated shape without repeating validation.
-- Owned compressed packet formatting summarizes byte lengths rather than
-  exposing complete payloads or native descriptor addresses.
-
-- Validation, timeout, HDR, withheld-metadata and completion refusals retain
-  typed evidence without formatting allocations. Wide cold-path evidence uses
-  boxes only on 32-bit targets; arbitrary color, encoder, filename-token and
-  rejected-address diagnostics remain boxed on every target. Diagnostic text
-  and the existing error-size bound are preserved.
-
-- Synchronous and async recorder starts both consume unreadable stale events;
-  only a queue that fails to drain refuses the next session.
-- Receive allocator replacement installs the new native callbacks before
-  retiring the old policy, avoiding dropped frames while the setter runs or
-  the old policy's destructor blocks. Pool-backed buffers avoid per-frame
-  handle boxing; arbitrary external handles remain boxed once per buffer.
-- Cancelling an async File creation whose handle has not reached the caller
-  requests cleanup without joining its owner thread, even after delivery.
-- Audio and metadata frame implementations supply only validated accessors;
-  shared views, copies and native descriptors cannot be overridden. Packed
-  audio copies derive and check their own layout. Failed packed-copy checks
-  leave reused video and audio destinations valid after unwinding.
-- Host lookups and `SourceCache` accept NDI machine names containing spaces,
-  underscores and other label text, while rejecting endpoint and URI syntax.
-  Matching and cache keys preserve ASCII case/final-dot equivalence without
-  allocating; machine-name queries match only SDK label machine components.
-- Every image encode into a writer flushes on success and preserves the first
-  writer error, including final JPEG and WebP writes from an owned `BufWriter`.
-- Custom receive buffers use the same stride validation as their requests.
-  Compressed buffers must match the requested payload size exactly; valid
-  uncompressed padding remains supported.
-- Synchronizer resources retain their receiver, source and configuration
-  dependencies through native destruction.
-- Shared sender teardown ends native loans before releasing their storage.
-  Frame-bound video authorization and exclusive descriptor keys keep copying,
-  submission and reclamation tied to the frame and slot they describe.
-- Finder snapshots acquire their lifetime lock within the lookup deadline
-  without polling, and share one native snapshot contract.
-- Custom allocator bookkeeping is reserved before callbacks run; successful
-  crate-owned allocation allocates only the frame memory.
-- File recorder waits and cleanup share a bounded drain and settlement kernel.
-  Reset advances waiter identity, lifecycle states own their stop obligations,
-  and idle pumps avoid native status queries and report clones.
-- Downscaled image conversion accumulates horizontal blocks and avoids full-block
-  divisions; JPEG reuses its final converted row for codec padding. Encoded
-  output is unchanged. Measured gains and the JPEG scratch-memory tradeoff are
-  recorded in the [performance guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/image-encoding-performance.md).
-- Queued sending reserves stable frame descriptors at construction; scatter
-  frames own their scatter lists.
-  Accepted submissions allocate nothing; `QueueFull` refusals allocate only
-  their returned `Rejected` value. Completion and collection remain allocation
-  free.
-- Recorder cleanup keeps waiting for every known open file within one shutdown
-  budget, even after an indeterminate report. A short finish wait no longer
-  shortens another clone's close budget. Starting another session waits for
-  known prior files to close, or requires explicit reset.
-- Async recorder finish waits use the event pump, allowing status and other
-  commands to run while finalization is pending. Concurrent finish waiters
-  observe the same session without serializing their waits. Successful reset
-  closes pending finish waits for the displaced recorder.
-- Custom receive allocation declines audio requests above the 64 MiB capture
-  limit before calling application policy. Unrepresentable video and audio
-  requests are declined without allocating on SDK threads.
-- Discovery Server connection requests inspect only receiver identifiers and
-  the matched receiver's commands. Unrelated malformed fields or snapshot-copy
-  limits no longer prevent an otherwise valid request.
-- Runtime-authorized layouts guard native video send paths. Older runtimes
-  reject sending planar 4:4:4 video before native calls; receiver settings
-  carry the same structural checks. Descriptor construction, V210/P216
-  conversion and AV-sync timestamp matching need no send-format capability.
-  AV sync accepts owned and borrowed planar 4:4:4 frames consistently.
-- Dropped async receiver waits stop before their next bounded attempt, releasing
-  their receiver and blocking worker without waiting for the original timeout.
-  Source-name polling now uses the same bounded attempts.
-- Sender tally polls retain changes for the next waiter. Concurrent native
-  tally queries serialize within the wait budget, while polls return the
-  cached state without blocking.
-- Keyframe change waiters latch each active stream's demand before waking any
-  observer, so a keyframe sent by the first observer cannot erase another's report.
-- Concurrent Finder lookups and keyframe waiters share native change reports,
-  so one waiter cannot consume another waiter's notification. Native and
-  shared waits use the same deadline, including native waiter handoff.
-- [#140](https://github.com/GrantSparks/grafton-ndi/issues/140): enable runtime
-  JPEG SIMD with scalar fallback and direct contiguous packed-RGB input;
-  retry capture notifications immediately within bounded bursts; continue File
-  draining after full event bursts; copy cached descriptors outside the global
-  mutex; reuse image conversion storage. Capture deadlines, idle backoff and
-  owned cache results are preserved. JPEG bytes and decoded pixels can vary
-  with CPU capabilities. See [image performance](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/image-encoding-performance.md).
-- Synchronous media operations accept validated captured and external inputs
-  without a preliminary owned copy. Video with unsuitable padding uses reusable
-  staging; owned video retains scan-dependent SDK tail room. Direct sends from
-  caller padding/tail storage require explicit opt-in and initialized storage.
-- Frame and metadata copies reuse retained capacity. Advanced send queues
-  account for retained payload and metadata capacity in their byte limits.
-- Finder and Discovery Server collections share bounded copy accounting with
-  fallible allocation and typed resource-limit errors. Listeners omit entries
-  and events with over-limit strings, and entries with malformed nested arrays,
-  while retaining valid peers. Malformed top-level arrays are rejected.
-- Receiver drop percentages use the native received total, which includes
-  native drops. Color metadata ignores XML processing instructions.
-- Recording preflight rejects existing exact filenames and normalizes paths;
-  applications must still account for filesystem races and native search-path
-  trust. See [File requirements](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/file-io.md#requirements).
-- Async File command, event and shutdown notification paths contain consumer
-  waker panics so other waiters and recording/playback can continue. Executor
-  wakers are cloned, notified and released outside internal locks, preventing
-  reentrant cleanup from deadlocking polling, cancellation or shutdown.
-- Examples select the required Advanced runtime, stop the reception monitor
-  on capture errors, align KVM audio blocks with the output cadence and reuse
-  thumbnail conversion/output buffers. The recording example checks write
-  failures, empty files and unexpected SDK stops before reporting success. It
-  disables proxy recording to match the thumbnail example's one-video-track
-  requirement; thumbnails drain video and events together and pause playback
-  while encoding to avoid overrunning capture.
-- The release also includes the fixes already shipped in
-  [2.1.0](#210---2026-11-13), including bounded SDK text handling, finite wait
-  conversion, reconnect-friendly status polling and NV12 stride validation.
-
-### Build and platform support
-
-- Required CI checks include Miri and Memcheck padding regressions, rustdoc
-  for every linted feature combination, and warnings-denied Apple mobile lint.
-  Promising an NDI|HX decoder also requires its Advanced runtime prerequisites.
-
-- Rust 1.88 remains the minimum. Default desktop/Android builds need no SDK,
-  bindgen or `libclang`. Advanced native operations require Advanced headers
-  and `libclang`; missing declarations disable the affected operations.
-- iOS, tvOS and visionOS use vendor static archives. The tvOS and visionOS
-  configurations need newer toolchains; deployment floors and supported target
-  combinations are in [setup](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/setup.md#apple-mobile-targets).
-- The CI matrix covers Standard 6.1.1 and Standard/Advanced 6.3.2 and 6.4.0.2
-  with native runtime jobs on Linux, macOS and Windows, alternate header/runtime
-  combinations and cross-version media exchange. Additional targets compile or
-  build without runtime testing. See [platform coverage](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/setup.md#platforms)
-  and [CI results](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml).
-- Core bindings are generated from 6.4.0.2 headers and included in the crate.
-  The package license expression is `Apache-2.0 AND MIT`, reflecting the
-  wrapper and included SDK declarations.
-- API documentation is published to GitHub Pages and tracks `main`. The
-  packaged README uses absolute links so its guides also work on crates.io.
-  The package contains sources, examples, build scripts, README, changelog and
-  license; guides remain available in the repository.
+- Multiple finder consumers can observe a published source change without
+  competing for a single native notification.
+- Sender tally polling retains the current value and preserves changes for a
+  waiting consumer. Polling can read the cached value while a native wait
+  is active.
+- Receiver drop percentages use the native total, which includes drops.
+  Negative native statistics and audio queue depths produce typed refusals.
+- Received video and audio remain available when optional frame metadata
+  cannot be read. Frame copies keep the reason the text was withheld.
+- Owned media replacements and copies preserve a valid layout and its
+  storage when validation fails or copying unwinds.
+- Includes the [2.1.0 fixes](#210---2026-11-13) for bounded SDK text, finite
+  waits, reconnect-friendly status polling and NV12 stride validation.
 
 ## [2.1.0] - 2026-11-13
 

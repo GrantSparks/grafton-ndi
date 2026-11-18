@@ -210,6 +210,50 @@ class Documentation(unittest.TestCase):
         self.write('docs/usage.md', 'The `removed_method` is gone.')
         self.assertIn('docs/usage.md:1:', docs.guide_api_name_violations(self.root, self.root / 'target/doc')[0])
 
+    def test_migration_checks_removed_names_at_its_tag(self):
+        self.write('src/lib.rs', 'pub struct Foo; impl Foo { pub fn old_api() {} }')
+        subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
+        subprocess.run(['git', '-C', str(self.root), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=Test',
+                        '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'release'],
+                       check=True)
+        subprocess.run(['git', '-C', str(self.root), 'tag', 'v2.1.0'], check=True)
+        self.write('src/lib.rs', 'pub fn current_api() {} pub fn unreleased_api() {}')
+        guide = self.write(docs.MIGRATION_GUIDE,
+                           '# Upgrade\n\nCompare against `v2.1.0`.\n\n'
+                           'Replace `Foo::old_api()` with `current_api()`.\n'
+                           'Use `absent_but_not_a_removed_name` for this check.\n'
+                           'Use `current_api()` to remove data from a local buffer.\n'
+                           '\n```text\nRemove `example_only`.\n```\n')
+        self.assertEqual(docs.previous_release_name_violations(self.root), [])
+        text = guide.read_text(encoding='utf-8')
+        guide.write_text(text + '\nRemove this\n`unreleased_api`.\n', encoding='utf-8')
+        errors = docs.previous_release_name_violations(self.root)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('docs/migration/2.0-to-3.0.md:14:', errors[0])
+        self.assertIn('unreleased_api did not occur at v2.1.0', errors[0])
+        guide.write_text(text.replace('v2.1.0', 'v9.9.9'), encoding='utf-8')
+        self.assertIn('cannot read previous release tag v9.9.9',
+                      docs.previous_release_name_violations(self.root)[0])
+        guide.write_text(text.replace('`v2.1.0`', 'the previous version'), encoding='utf-8')
+        self.assertIn('first paragraph must name the previous release tag',
+                      docs.previous_release_name_violations(self.root)[0])
+
+    def test_migration_checks_replacements_against_current_rustdoc(self):
+        self.write('target/doc/grafton_ndi/index.html', '<a href="struct.Foo.html">Foo</a>')
+        self.write('target/doc/grafton_ndi/struct.Foo.html',
+                   '<section id="method.current_api"></section>')
+        preamble = '# Upgrade\n\nCompare against `v2.1.0`.\n\n'
+        changes = ('| 2.1.0 | 3.0 |\n| --- | --- |\n'
+                   '| `Foo::old_api()` | `Foo::current_api()` |\n'
+                   '\nRename `Foo::old_api()` to `Foo::missing_api()`.\n')
+        self.write(docs.MIGRATION_GUIDE, preamble + changes)
+        self.write('docs/migration/1.x-to-2.0.md', 'Use `Foo::archived_api()`.\n')
+        errors = docs.guide_api_name_violations(self.root, self.root / 'target/doc')
+        self.assertEqual(errors, [
+            'docs/migration/2.0-to-3.0.md:9: unknown documented API name: Foo::missing_api()',
+        ])
+
     def test_rustdoc_cli_rejects_a_missing_prose_method(self):
         self.write('target/doc/grafton_ndi/index.html', '<a href="struct.Foo.html">Foo</a>')
         self.write('target/doc/grafton_ndi/struct.Foo.html', '<section id="method.new"></section>')

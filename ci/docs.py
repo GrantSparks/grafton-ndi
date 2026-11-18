@@ -8,7 +8,8 @@ Rust fences are compiled (never run) against the current crate and locked
 versions of its dependencies. Use a linked runnable example for code fragments.
 With --rustdoc, GitHub Pages API URLs and current-version docs.rs URLs are
 checked against generated HTML. Prose API names in current guides are checked
-against the same item and member names.
+against the same item and member names. Migration instructions check old names
+against the tagged release they compare.
 Documented dependency features and the README feature table are checked against
 Cargo.toml so removed or renamed features cannot remain in install instructions.
 Native table entry points need public SDK search aliases or an explicit internal
@@ -992,6 +993,89 @@ def documented_api_names(directory):
     return names, qualified
 
 
+MIGRATION_GUIDE = Path('docs/migration/2.0-to-3.0.md')
+MIGRATION_INDEX = Path('docs/migration/README.md')
+INLINE_CODE = re.compile(r'(?P<ticks>`+)(?P<code>.+?)(?P=ticks)')
+MIGRATION_OLD_COLUMN = re.compile(r'^\s*\|\s*(?:2\.1\.0|2\.x|removed api|previous spelling or shape)\s*\|', re.I)
+MIGRATION_REMOVAL = re.compile(
+    r'(?:^|[.!?]\s+|^\s*(?:[-*]|[0-9]+[.)])\s+)'
+    r'(?:replace|remove|delete|rename)\b(?P<old>.*?)'
+    r'(?=\b(?:with|to|but|and\s+(?:use|call|enable|keep|handle))\b|[.!?;]|\Z)',
+    re.I | re.M | re.S,
+)
+
+
+def migration_old_spans(text):
+    """Identify code in old-API table cells and in removal instructions."""
+    lines = text.splitlines()
+    for first, last, _, _ in fences(text):
+        for index in range(first - 1, last or len(lines)):
+            lines[index] = ''
+    old = set()
+
+    def collect(line, column, code):
+        for span in INLINE_CODE.finditer(code):
+            old.add((line, column + span.start(), span.group('code').strip()))
+
+    in_old_table = False
+    for line, content in enumerate(lines, 1):
+        if (first := re.match(r'^\s*\|([^|]*)\|', content)) is None:
+            in_old_table = False
+        elif MIGRATION_OLD_COLUMN.match(content):
+            in_old_table = True
+        elif in_old_table:
+            collect(line, first.start(1), first.group(1))
+
+    # Mask code spans before finding sentence boundaries and directives so
+    # that punctuation or a directive within a Rust name cannot end a match.
+    first_line = 1
+    for paragraph in re.split(r'(?<=\n)\n', '\n'.join(lines)):
+        spans = list(INLINE_CODE.finditer(paragraph))
+        masked = INLINE_CODE.sub(lambda match: ' ' * len(match.group(0)), paragraph)
+        for removal in MIGRATION_REMOVAL.finditer(masked):
+            start, end = removal.span('old')
+            for span in spans:
+                if start <= span.start() < end:
+                    line = first_line + paragraph.count('\n', 0, span.start())
+                    column = span.start() - (paragraph.rfind('\n', 0, span.start()) + 1)
+                    old.add((line, column, span.group('code').strip()))
+        first_line += paragraph.count('\n') + 1
+    return old
+
+
+def previous_release_name_violations(root):
+    """Check API names presented as belonging to the guide's tagged baseline."""
+    source = root / MIGRATION_GUIDE
+    if not source.is_file():
+        return []
+    text = source.read_text(encoding='utf-8')
+    lines = text.splitlines()
+    first = next((index for index, line in enumerate(lines) if line.strip()
+                  and not HEADING.match(line)), len(lines))
+    last = next((index for index in range(first, len(lines)) if not lines[index].strip()), len(lines))
+    baseline = re.search(r'`(v[0-9]+\.[0-9]+\.[0-9]+)`', ' '.join(lines[first:last]))
+    if not baseline:
+        return [f'{MIGRATION_GUIDE}:{first + 1}: first paragraph must name the previous release tag']
+    tag = baseline.group(1)
+    # Use the full ref so a branch or other revision cannot stand in for a tag.
+    result = subprocess.run(
+        ['git', '-C', str(root), 'grep', '-h', '-I', '-E', '[A-Za-z_]',
+         f'refs/tags/{tag}', '--', 'src', 'Cargo.toml'],
+        text=True, encoding='utf-8', errors='replace', capture_output=True,
+    )
+    if result.returncode:
+        return [f'{MIGRATION_GUIDE}:{first + 1}: cannot read previous release tag {tag}']
+    released = set(re.findall(r'\b[A-Za-z_]\w*\b', result.stdout))
+    found = []
+    for line, _, code in sorted(migration_old_spans(text)):
+        path = re.match(r'\.?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)', code)
+        if path:
+            for name in path.group(1).split('::'):
+                if name not in released:
+                    found.append(f'{MIGRATION_GUIDE}:{line}: {name} did not occur at {tag} ({code})')
+    return found
+
+
 def guide_api_name_violations(root, directory):
     """Reject stale API identifiers in prose code spans, excluding history."""
     root, directory = root.resolve(), directory.resolve()
@@ -1003,18 +1087,20 @@ def guide_api_name_violations(root, directory):
     found = []
     for source in documents(root):
         relative = source.relative_to(root)
-        if source.name == 'CHANGELOG.md' or relative == Path('docs/api-conventions.md') or relative.parts[:2] == ('docs', 'migration'):
+        if (source.name == 'CHANGELOG.md' or relative == Path('docs/api-conventions.md')
+                or (relative.parts[:2] == ('docs', 'migration') and relative not in (MIGRATION_GUIDE, MIGRATION_INDEX))):
             continue
         text = source.read_text(encoding='utf-8')
+        previous = migration_old_spans(text) if relative == MIGRATION_GUIDE else set()
         excluded = set()
         for first, last, _, _ in fences(text):
             excluded.update(range(first, (last or len(text.splitlines())) + 1))
         for line, content in enumerate(text.splitlines(), 1):
             if line in excluded:
                 continue
-            for span in re.finditer(r'(?P<ticks>`+)(?P<code>.+?)(?P=ticks)', content):
+            for span in INLINE_CODE.finditer(content):
                 token = span.group('code').strip()
-                if token in NON_API_CODE_NAMES:
+                if token in NON_API_CODE_NAMES or (line, span.start(), token) in previous:
                     continue
                 # Paths, files, target triples and globs cannot match either
                 # identifier form. Module paths contain no uppercase owner.
@@ -1074,6 +1160,7 @@ def main():
     found.extend(readme_link_violations(ROOT))
     found.extend(sdk_alias_violations(ROOT))
     found.extend(method_twin_violations(ROOT))
+    found.extend(previous_release_name_violations(ROOT))
     if args.rustdoc:
         found.extend(rustdoc_violations(ROOT, args.rustdoc))
         found.extend(parameter_name_violations(ROOT, args.rustdoc))
