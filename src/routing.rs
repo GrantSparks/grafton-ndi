@@ -137,7 +137,7 @@ pub struct Router {
     #[cfg(feature = "advanced")]
     pub(crate) connection_metadata: crate::connection_metadata::ConnectionMetadata,
     #[cfg(feature = "advanced")]
-    _config: Option<crate::advanced::AdvancedConfig>,
+    _config: crate::advanced::RetainedConfig,
 }
 
 const_assert!({
@@ -169,19 +169,24 @@ impl Router {
     #[doc(alias = "NDIlib_routing_create_v2")]
     pub fn new(ndi: &Ndi, options: &RouterOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
-        if let Some(config) = &options.config {
-            return Self::new_configured(ndi, options, config);
+        {
+            <Self as crate::advanced::Configurable>::create_from_options(ndi, options)
         }
+        #[cfg(not(feature = "advanced"))]
+        {
+            Self::create_plain(ndi, options)
+        }
+    }
+
+    pub(crate) fn create_plain(ndi: &Ndi, options: &RouterOptions) -> Result<Self> {
         // SAFETY: the SDK's router creation returns null or a fresh router
         // that nothing else owns, and the settings outlive the call.
         unsafe {
-            Self::create(
-                ndi,
-                options,
-                #[cfg(feature = "advanced")]
-                None,
-                |routing, settings| routing.named().NDIlib_routing_create(settings),
-            )
+            Self::create(ndi, options, |routing, settings| {
+                crate::runtime::NativeCreation::plain(
+                    routing.named().NDIlib_routing_create(settings),
+                )
+            })
         }
     }
 
@@ -196,11 +201,10 @@ impl Router {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         options: &RouterOptions,
-        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
             &sys::Routing,
             &NDIlib_routing_create_t,
-        ) -> sys::table::Called<NDIlib_routing_instance_t>,
+        ) -> crate::runtime::NativeCreation<NDIlib_routing_instance_t>,
     ) -> Result<Self> {
         // A router with a configuration gets here only once its own
         // capability, which requires routing, has been allowed, so it is
@@ -208,15 +212,14 @@ impl Router {
         let routing = ndi.bind::<sys::Routing>()?;
         let name = CString::new(options.name.as_str())?;
         let groups = crate::list_setting::list_cstring(options.groups.as_deref(), "groups")?;
-        let instance = create(
+        let created = create(
             &routing,
             &NDIlib_routing_create_t {
                 p_ndi_name: name.as_ptr(),
                 p_groups: groups.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
             },
-        )
-        .created()?
-        .as_ptr();
+        );
+        let instance = created.call.created()?.as_ptr();
         Ok(Self {
             instance: RoutingInstance(instance),
             routing,
@@ -226,7 +229,7 @@ impl Router {
             #[cfg(feature = "advanced")]
             connection_metadata: crate::connection_metadata::ConnectionMetadata::default(),
             #[cfg(feature = "advanced")]
-            _config: config,
+            _config: created.config,
         })
     }
 

@@ -59,14 +59,14 @@ fn sender(trace: &Trace) -> Sender {
         Sender::create(
             &ndi,
             &SenderOptions::new("synthetic shared owner"),
-            #[cfg(feature = "advanced")]
-            None,
             |_, _| {
                 let native = Box::new(Native {
                     trace: Arc::clone(trace),
                     pending: None,
                 });
-                sys::table::for_test(Box::into_raw(native).cast(), c"NDIlib_send_create")
+                crate::runtime::NativeCreation::plain(sys::table::for_test(
+                    Box::into_raw(native).cast(), c"NDIlib_send_create"
+                ))
             },
         )
     }

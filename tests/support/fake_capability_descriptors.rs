@@ -56,6 +56,8 @@ pub unsafe extern "C" fn NDIlib_genlock_create(
     config: *const std::ffi::c_char,
 ) -> *mut std::ffi::c_void {
     log("genlock-create");
+    #[cfg(fake_config_lending)]
+    log_configuration("genlock", config);
     Box::into_raw(Box::new(GenlockState { source, config })).cast()
 }
 
@@ -65,8 +67,12 @@ pub unsafe extern "C" fn NDIlib_genlock_destroy(instance: *mut std::ffi::c_void)
     let state = unsafe { Box::from_raw(instance.cast::<GenlockState>()) };
     let source = unsafe { &*state.source };
     let name = unsafe { std::ffi::CStr::from_ptr(source.p_ndi_name) };
-    let config = unsafe { std::ffi::CStr::from_ptr(state.config) };
-    log(&format!("genlock-destroy:{}:{}", name.to_string_lossy(), config.to_string_lossy()));
+    let config = if state.config.is_null() {
+        "<null>".into()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(state.config) }.to_string_lossy()
+    };
+    log(&format!("genlock-destroy:{}:{config}", name.to_string_lossy()));
 }
 
 #[cfg(fake_advanced)]

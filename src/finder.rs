@@ -216,7 +216,7 @@ pub struct Finder {
     _groups: Option<CString>,    // Hold ownership of CStrings
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
     #[cfg(feature = "advanced")]
-    _config: Option<crate::advanced::AdvancedConfig>,
+    _config: crate::advanced::RetainedConfig,
     sdk: crate::runtime::Bound<sys::Core>,
 }
 
@@ -719,19 +719,22 @@ impl Finder {
     #[doc(alias = "NDIlib_find_create_v3")]
     pub fn new(ndi: &Ndi, options: &FinderOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
-        if let Some(config) = &options.config {
-            return Self::new_configured(ndi, options, config);
+        {
+            <Self as crate::advanced::Configurable>::create_from_options(ndi, options)
         }
+        #[cfg(not(feature = "advanced"))]
+        {
+            Self::create_plain(ndi, options)
+        }
+    }
+
+    pub(crate) fn create_plain(ndi: &Ndi, options: &FinderOptions) -> Result<Self> {
         // SAFETY: the SDK's finder creation returns null or a fresh finder
         // that nothing else owns, and the settings outlive the call.
         unsafe {
-            Self::create(
-                ndi,
-                options,
-                #[cfg(feature = "advanced")]
-                None,
-                |core, raw| core.named().NDIlib_find_create_v2(raw),
-            )
+            Self::create(ndi, options, |core, raw| {
+                crate::runtime::NativeCreation::plain(core.named().NDIlib_find_create_v2(raw))
+            })
         }
     }
 
@@ -746,25 +749,23 @@ impl Finder {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         settings: &FinderOptions,
-        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
             &sys::Core,
             &NDIlib_find_create_t,
-        ) -> sys::table::Called<NDIlib_find_instance_t>,
+        ) -> crate::runtime::NativeCreation<NDIlib_find_instance_t>,
     ) -> Result<Self> {
         let groups = list_cstring(settings.groups.as_deref(), "groups")?;
         let extra_ips = list_cstring(settings.extra_ips.as_deref(), "extra_ips")?;
         let sdk = ndi.bind_core();
-        let instance = create(
+        let created = create(
             &sdk,
             &NDIlib_find_create_t {
                 show_local_sources: settings.show_local_sources,
                 p_groups: groups.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
                 p_extra_ips: extra_ips.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
             },
-        )
-        .created()?
-        .as_ptr();
+        );
+        let instance = created.call.created()?.as_ptr();
         let finder = Self {
             instance: FindInstance(instance),
             sources_lock: parking_lot::Mutex::new(FindInstance(instance)),
@@ -772,7 +773,7 @@ impl Finder {
             _groups: groups,
             _extra_ips: extra_ips,
             #[cfg(feature = "advanced")]
-            _config: config,
+            _config: created.config,
             sdk,
         };
         // Some standard-library mutexes allocate their native backing on the

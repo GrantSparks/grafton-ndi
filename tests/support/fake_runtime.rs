@@ -109,6 +109,11 @@ fn log(operation: &str) {
     }
 }
 
+#[cfg(fake_config_lending)]
+fn log_configuration(kind: &str, config: *const c_char) {
+    log(&format!("config:{kind}:{config:p}"));
+}
+
 #[cfg(fake_constructor)]
 extern "C" fn mark_load() {
     if let Some(path) = std::env::var_os("GRAFTON_REJECTED_CONSTRUCTOR_MARKER") {
@@ -1241,6 +1246,8 @@ pub unsafe extern "C" fn NDIlib_recv_create_v4(
     p_create_settings: *const NDIlib_recv_create_v3_t,
     _p_config_data: *const c_char,
 ) -> NDIlib_recv_instance_t {
+    #[cfg(fake_config_lending)]
+    log_configuration("receiver", _p_config_data);
     unsafe { NDIlib_recv_create_v3(p_create_settings) }
 }
 
@@ -1260,6 +1267,8 @@ pub unsafe extern "C" fn NDIlib_send_create_v2(
     p_create_settings: *const NDIlib_send_create_t,
     _p_config_data: *const c_char,
 ) -> NDIlib_send_instance_t {
+    #[cfg(fake_config_lending)]
+    log_configuration("sender", _p_config_data);
     unsafe { NDIlib_send_create(p_create_settings) }
 }
 
@@ -1332,6 +1341,8 @@ macro_rules! configured_creation {
             _p_config_data: *const c_char,
         ) -> $Instance {
             log(stringify!($name));
+            #[cfg(fake_config_lending)]
+            log_configuration(stringify!($name), _p_config_data);
             #[cfg(fake_configured_success)]
             { unsafe { $plain(_p_create_settings) } }
             #[cfg(not(fake_configured_success))]

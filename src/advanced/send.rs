@@ -684,9 +684,12 @@ impl CompressedSender {
     /// without an Advanced runtime (or in a build without the Advanced SDK).
     #[doc(alias = "NDIlib_send_create_v2")]
     pub fn new(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
-        let config = AdvancedConfig::or_empty(options.config.as_ref());
         let pending = PendingStreams::default();
-        let sender = Sender::new_configured(ndi, options, &config)?;
+        let sender = <Sender<CompressedAttached> as super::Configurable>::create_configured(
+            ndi,
+            options,
+            options.configured_config(),
+        )?;
         Ok(Self {
             lending: Lending::new(sender, pending),
         })

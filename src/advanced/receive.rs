@@ -12,10 +12,7 @@ use super::{
 };
 use crate::{
     capture::{AllSlots, AudioKind, CaptureStrategy, Guard, Media, MetadataKind, VideoKind},
-    sys::{
-        advanced::{native, ReceiverConfiguration},
-        bindings::*,
-    },
+    sys::bindings::*,
     timeout::Deadline,
     AudioFrame, AudioFrameRef, MetadataFrame, MetadataFrameRef, Ndi, Receiver, ReceiverEvent,
     ReceiverOptions, Result, VideoFrame, VideoFrameRef,
@@ -257,19 +254,11 @@ impl PacketReceiver {
     #[doc(alias = "NDIlib_recv_create_v4")]
     pub fn new(ndi: &Ndi, options: &ReceiverOptions, preset: PassthroughPreset) -> Result<Self> {
         let options = creation_options(options, ndi.passthrough_format(preset)?);
-        let config = AdvancedConfig::or_empty(options.config.as_ref());
-        // SAFETY: the closure returns what the SDK's configured receiver
-        // creation returned for the settings it was handed, which carry the
-        // preset's color format and fielded video; the strings they point to
-        // belong to the creation path, which outlives the call.
-        let receiver = unsafe {
-            <Receiver<PacketAttached> as super::Configurable>::configured(
-                ndi,
-                &options,
-                &config,
-                |table: &ReceiverConfiguration, _settings, _text| native!(ReceiverConfiguration, table => table.named().NDIlib_recv_create_v4(_settings, _text)),
-            )
-        }?;
+        let receiver = <Receiver<PacketAttached> as super::Configurable>::create_configured(
+            ndi,
+            &options,
+            options.configured_config(),
+        )?;
         Ok(Self::from_receiver(receiver))
     }
 

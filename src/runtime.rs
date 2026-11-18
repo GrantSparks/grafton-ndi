@@ -753,6 +753,23 @@ macro_rules! file_bound_tables {
 #[cfg(feature = "file-io")]
 file_bound_tables!(sys::FileRuntime, sys::FilePlayback, sys::FileRecording);
 
+/// A native constructor's result and any configuration it may have retained.
+pub(crate) struct NativeCreation<I> {
+    pub(crate) call: sys::table::Called<I>,
+    #[cfg(feature = "advanced")]
+    pub(crate) config: crate::advanced::RetainedConfig,
+}
+
+impl<I> NativeCreation<I> {
+    pub(crate) fn plain(call: sys::table::Called<I>) -> Self {
+        Self {
+            call,
+            #[cfg(feature = "advanced")]
+            config: crate::advanced::RetainedConfig::default(),
+        }
+    }
+}
+
 /// Native entry points paired with the initialized runtime they require.
 /// Only runtime binding paths can construct this capability. Dereferencing it
 /// borrows the table for no longer than the retained owner.
@@ -1199,16 +1216,13 @@ mod tests {
             // SAFETY: no native instance is returned; an exhausted bind must
             // panic before this closure can observe the settings at all.
             let _ = unsafe {
-                crate::Finder::create(
-                    &ndi,
-                    &crate::FinderOptions::new(),
-                    #[cfg(feature = "advanced")]
-                    None,
-                    |_, _| {
-                        creates.fetch_add(1, Ordering::Relaxed);
-                        sys::table::for_test(std::ptr::null_mut(), c"NDIlib_find_create_v2")
-                    },
-                )
+                crate::Finder::create(&ndi, &crate::FinderOptions::new(), |_, _| {
+                    creates.fetch_add(1, Ordering::Relaxed);
+                    NativeCreation::plain(sys::table::for_test(
+                        std::ptr::null_mut(),
+                        c"NDIlib_find_create_v2",
+                    ))
+                })
             };
         }));
         // An unavailable capability is still refused before the exhausted clone.

@@ -96,6 +96,7 @@ pub trait CompressedAudioSendMode: crate::sender::SenderMode {}
 pub use crate::framesync::capture::FrameSyncCapture;
 pub use allocators::*;
 pub use config::AdvancedConfig;
+pub(crate) use config::RetainedConfig;
 pub(crate) use configured::Configurable;
 pub use controls::*;
 pub use finder::ExtendedSource;

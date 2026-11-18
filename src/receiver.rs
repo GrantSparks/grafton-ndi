@@ -1524,7 +1524,7 @@ pub(crate) struct ReceiverCore {
     source_name: Mutex<LatestReport<SourceNameChange>>,
     _name: Option<CString>,
     #[cfg(feature = "advanced")]
-    _config: Option<crate::advanced::AdvancedConfig>,
+    _config: crate::advanced::RetainedConfig,
 }
 
 impl Receiver {
@@ -1591,25 +1591,27 @@ impl Receiver {
     #[doc(alias = "NDIlib_recv_create_v3")]
     pub fn new(ndi: &Ndi, options: &ReceiverOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
-        if let Some(config) = &options.config {
-            return Self::new_configured(ndi, options, config);
+        {
+            <Self as crate::advanced::Configurable>::create_from_options(ndi, options)
         }
-        // SAFETY: the SDK's receiver creation returns null or a fresh receiver
-        // that nothing else owns, and the settings outlive the call.
-        unsafe {
-            Self::create(
-                ndi,
-                options,
-                #[cfg(feature = "advanced")]
-                None,
-                |core, raw| core.named().NDIlib_recv_create_v3(raw),
-            )
+        #[cfg(not(feature = "advanced"))]
+        {
+            Self::create_plain(ndi, options)
         }
     }
 }
 
 #[allow(private_bounds)]
 impl<M: CreatableMode> Receiver<M> {
+    pub(crate) fn create_plain(ndi: &Ndi, options: &ReceiverOptions) -> Result<Self> {
+        // SAFETY: the SDK's receiver creation returns null or a fresh receiver
+        // that nothing else owns, and the settings outlive the call.
+        unsafe {
+            Self::create(ndi, options, |core, raw| {
+                crate::runtime::NativeCreation::plain(core.named().NDIlib_recv_create_v3(raw))
+            })
+        }
+    }
     /// The one creation path: check `options` against the runtime, create a
     /// receiver through `create`, which is
     /// handed the core table and the native settings for `options`, and keep
@@ -1622,11 +1624,10 @@ impl<M: CreatableMode> Receiver<M> {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         options: &ReceiverOptions,
-        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
             &sys::Core,
             &NDIlib_recv_create_v3_t,
-        ) -> sys::table::Called<NDIlib_recv_instance_t>,
+        ) -> crate::runtime::NativeCreation<NDIlib_recv_instance_t>,
     ) -> Result<Self> {
         let validated = options.validate_runtime(ndi.evidence())?;
         let target = RetainedSource::new(&options.source);
@@ -1635,7 +1636,8 @@ impl<M: CreatableMode> Receiver<M> {
         let sdk = ndi.bind_core();
         // The settings borrow the target's own descriptor and name. Both
         // owners move into the core after creation without moving their buffers.
-        let instance = create(&sdk, settings.raw()).created()?.as_ptr();
+        let created = create(&sdk, settings.raw());
+        let instance = created.call.created()?.as_ptr();
         Ok(Self {
             core: Arc::new(ReceiverCore {
                 instance: RecvInstance(instance),
@@ -1653,7 +1655,7 @@ impl<M: CreatableMode> Receiver<M> {
                 source_name: Mutex::new(LatestReport::default()),
                 _name: name,
                 #[cfg(feature = "advanced")]
-                _config: config,
+                _config: created.config,
             }),
             _mode: PhantomData,
         })

@@ -183,3 +183,14 @@ pub unsafe extern "C" fn NDIlib_find_get_current_sources_v2(
     unsafe { *count = snapshot.extended.len() as u32 };
     snapshot.extended.as_ptr()
 }
+
+
+#[cfg(fake_config_lending)]
+#[no_mangle]
+pub unsafe extern "C" fn NDIlib_find_create_v3(
+    settings: *const NDIlib_find_create_t,
+    config: *const c_char,
+) -> NDIlib_find_instance_t {
+    log_configuration("finder", config);
+    unsafe { NDIlib_find_create_v2(settings) }
+}

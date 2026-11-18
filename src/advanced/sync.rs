@@ -925,7 +925,7 @@ struct GenResource {
     handle: GenlockInstance,
     table: crate::runtime::Bound<GenlockTable>,
     source: RetainedSources,
-    _config: Option<AdvancedConfig>,
+    _config: super::RetainedConfig,
 }
 
 #[cfg(ndi_has_advanced_genlock)]
@@ -1093,22 +1093,20 @@ impl Genlock {
         let table = ndi.bind::<GenlockTable>()?;
         native!(Genlock, table, uses(options) => {
             let mut source = RetainedSources::default();
-            let handle = source.replace(options.source.as_ref(), |source| {
-                // SAFETY: the retention helper keeps the descriptor and text
-                // at stable addresses until after native destruction.
-                unsafe {
-                    table.named().NDIlib_genlock_create(
-                        source,
-                        options.config.as_ref().map_or(ptr::null(), AdvancedConfig::as_ptr),
-                    )
-                }
-            }).created()?.as_ptr();
+            let (call, config) = AdvancedConfig::lend(options.configured_config(), |config| {
+                source.replace(options.source.as_ref(), |source| {
+                    // SAFETY: the source helper and configuration owner retain
+                    // both pointers at stable addresses through native destruction.
+                    unsafe { table.named().NDIlib_genlock_create(source, config) }
+                })
+            });
+            let handle = call.created()?.as_ptr();
             Ok(Self {
                 resource: GenResource {
                     handle: GenlockInstance(handle),
                     table,
                     source,
-                    _config: options.config.clone(),
+                    _config: config,
                 },
                 _not_sync: NotSync::default(),
             })

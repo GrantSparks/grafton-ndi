@@ -235,7 +235,7 @@ mod ownership {
         // A registration may keep this native sender alive after Sender drops.
         pub(super) failover: parking_lot::Mutex<RetainedSources>,
         #[cfg(feature = "advanced")]
-        pub(super) _config: Option<crate::advanced::AdvancedConfig>,
+        pub(super) _config: crate::advanced::RetainedConfig,
         sdk: crate::runtime::Bound<sys::Core>,
     }
 
@@ -257,7 +257,7 @@ mod ownership {
             instance: SendInstance,
             name: CString,
             groups: Option<CString>,
-            #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
+            #[cfg(feature = "advanced")] config: crate::advanced::RetainedConfig,
             sdk: crate::runtime::Bound<sys::Core>,
         ) -> Self {
             Self {
@@ -1523,19 +1523,22 @@ impl<M: SenderMode> Sender<M> {
     /// Advanced configuration, the plain one otherwise.
     pub(crate) fn open(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
         #[cfg(feature = "advanced")]
-        if let Some(config) = &options.config {
-            return Self::new_configured(ndi, options, config);
+        {
+            <Self as crate::advanced::Configurable>::create_from_options(ndi, options)
         }
+        #[cfg(not(feature = "advanced"))]
+        {
+            Self::create_plain(ndi, options)
+        }
+    }
+
+    pub(crate) fn create_plain(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
         // SAFETY: the SDK's sender creation returns null or a fresh sender
         // that nothing else owns, and the settings outlive the call.
         unsafe {
-            Self::create(
-                ndi,
-                options,
-                #[cfg(feature = "advanced")]
-                None,
-                |core, raw| core.named().NDIlib_send_create(raw),
-            )
+            Self::create(ndi, options, |core, raw| {
+                crate::runtime::NativeCreation::plain(core.named().NDIlib_send_create(raw))
+            })
         }
     }
 
@@ -1550,16 +1553,15 @@ impl<M: SenderMode> Sender<M> {
     pub(crate) unsafe fn create(
         ndi: &Ndi,
         options: &SenderOptions,
-        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
             &sys::Core,
             &NDIlib_send_create_t,
-        ) -> sys::table::Called<NDIlib_send_instance_t>,
+        ) -> crate::runtime::NativeCreation<NDIlib_send_instance_t>,
     ) -> Result<Self> {
         let name = CString::new(options.name.as_str())?;
         let groups = crate::list_setting::list_cstring(options.groups.as_deref(), "groups")?;
         let core = ndi.bind_core();
-        let instance = create(
+        let created = create(
             &core,
             &NDIlib_send_create_t {
                 p_ndi_name: name.as_ptr(),
@@ -1567,9 +1569,8 @@ impl<M: SenderMode> Sender<M> {
                 clock_video: options.clock_video,
                 clock_audio: options.clock_audio,
             },
-        )
-        .created()?
-        .as_ptr();
+        );
+        let instance = created.call.created()?.as_ptr();
         let instance = SendInstance(instance);
         Ok(Self {
             inner: Inner {
@@ -1583,7 +1584,7 @@ impl<M: SenderMode> Sender<M> {
                 name,
                 groups,
                 #[cfg(feature = "advanced")]
-                config,
+                created.config,
                 core,
             )),
             _mode: PhantomData,
