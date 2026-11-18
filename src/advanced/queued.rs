@@ -167,7 +167,7 @@ impl QueuedVideoFrame {
         sender: &Sender<QueueAttached>,
     ) -> std::result::Result<QueuedStorage, Rejected<Self>> {
         self.authorize_with(
-            |frame| sender.require_video_layout(frame),
+            |frame| Sendable::new(frame, sender.runtime()),
             |frame| ScatterSendable::checked(frame, sender.runtime()),
         )
     }
