@@ -39,8 +39,8 @@ use common::TestChild;
 
 use grafton_ndi::{
     AudioFrame, AudioSource, Error, FrameRate, FrameSync, FrameSyncAudioRequest, MetadataFrame,
-    Ndi, PixelFormat, Receiver, ReceiverItemRef, ReceiverMode, ReceiverOptions, ScanType, Sender,
-    SenderOptions, Source, Timecode, VideoFrame, VideoSource,
+    Ndi, PixelFormat, ReceiveDelay, Receiver, ReceiverItemRef, ReceiverMode, ReceiverOptions,
+    ScanType, Sender, SenderOptions, Source, Timecode, VideoFrame, VideoSource,
 };
 use std::{
     sync::{
@@ -525,9 +525,10 @@ fn shared_controls<M: ReceiverMode>(receiver: &Receiver<M>, kind: usize, round: 
             control_result(receiver.connection_stats());
             let _ = receiver.is_connected();
             // Older runtimes may lack the delay or keyframe families entirely.
+            let delay = ReceiveDelay::new(Duration::from_millis(round % 2)).unwrap();
             for result in [
-                receiver.set_video_delay(Duration::from_millis(round % 2)),
-                receiver.set_audio_delay(Duration::from_millis(round % 2)),
+                receiver.set_video_delay(delay),
+                receiver.set_audio_delay(delay),
             ] {
                 if !matches!(result, Err(Error::UnsupportedCapability { .. })) {
                     control_result(result);

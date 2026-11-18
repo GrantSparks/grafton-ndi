@@ -34,9 +34,9 @@ use grafton_ndi::{
     advanced::*,
     capabilities::{CapabilityStatus, RuntimeFeature, SdkEdition},
     AudioFrame, Error, Finder, FinderOptions, FrameRate, MediaTypes, MetadataFrame, Ndi,
-    PictureAspectRatio, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverMode,
-    ReceiverOptions, ScanType, Sender, SenderMode, SenderOptions, SettingChange, Source,
-    SourceCache, StreamTier, Tally, Timecode, VideoFrame, VideoFrameRef,
+    PictureAspectRatio, ReceiveDelay, Receiver, ReceiverBandwidth, ReceiverColorFormat,
+    ReceiverMode, ReceiverOptions, ScanType, Sender, SenderMode, SenderOptions, SettingChange,
+    Source, SourceCache, StreamTier, Tally, Timecode, VideoFrame, VideoFrameRef,
 };
 use std::{
     alloc::{alloc_zeroed, dealloc, Layout},
@@ -140,6 +140,22 @@ fn advanced_native_constructors_controls_and_queue() {
     {
         let session = receiver.kvm().unwrap();
         let _ = session.is_supported();
+        let view = session.receiver();
+        if ndi.capabilities().supports(RuntimeFeature::ReceiveDelay) {
+            let delay = ReceiveDelay::new(Duration::from_millis(1)).unwrap();
+            view.set_video_delay(delay).unwrap();
+            assert_eq!(view.video_delay().unwrap(), delay);
+            view.set_audio_delay(delay).unwrap();
+            assert_eq!(view.audio_delay().unwrap(), delay);
+        } else {
+            assert!(matches!(
+                view.video_delay(),
+                Err(Error::UnsupportedCapability {
+                    capability: grafton_ndi::Capability::Runtime(RuntimeFeature::ReceiveDelay),
+                    ..
+                })
+            ));
+        }
     }
     {
         // Nothing is connected, so the SDK sends no KVM message, and the

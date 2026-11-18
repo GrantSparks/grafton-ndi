@@ -148,9 +148,9 @@ pub use {
     },
     receiver::{
         AudioMode, ConnectionStats, EventMode, FrameSyncAttached, MetadataMode, Ptz, RawCapture,
-        Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverEvent, ReceiverItem,
-        ReceiverItemRef, ReceiverMode, ReceiverOptions, ReceiverStatus, SettingChange,
-        SourceNameChange, Tally, VideoMode,
+        ReceiveDelay, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverEvent,
+        ReceiverItem, ReceiverItemRef, ReceiverMode, ReceiverOptions, ReceiverStatus,
+        SettingChange, SourceNameChange, Tally, VideoMode,
     },
     runtime::{Ndi, ProcessLifetimeRuntime, Runtime, RuntimeOptions},
     sender::{AudioSendMode, RawSend, RawVideo, Sender, SenderMode, SenderOptions},

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use grafton_ndi::{
     advanced::{AllocatedReceiver, KvmReceiver, MouseButton, PacketAttached, PacketReceiver},
-    AudioMode, EventMode, MetadataFrame, MetadataMode, Receiver, ReceiverMode, Source, Tally,
+    AudioMode, EventMode, MetadataFrame, MetadataMode, ReceiveDelay, Receiver, ReceiverMode, Source, Tally,
     VideoMode,
 };
 
@@ -57,9 +57,9 @@ fn controls<M: ReceiverMode>(receiver: KvmReceiver<'_, M>) {
     let _ = receiver.connection_target();
     let _ = receiver.connection_stats().unwrap();
     let _ = receiver.request_keyframe();
-    let _ = receiver.set_video_delay(Duration::ZERO);
+    let _ = receiver.set_video_delay(ReceiveDelay::ZERO);
     let _ = receiver.video_delay();
-    let _ = receiver.set_audio_delay(Duration::ZERO);
+    let _ = receiver.set_audio_delay(ReceiveDelay::ZERO);
     let _ = receiver.audio_delay();
 }
 

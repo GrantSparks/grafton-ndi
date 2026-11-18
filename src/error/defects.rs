@@ -630,7 +630,7 @@ pub enum InputDefect {
         requested: DiagnosticDuration,
     },
     /// receive delay {requested:?} exceeds 2000 ms.
-    #[error("receive delay {requested:?} exceeds 2000 ms")]
+    #[error("receive delay {requested:?} exceeds {} ms", crate::ReceiveDelay::MAX.to_sdk())]
     ReceiveDelayTooLong {
         /// The requested.
         requested: DiagnosticDuration,

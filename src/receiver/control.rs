@@ -47,6 +47,41 @@ impl ReceiverCore {
             Err(mut control) => control.state.pending_tally = Some(tally),
         }
     }
+
+    pub(super) fn set_delay(
+        &self,
+        stream: ReceiveDelayStream,
+        delay: ReceiveDelay,
+    ) -> Result<SettingChange> {
+        let table = self.ndi().table::<sys::ReceiveDelay>()?;
+        let control = self.lock_control();
+        // SAFETY: the live receiver and permit cover this call. See the
+        // RecvInstance inventory for the delay state and connection locks.
+        let changed = unsafe {
+            match stream {
+                ReceiveDelayStream::Video => {
+                    table.NDIlib_recv_set_video_delay(control.instance.0, delay.to_sdk())
+                }
+                ReceiveDelayStream::Audio => {
+                    table.NDIlib_recv_set_audio_delay(control.instance.0, delay.to_sdk())
+                }
+            }
+        };
+        Ok(SettingChange::from_sdk(changed))
+    }
+
+    pub(super) fn delay(&self, stream: ReceiveDelayStream) -> Result<ReceiveDelay> {
+        let table = self.ndi().table::<sys::ReceiveDelay>()?;
+        let control = self.lock_control();
+        // SAFETY: the permit covers access to the live receiver's delay state.
+        let millis = unsafe {
+            match stream {
+                ReceiveDelayStream::Video => table.NDIlib_recv_get_video_delay(control.instance.0),
+                ReceiveDelayStream::Audio => table.NDIlib_recv_get_audio_delay(control.instance.0),
+            }
+        };
+        ReceiveDelay::from_sdk(millis)
+    }
 }
 
 impl ConnectionChange<'_> {
@@ -77,28 +112,6 @@ impl<'a> Control<'a> {
             // clears its receiver-owned list independently of connection state.
             unsafe { table.NDIlib_recv_clear_connection_metadata(self.instance.0) };
         });
-    }
-
-    pub(super) fn set_video_delay(&self, table: &sys::ReceiveDelay, millis: i32) -> bool {
-        // SAFETY: the live receiver and permit cover this call. See the
-        // RecvInstance inventory for the delay state and connection locks.
-        unsafe { table.NDIlib_recv_set_video_delay(self.instance.0, millis) }
-    }
-
-    pub(super) fn set_audio_delay(&self, table: &sys::ReceiveDelay, millis: i32) -> bool {
-        // SAFETY: the live receiver and permit cover this call. See the
-        // RecvInstance inventory for the delay state and connection locks.
-        unsafe { table.NDIlib_recv_set_audio_delay(self.instance.0, millis) }
-    }
-
-    pub(super) fn video_delay(&self, table: &sys::ReceiveDelay) -> i32 {
-        // SAFETY: the permit covers access to the live receiver's delay state.
-        unsafe { table.NDIlib_recv_get_video_delay(self.instance.0) }
-    }
-
-    pub(super) fn audio_delay(&self, table: &sys::ReceiveDelay) -> i32 {
-        // SAFETY: the permit covers access to the live receiver's delay state.
-        unsafe { table.NDIlib_recv_get_audio_delay(self.instance.0) }
     }
 
     pub(super) fn web_control(

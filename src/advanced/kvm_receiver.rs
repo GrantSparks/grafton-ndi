@@ -5,9 +5,9 @@ use std::time::Duration;
 use super::{PacketAttached, PacketItem, PacketItemRef, PacketReceiver};
 
 use crate::{
-    AudioMode, ConnectionStats, EventMode, MetadataMode, MetadataSource, Ptz, RawCapture, Receiver,
-    ReceiverEvent, ReceiverItem, ReceiverItemRef, ReceiverMode, Result, SettingChange, Source,
-    SourceNameChange, Tally, VideoMode,
+    AudioMode, ConnectionStats, EventMode, MetadataMode, MetadataSource, Ptz, RawCapture,
+    ReceiveDelay, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef, ReceiverMode, Result,
+    SettingChange, Source, SourceNameChange, Tally, VideoMode,
 };
 
 /// Restricted receiver access lent by [`super::KvmSession::receiver`].
@@ -48,7 +48,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     ///
     /// As for [`Receiver::set_video_delay`].
     #[doc(alias = "NDIlib_recv_set_video_delay")]
-    pub fn set_video_delay(&self, delay: Duration) -> Result<SettingChange> {
+    pub fn set_video_delay(&self, delay: ReceiveDelay) -> Result<SettingChange> {
         self.receiver.set_video_delay(delay)
     }
 
@@ -58,7 +58,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     ///
     /// As for [`Receiver::video_delay`].
     #[doc(alias = "NDIlib_recv_get_video_delay")]
-    pub fn video_delay(&self) -> Result<Duration> {
+    pub fn video_delay(&self) -> Result<ReceiveDelay> {
         self.receiver.video_delay()
     }
 
@@ -68,7 +68,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     ///
     /// As for [`Receiver::set_audio_delay`].
     #[doc(alias = "NDIlib_recv_set_audio_delay")]
-    pub fn set_audio_delay(&self, delay: Duration) -> Result<SettingChange> {
+    pub fn set_audio_delay(&self, delay: ReceiveDelay) -> Result<SettingChange> {
         self.receiver.set_audio_delay(delay)
     }
 
@@ -78,7 +78,7 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
     ///
     /// As for [`Receiver::audio_delay`].
     #[doc(alias = "NDIlib_recv_get_audio_delay")]
-    pub fn audio_delay(&self) -> Result<Duration> {
+    pub fn audio_delay(&self) -> Result<ReceiveDelay> {
         self.receiver.audio_delay()
     }
 

@@ -131,23 +131,58 @@ impl Drop for RecvStringGuard<'_> {
     }
 }
 
-/// The longest receive delay, in milliseconds, that a receiver sets or
-/// accepts from the SDK, for video and audio alike.
-///
-/// The NDI SDK documentation of receiver video and audio delay clamps both
-/// to 0 through 2000 ms; a longer delay is refused here rather than clamped.
-const MAX_RECEIVE_DELAY_MILLIS: u32 = 2000;
+/// A receiver's native video or audio buffering delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReceiveDelay(i32);
 
-/// Convert a delay the SDK reported, rejecting values outside
-/// 0..=[`MAX_RECEIVE_DELAY_MILLIS`].
-fn receiver_delay(millis: i32) -> Result<Duration> {
-    u32::try_from(millis)
-        .ok()
-        .filter(|millis| *millis <= MAX_RECEIVE_DELAY_MILLIS)
-        .map(|millis| Duration::from_millis(millis.into()))
-        .ok_or({
-            Error::UnexpectedSdkResult(crate::SdkResultDefect::InvalidReceiveDelay { millis })
-        })
+impl ReceiveDelay {
+    /// No additional buffering.
+    pub const ZERO: Self = Self(0);
+
+    /// The largest delay supported by the SDK.
+    pub const MAX: Self = Self(2000);
+
+    /// Round positive fractional milliseconds up to the next millisecond.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] when the rounded delay exceeds
+    /// [`Self::MAX`].
+    pub fn new(delay: Duration) -> Result<Self> {
+        timeout::sdk_millis(delay)
+            .and_then(|millis| Self::checked(i64::from(millis)))
+            .ok_or(Error::InvalidInput(
+                crate::InputDefect::ReceiveDelayTooLong {
+                    requested: delay.into(),
+                },
+            ))
+    }
+
+    /// The validated delay at the SDK's millisecond precision.
+    pub const fn duration(self) -> Duration {
+        Duration::from_millis(self.0 as u64)
+    }
+
+    pub(crate) const fn to_sdk(self) -> i32 {
+        self.0
+    }
+
+    pub(crate) fn from_sdk(millis: i32) -> Result<Self> {
+        Self::checked(i64::from(millis)).ok_or(Error::UnexpectedSdkResult(
+            crate::SdkResultDefect::InvalidReceiveDelay { millis },
+        ))
+    }
+
+    fn checked(millis: i64) -> Option<Self> {
+        (0..=i64::from(Self::MAX.0))
+            .contains(&millis)
+            .then_some(Self(millis as i32))
+    }
+}
+
+enum ReceiveDelayStream {
+    Video,
+    Audio,
 }
 
 /// A consumable report carries its publication order across an async worker.
@@ -380,20 +415,6 @@ impl PendingStatus {
             .ok()
             .map(|_| status))
     }
-}
-
-/// The SDK's millisecond count for a receive delay, rounded up by the one
-/// timeout rule, [`timeout::sdk_millis`], and refused above
-/// [`MAX_RECEIVE_DELAY_MILLIS`].
-fn receiver_delay_millis(delay: Duration) -> Result<i32> {
-    timeout::sdk_millis(delay)
-        .filter(|millis| *millis <= MAX_RECEIVE_DELAY_MILLIS)
-        .and_then(|millis| i32::try_from(millis).ok())
-        .ok_or({
-            Error::InvalidInput(crate::InputDefect::ReceiveDelayTooLong {
-                requested: delay.into(),
-            })
-        })
 }
 
 /// The pause after an attempt that returned before its own end without a
@@ -1762,24 +1783,19 @@ impl<M: ReceiverMode> Receiver<M> {
         )
     }
 
-    /// Set native video buffering, in the range zero through two seconds.
+    /// Set native video buffering.
     ///
-    /// Positive fractional milliseconds round up. Values above two seconds are
-    /// rejected instead of silently clamped. [`SettingChange::Unchanged`]
-    /// means the delay already had this value. Delay is independent of audio
+    /// [`SettingChange::Unchanged`] means the delay already had this value.
+    /// Delay is independent of audio
     /// buffering and stacks with FrameSync correction.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] for a delay above two seconds, and
     /// [`Error::UnsupportedCapability`] without
     /// [`RuntimeFeature::ReceiveDelay`](crate::RuntimeFeature::ReceiveDelay).
     #[doc(alias = "NDIlib_recv_set_video_delay")]
-    pub fn set_video_delay(&self, delay: Duration) -> Result<SettingChange> {
-        let millis = receiver_delay_millis(delay)?;
-        let table = self.core.delay()?;
-        let changed = self.core.lock_control().set_video_delay(table, millis);
-        Ok(SettingChange::from_sdk(changed))
+    pub fn set_video_delay(&self, delay: ReceiveDelay) -> Result<SettingChange> {
+        self.core.set_delay(ReceiveDelayStream::Video, delay)
     }
 
     /// Return the effective native video delay. Requires receiver-delay support.
@@ -1790,12 +1806,11 @@ impl<M: ReceiverMode> Receiver<M> {
     /// [`RuntimeFeature::ReceiveDelay`](crate::RuntimeFeature::ReceiveDelay), and [`Error::UnexpectedSdkResult`]
     /// when the SDK reports a delay outside 0 to 2000 ms.
     #[doc(alias = "NDIlib_recv_get_video_delay")]
-    pub fn video_delay(&self) -> Result<Duration> {
-        let table = self.core.delay()?;
-        receiver_delay(self.core.lock_control().video_delay(table))
+    pub fn video_delay(&self) -> Result<ReceiveDelay> {
+        self.core.delay(ReceiveDelayStream::Video)
     }
 
-    /// Set native audio buffering with the same rounding/range as [`Self::set_video_delay`].
+    /// Set native audio buffering independently of [`Self::set_video_delay`].
     ///
     /// Equal audio and video delays preserve their relative timing; different
     /// values deliberately offset the streams.
@@ -1804,11 +1819,8 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// As for [`Self::set_video_delay`].
     #[doc(alias = "NDIlib_recv_set_audio_delay")]
-    pub fn set_audio_delay(&self, delay: Duration) -> Result<SettingChange> {
-        let millis = receiver_delay_millis(delay)?;
-        let table = self.core.delay()?;
-        let changed = self.core.lock_control().set_audio_delay(table, millis);
-        Ok(SettingChange::from_sdk(changed))
+    pub fn set_audio_delay(&self, delay: ReceiveDelay) -> Result<SettingChange> {
+        self.core.set_delay(ReceiveDelayStream::Audio, delay)
     }
 
     /// Return the effective native audio delay. Requires receiver-delay support.
@@ -1817,9 +1829,8 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// As for [`Self::video_delay`].
     #[doc(alias = "NDIlib_recv_get_audio_delay")]
-    pub fn audio_delay(&self) -> Result<Duration> {
-        let table = self.core.delay()?;
-        receiver_delay(self.core.lock_control().audio_delay(table))
+    pub fn audio_delay(&self) -> Result<ReceiveDelay> {
+        self.core.delay(ReceiveDelayStream::Audio)
     }
 
     /// Add validated metadata sent immediately and again on each connection.
@@ -2186,10 +2197,6 @@ impl ReceiverCore {
             return table;
         }
         &self.sdk
-    }
-
-    fn delay(&self) -> Result<&sys::ReceiveDelay> {
-        self.ndi().table()
     }
 
     fn connection_metadata(&self) -> Result<&sys::ReceiverConnectionMetadata> {
@@ -3217,19 +3224,29 @@ mod tests {
             (Duration::from_nanos(1_999_999_999), 2000),
             (Duration::from_secs(2), 2000),
         ] {
-            assert_eq!(receiver_delay_millis(duration).unwrap(), millis);
+            let delay = ReceiveDelay::new(duration).unwrap();
+            assert_eq!(delay.to_sdk(), millis);
+            assert_eq!(delay.duration(), Duration::from_millis(millis as u64));
+            assert_eq!(ReceiveDelay::from_sdk(delay.to_sdk()).unwrap(), delay);
         }
-        assert!(receiver_delay_millis(Duration::from_secs(2) + Duration::from_nanos(1)).is_err());
-        assert!(receiver_delay_millis(Duration::MAX).is_err());
-        // Both directions share one bound: what may be set may be reported.
+        for too_long in [
+            ReceiveDelay::MAX.duration() + Duration::from_nanos(1),
+            Duration::MAX,
+        ] {
+            assert!(matches!(
+                ReceiveDelay::new(too_long),
+                Err(Error::InvalidInput(
+                    crate::InputDefect::ReceiveDelayTooLong { .. }
+                ))
+            ));
+        }
         for millis in [0, 1, 1999, 2000] {
-            let delay = receiver_delay(millis).unwrap();
-            assert_eq!(receiver_delay_millis(delay).unwrap(), millis);
+            assert_eq!(ReceiveDelay::from_sdk(millis).unwrap().to_sdk(), millis);
         }
         for millis in [-1, 2001, i32::MIN, i32::MAX] {
             assert!(matches!(
-                receiver_delay(millis),
-                Err(Error::UnexpectedSdkResult(_))
+                ReceiveDelay::from_sdk(millis),
+                Err(Error::UnexpectedSdkResult(crate::SdkResultDefect::InvalidReceiveDelay { millis: reported })) if reported == millis
             ));
         }
     }
@@ -3305,31 +3322,39 @@ mod tests {
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         if ndi.require_feature(RuntimeFeature::ReceiveDelay).is_ok() {
-            assert_eq!(receiver.video_delay().unwrap(), Duration::ZERO);
-            assert_eq!(receiver.audio_delay().unwrap(), Duration::ZERO);
+            assert_eq!(receiver.video_delay().unwrap(), ReceiveDelay::ZERO);
+            assert_eq!(receiver.audio_delay().unwrap(), ReceiveDelay::ZERO);
             use SettingChange::{Applied, Unchanged};
-            assert_eq!(receiver.set_video_delay(Duration::ZERO).unwrap(), Unchanged);
             assert_eq!(
-                receiver.set_video_delay(Duration::from_nanos(1)).unwrap(),
-                Applied
-            );
-            assert_eq!(receiver.video_delay().unwrap(), Duration::from_millis(1));
-            assert_eq!(
-                receiver.set_video_delay(Duration::from_millis(1)).unwrap(),
+                receiver.set_video_delay(ReceiveDelay::ZERO).unwrap(),
                 Unchanged
             );
-            assert_eq!(receiver.audio_delay().unwrap(), Duration::ZERO);
             assert_eq!(
-                receiver.set_audio_delay(Duration::from_secs(2)).unwrap(),
+                receiver
+                    .set_video_delay(ReceiveDelay::new(Duration::from_nanos(1)).unwrap())
+                    .unwrap(),
                 Applied
             );
-            assert_eq!(receiver.audio_delay().unwrap(), Duration::from_secs(2));
             assert_eq!(
-                receiver.set_audio_delay(Duration::from_secs(2)).unwrap(),
+                receiver.video_delay().unwrap(),
+                ReceiveDelay::new(Duration::from_millis(1)).unwrap()
+            );
+            assert_eq!(
+                receiver
+                    .set_video_delay(ReceiveDelay::new(Duration::from_millis(1)).unwrap())
+                    .unwrap(),
                 Unchanged
             );
-            assert!(receiver.set_audio_delay(Duration::from_secs(3)).is_err());
-            assert_eq!(receiver.audio_delay().unwrap(), Duration::from_secs(2));
+            assert_eq!(receiver.audio_delay().unwrap(), ReceiveDelay::ZERO);
+            assert_eq!(
+                receiver.set_audio_delay(ReceiveDelay::MAX).unwrap(),
+                Applied
+            );
+            assert_eq!(receiver.audio_delay().unwrap(), ReceiveDelay::MAX);
+            assert_eq!(
+                receiver.set_audio_delay(ReceiveDelay::MAX).unwrap(),
+                Unchanged
+            );
         } else {
             assert!(matches!(
                 receiver.video_delay(),
@@ -3340,11 +3365,11 @@ mod tests {
                 Err(Error::UnsupportedCapability { .. })
             ));
             assert!(matches!(
-                receiver.set_video_delay(Duration::ZERO),
+                receiver.set_video_delay(ReceiveDelay::ZERO),
                 Err(Error::UnsupportedCapability { .. })
             ));
             assert!(matches!(
-                receiver.set_audio_delay(Duration::ZERO),
+                receiver.set_audio_delay(ReceiveDelay::ZERO),
                 Err(Error::UnsupportedCapability { .. })
             ));
         }
