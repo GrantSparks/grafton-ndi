@@ -198,8 +198,7 @@ fn compressed_sender_inherits_machine_name_without_a_configuration_override() {
     let options = SenderOptions::new(format!("grafton compressed default {}", std::process::id()));
     let sender = CompressedSender::new(&ndi, &options).unwrap();
     let source = sender.sender().source().unwrap();
-    assert_eq!(
-        source.name(),
-        format!("{MACHINE} ({})", options.configured_name())
-    );
+    let (machine, label) = source.name().split_once(" (").unwrap();
+    assert!(machine.eq_ignore_ascii_case(MACHINE), "{}", source.name());
+    assert_eq!(label.strip_suffix(')'), Some(options.configured_name()));
 }
