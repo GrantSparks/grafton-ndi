@@ -211,6 +211,7 @@ FILTER_SELECTIONS = {
         'framesync::tests::test_framesync_audio_ref_supports',
         'advanced::sync::tests::returned_audio_is_released',
         'advanced::sync::tests::borrowed_avsync_audio',
+        'advanced::packets::tests::envelope_slices_keep_admitted_extents_after_native_header_writes',
     ),
     'miri-ownership': (
         'finder::cache_retirement_tests::retirement_',
