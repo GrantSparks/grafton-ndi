@@ -61,9 +61,9 @@ their default density behavior. This correction changes encoded bytes and
 aspect-aware rendering for affected thumbnails. WebP carries no pixel-shape
 tag; callers needing its display aspect retain `picture_aspect_ratio()` separately.
 
-Both density components are positive integers no larger than 65,535. Ordinary
-ratios are approximated to that precision; extreme ratios clamp to the nearest
-representable endpoint. No resampling to square pixels is performed.
+Both density components are positive integers no larger than 65,535. The
+encoder uses the pair whose vertical-to-horizontal density ratio is closest
+to the required pixel aspect. Extreme ratios clamp to the nearest endpoint.
 
 ## Formats
 

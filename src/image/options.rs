@@ -206,8 +206,9 @@ image_format_variants!(
 /// width/height ratio. Pixel dimensions and samples are unchanged. Outputs
 /// needing square pixels retain their default density behavior; equivalent
 /// implicit and explicit square-pixel sources produce identical bytes. Viewers
-/// may ignore these tags. WebP carries no pixel-shape tag. Extreme ratios use
-/// the nearest positive u16 density pair.
+/// may ignore these tags. WebP carries no pixel-shape tag. PNG and JPEG choose
+/// the positive `u16` density pair whose vertical-to-horizontal ratio is closest
+/// to the required pixel aspect.
 ///
 /// # Formats
 ///

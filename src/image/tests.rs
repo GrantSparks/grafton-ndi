@@ -3512,6 +3512,119 @@ fn density_resolution_is_allocation_free_and_preserves_square_source_tolerance()
 }
 
 #[test]
+fn nearest_density_matches_a_full_denominator_scan() {
+    let max = f64::from(u16::MAX);
+    let low = (max - 2.0) / (max - 1.0);
+    let high = (max - 1.0) / max;
+    let midpoint = (low + high) / 2.0;
+    let below = f64::from_bits(midpoint.to_bits() - 1);
+    let above = f64::from_bits(midpoint.to_bits() + 1);
+    for (aspect, expected) in [
+        (below, (u16::MAX - 1, u16::MAX - 2)),
+        (above, (u16::MAX, u16::MAX - 1)),
+    ] {
+        let density = super::PixelDensity::nearest(aspect);
+        assert_eq!((density.x, density.y), expected);
+    }
+    let fixed = [
+        f64::from(f32::MIN_POSITIVE),
+        max.recip(),
+        f64::from_bits(max.recip().to_bits() + 1),
+        (max - 0.5).recip(),
+        (max - 1.0).recip(),
+        0.3,
+        below,
+        midpoint,
+        above,
+        1.0 - f64::EPSILON,
+        1.0,
+        1.0 + f64::EPSILON,
+        std::f64::consts::PI,
+        40_000.0,
+        45_000.0,
+        max - 0.500_001,
+        max - 0.5,
+        max - 0.499_999,
+        max,
+        f64::from(f32::MAX),
+    ];
+    let mut state = 0x531u32;
+    let mut coordinate = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        f64::from((state >> 16).max(1))
+    };
+    let generated = (0..96).map(|i| {
+        let numerator = coordinate() + [0.0, 0.499, 0.501][i % 3];
+        let denominator = match i % 4 {
+            0 => 1.0,
+            1 => 2.0,
+            _ => coordinate(),
+        };
+        if i % 2 == 0 {
+            numerator / denominator
+        } else {
+            denominator / numerator
+        }
+    });
+    for aspect in fixed.into_iter().chain(generated) {
+        let density = super::PixelDensity::nearest(aspect);
+        assert!(density.x > 0 && density.y > 0);
+        let error = (f64::from(density.y) / f64::from(density.x) - aspect).abs();
+        let best = (1..=u16::MAX).fold(f64::INFINITY, |best, x| {
+            let x = f64::from(x);
+            let y = (aspect * x).round().clamp(1.0, max);
+            best.min((y / x - aspect).abs())
+        });
+        // The scan rounds its multiplication and division independently.
+        assert!(
+            error <= best + aspect * f64::EPSILON,
+            "{aspect}: {density:?} has error {error}, scan found {best}"
+        );
+    }
+}
+
+#[test]
+fn png_and_jpeg_write_reduced_density_pairs_without_changing_pixels() {
+    let mut frame = VideoFrame::builder()
+        .resolution(2, 2)
+        .pixel_format(PixelFormat::Bgra)
+        .data(any_frame_bytes(PixelFormat::Bgra, 2, 2, 0x531))
+        .build()
+        .unwrap();
+    let max = u32::from(u16::MAX);
+    for format in [ImageFormat::Png, ImageFormat::Jpeg(85)] {
+        frame.set_picture_aspect_ratio(crate::PictureAspectRatio::SQUARE_PIXELS);
+        let options = options(format);
+        let reference = decode_density_image(format, &frame.encode_image(&options).unwrap());
+        for (aspect, expected) in [
+            (0.5, (2, 1)),
+            (2.0, (1, 2)),
+            (40_000.0, (1, 40_000)),
+            (45_000.0, (1, 45_000)),
+            (f32::MIN_POSITIVE, (max, 1)),
+            (f32::MAX, (1, max)),
+        ] {
+            frame.set_picture_aspect_ratio(crate::PictureAspectRatio::new(aspect).unwrap());
+            let encoded = frame.encode_image(&options).unwrap();
+            assert_eq!(image_density(format, &encoded), ((2, 2), expected));
+            assert_eq!(decode_density_image(format, &encoded), reference);
+        }
+    }
+}
+
+#[test]
+fn square_pixel_sentinel_writes_exact_density_for_odd_reduced_shapes() {
+    let frame = VideoFrame::builder().resolution(6, 10).build().unwrap();
+    for format in [ImageFormat::Png, ImageFormat::Jpeg(85)] {
+        let encoded = frame
+            .encode_image(&options(format).downscale(Downscale::Quarter))
+            .unwrap();
+        // The 6:10 display aspect and 2:3 output shape require pixels at 9:10.
+        assert_eq!(image_density(format, &encoded), ((2, 3), (10, 9)));
+    }
+}
+
+#[test]
 fn square_pixel_encodes_stay_identical_and_extreme_aspects_remain_positive() {
     for pixel_format in PixelFormat::ALL {
         let base = VideoFrame::builder()
