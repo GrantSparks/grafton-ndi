@@ -194,7 +194,10 @@ fn metadata_probe_compares_reconnect_transitions() -> Result<(), grafton_ndi::Er
         trials[mode] += 1;
         let sender = Sender::new(
             &ndi,
-            &SenderOptions::new(common::unique_name("metadata reconnect probe")).clock_video(false),
+            &SenderOptions::new(common::unique_name(&format!(
+                "metadata reconnect probe {round}"
+            )))
+            .clock_video(false),
         )?;
         let receiver = Receiver::new(
             &ndi,
@@ -208,7 +211,7 @@ fn metadata_probe_compares_reconnect_transitions() -> Result<(), grafton_ndi::Er
         let video = VideoFrame::builder().resolution(16, 16).build()?;
         receiver.connect_to(&target);
         let mut observed_zero = None;
-        for stage in 0..2 {
+        for stage in 0..=3 {
             let now = Instant::now();
             let mut pictures = 0;
             let mut unexpected = 0;
@@ -247,10 +250,11 @@ fn metadata_probe_compares_reconnect_transitions() -> Result<(), grafton_ndi::Er
                 misses[mode] += 1;
                 break;
             }
-            if stage == 0 {
+            if stage < 3 {
                 while sender.capture_metadata(Duration::ZERO)?.is_some() {}
                 receiver.disconnect();
                 if observe_disconnect {
+                    observed_zero = None;
                     let since = Instant::now();
                     while since.elapsed() < Duration::from_secs(5) {
                         if sender.connection_count()? == 0

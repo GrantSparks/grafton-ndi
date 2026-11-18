@@ -69,21 +69,32 @@ jobs:
           python ci/sdk.py install 6.3.2-standard-windows --dest "$RUNNER_TEMP/ndi-runtime" --target "$TARGET" --github-env "$GITHUB_ENV"
           grep '^NDI_SDK_DIR=' "$RUNNER_TEMP/headers.env" >> "$GITHUB_ENV"
           echo 'GRAFTON_NDI_REQUIRE_RUNTIME=1' >> "$GITHUB_ENV"
-      - name: Repeat the Windows metadata test with its original test neighbor
+      - name: Run the metadata sequence directly against the native SDK
+        shell: pwsh
         run: |
-          cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features --test metadata_roundtrip --no-run
-          misses=0
-          for attempt in {1..40}; do
-            if cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features --test metadata_roundtrip -- --skip metadata_probe_compares_reconnect_transitions > "$RUNNER_TEMP/metadata-probe-baseline.log" 2>&1; then
-              echo "Baseline attempt $attempt passed"
-            else
-              echo "Baseline attempt $attempt failed"
-              cat "$RUNNER_TEMP/metadata-probe-baseline.log"
-              misses=$((misses + 1))
-              if [ "$misses" -ge 3 ]; then break; fi
-            fi
-          done
-          echo "Baseline: $misses failures in $attempt attempts"
+          $sdk = Split-Path (Split-Path $env:NDI_RUNTIME_DIR_V6 -Parent) -Parent
+          $include = Get-ChildItem -LiteralPath $sdk -Recurse -Filter Processing.NDI.Lib.h | Select-Object -First 1
+          $library = Get-ChildItem -LiteralPath $sdk -Recurse -Filter Processing.NDI.Lib.x64.lib | Select-Object -First 1
+          if (!$include -or !$library) { throw 'Native C SDK files are unavailable' }
+          $installer = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $visualStudio = & $installer -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $env:NDI_PROBE_VCVARS = Join-Path $visualStudio 'VC/Auxiliary/Build/vcvars64.bat'
+          $env:NDI_PROBE_INCLUDE = $include.Directory.FullName
+          $env:NDI_PROBE_LIB = $library.FullName
+          $script = Join-Path $env:RUNNER_TEMP 'metadata-probe.cmd'
+          @'
+          @echo off
+          call "%NDI_PROBE_VCVARS%"
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c11 /W4 /I"%NDI_PROBE_INCLUDE%" ci\metadata_native_probe.c "%NDI_PROBE_LIB%" /Fe:"%RUNNER_TEMP%\metadata-probe.exe"
+          if errorlevel 1 exit /b 1
+          set "PATH=%NDI_RUNTIME_DIR_V6%;%PATH%"
+          "%RUNNER_TEMP%\metadata-probe.exe" unique 12 3
+          if errorlevel 1 exit /b 1
+          "%RUNNER_TEMP%\metadata-probe.exe" reuse 12 1
+          '@ | Set-Content -LiteralPath $script -Encoding ascii
+          & cmd.exe /d /c $script
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Compare immediate and observed disconnects
         if: ${{ !cancelled() }}
         run: cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features --test metadata_roundtrip -- --ignored --exact metadata_probe_compares_reconnect_transitions --nocapture
