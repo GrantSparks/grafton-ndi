@@ -97,13 +97,6 @@ impl<'a> MetadataText<'a> {
         // frames asserts that the cap is smaller than i32::MAX.
         self.with_nul.len() as i32
     }
-
-    /// Complete the UTF-8 check after bounded_sdk_text has established the
-    /// cap and the sole terminal NUL. Used only after that bounded observation.
-    fn from_measured_bytes(bytes: &'a [u8]) -> Result<Self> {
-        let with_nul = str::from_utf8(bytes).map_err(Error::InvalidUtf8)?;
-        Ok(Self { with_nul })
-    }
 }
 
 impl fmt::Debug for MetadataText<'_> {
@@ -265,6 +258,38 @@ impl<'a> FrameMetadataRef<'a> {
     }
 }
 
+/// Classification shared by strict metadata and media with optional side text.
+enum MetadataClass<'a> {
+    Absent,
+    Text { bytes_with_nul: &'a str },
+    NotUtf8(str::Utf8Error),
+    Unterminated,
+}
+
+impl<'a> MetadataClass<'a> {
+    /// # Safety
+    ///
+    /// A non-null pointer must be readable through its first NUL or
+    /// `MAX_METADATA_BYTES`, whichever comes first, with the bytes it reads
+    /// live and unchanged for the returned borrow.
+    unsafe fn classify(pointer: *const c_char) -> Self {
+        if pointer.is_null() {
+            return Self::Absent;
+        }
+        // SAFETY: the caller provides the bounded readable extent.
+        let Some(payload) = (unsafe { bounded_sdk_text(pointer, MAX_METADATA_BYTES) }) else {
+            return Self::Unterminated;
+        };
+        // SAFETY: the scan observed the payload and terminal NUL within the
+        // bound. The caller keeps those initialized bytes live and unchanged.
+        let bytes = unsafe { slice::from_raw_parts(pointer.cast(), payload.len() + 1) };
+        match str::from_utf8(bytes) {
+            Ok(bytes_with_nul) => Self::Text { bytes_with_nul },
+            Err(error) => Self::NotUtf8(error),
+        }
+    }
+}
+
 /// Cached validation of one optional metadata pointer. Only readable text
 /// carries a length; the other states cannot accidentally reborrow bytes.
 #[derive(Debug, Clone, Copy)]
@@ -285,20 +310,15 @@ impl FrameMetadataState {
     /// A non-null pointer must be readable through its first NUL or the
     /// metadata cap, whichever comes first.
     pub(super) unsafe fn scan(pointer: *const c_char) -> Self {
-        if pointer.is_null() {
-            return Self(MetadataScan::Absent);
-        }
-        // SAFETY: the caller guarantees the bounded readable extent.
-        let Some(bytes) = (unsafe { bounded_sdk_text(pointer, MAX_METADATA_BYTES) }) else {
-            return Self(MetadataScan::Withheld(MetadataWithheld::Unterminated));
-        };
-        if str::from_utf8(bytes).is_ok() {
-            Self(MetadataScan::Text {
-                len_with_nul: bytes.len() + 1,
-            })
-        } else {
-            Self(MetadataScan::Withheld(MetadataWithheld::NotUtf8))
-        }
+        // SAFETY: the scan's caller supplies this family's readable extent.
+        Self(match unsafe { MetadataClass::classify(pointer) } {
+            MetadataClass::Absent => MetadataScan::Absent,
+            MetadataClass::Text { bytes_with_nul } => MetadataScan::Text {
+                len_with_nul: bytes_with_nul.len(),
+            },
+            MetadataClass::NotUtf8(_) => MetadataScan::Withheld(MetadataWithheld::NotUtf8),
+            MetadataClass::Unterminated => MetadataScan::Withheld(MetadataWithheld::Unterminated),
+        })
     }
 
     /// Cache text that was already validated, including standalone metadata.
@@ -555,19 +575,15 @@ impl OwnedFrameMetadata {
 pub(crate) unsafe fn validate_frame_metadata<'a>(
     p_metadata: *const c_char,
 ) -> Result<Option<MetadataText<'a>>> {
-    if p_metadata.is_null() {
-        return Ok(None);
-    }
-
     // SAFETY: forwarded to the caller's obligation for a non-null pointer.
-    let Some(payload) = (unsafe { bounded_sdk_text(p_metadata, MAX_METADATA_BYTES) }) else {
-        return Err(Error::InvalidFrame(
+    match unsafe { MetadataClass::classify(p_metadata) } {
+        MetadataClass::Absent => Ok(None),
+        MetadataClass::Text { bytes_with_nul } => Ok(Some(MetadataText {
+            with_nul: bytes_with_nul,
+        })),
+        MetadataClass::NotUtf8(error) => Err(Error::InvalidUtf8(error)),
+        MetadataClass::Unterminated => Err(Error::InvalidFrame(
             crate::FrameDefect::MetadataUnterminated,
-        ));
-    };
-    // SAFETY: the scan just read these bytes and the NUL after them, all
-    // within the cap, from the non-null `p_metadata`, which the caller keeps
-    // live and unchanged for `'a`; `u8` needs no alignment.
-    let bytes = unsafe { slice::from_raw_parts(p_metadata.cast::<u8>(), payload.len() + 1) };
-    MetadataText::from_measured_bytes(bytes).map(Some)
+        )),
+    }
 }

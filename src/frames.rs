@@ -7,8 +7,8 @@ use std::{ffi::CString, ptr, str};
 
 use crate::{
     capture::{
-        AudioKind, FrameFree, FrameSyncAudioFree, FrameSyncVideoFree, Guard, RecvAudioGuard,
-        RecvMetadataGuard, SenderMetadataFree, VideoKind,
+        AudioKind, FrameFree, FrameSyncAudioFree, FrameSyncVideoFree, Guard, RecvMetadataGuard,
+        SenderMetadataFree, VideoKind,
     },
     framesync::{AudioInputFormat, FrameSyncAudioRef, FrameSyncVideoRef},
     media::SdkQuantity,
@@ -3157,6 +3157,14 @@ pub struct AudioFrameRef<'rx> {
 }
 
 macro_rules! borrowed_audio_accessors {
+    (new $name:ident, $strategy:ty) => {
+        impl<'a> $name<'a> {
+            pub(crate) fn new(guard: Guard<'a, $strategy>) -> Result<Self> {
+                Ok(Self { inner: ValidatedAudio::validate(guard)? })
+            }
+        }
+        borrowed_audio_accessors!($name, $strategy);
+    };
     ($name:ident, $strategy:ty) => {
         // SAFETY: all parts borrow the one validated descriptor retained by
         // this wrapper's private core, with no change to storage or freeing.
@@ -3241,26 +3249,10 @@ macro_rules! borrowed_audio_accessors {
             }
     };
 }
-borrowed_audio_accessors!(AudioFrameRef, AudioKind);
-borrowed_audio_accessors!(FrameSyncAudioRef, FrameSyncAudioFree);
+borrowed_audio_accessors!(new AudioFrameRef, AudioKind);
+borrowed_audio_accessors!(new FrameSyncAudioRef, FrameSyncAudioFree);
 #[cfg(feature = "advanced")]
 borrowed_audio_accessors!(AvSyncAudioRef, AvSyncAudioFree);
-
-impl<'rx> AudioFrameRef<'rx> {
-    pub(crate) fn new(guard: RecvAudioGuard<'rx>) -> Result<Self> {
-        Ok(Self {
-            inner: ValidatedAudio::validate(guard)?,
-        })
-    }
-}
-
-impl<'fs> FrameSyncAudioRef<'fs> {
-    pub(crate) fn new(guard: Guard<'fs, FrameSyncAudioFree>) -> Result<Self> {
-        Ok(Self {
-            inner: ValidatedAudio::validate(guard)?,
-        })
-    }
-}
 
 #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_av_sync)))]
 impl<'a> AvSyncAudioRef<'a> {
@@ -5342,8 +5334,6 @@ mod tests {
     /// Test that AudioFrameRef::new rejects unknown FourCC
     #[test]
     fn test_audioframeref_unknown_fourcc() {
-        use crate::capture::RecvAudioGuard;
-
         let num_samples = 1024;
         let num_channels = 2;
         let sample_count = (num_samples * num_channels) as usize;
@@ -5365,7 +5355,8 @@ mod tests {
         };
 
         let mock_instance = ptr::null_mut();
-        let guard = unsafe { RecvAudioGuard::with_test_free(mock_instance, c_frame, |_, _| {}) };
+        let guard =
+            unsafe { Guard::<AudioKind>::with_test_free(mock_instance, c_frame, |_, _| {}) };
 
         let result = AudioFrameRef::new(guard);
         assert!(result.is_err(), "Should reject unknown audio FourCC");
@@ -5387,8 +5378,6 @@ mod tests {
     /// Test that AudioFrameRef::new accepts known FourCC and stores validated format
     #[test]
     fn test_audioframeref_known_fourcc() {
-        use crate::capture::RecvAudioGuard;
-
         let num_samples = 1024;
         let num_channels = 2;
         let sample_count = (num_samples * num_channels) as usize;
@@ -5409,7 +5398,8 @@ mod tests {
         };
 
         let mock_instance = ptr::null_mut();
-        let guard = unsafe { RecvAudioGuard::with_test_free(mock_instance, c_frame, |_, _| {}) };
+        let guard =
+            unsafe { Guard::<AudioKind>::with_test_free(mock_instance, c_frame, |_, _| {}) };
 
         let frame_ref = AudioFrameRef::new(guard).expect("Should accept FLTP FourCC");
         assert_eq!(
@@ -6496,8 +6486,6 @@ mod tests {
 
     #[test]
     fn test_audio_frame_ref_metadata_is_text_and_owned_conversion_preserves_it() {
-        use crate::capture::RecvAudioGuard;
-
         let no_samples = 4;
         let no_channels = 2;
         let sample_count = (no_samples * no_channels) as usize;
@@ -6518,7 +6506,7 @@ mod tests {
             timestamp: 456,
         };
 
-        let guard = unsafe { RecvAudioGuard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
+        let guard = unsafe { Guard::<AudioKind>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         let frame_ref = AudioFrameRef::new(guard).expect("valid audio ref");
 
         assert_eq!(frame_ref.metadata(), Some("audio meta"));
@@ -8004,8 +7992,6 @@ mod tests {
     /// Test that AudioFrameRef::data() uses cached sample count
     #[test]
     fn test_audio_frame_ref_uses_cached_sample_count() {
-        use crate::capture::RecvAudioGuard;
-
         let no_samples = 1024;
         let no_channels = 2;
         let sample_count = (no_samples * no_channels) as usize;
@@ -8025,7 +8011,7 @@ mod tests {
             timestamp: 67890,
         };
 
-        let guard = unsafe { RecvAudioGuard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
+        let guard = unsafe { Guard::<AudioKind>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
 
         // Create the AudioFrameRef
         let frame_ref = AudioFrameRef::new(guard);
@@ -8506,12 +8492,12 @@ mod tests {
         let (framesync, received, bare) = unsafe {
             (
                 FrameSyncAudioRef::new(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})),
-                AudioFrameRef::new(RecvAudioGuard::with_test_free(
+                AudioFrameRef::new(Guard::<AudioKind>::with_test_free(
                     ptr::null_mut(),
                     raw,
                     |_, _| {},
                 )),
-                AudioFrameRef::new(RecvAudioGuard::with_test_free(
+                AudioFrameRef::new(Guard::<AudioKind>::with_test_free(
                     ptr::null_mut(),
                     bare,
                     |_, _| {},

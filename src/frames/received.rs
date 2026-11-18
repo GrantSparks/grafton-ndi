@@ -239,8 +239,8 @@ pub(crate) trait HoldsDescriptor {
         unsafe { self.descriptor().scan_metadata() }
     }
 
-    /// Normalize an audio timestamp for this descriptor's capture family.
-    fn audio_timestamp(&self, ticks: i64) -> Option<SdkTimestamp> {
+    /// Normalize a descriptor's timestamp using its capture family's markers.
+    fn normalize_timestamp(&self, ticks: i64) -> Option<SdkTimestamp> {
         SdkTimestamp::from_sdk(ticks)
     }
 }
@@ -260,8 +260,8 @@ where
         unsafe { S::scan_metadata(self.frame()) }
     }
 
-    fn audio_timestamp(&self, ticks: i64) -> Option<SdkTimestamp> {
-        if ticks == S::AUDIO_TIMESTAMP_UNDEFINED {
+    fn normalize_timestamp(&self, ticks: i64) -> Option<SdkTimestamp> {
+        if ticks == S::TIMESTAMP_UNDEFINED {
             None
         } else {
             SdkTimestamp::from_sdk(ticks)
@@ -392,7 +392,8 @@ impl<F: HoldsDescriptor, V> ValidatedFrame<F, V> {
 
     /// Normalize the held descriptor's timestamp for its capture family.
     pub(crate) fn timestamp(&self) -> Option<SdkTimestamp> {
-        self.frame.audio_timestamp(self.descriptor().timestamp()?)
+        self.frame
+            .normalize_timestamp(self.descriptor().timestamp()?)
     }
 
     /// Pair `frame` with `validated`, which the caller validated from its

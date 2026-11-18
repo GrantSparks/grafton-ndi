@@ -2029,7 +2029,7 @@ mod tests {
         assert_eq!(status.into_value(), crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_no_audio_stream_received);
         assert_eq!(raw.timestamp, 0);
         let guard = unsafe { Guard::<AvSyncAudioFree>::new(resource, raw) };
-        assert_eq!(guard.audio_timestamp(raw.timestamp), None);
+        assert_eq!(guard.normalize_timestamp(raw.timestamp), None);
         assert!(matches!(
             outcome(Synchronized::NoAudioStream, guard).unwrap(),
             AvSyncOutcomeRef::NoAudioStream

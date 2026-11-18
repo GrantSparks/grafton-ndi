@@ -161,7 +161,10 @@ impl ValidatedVideoLayout {
         // so the refusal and byte count are identical on every target.
         if minimum > MAX_VIDEO_BYTES as u64 {
             let stride = line_stride.map_or(minimum, |stride| (stride as u64).max(minimum));
-            video_plane_layouts(pixel_format.info(), stride, minimum, height as u64)?;
+            let info = pixel_format.info();
+            let dimensions = video_plane_dimensions(info, stride, minimum, height as u64)?;
+            let storage = video_storage_extent(&dimensions[..info.plane_count()]);
+            return Err(crate::LayoutDefect::VideoBytes(storage.into()));
         }
         let min_stride = minimum as usize;
         let line_stride = match line_stride {
@@ -514,12 +517,14 @@ impl VideoPlaneLayout {
 /// Plane offsets include preceding storage padding; payload lengths do not.
 const MAX_VIDEO_PLANES: usize = 4;
 
-fn video_plane_layouts(
+// Rows are (storage stride, active row bytes, row count). Keep them wide
+// until their complete storage extent has passed the frame size bound.
+fn video_plane_dimensions(
     info: PixelFormatInfo,
     stride: u64,
     active: u64,
     height: u64,
-) -> LayoutResult<[VideoPlaneLayout; MAX_VIDEO_PLANES]> {
+) -> LayoutResult<[(u64, u64, u64); MAX_VIDEO_PLANES]> {
     let mut dimensions = [(stride, active, height); MAX_VIDEO_PLANES];
     match info.category() {
         FormatCategory::Packed => {}
@@ -549,20 +554,29 @@ fn video_plane_layouts(
         FormatCategory::SemiPlanar422Alpha | FormatCategory::Planar444 => {}
         FormatCategory::Planar444Alpha => {}
     }
-    let count = info.plane_count();
+    Ok(dimensions)
+}
+
+fn video_storage_extent(dimensions: &[(u64, u64, u64)]) -> u64 {
     // Saturation retains one size cause even when an explicit stride near
     // usize::MAX makes the mathematical extent exceed u64::MAX.
-    let storage = dimensions[..count]
-        .iter()
-        .fold(0u64, |total, &(stride, _, rows)| {
-            total.saturating_add(stride.saturating_mul(rows))
-        });
-    validate_video_data_len(storage)?;
+    dimensions.iter().fold(0, |total, &(stride, _, rows)| {
+        total.saturating_add(stride.saturating_mul(rows))
+    })
+}
+
+fn video_plane_layouts(
+    info: PixelFormatInfo,
+    stride: u64,
+    active: u64,
+    height: u64,
+) -> LayoutResult<[VideoPlaneLayout; MAX_VIDEO_PLANES]> {
+    let dimensions = video_plane_dimensions(info, stride, active, height)?;
+    let dimensions = &dimensions[..info.plane_count()];
+    validate_video_data_len(video_storage_extent(dimensions))?;
     let mut planes = [VideoPlaneLayout::default(); MAX_VIDEO_PLANES];
     let mut offset = 0usize;
-    for (plane, &(row_stride, active_row_bytes, row_count)) in
-        planes.iter_mut().zip(&dimensions[..count])
-    {
+    for (plane, &(row_stride, active_row_bytes, row_count)) in planes.iter_mut().zip(dimensions) {
         // Each plane and partial sum fits the cap, which fits usize.
         let (row_stride, active_row_bytes, row_count) = (
             row_stride as usize,
