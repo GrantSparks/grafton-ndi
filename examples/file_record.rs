@@ -21,8 +21,7 @@
 //! avoids waiting for an optional proxy stream at startup and produces the
 //! single-video-track input supported by the `file_thumbnails` example.
 //!
-//! The File library ships with the NDI SDK, beside the runtime library. On
-//! Linux and macOS it needs the Advanced SDK runtime.
+//! See the [File library requirements](../docs/file-io.md#requirements).
 
 use std::{
     env,

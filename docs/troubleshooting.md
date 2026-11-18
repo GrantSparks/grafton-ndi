@@ -40,8 +40,7 @@ license entitlement.
 
 Native behavior needs validation with the runtime, platform and network you
 deploy. Use [runtime checks](../ci/README.md#test-against-an-installed-runtime)
-with your installation. Older incident reports do not establish that a different
-runtime is safe.
+with your installation.
 
 ## Discovery Server
 
@@ -60,8 +59,8 @@ these operations. See the [Discovery Server API](https://grantsparks.github.io/g
   format on the destination machine.
 - **Clocked output looks alive after input stops:** FrameSync can supply retained
   video or silent audio. Monitor incoming media separately when freshness matters.
-  A FrameSync owns its receiver; its restricted receiver handle excludes raw
-  audio capture, which would compete for its input.
+  A FrameSync owns its receiver. The [attached receiver](usage.md#use-framesync)
+  excludes raw video and audio capture to keep those streams available to FrameSync.
 - **A wait or shutdown stalls:** Genlock waits have no cancellation or deadline.
   Dropping a queued sender waits for queued frames to complete. Dropping a future
   cannot interrupt native work that already started. Keep these operations away

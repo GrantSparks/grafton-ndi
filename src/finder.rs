@@ -143,10 +143,10 @@ impl FinderOptions {
         self
     }
 
-    /// Set a non-empty list of IP addresses to query directly, replacing
-    /// `networks.ips` from the NDI configuration. Use [`Self::clear_extra_ips`]
-    /// to inherit the configuration. Creation refuses empty elements and
-    /// elements containing a comma or NUL.
+    /// Set a non-empty list of individual IP addresses to query directly.
+    /// This replaces `networks.ips` from the NDI configuration. Use
+    /// [`Self::clear_extra_ips`] to inherit the configuration. Creation
+    /// refuses empty elements and elements containing a comma or NUL.
     #[must_use]
     pub fn extra_ips(mut self, ips: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.extra_ips = Some(ips.into_iter().map(Into::into).collect());

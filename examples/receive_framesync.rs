@@ -112,8 +112,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Creating FrameSync for clock-corrected capture...");
     let framesync = FrameSync::new(receiver)?;
-    // The attached receiver exposes controls, metadata, and status.
-    // Raw video becomes available again after framesync.into_receiver().
+    // The attached receiver keeps metadata, shared controls and connection
+    // queries. Event polling returns with framesync.into_receiver().
     println!(
         "PTZ supported: {}",
         framesync.receiver().ptz().is_supported()

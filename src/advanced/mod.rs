@@ -1,8 +1,7 @@
 //! NDI Advanced SDK operations.
 //!
-//! * Per-instance JSON configuration of senders, receivers, finders, routers
-//!   and Discovery Server advertisers and listeners ([`AdvancedConfig`]),
-//!   given to each through the `config` setter of its options.
+//! * Per-instance JSON configuration through the `config` setter of
+//!   supported options. See [`AdvancedConfig`] for the configurable objects.
 //! * Compressed passthrough: receiving codec packets ([`PacketReceiver`]) and
 //!   sending them ([`CompressedSender`]), including scatter-gather submission.
 //! * Encoder guidance, keyframe demand and stream selection on the ordinary

@@ -10,8 +10,8 @@
 //! Run with: `cargo run --example find_sources`
 //!
 //! Optional arguments:
-//! - IP address or subnet to search: `cargo run --example find_sources -- 192.168.0.100`
-//! - Multiple IPs: `cargo run --example find_sources -- 192.168.0.100 10.0.0.0/24`
+//! - IP address to search: `cargo run --example find_sources -- 192.168.0.100`
+//! - Multiple IPs: `cargo run --example find_sources -- 192.168.0.100 10.0.0.8`
 //!
 //! Troubleshooting:
 //! - If no sources are found, try adding specific IP addresses with extra_ips()

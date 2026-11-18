@@ -1,5 +1,3 @@
-//! Port of SDK sample `NDIlib_Recv_Audio`.
-//!
 //! Example: Receiving NDI audio with 32-bit float format.
 //!
 //! This example demonstrates:

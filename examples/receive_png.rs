@@ -20,7 +20,7 @@
 //!
 //! Optional arguments:
 //! - IP address to search: `cargo run --features image-encoding --example receive_png -- 192.168.0.100`
-//! - Multiple IPs: `cargo run --features image-encoding --example receive_png -- 192.168.0.100 10.0.0.0/24`
+//! - Multiple IPs: `cargo run --features image-encoding --example receive_png -- 192.168.0.100 10.0.0.8`
 //! - Custom output file: `cargo run --features image-encoding --example receive_png -- --output MyImage.png`
 //! - Both: `cargo run --features image-encoding --example receive_png -- 192.168.0.100 --output MyImage.png`
 
