@@ -133,12 +133,12 @@ pub(super) fn copy_string(text: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::{
-        finder::{decode_source, source_pointers},
+        finder::{decode_source, source_pointers, HostQuery, SeenSource},
         sdk_copy::MAX_SDK_STRING_BYTES,
         sys::bindings::NDIlib_source_t,
         Source,
     };
-    use std::{ffi::CString, ptr};
+    use std::{collections::HashSet, ffi::CString, ptr};
 
     unsafe fn copy_text(
         budget: &mut SnapshotBudget,
@@ -259,9 +259,12 @@ mod tests {
             assert_eq!(sources.unwrap().len(), expected);
             assert_eq!(allocations, 4 * expected + usize::from(expected > 0));
         }
-        let query = super::super::HostQuery::checked("192.0.2.7").unwrap();
+        let query = HostQuery::checked("192.0.2.7").unwrap();
+        let empty_seen = HashSet::new();
         let (sources, allocations) = crate::test_alloc::allocation_count(|| {
-            selected_snapshot(&entries, |source| source.matches_query(query))
+            selected_snapshot(&entries, |source| {
+                source.selected_by(Some(query), &empty_seen)
+            })
         });
         assert_eq!(sources.unwrap().len(), 1);
         assert_eq!(allocations, 5);
@@ -269,10 +272,10 @@ mod tests {
         let seen = snapshot(&entries)
             .unwrap()
             .into_iter()
-            .map(super::super::SeenSource)
+            .map(SeenSource)
             .collect();
         let (sources, allocations) = crate::test_alloc::allocation_count(|| {
-            selected_snapshot(&entries, |source| Ok(!source.seen_in(&seen)?))
+            selected_snapshot(&entries, |source| source.selected_by(None, &seen))
         });
         assert!(sources.unwrap().is_empty());
         assert_eq!(
@@ -283,21 +286,26 @@ mod tests {
 
     #[test]
     fn selecting_host_and_seen_identity_decodes_lossy_text_once() {
-        let mut entry = named(c"STUDIO \xff (Camera)".as_ptr());
-        entry.__bindgen_anon_1.p_url_address = c"192.0.2.7:5961".as_ptr();
-        let seen = snapshot(&[entry])
-            .unwrap()
-            .into_iter()
-            .map(super::super::SeenSource)
-            .collect();
-        let query = super::super::HostQuery::checked("192.0.2.7").unwrap();
-        let (sources, allocations) = crate::test_alloc::allocation_count(|| {
-            selected_snapshot(&[entry], |source| {
-                source.selected_by(Some(query), Some(&seen))
-            })
-        });
-        assert!(sources.unwrap().is_empty());
-        assert_eq!(allocations, 1, "only the lossy name costs an allocation");
+        for (address, expected) in [
+            (c"192.0.2.7:5961", 1),
+            (c"ndi://192.0.2.7:5961/feed\xff", 2),
+        ] {
+            let mut entry = named(c"STUDIO \xff (Camera)".as_ptr());
+            entry.__bindgen_anon_1.p_url_address = address.as_ptr();
+            let seen = snapshot(&[entry])
+                .unwrap()
+                .into_iter()
+                .map(SeenSource)
+                .collect();
+            for host in ["192.0.2.7", "STUDIO \u{fffd}"] {
+                let query = HostQuery::checked(host).unwrap();
+                let (sources, allocations) = crate::test_alloc::allocation_count(|| {
+                    selected_snapshot(&[entry], |source| source.selected_by(Some(query), &seen))
+                });
+                assert!(sources.unwrap().is_empty(), "{host}");
+                assert_eq!(allocations, expected, "{host} and {address:?}");
+            }
+        }
     }
 
     #[test]
@@ -329,6 +337,7 @@ mod tests {
                 selected_snapshot(&entries, |source| Ok(source.name.equals(name))).unwrap();
             assert_eq!(actual, expected);
         }
+        let empty_seen = HashSet::new();
         for host in [
             "studio",
             "STUDIO \u{fffd}",
@@ -337,22 +346,21 @@ mod tests {
             "[2001:db8::1]",
             "missing",
         ] {
-            let query = super::super::HostQuery::checked(host).unwrap();
+            let query = HostQuery::checked(host).unwrap();
             let expected = copied
                 .iter()
                 .filter(|source| source.matches_query(query))
                 .cloned()
                 .collect::<Vec<_>>();
-            let actual = selected_snapshot(&entries, |source| source.matches_query(query)).unwrap();
+            let actual = selected_snapshot(&entries, |source| {
+                source.selected_by(Some(query), &empty_seen)
+            })
+            .unwrap();
             assert_eq!(actual, expected, "{host}");
         }
-        let seen = copied
-            .iter()
-            .cloned()
-            .map(super::super::SeenSource)
-            .collect();
+        let seen = copied.iter().cloned().map(SeenSource).collect();
         assert!(
-            selected_snapshot(&entries, |source| Ok(!source.seen_in(&seen)?))
+            selected_snapshot(&entries, |source| source.selected_by(None, &seen))
                 .unwrap()
                 .is_empty()
         );
@@ -360,6 +368,10 @@ mod tests {
 
     #[test]
     fn omitted_selection_keeps_ordinary_copy_charges_and_errors() {
+        let seen = HashSet::new();
+        let query = HostQuery::checked("192.0.2.254").unwrap();
+        let reject =
+            |source: &super::super::BorrowedSource<'_>| source.selected_by(Some(query), &seen);
         let mut both = named(c"a\xff".as_ptr());
         both.__bindgen_anon_1.p_url_address = c"http://camera.local:8080".as_ptr();
         let mut address_only = named(ptr::null());
@@ -377,7 +389,7 @@ mod tests {
             unsafe {
                 super::super::decode_source(name, address, &mut old, |_| Ok(true)).unwrap();
                 assert!(
-                    super::super::decode_source(name, address, &mut selected, |_| Ok(false))
+                    super::super::decode_source(name, address, &mut selected, reject)
                         .unwrap()
                         .is_none()
                 );
@@ -399,8 +411,7 @@ mod tests {
             let (expected, actual) = unsafe {
                 (
                     super::super::decode_source(name, address, &mut old, |_| Ok(true)).map(|_| ()),
-                    super::super::decode_source(name, address, &mut selected, |_| Ok(false))
-                        .map(|_| ()),
+                    super::super::decode_source(name, address, &mut selected, reject).map(|_| ()),
                 )
             };
             assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
@@ -519,6 +530,21 @@ mod tests {
             snapshot(&[malformed; 4]),
             Err(Error::ResourceLimit { .. })
         ));
+
+        let mut overlong_address = named(c"OTHER (Camera)".as_ptr());
+        overlong_address.__bindgen_anon_1.p_url_address = unterminated.as_ptr().cast();
+        let mut entries = [overlong_address; 5];
+        entries[0] = named(c"STUDIO_A (First)".as_ptr());
+        let query = HostQuery::checked("STUDIO_A").unwrap();
+        let seen = HashSet::new();
+        assert!(matches!(
+            selected_snapshot(&entries, |source| source.selected_by(Some(query), &seen)),
+            Err(Error::ResourceLimit {
+                resource: ResourceKind::FinderSnapshotBytes,
+                ..
+            })
+        ));
+
         let largest = CString::new(vec![b'x'; MAX_SDK_STRING_BYTES - 1]).unwrap();
         assert_eq!(
             snapshot(&[named(largest.as_ptr())]).unwrap()[0]

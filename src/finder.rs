@@ -401,7 +401,7 @@ impl SnapshotGuard<'_> {
             if let Some(source) = unsafe {
                 copy_source(entry, budget, |source| {
                     if retained.is_ok() {
-                        source.selected_by(query, Some(&staged.seen))
+                        source.selected_by(query, &staged.seen)
                     } else {
                         // Preserve the snapshot's error precedence even when
                         // the discovery window has run out of space.
@@ -613,7 +613,11 @@ pub(crate) struct BorrowedSource<'a> {
 }
 
 impl BorrowedSource<'_> {
-    fn with_key<T>(&self, inspect: impl FnOnce((&str, Option<&str>)) -> T) -> Result<T> {
+    fn selected_by(
+        &self,
+        query: Option<HostQuery<'_>>,
+        seen: &HashSet<SeenSource>,
+    ) -> Result<bool> {
         fn text<'a>(value: &LossyText<'a>) -> Result<Cow<'a, str>> {
             value.as_str().map_or_else(
                 || {
@@ -625,30 +629,42 @@ impl BorrowedSource<'_> {
                 |text| Ok(Cow::Borrowed(text)),
             )
         }
-        let name = text(&self.name)?;
-        let address = self.address.as_ref().map(text).transpose()?;
-        Ok(inspect((&name, address.as_deref())))
-    }
 
-    fn selected_by(
-        &self,
-        query: Option<HostQuery<'_>>,
-        seen: Option<&HashSet<SeenSource>>,
-    ) -> Result<bool> {
-        self.with_key(|key @ (name, address)| {
-            query.is_none_or(|query| source_matches_query(name, address, query))
-                && seen.is_none_or(|seen| !seen.contains(&key as &dyn SourceIdentity))
-        })
-    }
-
-    #[cfg(test)]
-    fn matches_query(&self, query: HostQuery<'_>) -> Result<bool> {
-        self.selected_by(Some(query), None)
-    }
-
-    #[cfg(test)]
-    fn seen_in(&self, seen: &HashSet<SeenSource>) -> Result<bool> {
-        Ok(!self.selected_by(None, Some(seen))?)
+        // The decoder already charged both fields. For single-field queries,
+        // match that field before decoding the other for the deduplication key.
+        let name = || text(&self.name);
+        let address = || self.address.as_ref().map(text).transpose();
+        let (name, address) = match query {
+            Some(query @ HostQuery::Machine(_)) => {
+                let name = name()?;
+                if !source_name_matches_query(&name, query) {
+                    return Ok(false);
+                }
+                (name, address()?)
+            }
+            Some(query @ HostQuery::Ip(_)) => {
+                let address = address()?;
+                if !address
+                    .as_deref()
+                    .is_some_and(|address| address_matches_query(address, query))
+                {
+                    return Ok(false);
+                }
+                (name()?, address)
+            }
+            query => {
+                let name = name()?;
+                let address = address()?;
+                if query
+                    .is_some_and(|query| !source_matches_query(&name, address.as_deref(), query))
+                {
+                    return Ok(false);
+                }
+                (name, address)
+            }
+        };
+        let key = (name.as_ref(), address.as_deref());
+        Ok(!seen.contains(&key as &dyn SourceIdentity))
     }
 }
 
@@ -1537,16 +1553,19 @@ fn address_matches_query(address: &str, query: HostQuery<'_>) -> bool {
         && parse_authority(address).is_some_and(|authority| query.matches(authority.host))
 }
 
+fn source_name_matches_query(name: &str, query: HostQuery<'_>) -> bool {
+    name.split_once(" (")
+        .filter(|(_, source)| source.ends_with(')'))
+        .is_some_and(|(machine, _)| query.matches(machine))
+}
+
 fn source_matches_query(name: &str, address: Option<&str>, query: HostQuery<'_>) -> bool {
     if address.is_some_and(|address| address_matches_query(address, query)) {
         return true;
     }
     match query {
         HostQuery::Ip(_) => false,
-        HostQuery::Host(_) | HostQuery::Machine(_) => name
-            .split_once(" (")
-            .filter(|(_, source)| source.ends_with(')'))
-            .is_some_and(|(machine, _)| query.matches(machine)),
+        HostQuery::Host(_) | HostQuery::Machine(_) => source_name_matches_query(name, query),
     }
 }
 
@@ -3835,6 +3854,45 @@ mod tests {
     }
 
     #[test]
+    fn discovery_rejects_before_decoding_unused_lossy_text() {
+        let mutex = parking_lot::Mutex::new(FindInstance(ptr::null_mut()));
+        let guard = SnapshotGuard {
+            instance: mutex.lock(),
+        };
+        let cases = [
+            (
+                "192.0.2.44",
+                [
+                    (c"STUDIO (Camera)", c"192.0.2.1:5960"),
+                    (c"STUDIO (Camera \xff)", c"192.0.2.1:5960"),
+                ],
+            ),
+            (
+                "STUDIO_B",
+                [
+                    (c"STUDIO_A (Camera)", c"ndi://studio.local:5960/feed"),
+                    (c"STUDIO_A (Camera)", c"ndi://studio.local:5960/feed\xff"),
+                ],
+            ),
+        ];
+
+        let allocations = cases.map(|(host, source_text)| {
+            let query = HostQuery::checked(host).unwrap();
+            source_text.map(|(name, address)| {
+                let entries = [source_entry(name.as_ptr(), address.as_ptr()); 128];
+                let mut window = DiscoveryWindow::default();
+                let (result, allocations) = crate::test_alloc::allocation_count(|| {
+                    guard.discover(&SliceSnapshot(&entries), &mut window, Some(query))
+                });
+                result.unwrap();
+                assert!(window.sources.is_empty(), "{host}");
+                allocations
+            })
+        });
+        assert_eq!(allocations, [[0, 0], [0, 0]]);
+    }
+
+    #[test]
     fn discovery_accumulates_distinct_name_and_address_text_in_order() {
         let lossy = source_entry(c"STUDIO (Camera \xff)".as_ptr(), c"192.0.2.1".as_ptr());
         let same = source_entry(c"STUDIO (Camera �)".as_ptr(), c"192.0.2.1".as_ptr());
@@ -3874,6 +3932,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first_named, window.sources[0]);
+
+        let mut matched_ip = DiscoveryWindow::default();
+        guard
+            .discover(
+                &SliceSnapshot(&[lossy, same, unrelated]),
+                &mut matched_ip,
+                Some(HostQuery::checked("192.0.2.1").unwrap()),
+            )
+            .unwrap();
+        assert_eq!(matched_ip.sources, window.sources[..1]);
     }
 
     #[test]
@@ -3918,7 +3986,11 @@ mod tests {
         let (_, first_peak) = crate::test_alloc::peak_bytes(|| first(&control));
         let (_, duplicate_peak) = crate::test_alloc::peak_bytes(|| first(&duplicates));
         assert_eq!(duplicate_peak, first_peak);
-        for query in [None, Some(query)] {
+        for query in [
+            None,
+            Some(query),
+            Some(HostQuery::checked("192.0.2.1").unwrap()),
+        ] {
             let (expected, control_allocations) =
                 crate::test_alloc::allocation_count(|| discover(&control, query));
             let (actual, allocations) =
