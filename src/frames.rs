@@ -2704,7 +2704,7 @@ const fn widest_pixel_bytes() -> usize {
 }
 
 // Revisit the frame and allocator limits when a wider format is introduced.
-const _: () = assert!(widest_pixel_bytes() == PixelFormat::Nb4g.packed_bytes_per_pixel_ceil());
+const_assert!(widest_pixel_bytes() == PixelFormat::Nb4g.packed_bytes_per_pixel_ceil());
 
 /// Maximum extent in bytes of an uncompressed video frame, excluding SDK send tail room.
 ///

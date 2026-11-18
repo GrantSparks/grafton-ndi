@@ -32,8 +32,15 @@ macro_rules! decoded_variants {
     ($name:ident: $($variant:ident),+ $(,)?) => {
         impl $name {
             /// Every variant, in declaration order.
-            pub(crate) const ALL: [Self; [$(stringify!($variant)),+].len()] =
-                [$(Self::$variant),+];
+            pub(crate) const ALL: [Self; [$(stringify!($variant)),+].len()] = const_assert!(@value {
+                let variants = [$(Self::$variant),+];
+                let mut index = 0;
+                while index < variants.len() {
+                    assert!(variants[index].index() == index);
+                    index += 1;
+                }
+                variants
+            });
 
             const fn index(self) -> usize {
                 enum Index { $($variant),+ }
@@ -41,13 +48,6 @@ macro_rules! decoded_variants {
             }
         }
 
-        const_assert!({
-            let mut index = 0;
-            while index < $name::ALL.len() {
-                assert!($name::ALL[index].index() == index);
-                index += 1;
-            }
-        });
     };
 }
 pub(crate) use decoded_variants;

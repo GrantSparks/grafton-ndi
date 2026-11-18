@@ -177,7 +177,8 @@ pub type Result<T> = std::result::Result<T, crate::error::Error>;
 /// polls without blocking.
 ///
 /// [`Duration::ZERO`]: std::time::Duration::ZERO
-pub const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(u32::MAX as u64 - 1);
+pub const MAX_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(timeout::MAX_MILLIS as u64);
 
 pub(crate) use timeout::to_ms_checked;
 

@@ -88,7 +88,7 @@ pub(crate) struct Attached<S: Synchronizer> {
     receiver: Receiver<S::Mode>,
 }
 
-impl<S: Synchronizer> Attached<S> {
+impl<S: Synchronizer<Mode = M>, M: SynchronizerMode> Attached<S> {
     /// Adopt a new native synchronizer created from this receiver.
     ///
     /// # Safety

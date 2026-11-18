@@ -629,6 +629,9 @@ impl Capabilities {
             (Some(required), None) => Err(CapabilityRefusal::RuntimeVersionUnknown { required }),
         };
         let own = |feature: RuntimeFeature| {
+            if feature.is_ungated() {
+                return Ok(());
+            }
             if !feature.is_advanced() {
                 return api.missing(feature).map_or_else(|| versioned(feature), Err);
             }
