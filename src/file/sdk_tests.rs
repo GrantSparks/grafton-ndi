@@ -1191,6 +1191,8 @@ fn a_rollover_into_a_missing_directory_is_refused_and_the_session_goes_on() {
     let scratch = FixtureDir::create("missing-directory");
     let source = LiveSource::start(&ndi, "missing-directory");
     let missing = || RecordingTarget::new(scratch.join("absent/take")).unwrap();
+    let directory_only = ["absent/", "absent/.", "absent/.."]
+        .map(|path| RecordingTarget::new(scratch.join(path)).unwrap());
     let not_found = |result: Result<()>| match result {
         Err(Error::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
         other => panic!("expected the directory to be reported missing: {other:?}"),
@@ -1201,23 +1203,44 @@ fn a_rollover_into_a_missing_directory_is_refused_and_the_session_goes_on() {
             .start(&missing(), RecordingTimecode::Preserve)
             .map(drop),
     );
+    for target in &directory_only {
+        let result = recorder.start(target, RecordingTimecode::Preserve);
+        assert!(
+            matches!(result, Err(Error::InvalidInput(_))),
+            "{target:?}: {result:?}"
+        );
+        assert_eq!(recorder.state(), RecorderState::Idle);
+    }
     recorder
         .start(
             &RecordingTarget::new(scratch.join("take.mkv")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
-    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    let mut timeline = Timeline::new();
+    let first = timeline.await_event(&mut recorder, 0, RecorderEventKind::FirstFrame, None);
 
     // Passed on, the library would accept this and then end the session.
     not_found(recorder.rollover(&missing()));
-    assert_eq!(recorder.state(), RecorderState::Recording);
-    assert!(recorder.is_recording());
-    thread::sleep(Duration::from_millis(200));
+    for target in &directory_only {
+        let result = recorder.rollover(target);
+        assert!(
+            matches!(result, Err(Error::InvalidInput(_))),
+            "{target:?}: {result:?}"
+        );
+        assert_eq!(recorder.state(), RecorderState::Recording);
+        assert!(recorder.is_recording());
+    }
+    let since = timeline.mark();
+    let next = scratch.join("next.mkv");
+    recorder
+        .rollover(&RecordingTarget::new(&next).unwrap())
+        .unwrap();
+    assert_eq!(timeline.await_change(&mut recorder, since, &first), next);
     let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap() else {
         panic!("the recording was not confirmed closed");
     };
-    assert_eq!(report.closed_files(), 1);
+    assert_eq!(report.closed_files(), 2);
     assert_eq!(report.error_events(), 0);
 }
 

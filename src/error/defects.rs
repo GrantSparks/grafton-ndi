@@ -567,6 +567,9 @@ pub enum InputDefect {
         "filename-pattern indexes must be in the file name; move {{index}} out of the directory"
     )]
     FilenamePatternIndexInDirectory,
+    /// The expanded recording path ends without a file name.
+    #[error("recording file path must end with a file name")]
+    RecordingPathMissingFilename,
     /// file position exceeds 64-bit ticks.
     #[error("file position exceeds 64-bit ticks")]
     FilePositionOverflow,

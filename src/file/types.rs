@@ -804,13 +804,22 @@ impl NamePattern {
 
         let mut name = String::with_capacity(bytes);
         pieces.for_each(|piece| name.push_str(piece));
-        let path = PathBuf::from(name);
+        let path = Path::new(&name);
         if !path.is_absolute() {
             return Err(Error::InvalidInput(
                 crate::InputDefect::RecordingPathNotAbsolute,
             ));
         }
-        Ok(path)
+        // Path::file_name skips terminal separators and ".", so also check
+        // the original spelling. The component check catches bare Windows
+        // UNC shares, which can have no terminal separator or file name.
+        let last = name.rsplit(std::path::is_separator).next();
+        if matches!(last, Some("" | "." | "..")) || path.file_name().is_none() {
+            return Err(Error::InvalidInput(
+                crate::InputDefect::RecordingPathMissingFilename,
+            ));
+        }
+        Ok(PathBuf::from(name))
     }
 
     /// Confirm that the SDK can create the file this pattern gives `target`:
@@ -2545,6 +2554,55 @@ mod tests {
             Err(Error::Io(error)) => error.kind(),
             other => panic!("expected a filesystem error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn recording_preflight_requires_an_expanded_filename() {
+        let directory = crate::test_support::FixtureDir::create("filename-ending");
+        let check = |pattern, prefix| {
+            let target = RecordingTarget::new(directory.join(prefix)).unwrap();
+            NamePattern::new(Some(pattern)).unwrap().check(&target)
+        };
+        for (pattern, prefix) in [
+            (EXACT_PATTERN, "missing/"),
+            (EXACT_PATTERN, "missing/."),
+            (EXACT_PATTERN, "missing/.."),
+            ("{prefix}/", "missing"),
+            ("{prefix}.", "missing/"),
+            ("{prefix}.", "missing/."),
+            #[cfg(windows)]
+            (EXACT_PATTERN, r"missing\"),
+            #[cfg(windows)]
+            ("{prefix}.", r"missing\."),
+        ] {
+            assert_eq!(
+                invalid_cause(check(pattern, prefix)),
+                crate::InputDefect::RecordingPathMissingFilename,
+                "{pattern:?} with prefix {prefix:?}"
+            );
+        }
+
+        std::fs::create_dir(directory.join("folder")).unwrap();
+        for (pattern, prefix) in [
+            (EXACT_PATTERN, ".hidden"),
+            ("{prefix}hidden", "folder/."),
+            ("{prefix}take.mkv", "folder/"),
+            #[cfg(unix)]
+            (EXACT_PATTERN, r"trailing\"),
+        ] {
+            check(pattern, prefix).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn recording_preflight_refuses_a_bare_unc_share() {
+        let root = RecordingTarget::new(r"\\grafton-ndi-invalid-host\share").unwrap();
+        let exact = NamePattern::new(Some(EXACT_PATTERN)).unwrap();
+        assert_eq!(
+            invalid_cause(exact.check(&root)),
+            crate::InputDefect::RecordingPathMissingFilename,
+        );
     }
 
     #[test]
