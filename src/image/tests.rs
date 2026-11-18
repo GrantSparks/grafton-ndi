@@ -1944,6 +1944,52 @@ fn unreadable_color_metadata_is_refused_unless_the_caller_overrides() {
 }
 
 #[test]
+fn xml_color_attribute_spellings_preserve_output_and_syntax_errors_refuse_it() {
+    let mut frame = VideoFrame::builder()
+        .resolution(2, 2)
+        .pixel_format(PixelFormat::Uyvy)
+        .metadata("<ndi_color_info matrix='bt_709'/>")
+        .build()
+        .unwrap();
+    let expected_color = frame.color_info().unwrap().unwrap();
+    assert_eq!(expected_color.matrix(), Some(YuvMatrix::Bt709));
+    let formats = [ImageFormat::Png, ImageFormat::Jpeg(85)];
+    let expected = formats.map(|format| frame.encode_image(&options(format)).unwrap());
+
+    for metadata in [
+        "<ndi_color_info matrix='bt_&#55;09'/>",
+        "<ndi_color_info matrix=\"bt_&#x37;09\"/>",
+    ] {
+        frame.set_metadata(metadata).unwrap();
+        assert_eq!(frame.color_info().unwrap(), Some(expected_color));
+        for (format, expected) in formats.into_iter().zip(&expected) {
+            assert_eq!(frame.encode_image(&options(format)).unwrap(), *expected);
+        }
+    }
+
+    for (metadata, expected) in [
+        (
+            "<ndi_color_info primaries='bt_709'transfer='bt_709'/>",
+            crate::ColorMetadataDefect::AttributeStart,
+        ),
+        (
+            "<ndi_color_info matrix='bt_&#x37'/>",
+            crate::ColorMetadataDefect::InvalidAttributeValue,
+        ),
+    ] {
+        frame.set_metadata(metadata).unwrap();
+        for format in formats {
+            let mut output = Vec::new();
+            let defect = invalid_frame(frame.encode_image_to(&options(format), &mut output));
+            assert!(
+                matches!(defect, crate::FrameDefect::ColorMetadata { issue, .. } if issue == expected)
+            );
+            assert!(output.is_empty());
+        }
+    }
+}
+
+#[test]
 fn withheld_color_metadata_is_refused_by_every_encoder_before_output() {
     for format in [PixelFormat::Uyvy, PixelFormat::Rgba] {
         let frame = VideoFrame::builder()

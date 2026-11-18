@@ -30,6 +30,9 @@ pub enum ColorMetadataDefect {
     /// A color attribute has an undefined value.
     #[error("a color attribute has an undefined value")]
     UndefinedValue,
+    /// A color attribute contains invalid XML value syntax or an unsupported entity reference.
+    #[error("a color attribute has an invalid XML value")]
+    InvalidAttributeValue,
 }
 
 /// The image encoder that refused output.

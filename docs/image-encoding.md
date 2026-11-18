@@ -122,6 +122,10 @@ high bit depth and HDR code values. Both deliver individual fields even with
 ### `ndi_color_info`
 
 Every frame's `color_info()` exposes this metadata without `image-encoding`.
+Separate attributes with XML whitespace. Recognized color values may use
+literal characters or XML character references, for example `bt_&#55;09`
+for `bt_709`. Color values also recognize predefined XML entities. Custom
+entity expansion is outside the color reader's supported syntax.
 Malformed or conflicting descriptions produce `InvalidFrame`, as does received
 metadata withheld with `FrameMetadataStatus::NotUtf8` or `Unterminated`. Owned
 copies and clones preserve that status without retaining the unreadable text,

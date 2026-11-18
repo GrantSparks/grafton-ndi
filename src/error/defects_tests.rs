@@ -335,6 +335,7 @@ fn color_metadata_issue_diagnostics_preserve_supplied_peer_text() {
         ColorMetadataDefect::UnclosedValue,
         ColorMetadataDefect::DuplicateAttribute,
         ColorMetadataDefect::UndefinedValue,
+        ColorMetadataDefect::InvalidAttributeValue,
     ] {
         let cause = FrameDefect::ColorMetadata {
             issue,
