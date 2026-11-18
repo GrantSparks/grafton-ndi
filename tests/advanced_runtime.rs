@@ -3212,8 +3212,16 @@ fn dci_8k_nb4g_sends_and_decodes_at_full_resolution() {
     assert_eq!(frame.data().len(), MAX_VIDEO_BYTES);
     let plane_bytes = WIDTH as usize * HEIGHT as usize * size_of::<u16>();
     for (index, plane) in frame.data_mut().chunks_exact_mut(plane_bytes).enumerate() {
-        for row in plane.chunks_exact_mut(WIDTH as usize * size_of::<u16>()) {
-            for (x, sample) in row.chunks_exact_mut(size_of::<u16>()).enumerate() {
+        for row in plane
+            .as_chunks_mut::<{ WIDTH as usize * size_of::<u16>() }>()
+            .0
+        {
+            for (x, sample) in row
+                .as_chunks_mut::<{ size_of::<u16>() }>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
                 let value = match index {
                     0 => 16_384 + x as u16 * 4,
                     1 | 2 => 32_768,
