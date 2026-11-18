@@ -123,8 +123,8 @@ impl RecordingReport {
     ///
     /// True once the session has ended, as [`RecorderState::Closed`] or
     /// [`RecorderState::Indeterminate`], without a stop requested through
-    /// [`request_stop`](FileRecorder::request_stop),
-    /// [`finish`](FileRecorder::finish), [`abandon`](FileRecorder::abandon)
+    /// [`request_stop`](super::FileRecorder::request_stop),
+    /// [`finish`](super::FileRecorder::finish), [`abandon`](super::FileRecorder::abandon)
     /// or dropping the recorder. The SDK ends a session after an error it
     /// cannot recover from, such as a new file it cannot open, and at a
     /// format change when the recorder does not roll over; the report's
