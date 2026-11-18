@@ -9,8 +9,7 @@
 //! drop requests shutdown without joining another File thread, so notifications
 //! cannot stall behind cleanup or deadlock one another.
 
-use super::recorder::CheckedRecorderOptions;
-use super::types::path_string;
+use super::types::{path_string, CheckedRecorderOptions};
 use super::{
     EventText, FileApi, FileDuration, FileInfo, FilePlayer, FilePlayerOptions, FilePosition,
     FileRecorder, FileRecorderOptions, FinishStatus, PlayerEvent, PlayerStats, RecorderEvent,
@@ -2389,7 +2388,7 @@ impl AsyncFileRecorder {
         let options = options.clone();
         self.worker.prepare(
             move || {
-                let options = CheckedRecorderOptions::new(&options)?;
+                let options = options.check()?;
                 Ok(move |recorder: &mut RecorderOwner| recorder.reset(options))
             },
             false,
@@ -6537,7 +6536,7 @@ mod tests {
         let options = FileRecorderOptions::new(SourceSpec::new("mock").unwrap())
             .naming(FileNaming::Exact)
             .format_change_rollover(true);
-        let (resolved, expected) = crate::test_alloc::allocation_count(|| options.resolve());
+        let (resolved, expected) = crate::test_alloc::allocation_count(|| options.check());
         assert!(resolved.is_err());
         let operation = AsyncFileRecorder::create(&mock::recorder_api(), &options);
         let (operation, allocations) = crate::test_alloc::allocation_count(|| operation.submit());

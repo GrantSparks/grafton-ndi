@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    types::{NamePattern, ResolvedRecorderOptions},
+    types::{CheckedRecorderOptions, NamePattern},
     EventText, FileApi, FileBound, FileRecorderOptions, RecorderEvent, RecorderEventKind,
     RecorderStats, RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec, StateConflict,
 };
@@ -203,42 +203,16 @@ pub(super) struct PreparedRecorder {
     options: CheckedRecorderOptions,
 }
 
-/// Every option needed for creation, retaining the one resolved naming proof.
-/// Reset can validate this before queueing without retaining another runtime.
-pub(super) struct CheckedRecorderOptions {
-    source: SourceSpec,
-    tracks: MediaTypes,
-    planar_audio: bool,
-    proxy: bool,
-    rollover_size: u64,
-    resolved: ResolvedRecorderOptions,
-}
-
-impl CheckedRecorderOptions {
-    pub(super) fn new(options: &FileRecorderOptions) -> Result<Self> {
-        let resolved = options.resolve()?;
-        Ok(Self {
-            source: options.source.clone(),
-            tracks: options.tracks,
-            planar_audio: options.planar_audio,
-            proxy: options.proxy,
-            rollover_size: options.rollover_size,
-            resolved,
-        })
-    }
-}
-
 impl PreparedRecorder {
     pub(super) fn create(self) -> Result<FileRecorder> {
         let Self { recording, options } = self;
         let native = NativeRecorder::create(recording, &options)?;
-        let resolved = options.resolved;
         Ok(FileRecorder {
             native,
             tracks: options.tracks,
-            cleanup: Some(resolved.drop_wait),
+            cleanup: Some(options.drop_wait),
             accepted_source: Some(options.source),
-            naming: resolved.naming,
+            naming: options.naming,
             ledger: Ledger::idle(),
             generation: 0,
         })
@@ -279,7 +253,7 @@ impl FileRecorder {
 
     pub(super) fn prepare(api: FileApi, options: &FileRecorderOptions) -> Result<PreparedRecorder> {
         let recording = api.into_table::<sys::FileRecording>()?;
-        let options = CheckedRecorderOptions::new(options)?;
+        let options = options.check()?;
         Ok(PreparedRecorder { recording, options })
     }
 
@@ -695,7 +669,7 @@ impl FileRecorder {
         self.reset_with(|recorder| {
             PreparedRecorder {
                 recording: recorder.native.recording(),
-                options: CheckedRecorderOptions::new(options)?,
+                options: options.check()?,
             }
             .create()
         })

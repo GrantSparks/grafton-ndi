@@ -126,21 +126,17 @@ impl NativeRecorder {
         recording: FileBound<sys::FileRecording>,
         options: &CheckedRecorderOptions,
     ) -> Result<Self> {
-        let resolved = &options.resolved;
         let settings = NDIlib_file_recorder_create_t {
             source_to_connect_to: raw_source(&options.source),
             track_flags: track_flags(options.tracks),
             record_float_audio_planar_32f: options.planar_audio,
-            disable_auto_rollover_on_format_change: !resolved.format_change_rollover,
-            p_output_filename_pattern: resolved
-                .pattern
-                .as_ref()
-                .map_or(std::ptr::null(), |pattern| pattern.as_ptr()),
+            disable_auto_rollover_on_format_change: !options.format_change_rollover,
+            p_output_filename_pattern: options.naming.as_sdk_ptr(),
             disable_proxy_track: !options.proxy,
             rollover_max_file_size_bytes: options.rollover_size,
         };
-        // SAFETY: `settings` and the strings it points to, owned by `options`
-        // and `resolved`, are valid for the call.
+        // SAFETY: `settings` and the strings it points to, owned by `options`,
+        // are valid for the call.
         let handle =
             unsafe { recording.named().NDIlib_file_recorder_create(&settings) }.created()?;
         Ok(Self {

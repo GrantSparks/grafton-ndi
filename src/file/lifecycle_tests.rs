@@ -1979,6 +1979,16 @@ fn values_a_refused_call_was_given_stay_with_the_caller_to_pass_again() {
 }
 
 #[test]
+fn preparing_a_player_allocates_only_its_checked_name() {
+    let options = FilePlayerOptions::new("mock player");
+    let api = mock::recorder_api();
+    let (_, allocations) = crate::test_alloc::allocation_count(|| {
+        crate::file::FilePlayer::prepare(api, &options).unwrap()
+    });
+    assert_eq!(allocations, 1);
+}
+
+#[test]
 fn players_borrow_their_options() {
     let api = FileApi::with_tables(
         sys::FilePlayback {
