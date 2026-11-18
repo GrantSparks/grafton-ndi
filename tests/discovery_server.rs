@@ -10,10 +10,15 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, prerequisites, name, discovery_server, child);
+common_helpers!(
+    runtime,
+    prerequisites,
+    name,
+    discovery_server,
+    child,
+    fixture
+);
 use common::TestChild;
-#[path = "support/fixture.rs"]
-mod fixture;
 
 use grafton_ndi::{
     capabilities::RuntimeFeature,
@@ -461,7 +466,7 @@ fn configured_servers_without_a_usable_endpoint_report_configuration_rejection()
         }
         return;
     }
-    let fixture = fixture::FixtureDir::create("discovery-configuration");
+    let fixture = common::FixtureDir::create("discovery-configuration");
     let scenarios = [
         ("absent", r#"{"ndi":{}}"#),
         (

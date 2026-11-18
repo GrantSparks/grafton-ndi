@@ -4,13 +4,12 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
+use runtime_fixture::read_fake_log;
 
 use grafton_ndi::{Error, Ndi, Receiver, ReceiverOptions, RuntimeOptions, Source};
 use std::{fs, sync::Barrier};
@@ -21,7 +20,7 @@ fn connection_target_tracks_native_requests() {
         exercise_target();
         return;
     }
-    let directory = fixture::FixtureDir::create("connection-target");
+    let directory = common::FixtureDir::create("connection-target");
     let library = directory.path().join("libndi_target.so");
     runtime_fixture::FakeRuntime {
         cfgs: vec!["fake_objects"],
@@ -80,7 +79,7 @@ fn connection_target_snapshot_does_not_wait_for_a_native_connection_request() {
         assert_eq!(receiver.connection_target(), blocked);
         return;
     }
-    let directory = fixture::FixtureDir::create("connection-target-blocked");
+    let directory = common::FixtureDir::create("connection-target-blocked");
     let library = directory.path().join("libndi_blocked.so");
     runtime_fixture::FakeRuntime {
         cfgs: vec!["fake_objects", "fake_blocking_connect"],
@@ -115,10 +114,8 @@ fn exercise_target() {
         Err(Error::InvalidCString(_))
     ));
     assert_eq!(receiver.connection_target(), b);
-    let log = std::path::PathBuf::from(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap());
     let requests = || {
-        fs::read_to_string(&log)
-            .unwrap()
+        read_fake_log()
             .lines()
             .filter_map(|line| line.strip_prefix("receiver-connect:").map(str::to_owned))
             .collect::<Vec<_>>()

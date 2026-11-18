@@ -21,7 +21,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name, unsupported, loopback);
+common_helpers!(runtime, name, unsupported, loopback, stop);
 
 use grafton_ndi::{
     capabilities::SdkEdition,
@@ -91,17 +91,6 @@ fn frame(
         .unwrap()
 }
 
-/// Stops a sending loop when the scope that waits for it ends, by return or
-/// by panic: a scope joins its threads either way, so a loop that only a
-/// later statement stops would hang a failed test instead of reporting it.
-struct StopOnDrop<'a>(&'a AtomicBool);
-
-impl Drop for StopOnDrop<'_> {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-}
-
 /// Send `frames` in rotation from one new sender, and receive from it in
 /// each of `formats` until every receiver holds a copy of each frame, which
 /// its metadata identifies. Returns one list a receiver, in `frames`' order.
@@ -128,7 +117,7 @@ fn round_trip(
                 std::thread::sleep(Duration::from_millis(40));
             }
         });
-        let _stop = StopOnDrop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         let received: Vec<Vec<VideoFrame>> = formats
             .iter()
             .map(|&format| {
@@ -685,7 +674,7 @@ fn framesync_frames_encode_like_the_frames_sent() {
                 std::thread::sleep(Duration::from_millis(40));
             }
         });
-        let _stop = StopOnDrop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         let receiver = Receiver::new(
             &ndi,
             &ReceiverOptions::new(source).color_format(ReceiverColorFormat::UyvyBgra),

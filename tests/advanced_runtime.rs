@@ -24,7 +24,9 @@ common_helpers!(
     loopback,
     endpoint,
     socket,
-    discovery_server
+    discovery_server,
+    fixture,
+    stop
 );
 
 use common::Requirement::{H264Decoder, Hevc444Decoder};
@@ -2237,7 +2239,7 @@ fn a_packet_receiver_moves_between_threads() {
     let stop = AtomicBool::new(false);
     let receiver = std::thread::scope(|scope| {
         let capture = scope.spawn(|| {
-            let _stop = StopOnDrop(&stop);
+            let _stop = common::StopOnDrop(&stop);
             let receiver = receiver;
             let deadline = Instant::now() + PATIENCE;
             let mut verified = 0;
@@ -2315,7 +2317,7 @@ fn an_allocated_packet_receiver_moves_between_threads() {
     let stop = AtomicBool::new(false);
     let packets = std::thread::scope(|scope| {
         let capture = scope.spawn(|| {
-            let _stop = StopOnDrop(&stop);
+            let _stop = common::StopOnDrop(&stop);
             let mut packets = packets;
             // Capture until video arrives after `count`'s policy has run.
             let used = |packets: &mut AllocatedReceiver<PacketAttached>,
@@ -2536,16 +2538,6 @@ fn wrapped_sender_tally_polls_preserve_waiters_changes() {
     check(queue.sender(), &receiver);
 }
 
-/// Sets a flag when it goes out of scope, so that a thread that runs until
-/// the flag is set also stops when the test fails.
-struct StopOnDrop<'a>(&'a AtomicBool);
-
-impl Drop for StopOnDrop<'_> {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
-}
-
 /// What each [`synchronized_audio`] request passes along with the video frame
 /// that paces it.
 #[derive(Clone, Copy)]
@@ -2673,7 +2665,7 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
         .unwrap();
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        let _stop = StopOnDrop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         scope.spawn(|| {
             while !stop.load(Ordering::Acquire) {
                 sender.send_video(&video).unwrap();
@@ -2808,7 +2800,7 @@ fn avsync_states_rates_for_non_stereo_sources() {
             .unwrap();
         let stop = AtomicBool::new(false);
         std::thread::scope(|scope| {
-            let _stop = StopOnDrop(&stop);
+            let _stop = common::StopOnDrop(&stop);
             scope.spawn(|| {
                 while !stop.load(Ordering::Acquire) {
                     sender.send_video(&video).unwrap();
@@ -2918,7 +2910,7 @@ fn an_avsync_moves_between_threads() {
         .unwrap();
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        let _stop = StopOnDrop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         scope.spawn(|| {
             while !stop.load(Ordering::Acquire) {
                 sender.send_video(&video).unwrap();
@@ -3638,7 +3630,7 @@ fn avsync_follows_source_format_changes_and_preserves_audio_samples() {
     let phase = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        let _stop = StopOnDrop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         scope.spawn(|| {
             let video = [
                 VideoFrame::builder()
@@ -3745,7 +3737,7 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
     let thirty = FrameRate::new(30, 1).unwrap();
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        let _stop = StopOnDrop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         scope.spawn(|| {
             let video = video();
             let audio = AudioFrame::builder()
@@ -3865,7 +3857,7 @@ fn a_genlock_moves_between_threads() {
     let thirty = FrameRate::new(30, 1).unwrap();
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        let _stop = StopOnDrop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         scope.spawn(|| {
             let video = video();
             let audio = AudioFrame::builder()
@@ -4206,16 +4198,10 @@ fn borrowed_packet_capture_decodes_formats_outside_its_preset() {
     // on 100ms receive timeouts or bursts of status/metadata notifications.
     let stop = AtomicBool::new(false);
     let submitted = AtomicUsize::new(0);
-    struct StopOnDrop<'a>(&'a AtomicBool);
-    impl Drop for StopOnDrop<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
-        }
-    }
     std::thread::scope(|scope| {
         // This guard signals even when capture or an assertion unwinds, so
         // the scope never waits for a producer whose stop flag was forgotten.
-        let _stop_on_exit = StopOnDrop(&stop);
+        let _stop_on_exit = common::StopOnDrop(&stop);
         scope.spawn(|| {
             let mut sender = sender;
             let mut pts = 0;
@@ -4317,7 +4303,7 @@ fn avsync_borrows_two_results_and_releases_them_out_of_order() {
         .unwrap();
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        let _stop = StopOnDrop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         scope.spawn(|| {
             while !stop.load(Ordering::Acquire) {
                 sender.send_video(&video).unwrap();

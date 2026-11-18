@@ -3351,11 +3351,7 @@ mod tests {
         );
         let fixture =
             include_str!("../../tests/ui/internal/fail/file_operation_cannot_defer_again.rs");
-        let directory = std::env::temp_dir().join(format!(
-            "grafton-file-operation-contract-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = crate::test_support::FixtureDir::create("file-operation-contract");
         for (name, body, succeeds) in [
             (
                 "live",
@@ -3368,7 +3364,7 @@ mod tests {
             std::fs::write(&path, format!("{definitions}\n{body}")).unwrap();
             let output = std::process::Command::new("rustc")
                 .args(["--edition=2021", "--emit=metadata", "--out-dir"])
-                .arg(&directory)
+                .arg(directory.path())
                 .arg(path)
                 .output()
                 .unwrap();
@@ -3381,7 +3377,6 @@ mod tests {
                 );
             }
         }
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -6031,15 +6026,13 @@ mod tests {
             block_on(player.close()).unwrap();
             return;
         }
-        let directory =
-            std::env::temp_dir().join(format!("grafton-file-start-path-{}", std::process::id()));
+        let directory = crate::test_support::FixtureDir::create("file-start-path");
         std::fs::create_dir_all(directory.join("submitted")).unwrap();
         std::fs::create_dir_all(directory.join("running")).unwrap();
         crate::test_support::TestChild::new("file::asynchronous::tests::a_relative_player_start_retains_the_directory_at_submission")
 
-            .env(CHILD, &directory)
+            .env(CHILD, directory.path())
             .run();
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

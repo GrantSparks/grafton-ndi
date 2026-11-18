@@ -4,22 +4,18 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture, stop);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
+use runtime_fixture::read_fake_log;
 
 use grafton_ndi::{
     Error, FrameRate, Ndi, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef, ReceiverOptions,
     RuntimeOptions, ScanType, Source, Timecode,
 };
-use std::{
-    fs,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 #[test]
 fn mixed_capture_dispatch_and_lifecycle() {
@@ -27,7 +23,7 @@ fn mixed_capture_dispatch_and_lifecycle() {
         exercise(std::path::PathBuf::from(library));
         return;
     }
-    let directory = fixture::FixtureDir::create("mixed-capture");
+    let directory = common::FixtureDir::create("mixed-capture");
     let library = directory.path().join("libndi_capture.so");
     runtime_fixture::FakeRuntime {
         cfgs: vec!["fake_objects", "fake_capture"],
@@ -44,18 +40,14 @@ fn script(serial: usize, items: &str) {
     std::env::set_var("GRAFTON_FAKE_CAPTURE_SCRIPT", format!("{serial}:{items}"));
 }
 
-fn log() -> String {
-    fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap()
-}
-
 fn captures() -> usize {
-    log()
+    read_fake_log()
         .lines()
         .filter(|line| line.starts_with("capture:"))
         .count()
 }
 fn frees(kind: &str) -> usize {
-    log()
+    read_fake_log()
         .lines()
         .filter(|line| *line == format!("free-{kind}"))
         .count()
@@ -64,7 +56,7 @@ fn frees(kind: &str) -> usize {
 #[cfg(any(feature = "tokio", feature = "smol"))]
 fn native_payload(kind: &str) -> usize {
     let prefix = format!("{kind}-data:");
-    log()
+    read_fake_log()
         .lines()
         .rev()
         .find_map(|line| line.strip_prefix(&prefix))
@@ -161,14 +153,14 @@ fn exercise(library: std::path::PathBuf) {
         receiver.next_event(Duration::ZERO).unwrap(),
         Some(ReceiverEvent::Unknown(987))
     );
-    assert!(log().lines().last().unwrap().ends_with(":000:0"));
+    assert!(read_fake_log().lines().last().unwrap().ends_with(":000:0"));
     assert!(receiver.capture_any_ref(Duration::ZERO).unwrap().is_none());
     script(91, "unknown");
     assert!(matches!(
         receiver.capture_any_ref(Duration::ZERO).unwrap(),
         Some(ReceiverItemRef::Event(ReceiverEvent::Unknown(987)))
     ));
-    assert!(log().lines().last().unwrap().ends_with(":111:0"));
+    assert!(read_fake_log().lines().last().unwrap().ends_with(":111:0"));
     assert!(receiver.next_event(Duration::ZERO).unwrap().is_none());
     assert!(receiver.capture_any_ref(Duration::ZERO).unwrap().is_none());
 
@@ -207,7 +199,7 @@ fn exercise(library: std::path::PathBuf) {
                 .map(|frame| frame.is_some()),
         };
         assert!(!typed_capture().unwrap());
-        assert!(log()
+        assert!(read_fake_log()
             .lines()
             .last()
             .unwrap()
@@ -215,7 +207,7 @@ fn exercise(library: std::path::PathBuf) {
         let before = frees(token);
         assert!(typed_capture().unwrap());
         assert_eq!(frees(token), before + 1);
-        assert!(log()
+        assert!(read_fake_log()
             .lines()
             .rev()
             .find(|line| line.starts_with("capture:"))
@@ -265,7 +257,7 @@ fn exercise(library: std::path::PathBuf) {
     assert_eq!(captures(), calls);
     assert!(receiver.capture_any(Duration::ZERO).unwrap().is_none());
     assert_eq!(captures(), calls + 1);
-    assert!(log().lines().last().unwrap().ends_with(":111:0"));
+    assert!(read_fake_log().lines().last().unwrap().ends_with(":111:0"));
 
     // Immediate native misses spend the whole budget with bounded retry
     // pauses, and media arriving later does not wait for another media kind.
@@ -791,19 +783,13 @@ async fn cancel_scoped<R: grafton_ndi::asynchronous::AsyncRuntime>(
         },
         task::{Context, Poll, Waker},
     };
-    struct ResultDrop(Arc<AtomicBool>);
-    impl Drop for ResultDrop {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
-        }
-    }
     script(serial, "video");
     if native_entry {
         std::env::set_var("GRAFTON_FAKE_CAPTURE_DELAY_MS", "80");
     }
     let calls = captures();
     let before = frees("video");
-    let destroyed = log()
+    let destroyed = read_fake_log()
         .lines()
         .filter(|&line| line == "receiver-destroy")
         .count();
@@ -815,7 +801,7 @@ async fn cancel_scoped<R: grafton_ndi::asynchronous::AsyncRuntime>(
         assert_eq!(width, 4);
         entered_tx.send(()).unwrap();
         release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        ResultDrop(worker_dropped)
+        common::StopOnDrop(worker_dropped)
     };
     let mut future = Box::pin(async {
         if typed {
@@ -855,7 +841,7 @@ async fn cancel_scoped<R: grafton_ndi::asynchronous::AsyncRuntime>(
     }
     assert_eq!(frees("video"), before, "callback retains the native buffer");
     assert_eq!(
-        log()
+        read_fake_log()
             .lines()
             .filter(|&line| line == "receiver-destroy")
             .count(),
@@ -866,7 +852,7 @@ async fn cancel_scoped<R: grafton_ndi::asynchronous::AsyncRuntime>(
     assert_eq!(frees("video"), before);
     release_tx.send(()).unwrap();
     while !dropped.load(Ordering::Acquire)
-        || log()
+        || read_fake_log()
             .lines()
             .filter(|&line| line == "receiver-destroy")
             .count()
@@ -879,7 +865,7 @@ async fn cancel_scoped<R: grafton_ndi::asynchronous::AsyncRuntime>(
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(frees("video"), before + 1);
-    let records = log();
+    let records = read_fake_log();
     assert!(records.rfind("free-video").unwrap() < records.rfind("receiver-destroy").unwrap());
     std::env::remove_var("GRAFTON_FAKE_CAPTURE_DELAY_MS");
 }

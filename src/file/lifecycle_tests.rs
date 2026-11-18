@@ -4,6 +4,7 @@ use super::{
     mock::{self, Closing, FILE_CLOSED, ROLLOVER, TAKE},
     *,
 };
+use crate::test_support::FixtureDir;
 use crate::{sys, timeout::Deadline, MediaTypes};
 use std::{
     cell::Cell,
@@ -1356,31 +1357,8 @@ fn a_session_the_sdk_ended_is_reported_as_stopped_by_it() {
     assert!(!report.stopped_by_sdk());
 }
 
-/// A directory of its own for one test's targets, removed when it ends.
-struct Directory(std::path::PathBuf);
-
-impl Directory {
-    fn new(test: &str) -> Self {
-        let directory = std::env::temp_dir().join(format!(
-            "grafton-ndi-mock-{test}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        Self(directory)
-    }
-
-    fn target(&self, name: &str) -> RecordingTarget {
-        RecordingTarget::new(self.0.join(name)).unwrap()
-    }
-}
-
-impl Drop for Directory {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+fn fixture_target(directory: &std::path::Path, name: &str) -> RecordingTarget {
+    RecordingTarget::new(directory.join(name)).unwrap()
 }
 
 fn exact() -> FileRecorderOptions {
@@ -1396,11 +1374,11 @@ fn io_kind<T: std::fmt::Debug>(result: Result<T>) -> std::io::ErrorKind {
 
 #[test]
 fn unreportable_recording_paths_never_reach_native_start_or_rollover() {
-    let directory = Directory::new("path-limit");
+    let directory = FixtureDir::create("path-limit");
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
-    let base = directory.0.to_str().unwrap();
+    let base = directory.path().to_str().unwrap();
     let path_bytes = sys::bindings::NDIlib_file_recorder_event_path_max_size as usize - 1;
     let too_long = RecordingTarget::new(format!(
         "{base}/{}",
@@ -1413,7 +1391,10 @@ fn unreportable_recording_paths_never_reach_native_start_or_rollover() {
     ));
     assert_eq!(device.starts.load(Ordering::Acquire), 0);
     recorder
-        .start(&directory.target("take.mkv"), RecordingTimecode::Preserve)
+        .start(
+            &fixture_target(directory.path(), "take.mkv"),
+            RecordingTimecode::Preserve,
+        )
         .unwrap();
     assert!(matches!(
         recorder.rollover(&too_long),
@@ -1536,7 +1517,7 @@ fn a_reset_to_conflicting_options_keeps_the_recorder() {
 
 #[test]
 fn an_exact_recorder_changes_source_only_between_sessions() {
-    let directory = Directory::new("exact-source");
+    let directory = FixtureDir::create("exact-source");
     let device = mock::Recorder::new(Closing::Never);
     device.install();
     let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
@@ -1546,7 +1527,10 @@ fn an_exact_recorder_changes_source_only_between_sessions() {
     assert_eq!(device.source_changes.load(Ordering::Acquire), 1);
 
     recorder
-        .start(&directory.target("take.mkv"), RecordingTimecode::Preserve)
+        .start(
+            &fixture_target(directory.path(), "take.mkv"),
+            RecordingTimecode::Preserve,
+        )
         .unwrap();
     assert!(matches!(
         recorder.set_source(&another()),
@@ -1585,39 +1569,44 @@ fn an_indexed_recorder_refuses_a_change_of_source_only_while_stopping() {
 
 #[test]
 fn an_exact_target_that_exists_is_refused_before_the_sdk_sees_it() {
-    let directory = Directory::new("exact-exists");
-    std::fs::write(directory.0.join("taken.mkv"), b"kept").unwrap();
+    let directory = FixtureDir::create("exact-exists");
+    std::fs::write(directory.join("taken.mkv"), b"kept").unwrap();
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
 
     assert_eq!(
-        io_kind(recorder.start(&directory.target("taken.mkv"), RecordingTimecode::Preserve)),
+        io_kind(recorder.start(
+            &fixture_target(directory.path(), "taken.mkv"),
+            RecordingTimecode::Preserve
+        )),
         std::io::ErrorKind::AlreadyExists
     );
     assert_eq!(device.starts.load(Ordering::Acquire), 0);
     assert_eq!(recorder.state(), RecorderState::Idle);
 
     recorder
-        .start(&directory.target("first.mkv"), RecordingTimecode::Preserve)
+        .start(
+            &fixture_target(directory.path(), "first.mkv"),
+            RecordingTimecode::Preserve,
+        )
         .unwrap();
     assert_eq!(
-        io_kind(recorder.rollover(&directory.target("taken.mkv"))),
+        io_kind(recorder.rollover(&fixture_target(directory.path(), "taken.mkv"))),
         std::io::ErrorKind::AlreadyExists
     );
     assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
     assert_eq!(recorder.state(), RecorderState::Recording);
-    recorder.rollover(&directory.target("second.mkv")).unwrap();
+    recorder
+        .rollover(&fixture_target(directory.path(), "second.mkv"))
+        .unwrap();
     assert_eq!(device.rollovers.load(Ordering::Acquire), 1);
-    assert_eq!(
-        std::fs::read(directory.0.join("taken.mkv")).unwrap(),
-        b"kept"
-    );
+    assert_eq!(std::fs::read(directory.join("taken.mkv")).unwrap(), b"kept");
 }
 
 #[test]
 fn the_directory_a_pattern_names_is_checked_before_the_sdk_sees_it() {
-    let directory = Directory::new("pattern-directory");
+    let directory = FixtureDir::create("pattern-directory");
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
@@ -1626,16 +1615,22 @@ fn the_directory_a_pattern_names_is_checked_before_the_sdk_sees_it() {
 
     // The target's own directory exists; the one the pattern names does not.
     assert_eq!(
-        io_kind(recorder.start(&directory.target("first"), RecordingTimecode::Preserve)),
+        io_kind(recorder.start(
+            &fixture_target(directory.path(), "first"),
+            RecordingTimecode::Preserve
+        )),
         std::io::ErrorKind::NotFound
     );
     assert_eq!(device.starts.load(Ordering::Acquire), 0);
-    std::fs::create_dir(directory.0.join("first")).unwrap();
+    std::fs::create_dir(directory.join("first")).unwrap();
     recorder
-        .start(&directory.target("first"), RecordingTimecode::Preserve)
+        .start(
+            &fixture_target(directory.path(), "first"),
+            RecordingTimecode::Preserve,
+        )
         .unwrap();
     assert_eq!(
-        io_kind(recorder.rollover(&directory.target("missing"))),
+        io_kind(recorder.rollover(&fixture_target(directory.path(), "missing"))),
         std::io::ErrorKind::NotFound
     );
     assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
@@ -1645,11 +1640,11 @@ fn the_directory_a_pattern_names_is_checked_before_the_sdk_sees_it() {
 /// Exercise the public start and rollover paths against a permission-restricted
 /// child directory, keeping the active session outside that directory.
 #[cfg(any(unix, windows))]
-fn unwritable_directory_is_refused_before_native_calls(directory: &Directory) {
+fn unwritable_directory_is_refused_before_native_calls(directory: &std::path::Path) {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let mut recorder = FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
-    let denied = directory.target("denied/take.mkv");
+    let denied = fixture_target(directory, "denied/take.mkv");
     let error = recorder
         .start(&denied, RecordingTimecode::Preserve)
         .unwrap_err();
@@ -1662,7 +1657,10 @@ fn unwritable_directory_is_refused_before_native_calls(directory: &Directory) {
     assert_eq!(recorder.state(), RecorderState::Idle);
 
     recorder
-        .start(&directory.target("live.mkv"), RecordingTimecode::Preserve)
+        .start(
+            &fixture_target(directory, "live.mkv"),
+            RecordingTimecode::Preserve,
+        )
         .unwrap();
     assert_eq!(
         io_kind(recorder.rollover(&denied)),
@@ -1671,9 +1669,7 @@ fn unwritable_directory_is_refused_before_native_calls(directory: &Directory) {
     assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
     assert_eq!(recorder.state(), RecorderState::Recording);
     assert_eq!(
-        std::fs::read_dir(directory.0.join("denied"))
-            .unwrap()
-            .count(),
+        std::fs::read_dir(directory.join("denied")).unwrap().count(),
         0
     );
 }
@@ -1688,8 +1684,8 @@ fn unwritable_unix_recording_directories_never_reach_the_sdk() {
             std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
-    let directory = Directory::new("unwritable-unix");
-    let denied = directory.0.join("denied");
+    let directory = FixtureDir::create("unwritable-unix");
+    let denied = directory.join("denied");
     std::fs::create_dir(&denied).unwrap();
     let _restore = Restore(denied.clone());
     std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -1712,7 +1708,7 @@ fn unwritable_unix_recording_directories_never_reach_the_sdk() {
         crate::test_support::unsupported("this process can override directory write permissions");
         return;
     }
-    unwritable_directory_is_refused_before_native_calls(&directory);
+    unwritable_directory_is_refused_before_native_calls(directory.path());
 }
 
 #[cfg(target_os = "linux")]
@@ -1723,7 +1719,7 @@ fn an_effective_identity_without_write_access_is_refused() {
     if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
         // This isolated subprocess alone changes identity. The parent retains
         // ownership of the fixture and removes it after this process exits.
-        let directory = std::mem::ManuallyDrop::new(Directory(directory.into()));
+        let directory = std::path::PathBuf::from(directory);
         // SAFETY: geteuid/getuid take no arguments and inspect this process.
         assert_eq!(unsafe { libc::getuid() }, 0);
         assert_eq!(unsafe { libc::geteuid() }, 0);
@@ -1749,15 +1745,15 @@ fn an_effective_identity_without_write_access_is_refused() {
         crate::test_support::unsupported("this identity-switching regression requires root");
         return;
     }
-    let directory = Directory::new("effective-identity");
-    std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o777)).unwrap();
-    let denied = directory.0.join("denied");
+    let directory = FixtureDir::create("effective-identity");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let denied = directory.join("denied");
     std::fs::create_dir(&denied).unwrap();
     std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).unwrap();
     crate::test_support::TestChild::new(
         "file::lifecycle_tests::an_effective_identity_without_write_access_is_refused",
     )
-    .env(CHILD_DIRECTORY, &directory.0)
+    .env(CHILD_DIRECTORY, directory.path())
     .run();
 }
 
@@ -1779,8 +1775,8 @@ fn acl_denied_windows_recording_directories_never_reach_the_sdk() {
             );
         }
     }
-    let directory = Directory::new("unwritable-windows");
-    let denied = directory.0.join("denied");
+    let directory = FixtureDir::create("unwritable-windows");
+    let denied = directory.join("denied");
     std::fs::create_dir(&denied).unwrap();
     let _restore = Restore(denied.clone());
     // Deny Everyone's write-data/add-file right on this test-owned directory.
@@ -1795,7 +1791,7 @@ fn acl_denied_windows_recording_directories_never_reach_the_sdk() {
         "{}",
         String::from_utf8_lossy(&restricted.stderr)
     );
-    unwritable_directory_is_refused_before_native_calls(&directory);
+    unwritable_directory_is_refused_before_native_calls(directory.path());
 }
 
 #[cfg(windows)]
@@ -1839,9 +1835,9 @@ fn low_integrity_recording_honours_the_directory_label() {
         assert_ne!(value, 0, "{}", std::io::Error::last_os_error());
     }
 
-    let directory = Directory::new("integrity-windows");
+    let directory = FixtureDir::create("integrity-windows");
     for (name, label) in [("low", "(OI)(CI)L"), ("medium", "(OI)(CI)M")] {
-        let child = directory.0.join(name);
+        let child = directory.join(name);
         std::fs::create_dir(&child).unwrap();
         let output = std::process::Command::new("icacls")
             .arg(&child)
@@ -1858,8 +1854,8 @@ fn low_integrity_recording_honours_the_directory_label() {
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let mut recorder = FileRecorder::new(&mock::recorder_api(), &exact()).unwrap();
-    let low = directory.target("low/take.mkv");
-    let medium = directory.target("medium/take.mkv");
+    let low = fixture_target(directory.path(), "low/take.mkv");
+    let medium = fixture_target(directory.path(), "medium/take.mkv");
 
     let mut process_token = ptr::null_mut();
     // SAFETY: the process pseudo-handle is live and the out handle is writable.
@@ -1932,28 +1928,28 @@ fn low_integrity_recording_honours_the_directory_label() {
 
 #[test]
 fn values_a_refused_call_was_given_stay_with_the_caller_to_pass_again() {
-    let directory = Directory::new("borrowed");
+    let directory = FixtureDir::create("borrowed");
     let device = mock::Recorder::new(Closing::AtStop);
     device.install();
     let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap());
     let mut recorder = crate::file::FileRecorder::new(&mock::recorder_api(), &options).unwrap();
 
     // The indexed pattern puts each file in the directory the target names.
-    let first = directory.target("first/take");
+    let first = fixture_target(directory.path(), "first/take");
     assert_eq!(
         io_kind(recorder.start(&first, RecordingTimecode::Preserve)),
         std::io::ErrorKind::NotFound
     );
-    std::fs::create_dir(directory.0.join("first")).unwrap();
+    std::fs::create_dir(directory.join("first")).unwrap();
     recorder.start(&first, RecordingTimecode::Preserve).unwrap();
 
-    let second = directory.target("second/take");
+    let second = fixture_target(directory.path(), "second/take");
     assert_eq!(
         io_kind(recorder.rollover(&second)),
         std::io::ErrorKind::NotFound
     );
     assert_eq!(recorder.state(), RecorderState::Recording);
-    std::fs::create_dir(directory.0.join("second")).unwrap();
+    std::fs::create_dir(directory.join("second")).unwrap();
     recorder.rollover(&second).unwrap();
     assert_eq!(device.rollovers.load(Ordering::Acquire), 1);
 

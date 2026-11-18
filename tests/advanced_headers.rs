@@ -3,14 +3,17 @@
 // provides libclang. SDK-free builds exercise the selector in build_configuration.
 #![cfg(all(feature = "advanced", ndi_has_advanced_header))]
 
-#[path = "support/fixture.rs"]
-mod fixture;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(fixture);
+
 #[path = "support/nested_cargo.rs"]
 mod nested_cargo;
 
 #[test]
 fn partial_advanced_headers_disable_only_the_missing_declarations() {
-    let fixture = fixture::FixtureDir::create("partial-advanced");
+    let fixture = common::FixtureDir::create("partial-advanced");
     let include = fixture.path().join("include");
     std::fs::create_dir(&include).unwrap();
     // Synthetic ABI declarations, not redistributed vendor headers. The

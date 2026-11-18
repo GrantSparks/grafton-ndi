@@ -4,17 +4,14 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
 #[path = "../src/sys/loader/file_policy.rs"]
 mod file_policy;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
-use fixture::FixtureDir;
 use grafton_ndi::{Ndi, RuntimeOptions};
 use runtime_fixture::FakeRuntime;
 use std::{fs, path::PathBuf};
@@ -53,7 +50,7 @@ fn relative_environment_directories_never_run_constructors() {
         if scenario == "file" && !cfg!(feature = "file-io") {
             continue;
         }
-        let directory = FixtureDir::create("relative-loader-trust");
+        let directory = common::FixtureDir::create("relative-loader-trust");
         let root = directory.path();
         for name in ["trusted", "executable", "relative", "loader"] {
             fs::create_dir(root.join(name)).unwrap();
@@ -161,7 +158,7 @@ fn explicit_paths_avoid_rejected_search_candidates() {
         if scenario.starts_with("file-") && !cfg!(feature = "file-io") {
             continue;
         }
-        let directory = FixtureDir::create("loader-trust");
+        let directory = common::FixtureDir::create("loader-trust");
         let root = directory.path();
         for name in ["trusted", "executable", "file-runtime"] {
             fs::create_dir(root.join(name)).unwrap();

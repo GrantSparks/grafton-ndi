@@ -1,7 +1,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name, loopback);
+common_helpers!(runtime, name, loopback, stop);
 
 use std::{
     sync::{mpsc, Arc, Barrier},
@@ -213,12 +213,6 @@ fn split_clocked_video_keeps_audio_flowing_on_another_thread() -> grafton_ndi::R
         .num_samples(480)
         .build()?;
     let ready = AtomicBool::new(false);
-    struct Ready<'a>(&'a AtomicBool);
-    impl Drop for Ready<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
-        }
-    }
     thread::scope(|scope| {
         scope.spawn(|| {
             while !ready.load(Ordering::Acquire) {
@@ -226,7 +220,7 @@ fn split_clocked_video_keeps_audio_flowing_on_another_thread() -> grafton_ndi::R
                 thread::sleep(Duration::from_millis(10));
             }
         });
-        let _ready = Ready(&ready);
+        let _ready = common::StopOnDrop(&ready);
         let deadline = Instant::now() + Duration::from_secs(15);
         while receiver
             .capture_audio(Duration::from_millis(100))

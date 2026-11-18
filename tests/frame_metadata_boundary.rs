@@ -4,11 +4,9 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
@@ -46,7 +44,7 @@ fn malformed_per_frame_metadata_preserves_typed_mixed_and_async_media() {
         ));
         return;
     }
-    let directory = fixture::FixtureDir::create("frame-metadata");
+    let directory = common::FixtureDir::create("frame-metadata");
     let library = directory.path().join("libndi_capture.so");
     runtime_fixture::FakeRuntime {
         cfgs: vec!["fake_objects", "fake_capture"],

@@ -3,19 +3,16 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use fixture::FixtureDir;
 use grafton_ndi::{
     Error, Finder, FinderOptions, Ndi, RuntimeOptions, Source, SourceAddress, SourceCache,
 };
-use runtime_fixture::FakeRuntime;
+use runtime_fixture::{read_fake_log, FakeRuntime};
 use std::{
     path::PathBuf,
     sync::Arc,
@@ -74,8 +71,7 @@ fn owning_cache_retains_discovery_scope_and_runtime_across_server_workers() {
             !Ndi::is_running(),
             "the last cache owner releases its runtime"
         );
-        let calls =
-            std::fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap();
+        let calls = read_fake_log();
         for operation in ["initialize", "finder-create", "finder-destroy", "destroy"] {
             assert_eq!(
                 calls.lines().filter(|line| *line == operation).count(),
@@ -86,7 +82,7 @@ fn owning_cache_retains_discovery_scope_and_runtime_across_server_workers() {
         assert!(calls.find("finder-destroy").unwrap() < calls.rfind("destroy").unwrap());
         return;
     }
-    let directory = FixtureDir::create("owned-source-cache");
+    let directory = common::FixtureDir::create("owned-source-cache");
     let library = directory.path().join("finder.so");
     FakeRuntime {
         cfgs: vec!["fake_finder"],
@@ -249,7 +245,7 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
             .unwrap();
         return;
     }
-    let directory = FixtureDir::create("finder-selection");
+    let directory = common::FixtureDir::create("finder-selection");
     let library = directory.path().join("finder.so");
     FakeRuntime {
         cfgs: vec!["fake_finder"],

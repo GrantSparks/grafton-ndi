@@ -4,19 +4,18 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
+use runtime_fixture::read_fake_log;
 
 use grafton_ndi::{
     advanced::MouseButton, Error, FrameSync, FrameSyncAudioRequest, MediaTypes, Ndi, Receiver,
     ReceiverOptions, RuntimeFeature, RuntimeOptions, ScanType, SettingChange, Source, StreamTier,
 };
-use std::{fs, time::Duration};
+use std::time::Duration;
 
 #[test]
 fn kvm_release_precedes_connection_changes_on_the_same_receiver() {
@@ -24,7 +23,7 @@ fn kvm_release_precedes_connection_changes_on_the_same_receiver() {
         exercise_kvm(library.into());
         return;
     }
-    let directory = fixture::FixtureDir::create("kvm-controls");
+    let directory = common::FixtureDir::create("kvm-controls");
     let library = directory.path().join("libkvm.so");
     runtime_fixture::FakeRuntime {
         cfgs: vec![
@@ -54,12 +53,11 @@ fn exercise_kvm(library: std::path::PathBuf) {
         ));
         return;
     }
-    let log_path = std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap();
     let mut session = receiver.kvm().unwrap();
-    let before = fs::read_to_string(&log_path).unwrap();
+    let before = read_fake_log();
     let view = session.receiver();
     let _ = view.ptz();
-    assert_eq!(fs::read_to_string(&log_path).unwrap(), before);
+    assert_eq!(read_fake_log(), before);
     assert_eq!(view.connection_target(), first);
     view.set_tally(grafton_ndi::Tally::new(true, false));
     session.key_down(0xffe1).unwrap();
@@ -100,7 +98,7 @@ fn exercise_kvm(library: std::path::PathBuf) {
     receiver.reconnect();
     drop(receiver);
 
-    let log = fs::read_to_string(&log_path).unwrap();
+    let log = read_fake_log();
     let lines: Vec<_> = log.lines().collect();
     let id = lines
         .iter()
@@ -221,7 +219,7 @@ fn controls_keep_the_same_receiver_and_synchronizer() {
         exercise(std::path::PathBuf::from(library));
         return;
     }
-    let directory = fixture::FixtureDir::create("framesync-controls");
+    let directory = common::FixtureDir::create("framesync-controls");
     for advanced in [false, true] {
         let library = directory.path().join(format!("libcontrols-{advanced}.so"));
         let mut fake = runtime_fixture::FakeRuntime {
@@ -344,7 +342,7 @@ fn exercise(library: std::path::PathBuf) {
     assert_eq!(receiver.connection_target(), source);
     drop(receiver);
 
-    let log = fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap();
+    let log = read_fake_log();
     let created: Vec<_> = log
         .lines()
         .filter(|line| line.starts_with("fs-create:"))

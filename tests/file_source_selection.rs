@@ -4,11 +4,8 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, file);
-#[path = "support/fixture.rs"]
-mod fixture;
+common_helpers!(runtime, file, fixture);
 
-use fixture::FixtureDir;
 use grafton_ndi::{
     file::{
         FileNaming, FileRecorderOptions, FinishStatus, RecorderEventKind, RecordingTarget,
@@ -32,7 +29,7 @@ fn configured_discovery_preserves_endpoint_and_explicit_name_recording() {
     // This executable has one test and loads no SDK before installing its own
     // process configuration. IP queries provide loopback discovery without
     // changing system or concurrent test-process configuration.
-    let fixture = FixtureDir::create("file-source-selection");
+    let fixture = common::FixtureDir::create("file-source-selection");
     let configuration = fixture.path().join("config");
     let temporary = fixture.path().join("tmp");
     std::fs::create_dir(&configuration).unwrap();

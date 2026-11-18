@@ -4,7 +4,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(policy, prerequisites, child);
+common_helpers!(policy, prerequisites, child, fixture);
 use common::TestChild;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
@@ -18,7 +18,7 @@ use grafton_ndi::{
     Error, Ndi, Receiver, ReceiverOptions, Sender, SenderOptions, Source, SourceAddress,
     VideoFrame,
 };
-use runtime_fixture::FakeRuntime;
+use runtime_fixture::{read_fake_log, FakeRuntime};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -39,9 +39,6 @@ fn fixture(directory: &Path, advanced: bool) -> PathBuf {
     } else {
         runtime.build(&directory.join("libndi.so"))
     }
-}
-fn log() -> String {
-    fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap()
 }
 /// Bytes as the fake runtime logs the strings it is given.
 fn hex(bytes: &[u8]) -> String {
@@ -73,7 +70,7 @@ fn retained_source(name: &str, address: &str) -> Source {
 
 fn assert_retained_reads(kind: &str, expected: &[(&str, &str)]) {
     let prefix = format!("retained-source:{kind}:");
-    let observed = log()
+    let observed = read_fake_log()
         .lines()
         .filter_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
         .collect::<Vec<_>>();
@@ -93,11 +90,9 @@ fn native_resource_ownership() {
         child(&case);
         return;
     }
-    let directory =
-        std::env::temp_dir().join(format!("grafton-ndi-ownership-{}", std::process::id()));
-    fs::create_dir_all(&directory).unwrap();
-    let standard = fixture(&directory, false);
-    let advanced = fixture(&directory, true);
+    let directory = common::FixtureDir::create("ownership");
+    let standard = fixture(directory.path(), false);
+    let advanced = fixture(directory.path(), true);
     let missing_scatter = directory.join("missing-scatter");
     fs::create_dir_all(&missing_scatter).unwrap();
     let missing_scatter = FakeRuntime {
@@ -185,7 +180,6 @@ fn native_resource_ownership() {
             )
             .run();
     }
-    fs::remove_dir_all(directory).unwrap();
 }
 fn child(case: &str) {
     let advanced = case.starts_with("queue_")
@@ -242,11 +236,11 @@ fn child(case: &str) {
                 .register(&sender, &SendAdvertisement::default())
                 .unwrap();
             drop(sender);
-            assert!(!log().contains("sender-destroy\n"));
+            assert!(!read_fake_log().contains("sender-destroy\n"));
             assert_retained_reads("failover", &[]);
             drop(advertiser);
             assert_retained_reads("failover", &[("registered failover", "192.0.2.5:5960")]);
-            let events = log();
+            let events = read_fake_log();
             assert!(
                 position(&events, "send-advertiser-destroy")
                     < position(&events, "sender-destroy-begin")
@@ -267,7 +261,7 @@ fn child(case: &str) {
                 }
             });
             drop(sender);
-            let events = log();
+            let events = read_fake_log();
             let reads = events
                 .lines()
                 .filter_map(|line| line.strip_prefix("retained-source:failover:"))
@@ -375,7 +369,7 @@ fn child(case: &str) {
                 .add_connection_metadata(&grafton_ndi::MetadataFrame::new("<last/>").unwrap())
                 .unwrap();
             drop(receiver);
-            let events = log();
+            let events = read_fake_log();
             for index in 0..16 {
                 let expected = format!(
                     "retained-metadata:receiver:{}:{index}",
@@ -409,7 +403,7 @@ fn child(case: &str) {
                 .add_connection_metadata(&grafton_ndi::MetadataFrame::new("<last/>").unwrap())
                 .unwrap();
             drop(router);
-            let events = log();
+            let events = read_fake_log();
             for index in 0..16 {
                 let expected = format!(
                     "retained-metadata:router:{}:{index}",
@@ -432,13 +426,13 @@ fn child(case: &str) {
                     .register(&receiver, &RecvAdvertisement::default())
                     .unwrap();
                 drop(receiver);
-                assert!(!log().contains("receiver-destroy\n"));
+                assert!(!read_fake_log().contains("receiver-destroy\n"));
                 drop(advertiser);
             } else {
                 drop(receiver);
             }
             let expected = format!("retained-receiver-name:{}", hex(name.as_bytes()));
-            let events = log();
+            let events = read_fake_log();
             let reads: Vec<_> = events
                 .lines()
                 .filter(|line| line.starts_with("retained-receiver-name:"))
@@ -468,7 +462,7 @@ fn child(case: &str) {
                 assert!(sender.submit_video(frame).is_none());
             }
             let reclaimed = sender.reclaim_video();
-            let events = log();
+            let events = read_fake_log();
             assert_eq!(events.matches("sender-flush\n").count(), 1);
             assert!(!events.contains("sender-destroy-begin\n"));
             for value in [11, 22] {
@@ -479,7 +473,11 @@ fn child(case: &str) {
             }
             let empty = sender.split().0.reclaim_video();
             assert!(empty.program.is_none() && empty.preview.is_none());
-            assert_eq!(log(), events, "an empty reclaim makes no native call");
+            assert_eq!(
+                read_fake_log(),
+                events,
+                "an empty reclaim makes no native call"
+            );
             for (frame, value) in [
                 (reclaimed.program.unwrap(), 11),
                 (reclaimed.preview.unwrap(), 22),
@@ -491,7 +489,10 @@ fn child(case: &str) {
                 assert!(sender.submit_video(frame).is_none());
             }
             drop(sender);
-            assert!(position(&log(), "sender-flush") < position(&log(), "sender-destroy-begin"));
+            assert!(
+                position(&read_fake_log(), "sender-flush")
+                    < position(&read_fake_log(), "sender-destroy-begin")
+            );
         }
         #[cfg(feature = "advanced")]
         "compressed_destroy" | "compressed_close" => {
@@ -528,7 +529,7 @@ fn child(case: &str) {
             } else {
                 drop(sender);
             }
-            let events = log();
+            let events = read_fake_log();
             for value in [11, 22] {
                 let release = position(&events, &format!("sender-loan-released={value}"));
                 assert!(position(&events, "sender-destroy-begin") < release);
@@ -558,7 +559,7 @@ fn child(case: &str) {
             pixels.fill(9);
             drop(pixels);
             drop(sender);
-            let events = log();
+            let events = read_fake_log();
             for value in 1..=6 {
                 assert_eq!(
                     events
@@ -578,9 +579,8 @@ fn child(case: &str) {
         }
         "sender_split_overlap" => {
             use std::time::Instant;
-            let gate = std::env::temp_dir().join(format!("raw-video-gate-{}", std::process::id()));
-            fs::create_dir_all(&gate).unwrap();
-            std::env::set_var("GRAFTON_FAKE_VIDEO_GATE", &gate);
+            let gate = common::FixtureDir::create("raw-video-gate");
+            std::env::set_var("GRAFTON_FAKE_VIDEO_GATE", gate.path());
             struct Release<'a>(&'a Path);
             impl Drop for Release<'_> {
                 fn drop(&mut self) {
@@ -591,7 +591,7 @@ fn child(case: &str) {
             let (mut video, shared) = sender.split();
             std::thread::scope(|scope| {
                 let submission = scope.spawn(move || video.submit_video(frame()).unwrap());
-                let _release = Release(&gate);
+                let _release = Release(gate.path());
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while !gate.join("entered").exists() {
                     assert!(Instant::now() < deadline, "video never entered the SDK");
@@ -616,17 +616,16 @@ fn child(case: &str) {
                     !submission.is_finished(),
                     "video must still be blocked in the SDK"
                 );
-                let events = log();
+                let events = read_fake_log();
                 assert!(events.contains("sender-audio\n"));
                 assert!(!events.contains("sender-video-released\n"));
             });
             std::env::remove_var("GRAFTON_FAKE_VIDEO_GATE");
             drop(sender);
-            let events = log();
+            let events = read_fake_log();
             assert!(position(&events, "sender-audio") < position(&events, "sender-video-released"));
             assert_eq!(events.matches("sender-flush\n").count(), 1);
             assert_eq!(events.matches("sender-destroy\n").count(), 1);
-            fs::remove_dir_all(gate).unwrap();
         }
         "sender_split_drop" => {
             let mut sender = sender(&ndi);
@@ -639,9 +638,9 @@ fn child(case: &str) {
                 video.submit_video(frame()).unwrap();
             }
             // Dropping the borrowed view leaves this final loan with its owner.
-            assert_eq!(log().matches("sender-flush\n").count(), 1);
+            assert_eq!(read_fake_log().matches("sender-flush\n").count(), 1);
             drop(sender);
-            let events = log();
+            let events = read_fake_log();
             assert_eq!(events.matches("sender-flush\n").count(), 2);
             assert_eq!(events.matches("sender-destroy\n").count(), 1);
         }
@@ -649,7 +648,7 @@ fn child(case: &str) {
             let mut sender = sender(&ndi);
             sender.submit_video(frame()).unwrap();
             drop(sender);
-            let events = log();
+            let events = read_fake_log();
             assert_eq!(events.matches("sender-flush\n").count(), 1);
             assert!(position(&events, "sender-flush") < position(&events, "sender-destroy-begin"));
             assert_eq!(events.matches("sender-destroy\n").count(), 1);
@@ -665,17 +664,17 @@ fn child(case: &str) {
                 .is_err());
             sender.submit_video(frame()).unwrap();
             drop(sender);
-            assert!(log().contains("sender-flush\n"));
+            assert!(read_fake_log().contains("sender-flush\n"));
             // The registration, not the dropped handle, keeps the sender alive.
-            assert!(!log().contains("sender-destroy\n"));
+            assert!(!read_fake_log().contains("sender-destroy\n"));
             advertiser.unregister(registration).unwrap();
-            let events = log();
+            let events = read_fake_log();
             assert!(
                 position(&events, "send-advertiser-remove") < position(&events, "sender-destroy")
             );
             assert!(!events.contains("send-advertiser-destroy\n"));
             drop(advertiser);
-            let events = log();
+            let events = read_fake_log();
             assert_eq!(
                 events
                     .matches("send-advertiser-add monitoring=false\n")
@@ -697,14 +696,14 @@ fn child(case: &str) {
                 )
                 .unwrap();
             drop(sender);
-            let events = log();
+            let events = read_fake_log();
             assert!(events.contains("send-advertiser-add monitoring=true\n"));
             assert!(!events.contains("send-advertiser-remove\n"));
             assert!(!events.contains("sender-destroy\n"));
             drop(advertiser);
             // The SDK's teardown order: stop advertising the sender, destroy
             // the advertiser, and only then destroy the sender.
-            let events = log();
+            let events = read_fake_log();
             assert!(
                 position(&events, "send-advertiser-remove")
                     < position(&events, "send-advertiser-destroy")
@@ -725,9 +724,9 @@ fn child(case: &str) {
                 .register(&receiver, &RecvAdvertisement::default())
                 .is_err());
             drop(receiver);
-            assert!(!log().contains("receiver-destroy\n"));
+            assert!(!read_fake_log().contains("receiver-destroy\n"));
             advertiser.unregister(registration).unwrap();
-            let events = log();
+            let events = read_fake_log();
             assert!(
                 position(&events, "recv-advertiser-remove group=null")
                     < position(&events, "receiver-destroy")
@@ -746,11 +745,11 @@ fn child(case: &str) {
                 )
                 .unwrap();
             drop(receiver);
-            assert!(!log().contains("receiver-destroy\n"));
+            assert!(!read_fake_log().contains("receiver-destroy\n"));
             drop(advertiser);
             // The input-group name is still intact when the registration
             // ends, which is when this runtime reads it.
-            let events = log();
+            let events = read_fake_log();
             let removed = format!("recv-advertiser-remove group={}", hex(b"Program"));
             assert!(position(&events, &removed) < position(&events, "recv-advertiser-destroy"));
             assert!(
@@ -770,7 +769,7 @@ fn child(case: &str) {
             // SDK for it: it hands the registration back with the reason.
             let rejected = other.unregister(registration).unwrap_err();
             assert!(matches!(rejected.error(), Error::InvalidInput(_)));
-            assert!(!log().contains("send-advertiser-remove\n"));
+            assert!(!read_fake_log().contains("send-advertiser-remove\n"));
             let registration = rejected.into_inner();
             // It may advertise the same sender itself.
             let second = other
@@ -779,10 +778,10 @@ fn child(case: &str) {
             other.unregister(second).unwrap();
             drop(other);
             drop(sender);
-            assert!(!log().contains("sender-destroy\n"));
+            assert!(!read_fake_log().contains("sender-destroy\n"));
             // The registration that came back still ends where it was issued.
             advertiser.unregister(registration).unwrap();
-            assert_eq!(log().matches("sender-destroy\n").count(), 1);
+            assert_eq!(read_fake_log().matches("sender-destroy\n").count(), 1);
             drop(advertiser);
 
             let receiver =
@@ -793,10 +792,10 @@ fn child(case: &str) {
                 .register(&receiver, &RecvAdvertisement::default())
                 .unwrap();
             let rejected = other.unregister(registration).unwrap_err();
-            assert!(!log().contains("recv-advertiser-remove"));
+            assert!(!read_fake_log().contains("recv-advertiser-remove"));
             drop(receiver);
             advertiser.unregister(rejected.into_inner()).unwrap();
-            assert_eq!(log().matches("receiver-destroy\n").count(), 1);
+            assert_eq!(read_fake_log().matches("receiver-destroy\n").count(), 1);
         }
         "refused_unregistration" => {
             let sender = sender(&ndi);
@@ -814,11 +813,11 @@ fn child(case: &str) {
                 Error::NativeOperationFailed {
                     operation} if operation.name() == c"NDIlib_send_advertiser_del_sender"
             ));
-            assert!(!log().contains("sender-destroy\n"));
+            assert!(!read_fake_log().contains("sender-destroy\n"));
             std::env::remove_var("GRAFTON_FAKE_ADVERTISER_REMOVE");
             // The registration that came back can still be ended.
             advertiser.unregister(rejected.into_inner()).unwrap();
-            assert_eq!(log().matches("sender-destroy\n").count(), 1);
+            assert_eq!(read_fake_log().matches("sender-destroy\n").count(), 1);
             drop(advertiser);
 
             let receiver =
@@ -835,11 +834,11 @@ fn child(case: &str) {
                 Error::NativeOperationFailed {
                     operation} if operation.name() == c"NDIlib_recv_advertiser_del_receiver"
             ));
-            assert!(!log().contains("receiver-destroy\n"));
+            assert!(!read_fake_log().contains("receiver-destroy\n"));
             std::env::remove_var("GRAFTON_FAKE_ADVERTISER_REMOVE");
             // Dropping the advertiser ends the registration that remained.
             drop(advertiser);
-            let events = log();
+            let events = read_fake_log();
             assert!(
                 position(&events, "recv-advertiser-remove group=null")
                     < position(&events, "receiver-destroy")
@@ -849,8 +848,8 @@ fn child(case: &str) {
         "malformed_metadata" => {
             let sender = sender(&ndi);
             assert!(sender.capture_metadata(Duration::ZERO).is_err());
-            assert_eq!(log().matches("sender-metadata-free\n").count(), 1);
-            assert!(log().contains("sender-metadata-free-count=2\n"));
+            assert_eq!(read_fake_log().matches("sender-metadata-free\n").count(), 1);
+            assert!(read_fake_log().contains("sender-metadata-free-count=2\n"));
             drop(sender);
         }
         "metadata_count" => {
@@ -859,7 +858,7 @@ fn child(case: &str) {
             let frame = sender.capture_metadata(Duration::ZERO).unwrap().unwrap();
             assert_eq!(frame.data(), "x");
             assert_eq!(frame.timecode().ticks(), 123);
-            let events = log();
+            let events = read_fake_log();
             assert_eq!(events.matches("sender-metadata-free\n").count(), 1);
             assert!(events.contains("sender-metadata-free-count=1\n"));
             drop(sender);
@@ -889,9 +888,9 @@ fn child(case: &str) {
             assert_ne!(next, id);
             assert!(!queue.completion_protocol_failed());
             drop(queue);
-            assert_eq!(log().matches("sender-completion\n").count(), 2);
-            assert_eq!(log().matches("sender-submit-return\n").count(), 2);
-            assert_eq!(log().matches("sender-destroy\n").count(), 1);
+            assert_eq!(read_fake_log().matches("sender-completion\n").count(), 2);
+            assert_eq!(read_fake_log().matches("sender-submit-return\n").count(), 2);
+            assert_eq!(read_fake_log().matches("sender-destroy\n").count(), 1);
             // A frame larger than the byte limit is handed back unsent.
             let mut small = QueuedSender::new(
                 &ndi,
@@ -902,7 +901,7 @@ fn child(case: &str) {
             let rejected = small.try_submit(frame()).unwrap_err();
             assert!(matches!(rejected.error(), Error::InvalidInput(_)));
             assert_eq!(small.retained_frames(), 0);
-            assert_eq!(log().matches("sender-submit-return\n").count(), 2);
+            assert_eq!(read_fake_log().matches("sender-submit-return\n").count(), 2);
 
             // Compressed metadata retains its caller's string allocation;
             // unused capacity must count towards the queue limit too.
@@ -930,7 +929,7 @@ fn child(case: &str) {
             };
             assert_eq!(packet.metadata().unwrap().as_ptr(), metadata_pointer);
             assert_eq!(bounded.retained_frames(), 0);
-            assert_eq!(log().matches("sender-submit-return\n").count(), 2);
+            assert_eq!(read_fake_log().matches("sender-submit-return\n").count(), 2);
 
             let packet = |capacity| {
                 let mut bytes = Vec::with_capacity(capacity);
@@ -963,13 +962,13 @@ fn child(case: &str) {
             };
             assert_eq!(pooled.data().as_ptr(), original);
             assert_eq!(exact.retained_frames(), 1);
-            assert_eq!(log().matches("sender-submit-return\n").count(), 3);
+            assert_eq!(read_fake_log().matches("sender-submit-return\n").count(), 3);
             assert_eq!(
                 exact.next_completed(Duration::ZERO).unwrap().unwrap().id(),
                 first
             );
             exact.try_submit(rejected.into_inner()).unwrap();
-            assert_eq!(log().matches("sender-submit-return\n").count(), 4);
+            assert_eq!(read_fake_log().matches("sender-submit-return\n").count(), 4);
         }
         #[cfg(feature = "advanced")]
         "queue_scatter_immediate"
@@ -1017,7 +1016,7 @@ fn child(case: &str) {
                         .collect::<Vec<_>>(),
                     original
                 );
-                assert!(!log().contains("sender-scatter-submit"));
+                assert!(!read_fake_log().contains("sender-scatter-submit"));
             } else if case == "queue_scatter_protocol" {
                 std::env::set_var("GRAFTON_FAKE_SCATTER_KEY", "altered");
                 let frame = packet();
@@ -1051,7 +1050,7 @@ fn child(case: &str) {
                         .collect::<Vec<_>>(),
                     original
                 );
-                assert_eq!(log().matches("sender-destroy\n").count(), 1);
+                assert_eq!(read_fake_log().matches("sender-destroy\n").count(), 1);
             } else {
                 let mut submitted = Vec::new();
                 for _ in 0..3 {
@@ -1132,11 +1131,11 @@ fn child(case: &str) {
                     started.wait();
                     sender.send_audio(&audio);
                     assert!(!finished.load(Ordering::Acquire));
-                    assert_eq!(log().matches("sender-audio\n").count(), 1);
+                    assert_eq!(read_fake_log().matches("sender-audio\n").count(), 1);
                 });
             });
             drop(queue);
-            let events = log();
+            let events = read_fake_log();
             assert!(position(&events, "sender-audio") < position(&events, "sender-destroy-begin"));
             assert_eq!(events.matches("sender-completion\n").count(), 1);
         }
@@ -1198,8 +1197,11 @@ fn child(case: &str) {
             assert_eq!(queue.retained_frames(), 0);
             assert!(!queue.completion_protocol_failed());
             drop(queue);
-            assert_eq!(log().matches("sender-completion\n").count(), 128);
-            assert_eq!(log().matches("sender-submit-return\n").count(), 128);
+            assert_eq!(read_fake_log().matches("sender-completion\n").count(), 128);
+            assert_eq!(
+                read_fake_log().matches("sender-submit-return\n").count(),
+                128
+            );
         }
         #[cfg(feature = "advanced")]
         "queue_destroy" | "queue_close" => {
@@ -1232,7 +1234,7 @@ fn child(case: &str) {
             } else {
                 drop(queue);
             }
-            let events = log();
+            let events = read_fake_log();
             assert!(
                 events.find("sender-destroy-begin\n").unwrap()
                     < events.find("sender-completion\n").unwrap()
@@ -1259,8 +1261,8 @@ fn child(case: &str) {
             let mut sender = QueuedSender::from_sender(sender, &QueueLimits::default())
                 .expect_err("a registered sender is refused")
                 .into_inner();
-            assert!(!log().contains("sender-flush\n"));
-            assert_eq!(log().matches("sender-submit\n").count(), 1);
+            assert!(!read_fake_log().contains("sender-flush\n"));
+            assert_eq!(read_fake_log().matches("sender-submit\n").count(), 1);
             // The refusal did not reclaim or replace the original native loan.
             assert_eq!(sender.reclaim_video().unwrap().data().as_ptr(), pixels);
             assert!(sender.reclaim_video().is_none());
@@ -1271,10 +1273,10 @@ fn child(case: &str) {
             let (queue, earlier) =
                 QueuedSender::from_sender(sender, &QueueLimits::default()).unwrap();
             assert_eq!(earlier.unwrap().data().as_ptr(), retained_pixels);
-            assert_eq!(log().matches("sender-flush\n").count(), 2);
+            assert_eq!(read_fake_log().matches("sender-flush\n").count(), 2);
             drop(queue);
             drop(advertiser);
-            assert_eq!(log().matches("sender-destroy\n").count(), 1);
+            assert_eq!(read_fake_log().matches("sender-destroy\n").count(), 1);
         }
         #[cfg(feature = "advanced")]
         "queue_sender_conversion" => {
@@ -1287,10 +1289,10 @@ fn child(case: &str) {
                 QueuedSender::from_sender(sender, &QueueLimits::default()).unwrap();
             let earlier = earlier.unwrap();
             assert_eq!(earlier.data().as_ptr(), pixels);
-            assert_eq!(log().matches("sender-flush\n").count(), 1);
-            assert!(!log().contains("sender-destroy\n"));
+            assert_eq!(read_fake_log().matches("sender-flush\n").count(), 1);
+            assert!(!read_fake_log().contains("sender-destroy\n"));
             queue.try_submit(earlier).unwrap();
-            let events = log();
+            let events = read_fake_log();
             assert!(position(&events, "sender-flush") < events.rfind("sender-submit\n").unwrap());
             let completed = queue.close();
             assert_eq!(completed.len(), 1);
@@ -1298,7 +1300,7 @@ fn child(case: &str) {
                 panic!("the recovered frame changed type")
             };
             assert_eq!(recovered.data().as_ptr(), pixels);
-            let events = log();
+            let events = read_fake_log();
             assert_eq!(events.matches("sender-flush\n").count(), 1);
             assert_eq!(events.matches("sender-destroy\n").count(), 1);
         }

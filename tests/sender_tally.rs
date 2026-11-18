@@ -2,7 +2,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name, loopback);
+common_helpers!(runtime, name, loopback, stop);
 
 use grafton_ndi::{
     Error, FrameRate, Receiver, ReceiverOptions, Sender, SenderOptions, Tally, VideoFrame,
@@ -31,12 +31,6 @@ fn with_connected_sender(label: &str, run: impl FnOnce(&Sender, &Receiver)) {
     .unwrap();
     let video = VideoFrame::builder().resolution(64, 32).build().unwrap();
     let stopped = AtomicBool::new(false);
-    struct Stop<'a>(&'a AtomicBool);
-    impl Drop for Stop<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
-        }
-    }
     thread::scope(|scope| {
         let producer = scope.spawn(|| {
             while !stopped.load(Ordering::Acquire) {
@@ -44,7 +38,7 @@ fn with_connected_sender(label: &str, run: impl FnOnce(&Sender, &Receiver)) {
                 thread::sleep(Duration::from_millis(10));
             }
         });
-        let stop = Stop(&stopped);
+        let stop = common::StopOnDrop(&stopped);
         receiver.set_tally(Tally::new(true, false));
         let end = Instant::now() + Duration::from_secs(15);
         while sender

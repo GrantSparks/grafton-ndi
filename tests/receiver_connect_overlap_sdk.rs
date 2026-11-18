@@ -16,21 +16,26 @@ common_helpers!(
     name,
     loopback,
     discovery_server,
-    child
+    child,
+    fixture,
+    stop
 );
 #[cfg(all(
     feature = "advanced",
     not(all(target_os = "linux", not(ndi_link_static)))
 ))]
-common_helpers!(runtime, prerequisites, name, loopback, discovery_server);
+common_helpers!(
+    runtime,
+    prerequisites,
+    name,
+    loopback,
+    discovery_server,
+    stop
+);
 #[cfg(not(any(feature = "advanced", all(target_os = "linux", not(ndi_link_static)))))]
-common_helpers!(runtime, name, loopback);
+common_helpers!(runtime, name, loopback, stop);
 #[cfg(all(target_os = "linux", not(ndi_link_static)))]
 use common::TestChild;
-
-#[cfg(all(target_os = "linux", not(ndi_link_static)))]
-#[path = "support/fixture.rs"]
-mod fixture;
 
 use grafton_ndi::{
     AudioFrame, AudioSource, Error, FrameRate, FrameSync, FrameSyncAudioRequest, MetadataFrame,
@@ -81,13 +86,6 @@ fn timed<T>(operation: &str, budget: Duration, call: impl FnOnce() -> T) -> T {
         began.elapsed()
     );
     result
-}
-
-struct Stop<'a>(&'a AtomicBool);
-impl Drop for Stop<'_> {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
 }
 
 struct Peers {
@@ -229,7 +227,7 @@ impl Peers {
                     }
                 });
             }
-            let _stop = Stop(&stopped);
+            let _stop = common::StopOnDrop(&stopped);
             work(&stopped, &traffic);
         });
         traffic
@@ -435,7 +433,7 @@ fn native_capture_and_connect_overlap_without_torn_frames() {
     assert!(workers >= 3);
     peers.run(|stopped| {
         thread::scope(|scope| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             for kind in 0..workers {
                 let (receiver, peers, loans) = (&receiver, &peers, &loans);
                 scope.spawn(move || {
@@ -615,7 +613,7 @@ fn characterize_per_change_control_liveness() {
     );
     let upstream = peers.run(|stopped| {
         thread::scope(|scope| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             for &kind in kinds {
                 let (receiver, controls) = (&receiver, &controls.0[kind]);
                 scope.spawn(move || {
@@ -717,7 +715,7 @@ fn control_load_then_settle(kinds: &[usize]) {
     };
     let upstream = peers.run_with_traffic(true, |stopped, traffic| {
         thread::scope(|captures| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             for kind in 0..workers {
                 let (receiver, peers, loans, latest_video, audio) = (
                     &receiver,
@@ -791,7 +789,7 @@ fn control_load_then_settle(kinds: &[usize]) {
             );
             let stop_controls = AtomicBool::new(false);
             thread::scope(|control_scope| {
-                let _stop_controls = Stop(&stop_controls);
+                let _stop_controls = common::StopOnDrop(&stop_controls);
                 for &kind in kinds {
                     let (receiver, count, stopped) = (&receiver, &controls.0[kind], &stop_controls);
                     control_scope.spawn(move || {
@@ -904,7 +902,7 @@ fn kvm_overlap(
         let mut session = receiver.kvm().unwrap();
         let view = session.receiver();
         thread::scope(|scope| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             scope.spawn(|| changes(stopped));
             scope.spawn(|| {
                 while !stopped.load(Ordering::Acquire) {
@@ -981,7 +979,7 @@ fn framesync_capture_and_connect_overlap_without_torn_frames() {
     let loans = Loans::default();
     peers.run(|stopped| {
         thread::scope(|scope| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             scope.spawn(|| {
                 while !stopped.load(Ordering::Acquire) {
                     if let Some(frame) = timed("FrameSync video", Duration::ZERO, || {
@@ -1062,9 +1060,9 @@ fn avsync_capture_and_connect_overlap_without_invalid_audio() {
         }
         let finished = AtomicBool::new(false);
         thread::scope(|scope| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             scope.spawn(|| {
-                let _finished = Stop(&finished);
+                let _finished = common::StopOnDrop(&finished);
                 storm(receiver, &peers, stopped);
             });
             while !finished.load(Ordering::Acquire) {
@@ -1093,7 +1091,7 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
     // connections. Its native internal finder needs a loopback discovery hint,
     // installed before the child initializes the SDK's process configuration.
     if std::env::var_os("GRAFTON_NDI_OVERLAP_REMOTE_CHILD").is_none() {
-        let fixture = fixture::FixtureDir::create("overlap-remote");
+        let fixture = common::FixtureDir::create("overlap-remote");
         std::fs::write(
             fixture.path().join("ndi-config.v1.json"),
             r#"{"ndi":{"networks":{"ips":"127.0.0.1"}}}"#,
@@ -1202,7 +1200,7 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
     let loans = Loans::default();
     peers.run(|stopped| {
         thread::scope(|scope| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             for kind in 0..3 {
                 let receiver = &receiver;
                 scope.spawn(move || {
@@ -1317,7 +1315,7 @@ fn advertiser_membership_changes_overlap_capture_connect_and_controls() {
     let memberships = AtomicU64::new(0);
     peers.run(|stopped| {
         thread::scope(|captures| {
-            let _stop = Stop(stopped);
+            let _stop = common::StopOnDrop(stopped);
             let receiver = &receiver;
             captures.spawn(|| {
                 while !stopped.load(Ordering::Acquire) {
@@ -1565,7 +1563,7 @@ fn receiver_mutation_allows_membership_changes_from_active_allocator_policies() 
         Owner::Shared(owner)
     };
     thread::scope(|scope| {
-        let _stop = Stop(&stopped);
+        let _stop = common::StopOnDrop(&stopped);
         scope.spawn(|| {
             let frame = VideoFrame::builder()
                 .resolution(64, 64)
@@ -1800,7 +1798,7 @@ fn allocator_code_uses_shared_controls_during_connection_changes() {
     owner.set(Arc::downgrade(&allocated)).unwrap();
     let stopped = AtomicBool::new(false);
     thread::scope(|scope| {
-        let _stop = Stop(&stopped);
+        let _stop = common::StopOnDrop(&stopped);
         scope.spawn(|| {
             let frame = VideoFrame::builder()
                 .resolution(64, 64)

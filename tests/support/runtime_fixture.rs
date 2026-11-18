@@ -44,3 +44,21 @@ impl FakeRuntime<'_> {
         run(rustc, output)
     }
 }
+
+/// Read the log named by the test, which may still be waiting for its first event.
+#[allow(dead_code)]
+pub fn read_fake_log() -> String {
+    let path = fake_log_path();
+    match std::fs::read_to_string(&path) {
+        Ok(log) => log,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => panic!("cannot read fake runtime log {}: {error}", path.display()),
+    }
+}
+
+/// The configured log path, also used when asserting the SDK has not yet created it.
+pub fn fake_log_path() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("GRAFTON_FAKE_NDI_LOG").expect("the test must set GRAFTON_FAKE_NDI_LOG"),
+    )
+}

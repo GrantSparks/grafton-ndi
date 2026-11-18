@@ -5,7 +5,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name, loopback);
+common_helpers!(runtime, name, loopback, stop);
 
 use grafton_ndi::{
     Finder, FinderOptions, FrameSync, Ndi, PixelFormat, Receiver, ReceiverColorFormat,
@@ -148,13 +148,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                 sender.send_video(&frame).unwrap();
             }
         });
-        struct Stop(Arc<AtomicBool>);
-        impl Drop for Stop {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Relaxed);
-            }
-        }
-        let _stop = Stop(stop);
+        let _stop = common::StopOnDrop(stop);
         let receiver = receiver(&ndi, source);
         let deadline = Instant::now() + Duration::from_secs(30);
         let borrowed = loop {
@@ -394,13 +388,7 @@ fn live_yuv_frames_encode_from_sdk_rows() {
             });
             // A scope joins its threads even when it unwinds: stop the loop
             // then too, or a failed test would hang instead of reporting.
-            struct StopOnDrop<'a>(&'a AtomicBool);
-            impl Drop for StopOnDrop<'_> {
-                fn drop(&mut self) {
-                    self.0.store(true, Ordering::Relaxed);
-                }
-            }
-            let _stop = StopOnDrop(&stop);
+            let _stop = common::StopOnDrop(&stop);
             for color_format in color_formats {
                 let receiver = Receiver::new(
                     &ndi,

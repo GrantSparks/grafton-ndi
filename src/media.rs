@@ -468,9 +468,7 @@ mod tests {
              struct SdkQuantity(NonZeroU32);\n{quantity}\n{rate}\n\
              impl FrameRate {{ {per_second} }}\n"
         );
-        let directory =
-            std::env::temp_dir().join(format!("grafton-const-frame-rate-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = crate::test_support::FixtureDir::create("const-frame-rate");
         for (name, fixture, succeeds) in [
             (
                 "positive",
@@ -483,7 +481,7 @@ mod tests {
             std::fs::write(&path, format!("{definitions}\n{fixture}")).unwrap();
             let output = std::process::Command::new("rustc")
                 .args(["--edition=2021", "--emit=metadata", "--out-dir"])
-                .arg(&directory)
+                .arg(directory.path())
                 .arg(path)
                 .output()
                 .unwrap();
@@ -493,7 +491,6 @@ mod tests {
                 assert!(error.contains("E0080"), "{error}");
             }
         }
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

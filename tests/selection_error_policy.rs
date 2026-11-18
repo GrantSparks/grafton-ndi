@@ -4,14 +4,11 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, file, child);
+common_helpers!(runtime, file, child, fixture);
 use common::TestChild;
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use fixture::FixtureDir;
 use grafton_ndi::{Ndi, RuntimeOptions};
 use runtime_fixture::FakeRuntime;
 use std::{fs, path::PathBuf};
@@ -31,7 +28,7 @@ fn prerequisite_helpers_fail_when_native_code_loaded_but_was_refused() {
         }
         return;
     }
-    let directory = FixtureDir::create("selection-policy");
+    let directory = common::FixtureDir::create("selection-policy");
     let root = directory.path();
     for name in ["trusted", "executable", "refused", "absent", "loader"] {
         fs::create_dir(root.join(name)).unwrap();

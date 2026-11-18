@@ -1769,14 +1769,8 @@ mod tests {
             .build()
             .unwrap();
         let stop = AtomicBool::new(false);
-        struct Stop<'a>(&'a AtomicBool);
-        impl Drop for Stop<'_> {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
-            }
-        }
         std::thread::scope(|scope| {
-            let _stop = Stop(&stop);
+            let _stop = crate::test_support::StopOnDrop(&stop);
             scope.spawn(|| {
                 while !stop.load(Ordering::Acquire) {
                     sender.send_video(&video).unwrap();

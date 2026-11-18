@@ -1,5 +1,10 @@
 // Exercise SDK discovery and static-archive contracts without an installed SDK
 // or native runtime.
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(fixture);
+
 #[path = "../build_advanced.rs"]
 mod build_advanced;
 #[path = "../build_apple.rs"]
@@ -98,14 +103,13 @@ fn unavailable_advanced_selection_discards_every_declaration() {
 }
 
 /// A synthetic SDK installation in a private temporary directory.
-struct Sdk(PathBuf);
+struct Sdk(common::FixtureDir);
 impl Sdk {
     fn new(name: &str) -> Self {
-        let p = std::env::temp_dir().join(format!("grafton-profile-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(p.join("Include")).unwrap();
-        fs::write(p.join("Include/Processing.NDI.Lib.h"), "").unwrap();
-        Self(p)
+        let root = common::FixtureDir::create(name);
+        fs::create_dir_all(root.join("Include")).unwrap();
+        fs::write(root.join("Include/Processing.NDI.Lib.h"), "").unwrap();
+        Self(root)
     }
     fn artifact(&self, relative: &str) -> PathBuf {
         let p = self.0.join(relative);
@@ -114,15 +118,10 @@ impl Sdk {
         p
     }
     fn root(&self) -> &Path {
-        &self.0
+        self.0.path()
     }
     fn located(&self) -> build_support::Sdk {
         build_support::Sdk::open(self.root()).unwrap()
-    }
-}
-impl Drop for Sdk {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

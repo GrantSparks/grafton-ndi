@@ -2491,19 +2491,6 @@ mod tests {
             .unwrap();
     }
 
-    /// A fresh directory under the system temporary directory.
-    fn scratch(name: &str) -> PathBuf {
-        let directory = std::env::temp_dir().join(format!(
-            "grafton-ndi-naming-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        directory
-    }
-
     fn io_kind(result: Result<()>) -> std::io::ErrorKind {
         match result {
             Err(Error::Io(error)) => error.kind(),
@@ -2513,7 +2500,7 @@ mod tests {
 
     #[test]
     fn the_file_a_pattern_names_is_where_it_is_checked() {
-        let directory = scratch("check");
+        let directory = crate::test_support::FixtureDir::create("check");
         let target = RecordingTarget::new(directory.join("take")).unwrap();
         let first = |pattern: &str| {
             NamePattern::new(pattern)
@@ -2553,7 +2540,6 @@ mod tests {
         std::fs::write(directory.join("take_001.mkv"), b"kept").unwrap();
         indexed.check(&target).unwrap();
         assert_eq!(std::fs::read(directory.join("take.mkv")).unwrap(), b"kept");
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -2641,7 +2627,7 @@ mod tests {
         // Changing the working directory only in a child avoids racing other
         // tests. A pattern omitting {prefix} resolves relative to that directory.
         use std::os::unix::ffi::OsStringExt;
-        let directory = scratch("non-utf8-output");
+        let directory = crate::test_support::FixtureDir::create("non-utf8-output");
         let non_utf8 = directory.join(std::ffi::OsString::from_vec(vec![0xff]));
         std::fs::create_dir(&non_utf8).unwrap();
         let output = crate::test_support::TestChild::new(
@@ -2650,7 +2636,6 @@ mod tests {
         .env(CHILD, "1")
         .current_dir(non_utf8)
         .run();
-        let _ = std::fs::remove_dir_all(directory);
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 

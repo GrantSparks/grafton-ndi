@@ -54,9 +54,9 @@ fn timer_released_recordings_finalize_while_other_file_deadlines_continue() {
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("timer-release");
+    let scratch = crate::test_support::FixtureDir::create("timer-release");
     let source = LiveSource::start(&ndi, "timer-release");
-    let path = scratch.path("take.mkv");
+    let path = scratch.join("take.mkv");
     let recorder = recording(&api, &source, &path);
     let player = block_on(AsyncFilePlayer::create(
         &api,
@@ -95,11 +95,11 @@ fn recorders_whose_callbacks_release_each_other_finalize_without_a_join_cycle() 
     let Some((ndi, api)) = file_api() else {
         return;
     };
-    let scratch = Scratch::new("owner-release-cycle");
+    let scratch = crate::test_support::FixtureDir::create("owner-release-cycle");
     let source = LiveSource::start(&ndi, "owner-release-cycle");
-    let first_path = scratch.path("first.mkv");
-    let second_path = scratch.path("second.mkv");
-    let rolled_path = scratch.path("rolled.mkv");
+    let first_path = scratch.join("first.mkv");
+    let second_path = scratch.join("second.mkv");
+    let rolled_path = scratch.join("rolled.mkv");
     let first = recording(&api, &source, &first_path);
     let second = recording(&api, &source, &second_path);
     let trigger = first.clone();

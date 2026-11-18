@@ -4,13 +4,12 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
+use runtime_fixture::read_fake_log;
 
 use grafton_ndi::{
     Error, FrameSync, Ndi, Receiver, ReceiverEvent, ReceiverItem, ReceiverOptions, RuntimeOptions,
@@ -86,8 +85,7 @@ fn negative_counts_are_errors_and_status_survives() {
             -1,
         );
         let captures = || {
-            std::fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap())
-                .unwrap()
+            read_fake_log()
                 .lines()
                 .filter(|line| line.starts_with("capture:"))
                 .count()
@@ -145,7 +143,7 @@ fn negative_counts_are_errors_and_status_survives() {
         assert_eq!(framesync.audio_queue_depth().unwrap(), 42);
         return;
     }
-    let directory = fixture::FixtureDir::create("negative-native-counts");
+    let directory = common::FixtureDir::create("negative-native-counts");
     let library = runtime_fixture::FakeRuntime {
         cfgs: vec!["fake_objects", "fake_capture", "fake_receiver_controls"],
         ..Default::default()

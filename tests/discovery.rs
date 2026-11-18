@@ -8,7 +8,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
 #[path = "support/runtime_fixture.rs"]
@@ -25,8 +25,8 @@ use grafton_ndi::{
     runtime::RuntimeOptions,
     Error, Ndi, Receiver, ReceiverOptions, ResourceKind, Sender, SenderOptions, Source,
 };
-use runtime_fixture::FakeRuntime;
-use std::{fs, path::PathBuf, time::Duration};
+use runtime_fixture::{read_fake_log, FakeRuntime};
+use std::{path::PathBuf, time::Duration};
 
 /// The capabilities whose objects talk to a Discovery Server, with the names
 /// their errors carry.
@@ -106,9 +106,7 @@ fn discovery_server_objects() {
         child(&scenario);
         return;
     }
-    let directory =
-        std::env::temp_dir().join(format!("grafton-ndi-discovery-{}", std::process::id()));
-    fs::create_dir_all(&directory).unwrap();
+    let directory = common::FixtureDir::create("discovery");
     for variant in VARIANTS {
         let mut runtime = FakeRuntime {
             version: Some(variant.version),
@@ -129,12 +127,6 @@ fn discovery_server_objects() {
                 .run();
         }
     }
-    fs::remove_dir_all(directory).unwrap();
-}
-
-/// Everything the fake runtime has logged so far.
-fn log() -> String {
-    fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap_or_default()
 }
 
 /// Bytes as the fake runtime logs the identifiers it is given.
@@ -203,7 +195,11 @@ fn assert_refused(ndi: &Ndi, expected: CapabilityUnavailable) {
             );
         }
     }
-    assert!(!log().contains("-create\n"), "{}", log());
+    assert!(
+        !read_fake_log().contains("-create\n"),
+        "{}",
+        read_fake_log()
+    );
 }
 
 fn child(scenario: &str) {
@@ -297,7 +293,7 @@ fn child(scenario: &str) {
                 send_listener,
                 recv_listener,
             ));
-            let events = log();
+            let events = read_fake_log();
             for object in [
                 "send-advertiser",
                 "recv-advertiser",
@@ -343,7 +339,11 @@ fn child(scenario: &str) {
                     "{reason}"
                 );
             }
-            assert!(!log().contains("-create\n"), "{}", log());
+            assert!(
+                !read_fake_log().contains("-create\n"),
+                "{}",
+                read_fake_log()
+            );
         }
         "advertisement_options_reach_the_sdk" => {
             let receiver = |name: &str| {
@@ -366,7 +366,7 @@ fn child(scenario: &str) {
                     &RecvAdvertisement::default().allow_monitoring(true),
                 )
                 .unwrap();
-            let events = log();
+            let events = read_fake_log();
             // Each flag arrives as the one it was set as, for the receiver it
             // was set for.
             let registered: Vec<_> = events
@@ -384,7 +384,7 @@ fn child(scenario: &str) {
             // runtime reads it only when the registration ends.
             advertiser.unregister(in_group).unwrap();
             drop(advertiser);
-            let events = log();
+            let events = read_fake_log();
             assert!(
                 events.contains(&format!(
                     "recv-advertiser-remove group={}\n",
@@ -406,7 +406,7 @@ fn child(scenario: &str) {
                     &SendAdvertisement::default().allow_monitoring(true),
                 )
                 .unwrap();
-            let events = log();
+            let events = read_fake_log();
             assert_eq!(
                 events
                     .matches("send-advertiser-add monitoring=false\n")
@@ -471,7 +471,7 @@ fn child(scenario: &str) {
                     listener.subscribe(&id);
                     listener.subscribe(&id);
                     assert!(
-                        !log()
+                        !read_fake_log()
                             .contains(&format!("{}-retained-pointer {caller_pointer}\n", $prefix)),
                         "the listener must pass its own allocation"
                     );
@@ -480,14 +480,14 @@ fn child(scenario: &str) {
                     listener.next_events(Duration::from_millis(1)).unwrap();
                     listener.unsubscribe(&$Id::new($bytes).unwrap());
                     listener.$snapshot().unwrap();
-                    assert!(log().contains(concat!($prefix, "-retained-snapshot 0\n")));
+                    assert!(read_fake_log().contains(concat!($prefix, "-retained-snapshot 0\n")));
                     // Unknown unsubscriptions keep their borrowed-call contract.
                     listener.unsubscribe(&$Id::new("never-subscribed").unwrap());
                     let id = $Id::new($bytes).unwrap();
                     listener.subscribe(&id);
                     drop(id);
                     drop(listener);
-                    let log = log();
+                    let log = read_fake_log();
                     for operation in ["snapshot", "events", "unsubscribe", "destroy"] {
                         assert!(
                             log.contains(&format!("{}-retained-{operation} 1\n", $prefix)),
@@ -518,7 +518,7 @@ fn child(scenario: &str) {
             senders.subscribe(id);
             senders.unsubscribe(id);
             let expected = hex(SENDER_ID);
-            let events = log();
+            let events = read_fake_log();
             assert!(events.contains(&format!("send-listener-subscribe {expected}\n")));
             assert!(events.contains(&format!("send-listener-unsubscribe {expected}\n")));
 
@@ -531,7 +531,7 @@ fn child(scenario: &str) {
                 .unwrap();
             receivers.request_disconnect(controllable).unwrap();
             let expected = hex(RECEIVER_ID);
-            let events = log();
+            let events = read_fake_log();
             assert!(events.contains(&format!("recv-listener-subscribe {expected}\n")));
             assert!(events.contains(&format!(
                 "recv-listener-connect {expected} {}\n",
@@ -559,7 +559,7 @@ fn child(scenario: &str) {
                     }
                 }
             }
-            assert_eq!(log().matches("recv-listener-connect ").count(), 2);
+            assert_eq!(read_fake_log().matches("recv-listener-connect ").count(), 2);
         }
         "event_batches" => {
             let mut senders = SendListener::new(&ndi, &listeners).unwrap();
@@ -574,18 +574,25 @@ fn child(scenario: &str) {
             // A poll that finds nothing is an empty batch with nothing to free.
             assert!(senders.next_events(Duration::ZERO).unwrap().is_empty());
             assert_eq!(
-                log().matches("send-listener-free-events\n").count(),
+                read_fake_log()
+                    .matches("send-listener-free-events\n")
+                    .count(),
                 1,
                 "{}",
-                log()
+                read_fake_log()
             );
 
             let mut receivers = RecvListener::new(&ndi, &listeners).unwrap();
             // The longest wait never reaches the SDK's indefinite 0xFFFFFFFF.
             let events = receivers.next_events(grafton_ndi::MAX_TIMEOUT).unwrap();
             assert_eq!(events[0].id().unwrap().as_bytes(), RECEIVER_ID);
-            assert!(log().contains("recv-listener-events 4294967294\n"));
-            assert_eq!(log().matches("recv-listener-free-events\n").count(), 1);
+            assert!(read_fake_log().contains("recv-listener-events 4294967294\n"));
+            assert_eq!(
+                read_fake_log()
+                    .matches("recv-listener-free-events\n")
+                    .count(),
+                1
+            );
         }
         "large_event_batches" => {
             let mut listener = SendListener::new(&ndi, &listeners).unwrap();
@@ -617,7 +624,12 @@ fn child(scenario: &str) {
                     limit: 16_777_216,
                 })
             ));
-            assert_eq!(log().matches("recv-listener-free-events\n").count(), 1);
+            assert_eq!(
+                read_fake_log()
+                    .matches("recv-listener-free-events\n")
+                    .count(),
+                1
+            );
 
             // A batch whose descriptors alone exceed 16 MiB is refused for its
             // size, and released: the listener keeps working afterwards.
@@ -629,7 +641,12 @@ fn child(scenario: &str) {
             else {
                 panic!("a batch larger than the copy limit must be refused");
             };
-            assert_eq!(log().matches("send-listener-free-events\n").count(), 3);
+            assert_eq!(
+                read_fake_log()
+                    .matches("send-listener-free-events\n")
+                    .count(),
+                3
+            );
             std::env::remove_var("GRAFTON_FAKE_EVENT_COUNT");
             assert_eq!(listener.next_events(wait).unwrap().len(), 2);
             assert_eq!(receivers.next_events(wait).unwrap().len(), 2);
@@ -641,7 +658,12 @@ fn child(scenario: &str) {
                 listener.next_events(Duration::from_millis(5)),
                 Err(Error::UnexpectedSdkResult(_))
             ));
-            assert_eq!(log().matches("send-listener-free-events\n").count(), 0);
+            assert_eq!(
+                read_fake_log()
+                    .matches("send-listener-free-events\n")
+                    .count(),
+                0
+            );
             std::env::remove_var("GRAFTON_FAKE_NULL_EVENT_BATCH");
             assert_eq!(
                 listener
@@ -650,7 +672,12 @@ fn child(scenario: &str) {
                     .len(),
                 2
             );
-            assert_eq!(log().matches("send-listener-free-events\n").count(), 1);
+            assert_eq!(
+                read_fake_log()
+                    .matches("send-listener-free-events\n")
+                    .count(),
+                1
+            );
         }
         "nested_snapshot_arrays_include_owned_storage" => {
             for array in ["groups", "streams", "commands"] {
@@ -742,7 +769,10 @@ fn child(scenario: &str) {
                     .unwrap();
                 listener.request_disconnect(survivor).unwrap();
                 requested += 2;
-                assert_eq!(log().matches("recv-listener-connect ").count(), requested);
+                assert_eq!(
+                    read_fake_log().matches("recv-listener-connect ").count(),
+                    requested
+                );
                 let omitted = ReceiverId::new("receiver-fixed").unwrap();
                 match malformed {
                     "receiver-id" | "commands-null" => {
@@ -766,13 +796,16 @@ fn child(scenario: &str) {
                             .unwrap();
                         listener.request_disconnect(&omitted).unwrap();
                         requested += 2;
-                        assert!(log().contains(&format!(
+                        assert!(read_fake_log().contains(&format!(
                             "recv-listener-connect {} null\n",
                             hex(b"receiver-fixed")
                         )));
                     }
                 }
-                assert_eq!(log().matches("recv-listener-connect ").count(), requested);
+                assert_eq!(
+                    read_fake_log().matches("recv-listener-connect ").count(),
+                    requested
+                );
                 std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
                 let restored = RecvListener::new(&ndi, &listeners)
                     .unwrap()
@@ -781,7 +814,7 @@ fn child(scenario: &str) {
                 assert_eq!(restored.len(), 2, "{malformed}: {restored:?}");
                 assert_eq!(restored[0].id().unwrap().as_bytes(), RECEIVER_ID);
             }
-            assert!(log().contains(&format!(
+            assert!(read_fake_log().contains(&format!(
                 "recv-listener-connect {} {}\n",
                 hex(RECEIVER_ID),
                 hex(b"STUDIO (Camera 2)")
@@ -803,13 +836,13 @@ fn child(scenario: &str) {
                 .request_connect(&target, "STUDIO (Camera 2)")
                 .unwrap();
             listener.request_disconnect(&target).unwrap();
-            assert_eq!(log().matches("recv-listener-connect ").count(), 2);
-            assert!(log().contains(&format!(
+            assert_eq!(read_fake_log().matches("recv-listener-connect ").count(), 2);
+            assert!(read_fake_log().contains(&format!(
                 "recv-listener-connect {} {}\n",
                 hex(RECEIVER_ID),
                 hex(b"STUDIO (Camera 2)")
             )));
-            assert!(log().contains(&format!(
+            assert!(read_fake_log().contains(&format!(
                 "recv-listener-connect {} null\n",
                 hex(RECEIVER_ID)
             )));
@@ -839,19 +872,33 @@ fn child(scenario: &str) {
                         && events[0].value().is_none()
                 );
                 assert_eq!(
-                    log().matches("send-listener-free-events\n").count(),
+                    read_fake_log()
+                        .matches("send-listener-free-events\n")
+                        .count(),
                     index + 1
                 );
                 assert_eq!(
-                    log().matches("recv-listener-free-events\n").count(),
+                    read_fake_log()
+                        .matches("recv-listener-free-events\n")
+                        .count(),
                     index + 1
                 );
             }
             std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
             assert_eq!(senders.next_events(wait).unwrap().len(), 2);
             assert_eq!(receivers.next_events(wait).unwrap().len(), 2);
-            assert_eq!(log().matches("send-listener-free-events\n").count(), 4);
-            assert_eq!(log().matches("recv-listener-free-events\n").count(), 4);
+            assert_eq!(
+                read_fake_log()
+                    .matches("send-listener-free-events\n")
+                    .count(),
+                4
+            );
+            assert_eq!(
+                read_fake_log()
+                    .matches("recv-listener-free-events\n")
+                    .count(),
+                4
+            );
         }
         "null_snapshot_arrays_are_refused" => {
             let mut senders = SendListener::new(&ndi, &listeners).unwrap();
@@ -875,7 +922,7 @@ fn child(scenario: &str) {
                 receivers.request_disconnect(&target),
                 Err(Error::UnexpectedSdkResult(_))
             ));
-            assert_eq!(log().matches("recv-listener-connect ").count(), 0);
+            assert_eq!(read_fake_log().matches("recv-listener-connect ").count(), 0);
             std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
             assert_eq!(senders.current_senders().unwrap().len(), 2);
             assert_eq!(receivers.current_receivers().unwrap().len(), 2);
@@ -907,7 +954,7 @@ fn child(scenario: &str) {
             })
             .join()
             .unwrap();
-            let events = log();
+            let events = read_fake_log();
             for destroyed in [
                 "router-destroy",
                 "send-advertiser-destroy",
@@ -1012,7 +1059,7 @@ fn child(scenario: &str) {
             assert!(router.wait_for_connection(Duration::MAX).is_err());
             drop(router);
             assert_eq!(
-                log(),
+                read_fake_log(),
                 "initialize\nrouter-create\nrouter-change STUDIO (Camera 2)\nrouter-clear\nrouter-destroy\n"
             );
         }

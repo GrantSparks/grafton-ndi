@@ -6,20 +6,17 @@
 #[path = "common/mod.rs"]
 mod helpers;
 #[cfg(feature = "advanced")]
-common_helpers!(feature_policy, child);
+common_helpers!(feature_policy, child, fixture);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 #[path = "../src/test_alloc.rs"]
 #[allow(dead_code)]
 mod test_alloc;
 
-use fixture::FixtureDir;
 use grafton_ndi::{Finder, FinderOptions, Ndi, RuntimeOptions};
-use runtime_fixture::FakeRuntime;
+use runtime_fixture::{read_fake_log, FakeRuntime};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -30,26 +27,30 @@ use std::{
 
 const PATIENCE: Duration = Duration::from_secs(5);
 
-fn events() -> String {
-    fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap_or_default()
-}
-
 fn wait_for_entries(label: &str, count: usize) {
     let end = Instant::now() + PATIENCE;
-    while events().lines().filter(|line| *line == label).count() < count {
-        assert!(Instant::now() < end, "missing {label}: {}", events());
+    while read_fake_log()
+        .lines()
+        .filter(|line| *line == label)
+        .count()
+        < count
+    {
+        assert!(Instant::now() < end, "missing {label}: {}", read_fake_log());
         thread::sleep(Duration::from_millis(1));
     }
 }
 
 fn no_overlapping_waits(label: &str) {
     let mut active = std::collections::HashSet::new();
-    for event in events().lines().filter(|line| line.starts_with(label)) {
+    for event in read_fake_log()
+        .lines()
+        .filter(|line| line.starts_with(label))
+    {
         if let Some(selector) = event.strip_suffix("-wait-begin") {
             assert!(
                 active.insert(selector.to_owned()),
                 "overlapping {selector} waits: {}",
-                events()
+                read_fake_log()
             );
         } else if let Some(selector) = event.strip_suffix("-wait-end") {
             assert!(active.remove(selector), "unmatched {event}");
@@ -58,7 +59,7 @@ fn no_overlapping_waits(label: &str) {
     assert!(
         active.is_empty(),
         "native waits were retained: {}",
-        events()
+        read_fake_log()
     );
 }
 
@@ -110,7 +111,7 @@ fn shared_native_change_reports() {
         }
         return;
     }
-    let directory = FixtureDir::create("change-notifications");
+    let directory = common::FixtureDir::create("change-notifications");
     let library = directory.path().join("libndi_advanced.so");
     FakeRuntime {
         cfgs: vec![
@@ -306,7 +307,7 @@ async fn async_queued_discovery(ndi: &Ndi) {
             released_wait(release_rx);
         });
         started_rx.recv_timeout(PATIENCE).unwrap();
-        let before = events()
+        let before = read_fake_log()
             .lines()
             .filter(|line| *line == "finder-snapshot")
             .count();
@@ -319,7 +320,7 @@ async fn async_queued_discovery(ndi: &Ndi) {
             blocker.await.unwrap();
             ::tokio::task::spawn_blocking(|| {}).await.unwrap();
             assert_eq!(
-                events()
+                read_fake_log()
                     .lines()
                     .filter(|line| *line == "finder-snapshot")
                     .count(),
@@ -331,13 +332,13 @@ async fn async_queued_discovery(ndi: &Ndi) {
             assert!(pending.await.unwrap().is_none());
             blocker.await.unwrap();
             assert_eq!(
-                events()
+                read_fake_log()
                     .lines()
                     .filter(|line| *line == "finder-snapshot")
                     .count(),
                 before + 1
             );
-            assert!(!events().contains("finder-wait-begin"));
+            assert!(!read_fake_log().contains("finder-wait-begin"));
         }
     }
     // Exercise a real discovery predicate, including resuming its panic payload.
@@ -367,7 +368,10 @@ async fn async_discovery<R: grafton_ndi::asynchronous::AsyncRuntime>(
         task::{Context, Poll, Waker},
     };
     fn count(label: &str) -> usize {
-        events().lines().filter(|line| *line == label).count()
+        read_fake_log()
+            .lines()
+            .filter(|line| *line == label)
+            .count()
     }
     fn wait_for_idle() {
         let deadline = Instant::now() + Duration::from_millis(150);
@@ -375,7 +379,7 @@ async fn async_discovery<R: grafton_ndi::asynchronous::AsyncRuntime>(
             assert!(
                 Instant::now() < deadline,
                 "an abandoned native wait stayed active: {}",
-                events()
+                read_fake_log()
             );
             thread::sleep(Duration::from_millis(1));
         }
@@ -477,8 +481,7 @@ async fn async_discovery<R: grafton_ndi::asynchronous::AsyncRuntime>(
         .watch()
         .wait_for_change(Duration::ZERO)
         .unwrap());
-    let directory =
-        PathBuf::from(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).with_extension("gate");
+    let directory = runtime_fixture::fake_log_path().with_extension("gate");
     fs::create_dir(&directory).unwrap();
     std::env::set_var("GRAFTON_FAKE_FINDER_GATE", &directory);
     fs::write(directory.join("fail-snapshot"), b"").unwrap();
@@ -486,7 +489,7 @@ async fn async_discovery<R: grafton_ndi::asynchronous::AsyncRuntime>(
     assert!(watch.wait_for_change(Duration::ZERO).await.unwrap());
     assert_eq!(watch.current_sources().await.unwrap().len(), 4);
     assert!(!watch.wait_for_change(Duration::ZERO).await.unwrap());
-    assert!(events()
+    assert!(read_fake_log()
         .lines()
         .filter_map(|line| line.strip_prefix("finder-wait-timeout:"))
         .all(|timeout| timeout.parse::<u32>().unwrap() <= 100));
@@ -503,8 +506,7 @@ fn failed_snapshot(ndi: &Ndi, publish: impl Fn(), consumed: bool) {
     if consumed {
         assert!(finder.watch().wait_for_change(Duration::ZERO).unwrap());
     }
-    let directory =
-        PathBuf::from(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).with_extension("gate");
+    let directory = runtime_fixture::fake_log_path().with_extension("gate");
     fs::create_dir(&directory).unwrap();
     std::env::set_var("GRAFTON_FAKE_FINDER_GATE", &directory);
     fs::write(directory.join("fail-snapshot"), b"").unwrap();
@@ -526,8 +528,7 @@ fn failed_snapshot(ndi: &Ndi, publish: impl Fn(), consumed: bool) {
 fn snapshot_ordering(ndi: &Ndi, publish: impl Fn() + Sync) {
     let finder = Finder::new(ndi, &FinderOptions::new()).unwrap();
     let mut watch = finder.watch();
-    let directory =
-        PathBuf::from(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).with_extension("gate");
+    let directory = runtime_fixture::fake_log_path().with_extension("gate");
     fs::create_dir(&directory).unwrap();
     std::env::set_var("GRAFTON_FAKE_FINDER_GATE", &directory);
     let (tx, rx) = mpsc::channel();
@@ -594,7 +595,7 @@ fn keyframe(ndi: &Ndi, clear_after_query: bool) {
         }
         ready.wait();
         let end = Instant::now() + PATIENCE;
-        while events()
+        while read_fake_log()
             .lines()
             .filter(|line| line.starts_with("keyframe-") && line.ends_with("-wait-begin"))
             .count()
@@ -603,7 +604,7 @@ fn keyframe(ndi: &Ndi, clear_after_query: bool) {
             assert!(
                 Instant::now() < end,
                 "keyframe waiters did not enter: {}",
-                events()
+                read_fake_log()
             );
             thread::sleep(Duration::from_millis(1));
         }

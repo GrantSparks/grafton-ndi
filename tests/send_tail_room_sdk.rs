@@ -18,7 +18,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, name, loopback, unsupported);
+common_helpers!(runtime, name, loopback, unsupported, stop);
 
 // Standard 6.1.1 produces different lossy pixels for identical initialized
 // submissions when this binary's guard-page stress sender runs concurrently.
@@ -410,17 +410,6 @@ fn strided_audio_ends_at_its_last_sample_before_the_guard_page() {
     }
 }
 
-/// Stops a sending loop when the scope that waits for it ends, by return or
-/// by panic: a scope joins its threads either way, so a loop that only a
-/// later statement stops would hang a failed test instead of reporting it.
-struct StopOnDrop<'a>(&'a AtomicBool);
-
-impl Drop for StopOnDrop<'_> {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-}
-
 /// The active pixels of the first 642x32 frame a new receiver gets while
 /// `frame` is sent.
 fn received(
@@ -444,7 +433,7 @@ fn received(
                 std::thread::sleep(Duration::from_millis(10));
             }
         });
-        let _stop = StopOnDrop(&stop);
+        let _stop = common::StopOnDrop(&stop);
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(Instant::now() < deadline, "{label}: no frame");

@@ -5,7 +5,7 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
 #[path = "support/runtime_fixture.rs"]
@@ -16,7 +16,7 @@ use grafton_ndi::{
     runtime::{Runtime, RuntimeOptions},
     Error, LibraryKind, LoadFailure, LoadOrigin, LoadRefusal, Ndi, SelectionConflict,
 };
-use runtime_fixture::FakeRuntime;
+use runtime_fixture::{read_fake_log, FakeRuntime};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -214,9 +214,6 @@ impl Fixtures {
     fn unloadable(&self) -> PathBuf {
         self.root.join("unloadable")
     }
-    fn log(&self) -> PathBuf {
-        PathBuf::from(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap())
-    }
 }
 
 /// How the parent launches one scenario.
@@ -331,8 +328,9 @@ fn selected_runtime_loader_contract() {
         child(&name, &Fixtures { root });
         return;
     }
-    let root = std::env::temp_dir().join(format!("grafton-ndi-loader-{}", std::process::id()));
-    let fixtures = Fixtures::build(&root);
+    let directory = common::FixtureDir::create("loader");
+    let root = directory.path();
+    let fixtures = Fixtures::build(root);
     let test_binary = std::env::current_exe().unwrap();
     let bundled_binary = fixtures.bundle().join("application");
     fs::copy(&test_binary, &bundled_binary).unwrap();
@@ -346,7 +344,7 @@ fn selected_runtime_loader_contract() {
         let mut command = TestChild::at(executable, "selected_runtime_loader_contract");
         command
             .env("GRAFTON_LOADER_CHILD", scenario.name)
-            .env("GRAFTON_LOADER_FIXTURES", &root)
+            .env("GRAFTON_LOADER_FIXTURES", root)
             .env(
                 "GRAFTON_FAKE_NDI_LOG",
                 root.join(format!("{}.log", scenario.name)),
@@ -369,7 +367,6 @@ fn selected_runtime_loader_contract() {
         }
         command.run();
     }
-    fs::remove_dir_all(root).unwrap();
 }
 
 /// The Standard edition, named explicitly so these tests do not depend on the
@@ -542,7 +539,7 @@ fn child(name: &str, fixtures: &Fixtures) {
                 Err(Error::InvalidInput(_))
             ));
             assert!(!Ndi::is_running());
-            assert!(!fixtures.log().exists());
+            assert!(!runtime_fixture::fake_log_path().exists());
             drop(Ndi::with_options(&options).unwrap());
         }
         "retry_and_capabilities" => {
@@ -577,7 +574,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             drop(ndi);
             assert!(!Ndi::is_running());
             drop(Ndi::with_options(&options).unwrap());
-            let log = fs::read_to_string(fixtures.log()).unwrap();
+            let log = read_fake_log();
             assert_eq!(log, "initialize\ndestroy\ninitialize\ndestroy\n");
         }
         "conflict" => {
@@ -666,7 +663,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             #[cfg(feature = "advanced")]
             configured_objects_are_refused_for_their_own_capability(&ndi);
             // Nothing was created, through either entry point.
-            let log = fs::read_to_string(fixtures.log()).unwrap();
+            let log = read_fake_log();
             assert_eq!(log, "initialize\n");
         }
         "process_lifetime" => {
@@ -675,7 +672,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert_eq!(token.ndi().info(), ndi.info());
             drop(ndi);
             assert!(Ndi::is_running());
-            let log = fs::read_to_string(fixtures.log()).unwrap();
+            let log = read_fake_log();
             assert_eq!(log, "initialize\n");
         }
         "foreign_symbol" => {
@@ -708,7 +705,7 @@ fn child(name: &str, fixtures: &Fixtures) {
                 })
                 .collect();
             ready.wait();
-            let log = fs::read_to_string(fixtures.log()).unwrap();
+            let log = read_fake_log();
             assert_eq!(log, "initialize\n");
             release.wait();
             for thread in threads {
@@ -817,11 +814,11 @@ fn child(name: &str, fixtures: &Fixtures) {
                 .supports(RuntimeFeature::ReceiveDelay));
             // Selected and inspected, and still not started.
             assert!(!Ndi::is_running());
-            assert!(!fixtures.log().exists());
+            assert!(!runtime_fixture::fake_log_path().exists());
 
             let ndi = runtime.initialize().unwrap();
             assert!(Ndi::is_running());
-            assert_eq!(fs::read_to_string(fixtures.log()).unwrap(), "initialize\n");
+            assert_eq!(read_fake_log(), "initialize\n");
             // Every handle refers to the one selection.
             let again = Runtime::select(&standard()).unwrap();
             assert!(std::ptr::eq(again.info(), runtime.info()));
@@ -836,10 +833,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert!(Ndi::is_running());
             drop(another);
             assert!(!Ndi::is_running());
-            assert_eq!(
-                fs::read_to_string(fixtures.log()).unwrap(),
-                "initialize\ndestroy\n"
-            );
+            assert_eq!(read_fake_log(), "initialize\ndestroy\n");
         }
         "a_failed_start_is_classified_and_can_be_retried" => {
             // The fake reads these variables on each call. This process runs
@@ -869,7 +863,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert!(Ndi::is_running());
             drop(ndi);
             assert_eq!(
-                fs::read_to_string(fixtures.log()).unwrap(),
+                read_fake_log(),
                 "initialize\ninitialize\ninitialize\ninitialize\ndestroy\n"
             );
         }

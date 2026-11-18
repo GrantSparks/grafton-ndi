@@ -1,7 +1,7 @@
 //! Native races between submitted finishes and recorder shutdown.
 use super::{
     super::{
-        sdk_tests::{exact_video, LiveSource, Scratch},
+        sdk_tests::{exact_video, LiveSource},
         RecorderEventKind,
     },
     tests::block_on,
@@ -13,9 +13,9 @@ fn a_native_finish_reports_confirmed_closure_when_another_clone_closes_it() {
     let Some((ndi, api)) = crate::test_support::file_api() else {
         return;
     };
-    let scratch = Scratch::new("finish-close-race");
+    let scratch = crate::test_support::FixtureDir::create("finish-close-race");
     let source = LiveSource::start(&ndi, "finish-close-race");
-    let path = scratch.path("take.mkv");
+    let path = scratch.join("take.mkv");
     let recorder = block_on(AsyncFileRecorder::create(&api, &exact_video(&source))).unwrap();
     block_on(recorder.start(
         &RecordingTarget::new(&path).unwrap(),

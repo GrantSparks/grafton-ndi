@@ -12,10 +12,13 @@ mod child;
 mod feature;
 #[cfg(feature = "file-io")]
 mod file_api;
+mod fixture;
 mod hx_placeholder;
 mod identity;
 mod policy;
 mod runtime;
+#[cfg(feature = "advanced")]
+mod stop;
 mod unique_name;
 mod unsupported;
 
@@ -25,9 +28,12 @@ pub use child::TestChild;
 pub use feature::require_feature;
 #[cfg(feature = "file-io")]
 pub use file_api::file_api;
+pub use fixture::FixtureDir;
 pub use hx_placeholder::is_hx_placeholder;
 use policy::Requirement;
 pub use runtime::ndi;
+#[cfg(feature = "advanced")]
+pub use stop::StopOnDrop;
 pub use unique_name::unique_name;
 pub use unsupported::unsupported;
 
@@ -135,6 +141,35 @@ mod tests {
         for decoder in [Requirement::H264Decoder, Requirement::Hevc444Decoder] {
             assert!(decoder.implied().contains(&Requirement::Advanced));
         }
+    }
+
+    #[test]
+    fn concurrent_fixtures_with_the_same_purpose_own_distinct_paths() {
+        let fixtures: Vec<_> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| FixtureDir::create("concurrent-test")))
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect()
+        });
+        let paths: std::collections::HashSet<_> = fixtures.iter().map(FixtureDir::path).collect();
+        assert_eq!(paths.len(), fixtures.len());
+        assert!(paths.iter().all(|path| path.is_dir()));
+    }
+
+    #[test]
+    fn fixture_cleans_up_after_unwinding() {
+        let mut path = None;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let fixture = FixtureDir::create("unwinding-test");
+            path = Some(fixture.path().to_owned());
+            std::fs::write(fixture.join("sentinel"), b"test").unwrap();
+            panic!("test fixture scope unwound");
+        }));
+        assert!(outcome.is_err());
+        assert!(!path.unwrap().exists());
     }
 
     #[test]

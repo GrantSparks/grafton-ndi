@@ -3,14 +3,11 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
-use fixture::FixtureDir;
 use grafton_ndi::{Error, Finder, FinderOptions, Ndi, ResourceKind, RuntimeOptions};
 use runtime_fixture::FakeRuntime;
 use std::{path::PathBuf, time::Duration};
@@ -75,7 +72,7 @@ fn finder_enforces_snapshot_and_whole_window_limits() {
         }
         return;
     }
-    let directory = FixtureDir::create("finder-limits");
+    let directory = common::FixtureDir::create("finder-limits");
     let library = directory.path().join("finder.so");
     FakeRuntime {
         cfgs: vec!["fake_advanced", "fake_finder"],

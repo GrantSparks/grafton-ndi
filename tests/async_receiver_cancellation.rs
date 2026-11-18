@@ -8,13 +8,12 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
+use runtime_fixture::read_fake_log;
 
 use grafton_ndi::{
     asynchronous::{AsyncReceiver, AsyncRuntime},
@@ -216,24 +215,20 @@ async fn replayed_notifications<R: AsyncRuntime>(ndi: &Ndi) {
     std::env::remove_var("GRAFTON_FAKE_SOURCE_NAME_SCRIPT");
 }
 
-fn log() -> String {
-    fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap_or_default()
-}
-
 fn calls(source_name: bool) -> usize {
     let prefix = if source_name {
         "source-name:"
     } else {
         "capture:"
     };
-    log()
+    read_fake_log()
         .lines()
         .filter(|line| line.starts_with(prefix))
         .count()
 }
 
 fn destroyed() -> usize {
-    log()
+    read_fake_log()
         .lines()
         .filter(|&line| line == "receiver-destroy")
         .count()
@@ -293,7 +288,7 @@ async fn cancelled_waits<R: AsyncRuntime>(ndi: &Ndi) {
         );
         assert_eq!(destroyed(), before_destroyed + 1);
     }
-    for line in log()
+    for line in read_fake_log()
         .lines()
         .filter(|line| line.starts_with("source-name:"))
     {
@@ -326,7 +321,7 @@ fn abandoned_waits_release_the_receiver_without_spending_their_timeout() {
         });
         return;
     }
-    let directory = fixture::FixtureDir::create("async-cancellation");
+    let directory = common::FixtureDir::create("async-cancellation");
     let library = directory.path().join("libndi_cancel.so");
     runtime_fixture::FakeRuntime {
         cfgs: vec!["fake_objects", "fake_capture", "fake_source_name"],
@@ -371,10 +366,10 @@ async fn source_name_worker_retains_runtime<R: AsyncRuntime>(ndi: Ndi) {
     // Stopping already reports not running, before the native destroy has
     // necessarily finished writing its lifecycle evidence.
     await_condition(
-        || log().lines().any(|line| line == "destroy"),
+        || read_fake_log().lines().any(|line| line == "destroy"),
         "runtime destruction did not complete",
     );
-    let events = log();
+    let events = read_fake_log();
     assert_eq!(destroyed(), 1);
     assert_eq!(events.lines().filter(|line| *line == "destroy").count(), 1);
     assert!(events.find("receiver-destroy").unwrap() < events.find("\ndestroy").unwrap());
@@ -400,7 +395,7 @@ fn a_source_name_worker_keeps_its_runtime_until_its_binding_drops() {
         >(ndi));
         return;
     }
-    let directory = fixture::FixtureDir::create("async-source-binding");
+    let directory = common::FixtureDir::create("async-source-binding");
     let library = directory.path().join("libndi_binding.so");
     runtime_fixture::FakeRuntime {
         cfgs: vec!["fake_objects", "fake_capture", "fake_source_name"],

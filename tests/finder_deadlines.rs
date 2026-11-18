@@ -3,15 +3,12 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use fixture::FixtureDir;
 use grafton_ndi::{Finder, FinderOptions, Ndi, RuntimeOptions, SourceCache};
 use runtime_fixture::FakeRuntime;
 use std::{
@@ -262,7 +259,7 @@ fn finder_lookup_snapshot_contention_spends_one_wait_budget() {
         exercise(&SourceCache::new(finder), &gate);
         return;
     }
-    let directory = FixtureDir::create("finder-deadlines");
+    let directory = common::FixtureDir::create("finder-deadlines");
     let library = directory.path().join("finder.so");
     FakeRuntime {
         cfgs: vec!["fake_finder"],

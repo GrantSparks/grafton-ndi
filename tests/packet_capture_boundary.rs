@@ -8,17 +8,16 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 use grafton_ndi::{
     advanced::*, Error, Ndi, ReceiverEvent, ReceiverOptions, RuntimeOptions, SdkResultDefect,
     Source,
 };
+use runtime_fixture::read_fake_log;
 use std::{fs, time::Duration};
 
 #[test]
@@ -31,10 +30,8 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
             PassthroughPreset::ProtectedWithAudio,
         )
         .unwrap();
-        let log_path = std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap();
-        let log = || fs::read_to_string(&log_path).unwrap();
         let frees = |kind: &str| {
-            log()
+            read_fake_log()
                 .lines()
                 .filter(|line| *line == format!("free-{kind}"))
                 .count()
@@ -60,7 +57,7 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
                 }
                 other => panic!("{other:?}"),
             };
-            assert!(log().contains(&format!("{medium}-data:{}", pointer as usize)));
+            assert!(read_fake_log().contains(&format!("{medium}-data:{}", pointer as usize)));
             packets.receiver().connection_stats().unwrap();
             drop(frame);
             assert_eq!(frees(medium), before + 1);
@@ -98,7 +95,7 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
         // capture guard. The following capture retains the original deadline.
         std::env::set_var("GRAFTON_FAKE_CAPTURE_SCRIPT", "26:none");
         std::env::set_var("GRAFTON_FAKE_CAPTURE_DELAY_MS", "40");
-        let calls = log()
+        let calls = read_fake_log()
             .lines()
             .filter(|line| line.starts_with("capture:"))
             .count();
@@ -110,7 +107,7 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
                     .is_none());
             });
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while log()
+            while read_fake_log()
                 .lines()
                 .filter(|line| line.starts_with("capture:"))
                 .count()
@@ -145,7 +142,7 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
             Some(PacketItem::Event(ReceiverEvent::SourceChanged))
         ));
         let captures = || {
-            log()
+            read_fake_log()
                 .lines()
                 .filter(|line| line.starts_with("capture:"))
                 .count()
@@ -175,7 +172,7 @@ fn borrowed_packet_capture_retains_native_buffers_and_preserves_events() {
         assert!(packets.capture_any_ref(Duration::ZERO).unwrap().is_none());
         return;
     }
-    let dir = fixture::FixtureDir::create("packet-capture");
+    let dir = common::FixtureDir::create("packet-capture");
     let library = dir.path().join("libndi_packet.so");
     runtime_fixture::FakeRuntime {
         cfgs: vec!["fake_objects", "fake_advanced", "fake_capture"],

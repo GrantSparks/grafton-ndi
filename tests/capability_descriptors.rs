@@ -6,12 +6,11 @@
 #[path = "common/mod.rs"]
 mod helpers;
 #[cfg(feature = "advanced")]
-common_helpers!(policy, prerequisites, child);
+common_helpers!(policy, prerequisites, child, fixture);
 use common::TestChild;
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
+use runtime_fixture::read_fake_log;
 
 use grafton_ndi::{
     capabilities::RuntimeFeature, Error, Ndi, PixelFormat, Receiver, ReceiverBandwidth,
@@ -59,12 +58,8 @@ fn frame(format: PixelFormat) -> VideoFrame {
         .unwrap()
 }
 
-fn events() -> String {
-    fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap_or_default()
-}
-
 fn calls(prefix: &str) -> usize {
-    events()
+    read_fake_log()
         .lines()
         .filter(|event| *event == prefix || (prefix.ends_with(':') && event.starts_with(prefix)))
         .count()
@@ -101,7 +96,7 @@ fn caller_descriptors_apply_version_gates_before_native_operations() {
         advanced(&ndi, modern);
         return;
     }
-    let directory = fixture::FixtureDir::create("capability-descriptors");
+    let directory = common::FixtureDir::create("capability-descriptors");
     for (version, modern) in [("6.3.2.0", false), ("6.4.0.2", true), ("7.0.0.0", true)] {
         let path = directory.path().join(version);
         fs::create_dir(&path).unwrap();
@@ -355,7 +350,8 @@ fn advanced(ndi: &Ndi, modern: bool) {
         assert_eq!(calls("avsync-synchronize:"), before + 1);
         if token.ends_with("invalid-metadata") {
             assert!(captured.metadata().is_none());
-            assert!(events().contains(&format!("avsync-synchronize:{}:5678:true", format as u32)));
+            assert!(read_fake_log()
+                .contains(&format!("avsync-synchronize:{}:5678:true", format as u32)));
         }
         let owned = captured.to_owned();
         drop(captured);
@@ -409,7 +405,7 @@ fn advanced(ndi: &Ndi, modern: bool) {
 fn synchronizer_lifetimes(ndi: &Ndi) {
     use grafton_ndi::advanced::{AdvancedConfig, AvSync, Genlock, GenlockOptions};
     for recover in [false, true] {
-        let start = events().len();
+        let start = read_fake_log().len();
         let receiver = Receiver::new(
             ndi,
             &ReceiverOptions::new(Source::new("lifetime fixture").unwrap()),
@@ -421,7 +417,7 @@ fn synchronizer_lifetimes(ndi: &Ndi) {
         } else {
             drop(sync);
         }
-        let trace = events();
+        let trace = read_fake_log();
         let trace = &trace[start..];
         assert_eq!(trace.matches("avsync-destroy").count(), 1);
         assert_eq!(trace.matches("receiver-destroy").count(), 1);
@@ -447,7 +443,7 @@ fn synchronizer_lifetimes(ndi: &Ndi) {
     drop(config);
     genlock.connect_to(&Source::new("genlock-reconnected").unwrap());
     drop(genlock);
-    assert!(events().contains(r#"genlock-destroy:genlock-reconnected:{"marker":"alive"}"#));
+    assert!(read_fake_log().contains(r#"genlock-destroy:genlock-reconnected:{"marker":"alive"}"#));
 }
 
 #[cfg(feature = "advanced")]
@@ -466,7 +462,7 @@ fn allocator_lifetimes(ndi: &Ndi) {
         AllocatorService::new(ndi.process_lifetime(), &AllocatorLimits::default()).unwrap();
     for packets in [false, true] {
         for recover in [false, true] {
-            let start = events().len();
+            let start = read_fake_log().len();
             let options = ReceiverOptions::new(Source::new("allocator lifetime fixture").unwrap());
             if packets {
                 let receiver = PacketReceiver::new(ndi, &options, PassthroughPreset::Hevc).unwrap();
@@ -497,7 +493,7 @@ fn allocator_lifetimes(ndi: &Ndi) {
                     drop(receiver);
                 }
             }
-            let trace = events();
+            let trace = read_fake_log();
             let trace = &trace[start..];
             assert_eq!(trace.matches("receiver-destroy").count(), 1, "{trace}");
             for stream in ["video", "audio"] {

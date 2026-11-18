@@ -9,15 +9,12 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use fixture::FixtureDir;
 use grafton_ndi::{
     capabilities::SdkEdition, runtime::RuntimeOptions, Error, LibraryKind, LoadFailure, LoadOrigin,
     LoadRefusal, Ndi,
@@ -57,7 +54,7 @@ fn loader_search_reports_what_the_platform_resolved() {
         child(&name, &root);
         return;
     }
-    let fixtures = FixtureDir::create("shadow");
+    let fixtures = common::FixtureDir::create("shadow");
     let root = fixtures.path();
     for directory in ["rejected", "anchorless", "usable"] {
         fs::create_dir(root.join(directory)).unwrap();

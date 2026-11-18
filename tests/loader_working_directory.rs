@@ -5,15 +5,12 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use fixture::FixtureDir;
 use grafton_ndi::{Error, LoadFailure, LoadOrigin, LoadRefusal, Runtime, RuntimeOptions};
 use runtime_fixture::FakeRuntime;
 use std::{
@@ -215,7 +212,7 @@ fn working_directory_libraries_never_run_constructors() {
         return;
     }
 
-    let directory = FixtureDir::create("working-directory-loader");
+    let directory = common::FixtureDir::create("working-directory-loader");
     let root = directory.path();
     for name in [
         "bin",

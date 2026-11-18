@@ -10,11 +10,8 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, prerequisites, child);
+common_helpers!(runtime, prerequisites, child, fixture);
 use common::TestChild;
-#[path = "support/fixture.rs"]
-mod fixture;
-use fixture::FixtureDir;
 use grafton_ndi::{
     file::{
         FileApi, FileApiOptions, FileNaming, FileRecorderOptions, FinishStatus, RecorderEventKind,
@@ -105,7 +102,7 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
         }
         return;
     }
-    let directory = FixtureDir::create("file-exact-race");
+    let directory = common::FixtureDir::create("file-exact-race");
     let interposer = directory.path().join("race.so");
     let output = Command::new("cc")
         .args(["-std=c11", "-shared", "-fPIC"])

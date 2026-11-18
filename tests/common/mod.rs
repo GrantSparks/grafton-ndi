@@ -41,6 +41,16 @@ macro_rules! common_helpers {
         mod child;
         pub use child::TestChild;
     };
+    (@ fixture) => {
+        #[path = "../../src/test_support/fixture.rs"]
+        mod fixture;
+        pub use fixture::FixtureDir;
+    };
+    (@ stop) => {
+        #[path = "../../src/test_support/stop.rs"]
+        mod stop;
+        pub use stop::StopOnDrop;
+    };
     (@ name) => {
         #[path = "../../src/test_support/unique_name.rs"]
         mod unique_name;

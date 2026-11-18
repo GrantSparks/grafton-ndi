@@ -6,15 +6,12 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(child);
+common_helpers!(child, fixture);
 use common::TestChild;
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use fixture::FixtureDir;
 use grafton_ndi::{
     capabilities::{CapabilityUnavailable, SdkEdition},
     file::{
@@ -23,7 +20,7 @@ use grafton_ndi::{
     runtime::RuntimeOptions,
     Error, LibraryKind, LoadFailure, LoadOrigin, LoadRefusal, Ndi, SelectionConflict,
 };
-use runtime_fixture::FakeRuntime;
+use runtime_fixture::{read_fake_log, FakeRuntime};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -204,7 +201,7 @@ fn file_library_loader_contract() {
         child(&name, &Fixtures { root });
         return;
     }
-    let directory = FixtureDir::create("file-loader");
+    let directory = common::FixtureDir::create("file-loader");
     let fixtures = Fixtures::build(directory.path());
     for scenario in SCENARIOS {
         let mut command = TestChild::new("file_library_loader_contract");
@@ -537,10 +534,8 @@ fn child(name: &str, fixtures: &Fixtures) {
             wait_for(|| !Ndi::is_running());
             // Stopping is already not running, before the native destroy
             // callback has necessarily appended its evidence.
-            wait_for(|| {
-                fs::read_to_string(&log).is_ok_and(|log| log.lines().any(|line| line == "destroy"))
-            });
-            let log = fs::read_to_string(log).unwrap();
+            wait_for(|| read_fake_log().lines().any(|line| line == "destroy"));
+            let log = read_fake_log();
             assert_eq!(log.lines().filter(|line| *line == "initialize").count(), 1);
             assert_eq!(log.lines().filter(|line| *line == "destroy").count(), 1);
         }

@@ -1,7 +1,6 @@
 //! Load the CI test pictures or generate them on demand for local runs.
 
-#[path = "fixture.rs"]
-mod fixture;
+use crate::common::FixtureDir;
 
 use std::{path::Path, process::Command, sync::OnceLock};
 
@@ -20,7 +19,7 @@ fn pictures() -> &'static (Vec<u8>, Vec<u8>) {
         if let Some(directory) = std::env::var_os("GRAFTON_NDI_HX_PICTURES") {
             return read_pictures(Path::new(&directory));
         }
-        let directory = fixture::FixtureDir::create("hx-pictures");
+        let directory = FixtureDir::create("hx-pictures");
         let python = if cfg!(windows) { "python" } else { "python3" };
         let output = Command::new(python)
             .arg(concat!(
