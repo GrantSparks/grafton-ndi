@@ -92,15 +92,18 @@ when upgrading from the released 2.1.0 API.
   and [Discovery Server](https://grantsparks.github.io/grafton-ndi/grafton_ndi/discovery_server/)
   APIs. Discovery Server advertisers and listeners require NDI 6.4 or later.
   Advertised senders can become connection targets, using name lookup when
-  the address or port is unusable.
+  the address or port is unusable. Standard Windows receivers can be monitored.
+  Discovery Server source control on Windows requires an Advanced runtime.
 - Optional [Advanced SDK integration](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/advanced.md)
   covers compressed and scatter packets, queued sending, custom receive
   allocation, AV sync, Genlock, per-instance configuration, encoder controls
-  and KVM. Missing native declarations or symbols disable the affected
-  capabilities.
+  and KVM. Packet roles share a generic API parameterized by `VideoPacketFormat`
+  or `AudioPacketFormat`. Missing native declarations or symbols disable the
+  affected capabilities.
 - The optional [File API](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/file-io.md)
   supports recording, playback, inspection and executor-independent async
-  owners. Finalization reports track file closure and recording outcomes.
+  owners. `SessionEnd` reports final outcomes, and bounded `finish` calls
+  also report timeouts.
   An incomplete file ledger requires a successful reset before another
   recording can start.
 - Expanded [image encoding](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/image-encoding.md)
@@ -108,9 +111,10 @@ when upgrading from the released 2.1.0 API.
   lossy WebP, writers, data URLs, reusable workspaces, downscaling, alpha,
   HDR code values and color policy.
 - Runtime-gated NDI 6.4 planar 4:4:4 formats, corresponding receiver options,
-  and V210/P216 conversion. The video extent limit supports DCI 8K in the
-  widest format. Advanced receive allocation publishes the largest admissible
-  request extent.
+  and V210/P216 conversion. The uncompressed video and custom receive
+  allocation limits are 283,115,520 bytes (270 MiB), sufficient for packed
+  DCI 8K NB4G. Compressed packet limits stay at 256 MiB. Receiver audio and
+  video delay controls share the checked `ReceiveDelay` type.
 - Setup and [platform coverage](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/setup.md#platforms)
   document dynamic builds, static Apple mobile targets and native SDK CI
   coverage. Core declarations from NDI 6.4.0.2 ship with the crate, which is
@@ -122,6 +126,9 @@ when upgrading from the released 2.1.0 API.
   from stored shape. Non-square-pixel sources can produce different encoded
   bytes at the same dimensions. The tags also cover downscaled output with
   partial blocks.
+- PNG and lossless WebP preserve an alpha channel when the source has one.
+  Opaque PNG sources produce RGB output. Use tagged PNG for BT.2020 primaries
+  and for explicit PQ or HLG code-value output.
 - JPEG can select a SIMD path at runtime. Encoded bytes and reconstructed
   pixels can vary with CPU capabilities. The
   [image performance guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/image-encoding-performance.md)

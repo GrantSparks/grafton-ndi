@@ -7,8 +7,8 @@ use super::{
     aliasable::AliasableVec,
     invalid_frame,
     packets::{EnvelopeExtents, PacketBytes, PacketLen},
-    AudioPacketFormat, CompressedAttached, CompressedAudioSendMode,
-    CompressedFrame, ScatterFrame, VideoPacketFormat,
+    AudioPacketFormat, CompressedAttached, CompressedAudioSendMode, CompressedFrame, ScatterFrame,
+    VideoPacketFormat,
 };
 use crate::{
     marker::NotSync,

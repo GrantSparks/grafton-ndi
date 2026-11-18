@@ -538,7 +538,13 @@ mod endpoint_tests {
         assert!(ServerOptions::server(&ListenerOptions::new())
             .unwrap()
             .is_none());
-        for text in ["", "café.local:5959", "127.0.0.1"] {
+        assert!(matches!(
+            ServerOptions::server(&ListenerOptions::new().server("")),
+            Err(crate::Error::InvalidInput(crate::InputDefect::Empty {
+                what: "server"
+            }))
+        ));
+        for text in ["café.local:5959", "127.0.0.1"] {
             let options = ListenerOptions::new().server(text);
             let endpoint = ServerOptions::server(&options).unwrap().unwrap();
             assert_eq!(endpoint.url.to_bytes(), text.as_bytes());

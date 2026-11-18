@@ -131,11 +131,12 @@ fn native_change_refuses_unsafe_controls_and_replays_tally_without_blocking_gett
         Receiver::create(
             &ndi,
             &ReceiverOptions::new(Source::new("").unwrap()),
-            #[cfg(feature = "advanced")]
-            None,
             |_, _| {
                 let instance = Box::into_raw(Box::new(Arc::clone(&native))).cast();
-                sys::table::for_test(instance, c"NDIlib_recv_create_v3")
+                crate::runtime::NativeCreation::plain(sys::table::for_test(
+                    instance,
+                    c"NDIlib_recv_create_v3",
+                ))
             },
         )
     }
