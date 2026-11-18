@@ -146,7 +146,7 @@ fn cleanup_stops_on_its_256th_late_event_and_settles_every_waiter() {
     for _ in 0..=STALE_EVENT_LIMIT {
         device.push(mock::FIRST_FRAME, mock::TAKE);
     }
-    recorder.cleanup = CleanupBudget::For(Timeout::new(Duration::ZERO).unwrap());
+    recorder.cleanup = Some(Timeout::new(Duration::ZERO).unwrap());
     let first = RefCell::new(None);
     let later = RefCell::new(None);
     let mut waiters = FinishWaiters::new();
@@ -179,7 +179,7 @@ fn cleanup_stops_on_its_256th_late_event_and_settles_every_waiter() {
     assert_eq!(delivered, STALE_EVENT_LIMIT);
     assert!(waiters.is_empty());
     for result in [first.into_inner(), later.into_inner()] {
-        assert!(matches!(result, Some(Ok(WaitOutcome::Expired(_)))));
+        assert!(matches!(result, Some(Ok(WaitOutcome::Expired(..)))));
     }
     assert!(recorder.next_event(Duration::ZERO).unwrap().is_some());
     recorder.abandon();
@@ -220,7 +220,7 @@ fn cleanup_spent_during_a_due_batch_also_settles_its_later_waiters() {
     assert_eq!(device.captures.load(Ordering::Acquire) - before, 1);
     assert!(waiters.is_empty());
     for result in [first.into_inner(), later.into_inner()] {
-        assert!(matches!(result, Some(Ok(WaitOutcome::Expired(_)))));
+        assert!(matches!(result, Some(Ok(WaitOutcome::Expired(..)))));
     }
     recorder.abandon();
 }
