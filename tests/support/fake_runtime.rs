@@ -347,7 +347,7 @@ stub! {
 
 }
 
-#[cfg(not(fake_capability_descriptors))]
+#[cfg(not(any(fake_capability_descriptors, fake_objects)))]
 stub! {
     fn NDIlib_send_send_video_v2(p_instance: NDIlib_send_instance_t, p_video_data: *const NDIlib_video_frame_v2_t);
 }
@@ -498,7 +498,7 @@ mod objects {
         }
 
         /// Report every retained frame as complete, most recent first.
-        unsafe fn complete(&mut self) {
+        pub(super) unsafe fn complete(&mut self) {
             unsafe { self.release_copy() };
             if std::env::var_os("GRAFTON_FAKE_VALIDATE_COMPRESSED_LOANS").is_some() {
                 for frame in self.pending.drain(..) {
@@ -513,6 +513,15 @@ mod objects {
                 log("sender-completion");
                 unsafe { completion(self.opaque, &frame) };
             }
+        }
+    }
+
+    #[cfg(not(fake_capability_descriptors))]
+    export! {
+        fn NDIlib_send_send_video_v2(p_instance: NDIlib_send_instance_t, _p_video_data: *const NDIlib_video_frame_v2_t) {
+            let sender = unsafe { &mut *p_instance.cast::<Sender>() };
+            log("sender-send");
+            unsafe { sender.complete() };
         }
     }
 
@@ -1294,10 +1303,14 @@ pub unsafe extern "C" fn NDIlib_send_send_video_scatter_async(
 #[cfg(all(fake_advanced, fake_objects, not(fake_omit_scatter)))]
 #[no_mangle]
 pub unsafe extern "C" fn NDIlib_send_send_video_scatter(
-    _instance: NDIlib_send_instance_t,
+    instance: NDIlib_send_instance_t,
     _frame: *const NDIlib_video_frame_v2_t,
     _scatter: *const FrameScatter,
-) {}
+) {
+    let sender = unsafe { &mut *instance.cast::<objects::Sender>() };
+    log("sender-scatter-send");
+    unsafe { sender.complete() };
+}
 
 #[cfg(all(fake_advanced, fake_objects, not(fake_omit_scatter)))]
 #[no_mangle]

@@ -489,6 +489,49 @@ fn child(case: &str) {
                 assert_eq!(frame.data()[0], value);
                 assert!(sender.submit_video(frame).is_none());
             }
+            let format = VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16).unwrap();
+            let mut synchronous =
+                CompressedFrame::<VideoPacketFormat>::new(format, vec![33; 16]).unwrap();
+            sender.send_video(&mut synchronous);
+            let after_send = log();
+            assert_eq!(after_send.matches("sender-flush\n").count(), 1);
+            let reclaimed = sender.reclaim_video();
+            assert!(reclaimed.program.is_some() && reclaimed.preview.is_some());
+            assert_eq!(
+                log(),
+                after_send,
+                "synchronous video already released both loans"
+            );
+            for value in [11, 22] {
+                assert!(
+                    position(&after_send, "sender-send")
+                        < after_send
+                            .rfind(&format!("sender-loan-released={value}"))
+                            .unwrap()
+                );
+            }
+            #[cfg(ndi_has_advanced_scatter_send)]
+            {
+                let mut scatter =
+                    grafton_ndi::advanced::ScatterFrame::new(format, vec![vec![44; 16]]).unwrap();
+                for frame in [reclaimed.program, reclaimed.preview].into_iter().flatten() {
+                    let SubmittedVideo::Contiguous(frame) = frame else {
+                        panic!("contiguous frame");
+                    };
+                    assert!(sender.submit_video(frame).is_none());
+                }
+                sender.send_scatter_video(&mut scatter).unwrap();
+                let after_send = log();
+                assert!(after_send.contains("sender-scatter-send\n"));
+                assert_eq!(after_send.matches("sender-flush\n").count(), 1);
+                let reclaimed = sender.reclaim_video();
+                assert!(reclaimed.program.is_some() && reclaimed.preview.is_some());
+                assert_eq!(
+                    log(),
+                    after_send,
+                    "synchronous scatter already released both loans"
+                );
+            }
             drop(sender);
             assert!(
                 position(&read_fake_log(), "sender-flush")

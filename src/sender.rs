@@ -98,10 +98,13 @@ pub(crate) struct SendHandle<'a> {
     _owner: PhantomData<&'a SenderResource>,
 }
 
-impl SendHandle<'_> {
-    #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
+impl<'a> SendHandle<'a> {
     pub(crate) fn instance(self) -> NDIlib_send_instance_t {
         self.instance.0
+    }
+
+    pub(crate) fn core(self) -> &'a sys::Core {
+        self.core
     }
 }
 
@@ -212,7 +215,7 @@ unsafe impl<'owner> crate::capture::FrameSource<'owner, crate::capture::SenderMe
 
     fn instance(&self) -> crate::capture::SenderMetadataInstance {
         crate::capture::SenderMetadataInstance {
-            instance: self.resource.instance(),
+            instance: self.resource.handle().instance(),
             free: self.table.NDIlib_send_free_metadata,
         }
     }
@@ -226,14 +229,14 @@ mod ownership {
     ///
     /// Nominally public only so that [`NativeOwner`] can name it; its implementation stays private.
     pub struct SenderResource {
-        pub(super) instance: SendInstance,
+        instance: SendInstance,
         pub(super) _name: CString,
         pub(super) _groups: Option<CString>,
         // A registration may keep this native sender alive after Sender drops.
         pub(super) failover: parking_lot::Mutex<RetainedSources>,
         #[cfg(feature = "advanced")]
         pub(super) _config: Option<crate::advanced::AdvancedConfig>,
-        pub(super) sdk: crate::runtime::Bound<sys::Core>,
+        sdk: crate::runtime::Bound<sys::Core>,
     }
 
     // No application code runs under the failover lock. A replacement keeps
@@ -250,26 +253,34 @@ mod ownership {
     }
 
     impl SenderResource {
-        /// The native sender this token keeps alive.
-        pub(crate) fn instance(&self) -> NDIlib_send_instance_t {
-            self.instance.0
+        pub(super) fn new(
+            instance: SendInstance,
+            name: CString,
+            groups: Option<CString>,
+            #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
+            sdk: crate::runtime::Bound<sys::Core>,
+        ) -> Self {
+            Self {
+                instance,
+                _name: name,
+                _groups: groups,
+                failover: parking_lot::Mutex::new(RetainedSources::default()),
+                #[cfg(feature = "advanced")]
+                _config: config,
+                sdk,
+            }
         }
-    }
 
-    impl SenderResource {
         /// The runtime whose native instance this resource owns.
         pub(super) fn ndi(&self) -> &Ndi {
             self.sdk.ndi()
         }
 
-        pub(super) fn core(&self) -> &sys::Core {
-            &self.sdk
-        }
-
-        pub(super) fn handle(&self) -> SendHandle<'_> {
+        /// Lend the native identity with the runtime that created it.
+        pub(crate) fn handle(&self) -> SendHandle<'_> {
             SendHandle {
                 instance: self.instance,
-                core: self.core(),
+                core: &self.sdk,
                 _owner: PhantomData,
             }
         }
@@ -278,7 +289,7 @@ mod ownership {
     impl Drop for SenderResource {
         fn drop(&mut self) {
             // SAFETY: this token is the instance's final owner.
-            unsafe { self.core().NDIlib_send_destroy(self.instance()) };
+            unsafe { self.sdk.NDIlib_send_destroy(self.instance.0) };
         }
     }
 
@@ -794,27 +805,48 @@ pub(crate) mod in_flight {
             let tier = next.tier();
             Stream {
                 slot: self.loans.slot(tier),
-                sender: self.sender.resource().handle(),
+                sender: self.sender.handle(),
             }
             .submit(next)
             .map(crate::advanced::PendingVideo::into_submitted)
         }
 
-        /// A null asynchronous flush synchronizes this sender's two streams
-        /// together. Release both slots inside this owner operation, then
-        /// recover their owned frames.
+        /// A synchronous video send ends both native loans. The frames stay
+        /// in their original slots for reclamation or same-stream replacement.
+        pub(crate) fn send_video(
+            &mut self,
+            frame: &mut crate::advanced::CompressedFrame<crate::advanced::VideoPacketFormat>,
+        ) {
+            let descriptor = frame.raw();
+            // SAFETY: this descriptor lends exclusively borrowed storage
+            // through the synchronous call.
+            self.synchronize_video(|sender| unsafe { send_video_native(sender, &descriptor) });
+        }
+
+        pub(crate) fn send_scatter_video(
+            &mut self,
+            frame: &mut crate::advanced::ScatterFrame<crate::advanced::VideoPacketFormat>,
+        ) -> Result<()> {
+            let admitted =
+                crate::advanced::ScatterSendable::borrowed(frame, self.sender.runtime())?;
+            self.synchronize_video(|sender| admitted.send_video(sender));
+            Ok(())
+        }
+
+        fn synchronize_video(&mut self, submit: impl FnOnce(SendHandle<'_>)) {
+            Stream {
+                slot: self.loans.slot(crate::StreamTier::Program),
+                sender: self.sender.handle(),
+            }
+            .synchronize(submit);
+            self.loans.slot(crate::StreamTier::Preview).mark_released();
+        }
+
+        /// Flush when the SDK still owns a loan, then recover both slots.
         pub(crate) fn finish(&mut self) -> crate::advanced::ReclaimedVideo {
             use crate::StreamTier::{Preview, Program};
             if self.loans.slot(Program).is_in_flight() || self.loans.slot(Preview).is_in_flight() {
-                // One native flush synchronizes both slots of this paired
-                // sender. Keep both releases inside this owner operation.
-                let mut program = Stream {
-                    slot: self.loans.slot(Program),
-                    sender: self.sender.resource().handle(),
-                };
-                program.flush_native();
-                program.slot.mark_released();
-                self.loans.slot(Preview).mark_released();
+                self.synchronize_video(flush_video_native);
             }
             self.loans.take_retained()
         }
@@ -836,11 +868,7 @@ pub(crate) mod in_flight {
             // admission from its own sender and callback. Admission retains
             // every descriptor and pointee before dispatch; the callback may
             // complete synchronously after its state lock has been released.
-            unsafe {
-                admitted
-                    .lent
-                    .submit(self.sender.resource().handle(), admitted.pointer)
-            };
+            unsafe { admitted.lent.submit(self.sender.handle(), admitted.pointer) };
             Ok(admitted.id)
         }
     }
@@ -922,8 +950,8 @@ pub(crate) mod in_flight {
                     // SAFETY: the caller guarantees descriptor and loan lifetimes.
                     unsafe {
                         sender
-                            .core
-                            .NDIlib_send_send_video_async_v2(sender.instance.0, descriptor)
+                            .core()
+                            .NDIlib_send_send_video_async_v2(sender.instance(), descriptor)
                     };
                 }
                 #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
@@ -1043,37 +1071,49 @@ pub(crate) mod in_flight {
         }
     }
 
+    fn flush_video_native(sender: SendHandle<'_>) {
+        // SAFETY: the handle retains the sender and its runtime. A true null
+        // descriptor drains that sender's asynchronous loans.
+        unsafe {
+            sender
+                .core()
+                .NDIlib_send_send_video_async_v2(sender.instance(), async_flush_frame_ptr())
+        };
+    }
+
+    /// # Safety
+    /// The caller retains the descriptor and all bytes it names through the
+    /// synchronous SDK call.
+    unsafe fn send_video_native(sender: SendHandle<'_>, frame: &NDIlib_video_frame_v2_t) {
+        // SAFETY: the handle retains the sender and its runtime. The caller
+        // keeps the descriptor and storage live.
+        unsafe {
+            sender
+                .core()
+                .NDIlib_send_send_video_v2(sender.instance(), frame)
+        };
+    }
+
     impl<T> Stream<'_, T> {
-        fn flush_native(&mut self) {
-            // SAFETY: this pair's owner retains its live sender and slots.
-            // A true null descriptor drains that sender's asynchronous loans.
-            unsafe {
-                self.sender.core.NDIlib_send_send_video_async_v2(
-                    self.sender.instance.0,
-                    async_flush_frame_ptr(),
-                )
-            };
+        /// Dispatch a synchronizing call through the handle paired with this
+        /// slot and release its loan after the call returns.
+        fn synchronize(&mut self, submit: impl FnOnce(SendHandle<'_>)) {
+            submit(self.sender);
+            self.slot.mark_released();
         }
 
         fn flush(&mut self) {
             if self.slot.is_in_flight() {
-                self.flush_native();
-                self.slot.mark_released();
+                self.synchronize(flush_video_native);
             }
         }
     }
 
     impl Stream<'_, Sendable<VideoFrame>> {
         fn send(&mut self, frame: PreparedVideo<'_>) {
-            // SAFETY: the pair retains the slot's live sender. PreparedVideo
-            // borrows initialized input or padded staging through this call;
-            // the synchronous send also ends this sender's previous loan.
-            unsafe {
-                self.sender
-                    .core
-                    .NDIlib_send_send_video_v2(self.sender.instance.0, &frame.raw)
-            };
-            self.slot.mark_released();
+            // SAFETY: PreparedVideo borrows initialized input or padded
+            // staging through the synchronous call.
+            self.synchronize(|sender| unsafe { send_video_native(sender, &frame.raw) });
         }
     }
 
@@ -1538,15 +1578,14 @@ impl<M: SenderMode> Sender<M> {
                 #[cfg(ndi_has_advanced_keyframe_demand)]
                 keyframe_changes: crate::keyframe_changes::KeyframeChanges::default(),
             },
-            native: NativeOwner::new(SenderResource {
+            native: NativeOwner::new(SenderResource::new(
                 instance,
-                _name: name,
-                _groups: groups,
-                failover: parking_lot::Mutex::new(RetainedSources::default()),
+                name,
+                groups,
                 #[cfg(feature = "advanced")]
-                _config: config,
-                sdk: core,
-            }),
+                config,
+                core,
+            )),
             _mode: PhantomData,
         })
     }
@@ -1827,19 +1866,20 @@ impl<M: AudioSendMode> Sender<M> {
     /// ```
     #[doc(alias = "NDIlib_send_send_audio_v3")]
     pub fn send_audio(&self, frame: &(impl AudioSource + ?Sized)) {
+        let handle = self.handle();
         // SAFETY: this borrow reaches the instance's owning resource, and every
         // pointer passed outlives the synchronous call.
         unsafe {
-            self.resource()
+            handle
                 .core()
-                .NDIlib_send_send_audio_v3(self.resource().instance(), &frame.audio_descriptor());
+                .NDIlib_send_send_audio_v3(handle.instance(), &frame.audio_descriptor());
         }
     }
 }
 
 impl<M: SenderMode> Sender<M> {
-    pub(crate) fn native_instance(&self) -> NDIlib_send_instance_t {
-        self.resource().instance()
+    pub(crate) fn handle(&self) -> SendHandle<'_> {
+        self.resource().handle()
     }
 
     /// All selectors consume the SDK's same one-shot report, including a
@@ -1853,12 +1893,6 @@ impl<M: SenderMode> Sender<M> {
     /// The single owner of this sender's native instance and runtime.
     fn resource(&self) -> &SenderResource {
         self.native.resource()
-    }
-
-    /// The core entry points of the runtime that created this sender.
-    #[cfg(feature = "advanced")]
-    pub(crate) fn core(&self) -> &sys::Core {
-        self.resource().core()
     }
 
     pub(crate) fn runtime(&self) -> &Ndi {
@@ -1912,6 +1946,7 @@ impl<M: SenderMode> Sender<M> {
     /// As for [`Self::capture_metadata`].
     #[doc(alias = "NDIlib_send_capture")]
     pub fn capture_metadata_ref(&self, timeout: Duration) -> Result<Option<MetadataFrameRef<'_>>> {
+        let handle = self.handle();
         let source = SenderMetadataSource::new(self.resource())?;
         let metadata = source.table;
         let deadline = Deadline::after(timeout)?;
@@ -1929,7 +1964,7 @@ impl<M: SenderMode> Sender<M> {
         let called = unsafe {
             metadata
                 .named()
-                .NDIlib_send_capture(self.resource().instance(), &mut raw, remaining)
+                .NDIlib_send_capture(handle.instance(), &mut raw, remaining)
         };
         let kind = *called.value();
         if kind == NDIlib_frame_type_e_NDIlib_frame_type_metadata {
@@ -1960,14 +1995,15 @@ impl<M: SenderMode> Sender<M> {
     /// wrapper. The SDK copies the text before returning.
     #[doc(alias = "NDIlib_send_send_metadata")]
     pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) {
+        let handle = self.handle();
         let raw = metadata.metadata_raw();
         // The borrowed C string remains live through this synchronous SDK call.
         // SAFETY: this borrow reaches the instance's owning resource, and every
         // pointer passed outlives the synchronous call.
         unsafe {
-            self.resource()
+            handle
                 .core()
-                .NDIlib_send_send_metadata(self.resource().instance(), &raw);
+                .NDIlib_send_send_metadata(handle.instance(), &raw);
         }
     }
 
@@ -2060,15 +2096,14 @@ impl<M: SenderMode> Sender<M> {
     /// Query the SDK's tally, waiting up to `timeout_ms`; returns whether it
     /// changed, and the tally.
     fn get_tally(&self, timeout_ms: u32) -> (bool, Tally) {
+        let handle = self.handle();
         let mut raw_tally = Tally::default().to_sdk();
         // SAFETY: this borrow reaches the instance's owning resource, and every
         // pointer passed outlives the synchronous call.
         let changed = unsafe {
-            self.resource().core().NDIlib_send_get_tally(
-                self.resource().instance(),
-                &mut raw_tally,
-                timeout_ms,
-            )
+            handle
+                .core()
+                .NDIlib_send_get_tally(handle.instance(), &mut raw_tally, timeout_ms)
         };
         (
             changed,
@@ -2102,13 +2137,14 @@ impl<M: SenderMode> Sender<M> {
     }
 
     fn connection_count_with_timeout(&self, timeout_ms: u32) -> Result<u32> {
+        let handle = self.handle();
         // SAFETY: this borrow keeps the sender and its runtime alive through
         // the bounded query, which writes no Rust-owned state.
         let count = unsafe {
-            self.resource()
+            handle
                 .core()
                 .named()
-                .NDIlib_send_get_no_connections(self.resource().instance(), timeout_ms)
+                .NDIlib_send_get_no_connections(handle.instance(), timeout_ms)
         };
         count.count()
     }
@@ -2116,12 +2152,13 @@ impl<M: SenderMode> Sender<M> {
     /// Remove all metadata registered for delivery to each new connection.
     #[doc(alias = "NDIlib_send_clear_connection_metadata")]
     pub fn clear_connection_metadata(&self) {
+        let handle = self.handle();
         // SAFETY: this borrow reaches the instance's owning resource, and every
         // pointer passed outlives the synchronous call.
         unsafe {
-            self.resource()
+            handle
                 .core()
-                .NDIlib_send_clear_connection_metadata(self.resource().instance())
+                .NDIlib_send_clear_connection_metadata(handle.instance())
         }
     }
 
@@ -2131,20 +2168,22 @@ impl<M: SenderMode> Sender<M> {
     /// the input can be released as soon as this method returns.
     #[doc(alias = "NDIlib_send_add_connection_metadata")]
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) {
+        let handle = self.handle();
         let raw = metadata.metadata_raw();
         // The borrowed C string remains live through this synchronous SDK call.
         // SAFETY: this borrow reaches the instance's owning resource, and every
         // pointer passed outlives the synchronous call.
         unsafe {
-            self.resource()
+            handle
                 .core()
-                .NDIlib_send_add_connection_metadata(self.resource().instance(), &raw)
+                .NDIlib_send_add_connection_metadata(handle.instance(), &raw)
         }
     }
 
     /// Set the validated failover source.
     #[doc(alias = "NDIlib_send_set_failover")]
     pub fn set_failover(&self, source: &Source) {
+        let handle = self.handle();
         self.resource()
             .failover
             .lock()
@@ -2152,9 +2191,9 @@ impl<M: SenderMode> Sender<M> {
                 // SAFETY: the native owner and its locked retention slot keep the
                 // previous and replacement descriptors live through this request.
                 unsafe {
-                    self.resource()
+                    handle
                         .core()
-                        .NDIlib_send_set_failover(self.resource().instance(), source)
+                        .NDIlib_send_set_failover(handle.instance(), source)
                 }
             });
     }
@@ -2162,13 +2201,14 @@ impl<M: SenderMode> Sender<M> {
     /// Clear the failover source previously configured with [`Self::set_failover`].
     #[doc(alias = "NDIlib_send_set_failover")]
     pub fn clear_failover(&self) {
+        let handle = self.handle();
         self.resource().failover.lock().replace(None, |source| {
             // SAFETY: the sender is live and the retention helper keeps the
             // previous descriptor until this null replacement returns.
             unsafe {
-                self.resource()
+                handle
                     .core()
-                    .NDIlib_send_set_failover(self.resource().instance(), source)
+                    .NDIlib_send_set_failover(handle.instance(), source)
             }
         });
     }
@@ -2198,13 +2238,14 @@ impl<M: SenderMode> Sender<M> {
     /// ```
     #[doc(alias = "NDIlib_send_get_source_name")]
     pub fn source(&self) -> Result<Source> {
+        let handle = self.handle();
         // SAFETY: this borrow reaches the instance's owning resource, and every
         // pointer passed outlives the synchronous call.
         let source_ptr = unsafe {
-            self.resource()
+            handle
                 .core()
                 .named()
-                .NDIlib_send_get_source_name(self.resource().instance())
+                .NDIlib_send_get_source_name(handle.instance())
         };
         // SAFETY: the SDK sender owns this live descriptor and its strings
         // through the synchronous copy performed here.

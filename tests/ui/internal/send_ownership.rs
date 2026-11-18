@@ -32,3 +32,8 @@ fn extract_foreign_dispatch<M: SenderMode, L>(pair: &LoanPair<'_, M, L>) {
 fn forge_destruction() {
     let _ = in_flight::Destroyed { _private: () };
 }
+
+#[cfg(ndi_test_send_ownership_types)]
+fn extract_sender_instance(resource: &SenderResource) {
+    let _ = resource.instance;
+}

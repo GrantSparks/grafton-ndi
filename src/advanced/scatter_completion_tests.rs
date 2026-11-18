@@ -48,11 +48,12 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             .clock_audio(false),
     )
     .unwrap();
+    let sender_handle = sender.handle();
     // SAFETY: this exclusively owned sender has no existing submissions. State
     // remains allocated until after sender destruction has drained callbacks.
     unsafe {
         completion.NDIlib_send_set_video_async_completion(
-            sender.native_instance(),
+            sender_handle.instance(),
             (&*reported as *const Completions).cast_mut().cast(),
             Some(completed),
         );
@@ -102,7 +103,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
             // SAFETY: descriptor and scatter list describe the retained frame; no
             // payload is accessed again until sender destruction drains callbacks.
             unsafe {
-                scatter.NDIlib_send_send_video_scatter_async(sender.native_instance(), &frame, list)
+                scatter.NDIlib_send_send_video_scatter_async(sender_handle.instance(), &frame, list)
             };
         };
     for number in 0..8 {

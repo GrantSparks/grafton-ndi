@@ -818,7 +818,7 @@ impl QueuedSender {
         // keeps it until after the sender has been destroyed.
         unsafe {
             register(
-                sender.native_instance(),
+                sender.handle().instance(),
                 state.cast_mut().cast(),
                 Some(completion),
             )

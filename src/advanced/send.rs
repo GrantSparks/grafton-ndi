@@ -12,18 +12,18 @@ use super::{
 };
 use crate::{
     marker::NotSync,
-    sender::in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans},
-    sys::{
-        advanced::{native, ScatterSend},
-        bindings::*,
+    sender::{
+        in_flight::{Destroyed, InFlight, Lend, Lending, Lent, LoanPair, Loans},
+        SendHandle,
     },
+    sys::advanced::{native, ScatterSend},
     Ndi, Rejected, Result, Sender, SenderOptions, StreamTier,
 };
 
 #[cfg(any(test, ndi_has_advanced_scatter_send))]
 use super::aliasable::AliasableBox;
 #[cfg(ndi_has_advanced_scatter_send)]
-use crate::sys::advanced::FrameScatter;
+use crate::sys::{advanced::FrameScatter, bindings::*};
 
 /// Maximum number of blocks in one scatter frame.
 pub const MAX_SCATTER_BLOCKS: usize = 65_536;
@@ -370,7 +370,7 @@ impl<F> ScatterSendable<F> {
 }
 
 impl<'a, F> ScatterSendable<&'a mut F, &'a ScatterSend> {
-    fn borrowed(frame: &'a mut F, ndi: &'a Ndi) -> Result<Self> {
+    pub(crate) fn borrowed(frame: &'a mut F, ndi: &'a Ndi) -> Result<Self> {
         Ok(Self {
             frame,
             table: ndi.table::<ScatterSend>()?,
@@ -379,23 +379,23 @@ impl<'a, F> ScatterSendable<&'a mut F, &'a ScatterSend> {
 }
 
 impl ScatterSendable<&mut ScatterFrame<VideoPacketFormat>, &ScatterSend> {
-    fn send_video(self, sender: NDIlib_send_instance_t) {
+    pub(crate) fn send_video(self, sender: SendHandle<'_>) {
         native!(ScatterSend, self.table, uses(self, sender) => {
             let (descriptor, scatter) = self.frame.lend_scatter();
             // SAFETY: the caller's live sender borrows this frame exclusively
             // through the synchronous call, including its stable scatter list.
-            unsafe { self.table.NDIlib_send_send_video_scatter(sender, &descriptor, scatter) };
+            unsafe { self.table.NDIlib_send_send_video_scatter(sender.instance(), &descriptor, scatter) };
         })
     }
 }
 
 impl ScatterSendable<&mut ScatterFrame<AudioPacketFormat>, &ScatterSend> {
-    fn send_audio(self, sender: NDIlib_send_instance_t) {
+    fn send_audio(self, sender: SendHandle<'_>) {
         native!(ScatterSend, self.table, uses(self, sender) => {
             let (descriptor, scatter) = self.frame.lend_scatter();
             // SAFETY: the caller retains its live sender and this exclusive
             // frame borrow, including every block and list, until return.
-            unsafe { self.table.NDIlib_send_send_audio_scatter(sender, &descriptor, scatter) };
+            unsafe { self.table.NDIlib_send_send_audio_scatter(sender.instance(), &descriptor, scatter) };
         })
     }
 }
@@ -517,15 +517,12 @@ unsafe impl Lend for PendingVideo {
     }
 }
 
-#[derive(Default)]
 /// The frame most recently submitted asynchronously on each stream.
 ///
-/// `Processing.NDI.Send.h` makes subsequent video sends synchronizing calls
-/// for the sender, across streams. The crate conservatively retains one frame
-/// per stream until the replacement on that same stream returns, an explicit
-/// reclaim releases it, or the native sender is destroyed. A synchronizing send on
-/// another stream can end the native loan earlier without releasing this
-/// retained storage to the caller.
+/// The loan kernel marks both slots released after synchronous video
+/// dispatch. Each frame remains in its own slot until that stream replaces it
+/// or the owner reclaims it. Sender destruction releases any outstanding loan.
+#[derive(Default)]
 pub(crate) struct PendingStreams {
     program: InFlight<PendingVideo>,
     preview: InFlight<PendingVideo>,
@@ -758,10 +755,10 @@ impl CompressedSender {
 
     /// Drain asynchronous video and return both streams' final frames.
     ///
-    /// One null asynchronous flush waits for the SDK to finish with all
-    /// pending video, without a timeout. The source stays available and can
-    /// send again; the next asynchronous send on either drained stream
-    /// returns `None`. Reclaiming from an empty sender makes no native call.
+    /// If the SDK still owns a loan, one null asynchronous flush waits for
+    /// it without a timeout. A preceding synchronous video send already
+    /// ends both loans and needs no flush. The source stays available and
+    /// the next asynchronous send on either drained stream returns `None`.
     /// Reclamation does not report whether receivers received the frames.
     #[doc(alias = "NDIlib_send_send_video_async_v2")]
     pub fn reclaim_video(&mut self) -> ReclaimedVideo {
@@ -820,22 +817,10 @@ pub struct CompressedVideo<'a> {
 }
 
 impl CompressedVideo<'_> {
-    fn instance(&self) -> NDIlib_send_instance_t {
-        self.pair.sender().native_instance()
-    }
-
     /// See [`CompressedSender::send_video`].
     #[doc(alias = "NDIlib_send_send_video_v2")]
     pub fn send_video(&mut self, frame: &mut CompressedFrame<VideoPacketFormat>) {
-        let descriptor = frame.raw();
-        // SAFETY: the sender is live, and the descriptor lends `frame`, which
-        // is borrowed exclusively for longer than this synchronous call.
-        unsafe {
-            self.pair
-                .sender()
-                .core()
-                .NDIlib_send_send_video_v2(self.instance(), &descriptor)
-        };
+        self.pair.send_video(frame);
     }
 
     /// See [`CompressedSender::submit_video`].
@@ -863,8 +848,7 @@ impl CompressedVideo<'_> {
         &mut self,
         frame: &mut ScatterFrame<VideoPacketFormat>,
     ) -> Result<()> {
-        ScatterSendable::borrowed(frame, self.pair.sender().runtime())?.send_video(self.instance());
-        Ok(())
+        self.pair.send_scatter_video(frame)
     }
 
     /// See [`CompressedSender::submit_scatter_video`].
@@ -890,11 +874,13 @@ impl<M: CompressedAudioSendMode> Sender<M> {
     #[doc(alias = "NDIlib_send_send_audio_v3")]
     pub fn send_compressed_audio(&self, frame: &mut CompressedFrame<AudioPacketFormat>) {
         let descriptor = frame.raw();
+        let handle = self.handle();
         // SAFETY: this live Advanced sender lends the exclusively borrowed
         // frame for the whole synchronous call, after which the SDK releases it.
         unsafe {
-            self.core()
-                .NDIlib_send_send_audio_v3(self.native_instance(), &descriptor)
+            handle
+                .core()
+                .NDIlib_send_send_audio_v3(handle.instance(), &descriptor)
         };
     }
 
@@ -907,7 +893,7 @@ impl<M: CompressedAudioSendMode> Sender<M> {
     /// unavailable in the selected runtime or build headers.
     #[doc(alias = "NDIlib_send_send_audio_scatter")]
     pub fn send_scatter_audio(&self, frame: &mut ScatterFrame<AudioPacketFormat>) -> Result<()> {
-        ScatterSendable::borrowed(frame, self.runtime())?.send_audio(self.native_instance());
+        ScatterSendable::borrowed(frame, self.runtime())?.send_audio(self.handle());
         Ok(())
     }
 }

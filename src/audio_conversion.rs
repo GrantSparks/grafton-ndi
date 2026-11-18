@@ -370,7 +370,7 @@ macro_rules! send_interleaved {
             let raw = frame.raw();
             // SAFETY: the sender instance is live for this borrow and the
             // validated source slice outlives the synchronous call.
-            unsafe { send.$send(self.native_instance(), &raw) };
+            unsafe { send.$send(self.handle().instance(), &raw) };
             Ok(())
         }
     };

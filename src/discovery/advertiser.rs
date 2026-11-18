@@ -217,7 +217,7 @@ impl AdvertiserApi for sys::SenderAdvertising {
         unsafe {
             self.named().NDIlib_send_advertiser_add_sender(
                 instance.0,
-                member.instance(),
+                member.handle().instance(),
                 options.monitoring,
             )
         }
@@ -230,7 +230,7 @@ impl AdvertiserApi for sys::SenderAdvertising {
         // SAFETY: forwarded to the caller's live-owner obligation.
         unsafe {
             self.named()
-                .NDIlib_send_advertiser_del_sender(instance.0, member.instance())
+                .NDIlib_send_advertiser_del_sender(instance.0, member.handle().instance())
         }
     }
 }
