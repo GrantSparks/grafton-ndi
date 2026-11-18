@@ -30,9 +30,11 @@ lock. Native snapshot work, copying and caller predicates can finish after the
 budget. `current_sources()` uses ordinary blocking serialization. Discovery
 cannot guarantee continued availability or observation of every source. Source
 identity compares the name and opaque address text. `Source::new(name)?` and
-`SourceAddress::new(text)?` reject interior NULs once at construction. Inspect
-addresses through `as_str()` or the derived `is_url()` test. Finder list settings
-accept iterables, such as `groups(["Public", "Studio"])` and
+`SourceAddress::new(text)?` reject interior NULs once at construction.
+`as_str()` returns the original address text, and `is_url()` checks for a
+valid initial scheme followed by `://`. Host and port come from the
+authority before the path, query or fragment. Finder list settings accept
+iterables, such as `groups(["Public", "Studio"])` and
 `extra_ips(["192.0.2.10"])`; their readback accessors return slices.
 
 Snapshots and accumulated results have bounded, fallible allocations.

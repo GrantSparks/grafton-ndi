@@ -278,12 +278,13 @@ mod tests {
             source.hash(&mut state);
             state.finish()
         };
-        for text in [
-            "camera.local:8080",
-            "192.0.2.1:5960",
-            "[2001:db8::1]:5960",
-            "ndi://h:1",
-            "opaque text",
+        for (text, is_url) in [
+            ("camera.local:8080", false),
+            ("192.0.2.1:5960", false),
+            ("[2001:db8::1]:5960", false),
+            ("ndi://h:1", true),
+            ("camera.local:8080?next=ndi://h:1", false),
+            ("opaque text", false),
         ] {
             let configured = Source::new("Camera")
                 .unwrap()
@@ -298,7 +299,7 @@ mod tests {
             assert_eq!(hash(&configured), hash(&discovered));
             let address = discovered.address().unwrap();
             assert_eq!(address.as_str(), text);
-            assert_eq!(address.is_url(), text.contains("://"));
+            assert_eq!(address.is_url(), is_url);
             // Both native union member names denote the same address pointer.
             // SAFETY: The retained target initialized the pointer member of this union.
             unsafe {

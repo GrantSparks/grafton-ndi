@@ -1353,8 +1353,20 @@ struct Authority<'a> {
     port: Option<u16>,
 }
 
+/// Strip an initial scheme of the form `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`
+/// followed by `://`.
+fn strip_url_scheme(address: &str) -> Option<&str> {
+    let mut bytes = address.bytes();
+    if !bytes.next()?.is_ascii_alphabetic() {
+        return None;
+    }
+    let end = 1 + bytes
+        .position(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')))?;
+    address.get(end..)?.strip_prefix("://")
+}
+
 fn parse_authority(address: &str) -> Option<Authority<'_>> {
-    let address = address.split_once("://").map_or(address, |(_, rest)| rest);
+    let address = strip_url_scheme(address).unwrap_or(address);
     let authority = address.split(['/', '?', '#']).next()?;
     let authority = authority.rsplit('@').next()?;
     if authority.is_empty() {
@@ -1692,9 +1704,13 @@ impl SourceAddress {
         self.0.as_c_str()
     }
 
-    /// Whether the address contains a URL scheme separator (`://`).
+    /// Whether the address starts with a valid URL scheme followed by `://`.
+    ///
+    /// The scheme starts with an ASCII letter and can contain ASCII letters,
+    /// digits, `+`, `-` and `.`. Use `as_str().contains("://")` to search for
+    /// the separator anywhere in the address text.
     pub fn is_url(&self) -> bool {
-        self.as_str().contains("://")
+        strip_url_scheme(self.as_str()).is_some()
     }
 
     /// Check whether this address has the exact host or IP.
@@ -1729,9 +1745,8 @@ impl SourceAddress {
 
     /// Extract an explicit port from conventional host/port or URL syntax.
     ///
-    /// SDK address strings are opaque; unrecognized syntax returns `None`.
-    ///
-    /// Parses the port from addresses in the format `host:port`.
+    /// Reads the authority before any path, query or fragment. SDK address
+    /// strings are opaque and unrecognized syntax returns `None`.
     ///
     /// # Returns
     ///
@@ -1937,7 +1952,8 @@ impl Source {
 
     /// Extract the host from conventional host/port or URL syntax.
     ///
-    /// Brackets around IPv6 literals are removed. SDK addresses are opaque;
+    /// Reads the authority before any path, query or fragment and removes
+    /// brackets around IPv6 literals. SDK addresses are opaque and
     /// unrecognized syntax returns `None`.
     ///
     /// For IP-based sources, this returns the IP portion without the port.
@@ -3594,6 +3610,56 @@ mod tests {
         assert!(parse_authority("[::1").is_none());
         assert!(parse_authority("camera:invalid").is_none());
         assert!(parse_authority("").is_none());
+    }
+
+    #[test]
+    fn authority_parsing_uses_the_outer_endpoint() {
+        for (endpoint, host, port, is_url) in [
+            ("camera-a.local", "camera-a.local", None, false),
+            ("camera-a.local.:5960", "camera-a.local.", Some(5960), false),
+            (
+                "NDI+v6.4-test://user:pass@[2001:db8::1]:5960",
+                "2001:db8::1",
+                Some(5960),
+                true,
+            ),
+            ("[2001:db8::1]:5960", "2001:db8::1", Some(5960), false),
+            ("2001:db8::1", "2001:db8::1", None, false),
+        ] {
+            for delimiter in ["/path/", "?next=", "#next="] {
+                let text = format!("{endpoint}{delimiter}https://camera-b.local:7443/live");
+                let source = Source::new("OTHER (Feed)")
+                    .unwrap()
+                    .with_address(SourceAddress::new(&text).unwrap());
+                let address = source.address().unwrap();
+                let query = host.trim_end_matches('.');
+                assert_eq!(address.as_str(), text);
+                assert_eq!(address.is_url(), is_url, "{text}");
+                assert_eq!(address.port(), port, "{text}");
+                assert_eq!(source.host(), Some(host), "{text}");
+                assert!(address.matches_host(query), "{text}");
+                assert!(source.matches_host(query), "{text}");
+                assert!(!address.matches_host("camera-b.local"), "{text}");
+                assert!(!source.matches_host("camera-b.local"), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn url_classification_requires_a_valid_initial_scheme() {
+        for text in [
+            "://camera.local",
+            "1ndi://camera.local",
+            "_ndi://camera.local",
+            "nd_i://camera.local",
+            "ndí://camera.local",
+            " ndi://camera.local",
+            "//camera.local",
+        ] {
+            assert!(!SourceAddress::new(text).unwrap().is_url(), "{text}");
+            assert!(parse_authority(text).is_none(), "{text}");
+        }
+        assert!(SourceAddress::new("a://camera.local").unwrap().is_url());
     }
 
     #[test]
