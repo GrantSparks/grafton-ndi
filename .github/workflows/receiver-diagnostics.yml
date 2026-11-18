@@ -101,6 +101,13 @@ jobs:
             macOS) ci/offline/macos.sh python3 ci/offline/check.py ;;
             *) exit 1 ;;
           esac
+      - name: Check stack capture on a deliberate stall
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ci/offline/linux.sh python3 ci/receiver_watchdog.py --check-debugger ;;
+            macOS) ci/offline/macos.sh python3 ci/receiver_watchdog.py --check-debugger ;;
+            *) exit 1 ;;
+          esac
       - name: Repeat the reconnect case
         if: ${{ !cancelled() && steps.isolation.outcome == 'success' }}
         run: |

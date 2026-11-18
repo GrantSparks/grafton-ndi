@@ -27,8 +27,9 @@ WORKFLOWS = ROOT / '.github' / 'workflows'
 READ_ONLY = {'contents': 'read'}
 # Only deployment jobs and the reusable-workflow caller may request write permissions.
 JOB_PERMISSIONS = {
-    ('publish.yml', 'ci'): {'contents': 'read', 'pages': 'write', 'id-token': 'write'},
+    ('publish.yml', 'ci'): {'contents': 'read', 'actions': 'read', 'pull-requests': 'read', 'pages': 'write', 'id-token': 'write'},
     ('publish.yml', 'publish'): {'contents': 'read', 'id-token': 'write'},
+    ('rust.yml', 'verified-tree'): {'contents': 'read', 'actions': 'read', 'pull-requests': 'read'},
     ('rust.yml', 'deploy-docs'): {'contents': 'read', 'pages': 'write', 'id-token': 'write'},
 }
 RECEIVER_CONFIGURATIONS = [f'receiver-diagnostic-{target}' for target in ('macos', 'linux-x86', 'linux-x64')]
@@ -44,9 +45,18 @@ SECRET_USES = {
 # Where the secrets exist: not in pull requests from forks, and not in runs that Dependabot starts.
 SECRETS_AVAILABLE = ("github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || "
                      "github.event.pull_request.head.repo.full_name == github.repository)")
+REUSE_ALLOWED = ("github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && "
+                 "github.ref == 'refs/heads/main' && vars.NDI_CI_RELEASED == 'true'")
+FULL_REQUIRED = "needs.verified-tree.outputs.run_id == ''"
+FULL_CONDITION = f"${{{{ !cancelled() && {FULL_REQUIRED} }}}}"
+PUBLISH_PROOF = ("github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == "
+                 "github.repository && needs.sdk.result == 'success'")
 JOB_CONDITIONS = {
     'receiver-diagnostics.yml': {'probe': RECEIVER_TRUST},
-    'rust.yml': {'sdk': f"vars.NDI_CI_RELEASED == 'true' && {SECRETS_AVAILABLE}", 'required-ci': 'always()', 'deploy-docs': "${{ !cancelled() && needs.required-ci.result == 'success' && github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' }}"},
+    'rust.yml': {'verified-tree': REUSE_ALLOWED,
+                 **dict.fromkeys(('test', 'cross', 'hx-pictures', 'miri'), FULL_CONDITION),
+                 'sdk': (f"!cancelled() && needs.hx-pictures.result == 'success' && {FULL_REQUIRED} && "
+                         f"vars.NDI_CI_RELEASED == 'true' && {SECRETS_AVAILABLE}"), 'required-ci': 'always()', 'deploy-docs': "${{ !cancelled() && needs.required-ci.result == 'success' && github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' }}"},
     'publish.yml': {'release': "github.repository == 'GrantSparks/grafton-ndi'"},
 }
 TRIGGERS = {
@@ -72,7 +82,8 @@ ACTIONS = {
         'miri': ['actions/checkout'],
         'hx-pictures': ['actions/checkout', 'actions/upload-artifact'],
         'sdk': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'actions/download-artifact'],
-        'required-ci': ['actions/checkout'],
+        'verified-tree': ['actions/checkout'],
+        'required-ci': ['actions/checkout', 'actions/upload-artifact'],
         'deploy-docs': ['actions/deploy-pages'],
     },
     'publish.yml': {
@@ -210,7 +221,7 @@ def sdk_input_violations(rust):
     directory = '${{ runner.temp }}/ndi-hx-pictures'
     upload = fixture_steps.get('Upload test pictures', {})
     download = sdk_steps.get('Download test pictures', {})
-    found = (differs('rust.yml: SDK picture dependency', sdk_job.get('needs'), 'hx-pictures')
+    found = (differs('rust.yml: SDK picture dependency', sdk_job.get('needs'), ['verified-tree', 'hx-pictures'])
              + differs('rust.yml: SDK picture upload', upload.get('with'), {
                  'name': 'ndi-hx-pictures', 'path': '\n'.join(f'{directory}/{name}' for name in names),
                  'if-no-files-found': 'error', 'retention-days': '1'})
@@ -505,11 +516,27 @@ def gate_violations(rust):
     """required-ci waits for every check; deployment follows the gate."""
     jobs = rust['jobs']
     gate = jobs['required-ci']
-    step = gate['steps'][-1]
-    return (differs('rust.yml: jobs required-ci waits for', sorted(gate.get('needs') or []),
+    steps = {step.get('name'): step for step in gate['steps']}
+    step = steps.get('Every job this event requires succeeded', {})
+    record = steps.get('Record the fully tested pull request tree', {})
+    upload = steps.get('Preserve the verified tree', {})
+    lookup = jobs['verified-tree']
+    verify = lookup['steps'][-1]
+    found = []
+    for job in ('test', 'cross', 'hx-pictures', 'miri'):
+        found += differs(f'rust.yml: {job} waits for the verified tree decision', jobs[job].get('needs'), 'verified-tree')
+    return (found + differs('rust.yml: jobs required-ci waits for', sorted(gate.get('needs') or []),
                     sorted(set(jobs) - {'required-ci', 'deploy-docs'}))
             + differs('rust.yml: the gate step', step.get('env'), {
-                'RESULTS': '${{ toJSON(needs) }}', 'SDK_EXPECTED': f'${{{{ {SECRETS_AVAILABLE} }}}}'})
+                'RESULTS': '${{ toJSON(needs) }}', 'SDK_EXPECTED': f'${{{{ {SECRETS_AVAILABLE} }}}}',
+                'REUSE_ALLOWED': f'${{{{ {REUSE_ALLOWED} }}}}'})
+            + differs('rust.yml: verifier output', lookup.get('outputs'), {'run_id': '${{ steps.lookup.outputs.run_id }}'})
+            + differs('rust.yml: verifier token', verify.get('env'), {'GH_TOKEN': '${{ github.token }}'})
+            + differs('rust.yml: record only a full PR result', record.get('if'), PUBLISH_PROOF)
+            + differs('rust.yml: upload only a full PR result', upload.get('if'), PUBLISH_PROOF)
+            + differs('rust.yml: verified tree upload', upload.get('with'), {
+                'name': 'ci-tested-tree-${{ github.run_attempt }}', 'path': '${{ runner.temp }}/ci-tested-tree.json',
+                'if-no-files-found': 'error', 'retention-days': '30'})
             + differs('rust.yml: the step given the secrets',
                       [(item.get('name'), item['env']) for item in jobs['sdk']['steps']
                        if any('secrets' in value.lower() for value in (item.get('env') or {}).values())],
@@ -572,7 +599,7 @@ WRONG_EDITS = (
     ('a job the gate does not wait for', 'rust.yml', '  required-ci:\n',
      '  docs:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n    steps:\n      - run: exit 1\n\n  required-ci:\n',
      'required-ci waits for'),
-    ('the gate no longer waits for sdk', 'rust.yml', '    needs: [lint, test, cross, hx-pictures, sdk, miri]\n',
+    ('the gate no longer waits for sdk', 'rust.yml', '    needs: [verified-tree, lint, test, cross, hx-pictures, sdk, miri]\n',
      '    needs: [lint, test, cross]\n', 'required-ci waits for'),
     ('the gate skipped when a job fails', 'rust.yml', '    name: required-ci\n    if: always()\n',
      '    name: required-ci\n', 'job conditions'),
@@ -592,7 +619,7 @@ WRONG_EDITS = (
     ('an upload from the sdk job', 'rust.yml', '      - name: Vendored bindings are current\n',
      '      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7\n'
      '        with:\n          path: target\n      - name: Vendored bindings are current\n', 'actions of sdk'),
-    ('SDK no longer waits for pictures', 'rust.yml', '    needs: hx-pictures\n', '', 'SDK picture dependency'),
+    ('SDK no longer waits for pictures', 'rust.yml', '    needs: [verified-tree, hx-pictures]\n', '', 'SDK picture dependency'),
     ('an action pinned by tag', 'publish.yml', 'rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18',
      'rust-lang/crates-io-auth-action@v1', 'pinned to a commit'),
     ('a job without a timeout', 'rust.yml', '    name: cross\n    runs-on: ubuntu-24.04\n    timeout-minutes: 45\n',

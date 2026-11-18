@@ -19,7 +19,7 @@ WORKFLOW = Path(__file__).resolve().parents[2] / '.github' / 'workflows' / 'rust
 class Gate(unittest.TestCase):
     def test_the_gate_needs_exactly_the_jobs_these_tests_assume(self):
         needs = re.search(r'\n  required-ci:\n(?:.*\n)*?    needs: \[([^\]]+)\]', WORKFLOW.read_text(encoding='utf-8'))
-        self.assertEqual(sorted(needs.group(1).split(', ')), sorted(GREEN))
+        self.assertEqual(sorted(needs.group(1).split(', ')), sorted(set(GREEN) | {gate.LOOKUP_JOB}))
         self.assertIn(gate.SDK_JOB, GREEN)
 
     def test_same_repository_events_need_every_job(self):
@@ -50,9 +50,10 @@ class Gate(unittest.TestCase):
         self.assertEqual(gate.failures(GREEN, False), ['sdk: success (required: skipped)'])
         self.assertEqual(gate.failures(FORK, True), ['sdk: skipped (required: success)'])
 
-    def run_main(self, results, sdk_expected):
-        environ = {'RESULTS': json.dumps({job: {'result': result, 'outputs': {}} for job, result in results.items()}),
-                   'SDK_EXPECTED': sdk_expected}
+    def run_main(self, results, sdk_expected, *, reuse_allowed='false', run_id='', lookup='skipped'):
+        needs = {job: {'result': result, 'outputs': {}} for job, result in results.items()}
+        needs[gate.LOOKUP_JOB] = {'result': lookup, 'outputs': {'run_id': run_id}}
+        environ = {'RESULTS': json.dumps(needs), 'SDK_EXPECTED': sdk_expected, 'REUSE_ALLOWED': reuse_allowed}
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, environ), contextlib.redirect_stdout(stdout), \
                 contextlib.redirect_stderr(stderr):
@@ -66,6 +67,27 @@ class Gate(unittest.TestCase):
         self.assertIn('NDI_CI_RELEASED', stderr)
         status, stdout, stderr = self.run_main({**GREEN, 'sdk': 'failure'}, 'true')
         self.assertEqual((status, stdout, stderr), (1, '::error::sdk: failure (required: success)\n', ''))
+
+    def test_exact_tree_main_push_can_skip_only_the_replaced_jobs(self):
+        checks = {job: 'skipped' for job in GREEN} | {'lint': 'success'}
+        options = {'reuse_allowed': 'true', 'run_id': '1234', 'lookup': 'success'}
+        self.assertEqual(self.run_main(checks, 'true', **options),
+                         (0, 'Full native and platform checks passed in Actions run 1234.\n', ''))
+        for job in checks:
+            with self.subTest(job=job):
+                self.assertEqual(self.run_main(checks | {job: 'failure'}, 'true', **options)[0], 1)
+        self.assertEqual(self.run_main(checks, 'false', **options)[0], 1)
+
+    def test_an_empty_invalid_or_disallowed_run_cannot_replace_checks(self):
+        checks = {job: 'skipped' for job in GREEN} | {'lint': 'success'}
+        for options in ({'reuse_allowed': 'false', 'run_id': '123', 'lookup': 'success'},
+                        {'reuse_allowed': 'true', 'run_id': '123', 'lookup': 'skipped'},
+                        {'reuse_allowed': 'true', 'run_id': '123', 'lookup': 'failure'},
+                        {'reuse_allowed': 'true', 'run_id': 'invalid', 'lookup': 'success'},
+                        {'reuse_allowed': 'true', 'run_id': '', 'lookup': 'success'}):
+            with self.subTest(options=options):
+                self.assertEqual(self.run_main(checks, 'true', **options)[0], 1)
+        self.assertEqual(self.run_main(GREEN, 'true', reuse_allowed='true', lookup='success')[0], 0)
 
 
 if __name__ == '__main__':

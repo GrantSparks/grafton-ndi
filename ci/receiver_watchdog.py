@@ -37,6 +37,7 @@ def dump_threads(pid, system):
         processes = descendants(pid)
     except (OSError, subprocess.SubprocessError):
         processes = [pid]
+    captured = False
     for child in processes[:4]:
         print(f"receiver-watchdog: thread stacks for process {child}", flush=True)
         if system == "Darwin":
@@ -47,8 +48,10 @@ def dump_threads(pid, system):
                        "-ex", "thread apply all bt 20"]
         try:
             subprocess.run(command, stdin=subprocess.DEVNULL, timeout=6, check=True)
+            captured = True
         except (OSError, subprocess.SubprocessError) as error:
             print(f"receiver-watchdog: debugger unavailable or incomplete: {error}", flush=True)
+    return captured
 
 
 def stop_group(process):
@@ -59,7 +62,7 @@ def stop_group(process):
     process.wait()
 
 
-def supervise(command, *, system, suite_timeout=None, reconnect_timeout=45):
+def supervise(command, *, system, suite_timeout=None, reconnect_timeout=45, require_stacks=False):
     parent = os.getpid()
     setup = (lambda: allow_debugger(parent)) if system == "Linux" else None
     environment = os.environ.copy()
@@ -81,8 +84,8 @@ def supervise(command, *, system, suite_timeout=None, reconnect_timeout=45):
                     if child.poll() is None and now >= deadline:
                         phase = "receiver overlap suite" if suite_end <= reconnect_end else "reconnect case"
                         print(f"receiver-watchdog: {phase} exceeded its deadline", flush=True)
-                        dump_threads(child.pid, system)
-                        return 124
+                        captured = dump_threads(child.pid, system)
+                        return 125 if require_stacks and not captured else 124
                     if not output.get_map():
                         time.sleep(0.05)
                         continue
@@ -112,6 +115,10 @@ def supervise(command, *, system, suite_timeout=None, reconnect_timeout=45):
 
 
 def main(args):
+    if args == ["--check-debugger"]:
+        focus = [sys.executable, "-c", "import time; time.sleep(30)"]
+        result = supervise(focus, system=platform.system(), suite_timeout=1, require_stacks=True)
+        return 0 if result == 124 else 1
     if args[0] == "--exec-child":
         allow_debugger(int(os.environ["GRAFTON_NDI_WATCHDOG_PID"]))
         os.execvp(args[1], args[1:])

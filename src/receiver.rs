@@ -4097,15 +4097,23 @@ mod tests {
 
     #[test]
     fn reconnect_returns_while_a_capture_attempt_is_in_flight() {
+        struct FinishTrace(bool);
+        impl Drop for FinishTrace {
+            fn drop(&mut self) {
+                if self.0 {
+                    eprintln!("receiver-watchdog: reconnect case finished");
+                }
+            }
+        }
         let diagnostics = std::env::var("GRAFTON_NDI_RECEIVER_DIAGNOSTICS").as_deref() == Ok("1");
         let trace = |phase| {
             if diagnostics {
                 eprintln!("receiver-watchdog: reconnect {phase}");
             }
         };
+        let _finish = FinishTrace(diagnostics);
         trace("case started");
         let Some(ndi) = crate::test_support::ndi() else {
-            trace("case finished");
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
@@ -4133,7 +4141,6 @@ mod tests {
         });
         trace("destroying receiver");
         drop(receiver);
-        trace("case finished");
     }
 
     #[test]

@@ -54,8 +54,11 @@ use std::{
 const SLICE: Duration = Duration::from_millis(100);
 const PATIENCE: Duration = Duration::from_secs(15);
 
-fn trace(phase: &str) {
-    if std::env::var("GRAFTON_NDI_RECEIVER_DIAGNOSTICS").as_deref() == Ok("1") {
+fn trace(phase: std::fmt::Arguments<'_>) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED
+        .get_or_init(|| std::env::var("GRAFTON_NDI_RECEIVER_DIAGNOSTICS").as_deref() == Ok("1"))
+    {
         let thread = thread::current();
         let name = thread.name().unwrap_or("worker");
         eprintln!("receiver-watchdog: {name}: {phase}");
@@ -64,11 +67,11 @@ fn trace(phase: &str) {
 
 fn sockets() -> MutexGuard<'static, ()> {
     static SOCKETS: Mutex<()> = Mutex::new(());
-    trace("waiting for the socket test lock");
+    trace(format_args!("waiting for the socket test lock"));
     let turn = SOCKETS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    trace("acquired the socket test lock");
+    trace(format_args!("acquired the socket test lock"));
     turn
 }
 
@@ -90,13 +93,13 @@ fn margin() -> Duration {
 
 fn timed<T>(operation: &str, budget: Duration, call: impl FnOnce() -> T) -> T {
     if operation.contains("connect") {
-        trace(&format!("entering {operation}"));
+        trace(format_args!("entering {operation}"));
     }
     let began = Instant::now();
     let result = call();
     let elapsed = began.elapsed();
     if operation.contains("connect") {
-        trace(&format!("returned from {operation}"));
+        trace(format_args!("returned from {operation}"));
     }
     assert!(
         elapsed <= budget + margin(),

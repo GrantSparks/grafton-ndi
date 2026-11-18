@@ -15,6 +15,13 @@ repository scripts. A run skips deployment when its commit is no longer the
 tip of `main`. The release caller forwards those permissions for reusable
 workflow validation. Its tag ref keeps the Pages job disabled.
 
+A push to `main` can reuse full validation from a successful same-repository
+pull request. CI checks the tested tree against the new `main` tree and verifies
+the GitHub-signed synthetic merge and the successful SDK checks for that run
+attempt. Lint still checks the merged checkout and builds its Pages artifact.
+If the evidence is missing or differs, the push runs the full matrix. Use the
+manual CI workflow for a fresh full run on an existing commit.
+
 Use the pinned Rust toolchain with Clippy and rustfmt:
 
 ```sh

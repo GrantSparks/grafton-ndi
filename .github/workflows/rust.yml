@@ -35,6 +35,25 @@ env:
   WINDOWS_LLVM_SHA256: 3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b
 
 jobs:
+  verified-tree:
+    name: Find full CI for the merged tree
+    if: github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' && vars.NDI_CI_RELEASED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      run_id: ${{ steps.lookup.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify the completed pull request run
+        id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/verified_tree.py reuse
+
   # The crate builds without an NDI SDK, so everything in lint, test and cross
   # runs for every event, including pull requests from forks.
   lint:
@@ -128,6 +147,8 @@ jobs:
           cargo audit --deny warnings
 
   test:
+    needs: verified-tree
+    if: ${{ !cancelled() && needs.verified-tree.outputs.run_id == '' }}
     name: test (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -198,6 +219,8 @@ jobs:
           cargo test --locked --no-fail-fast --all-features --config "$runner" --lib -- --exact "${tests[@]}" --test-threads=1
 
   miri:
+    needs: verified-tree
+    if: ${{ !cancelled() && needs.verified-tree.outputs.run_id == '' }}
     name: miri (${{ matrix.model }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -227,6 +250,8 @@ jobs:
           done
 
   cross:
+    needs: verified-tree
+    if: ${{ !cancelled() && needs.verified-tree.outputs.run_id == '' }}
     name: cross
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -259,6 +284,8 @@ jobs:
         run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/build-android.sh aarch64-linux-android
 
   hx-pictures:
+    needs: verified-tree
+    if: ${{ !cancelled() && needs.verified-tree.outputs.run_id == '' }}
     name: NDI HX test pictures
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -295,8 +322,10 @@ jobs:
   # generated into the target directory must stay on the runner.
   sdk:
     name: sdk (${{ matrix.name }})
-    needs: hx-pictures
+    needs: [verified-tree, hx-pictures]
     if: >-
+      !cancelled() && needs.hx-pictures.result == 'success' &&
+      needs.verified-tree.outputs.run_id == '' &&
       vars.NDI_CI_RELEASED == 'true' && github.actor != 'dependabot[bot]' &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
@@ -727,7 +756,7 @@ jobs:
   required-ci:
     name: required-ci
     if: always()
-    needs: [lint, test, cross, hx-pictures, sdk, miri]
+    needs: [verified-tree, lint, test, cross, hx-pictures, sdk, miri]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -735,11 +764,23 @@ jobs:
       - name: Every job this event requires succeeded
         env:
           RESULTS: ${{ toJSON(needs) }}
+          REUSE_ALLOWED: ${{ github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' && vars.NDI_CI_RELEASED == 'true' }}
           # The condition of the sdk job, without the switch that turns it on.
           SDK_EXPECTED: >-
             ${{ github.actor != 'dependabot[bot]' &&
             (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         run: python3 ci/gate.py
+      - name: Record the fully tested pull request tree
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.sdk.result == 'success'
+        run: python3 ci/verified_tree.py record "$RUNNER_TEMP/ci-tested-tree.json"
+      - name: Preserve the verified tree
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.sdk.result == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ci-tested-tree-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-tested-tree.json
+          if-no-files-found: error
+          retention-days: 30
 
   deploy-docs:
     name: publish documentation

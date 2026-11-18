@@ -352,6 +352,15 @@ def obligations(msrv, features, miri_groups):
         esac
         ''',
     )
+    table['receiver-diagnostics.yml', 'probe', 'Check stack capture on a deliberate stall'] = Obligation(
+        r'''
+        case "$RUNNER_OS" in
+          Linux) ci/offline/linux.sh python3 ci/receiver_watchdog.py --check-debugger ;;
+          macOS) ci/offline/macos.sh python3 ci/receiver_watchdog.py --check-debugger ;;
+          *) exit 1 ;;
+        esac
+        ''',
+    )
     table['receiver-diagnostics.yml', 'probe', 'Repeat the reconnect case'] = Obligation(
         r'''
         for attempt in 1 2 3 4 5; do
@@ -367,6 +376,10 @@ def obligations(msrv, features, miri_groups):
         done
         ''',
         condition="${{ !cancelled() && steps.isolation.outcome == 'success' }}",
+    )
+
+    table['rust.yml', 'verified-tree', 'Verify the completed pull request run'] = Obligation(
+        'python3 ci/verified_tree.py reuse',
     )
 
     # rust.yml, lint
@@ -766,6 +779,10 @@ def obligations(msrv, features, miri_groups):
     # rust.yml, required-ci
     table['rust.yml', 'required-ci', 'Every job this event requires succeeded'] = Obligation(
         'python3 ci/gate.py',
+    )
+    table['rust.yml', 'required-ci', 'Record the fully tested pull request tree'] = Obligation(
+        'python3 ci/verified_tree.py record "$RUNNER_TEMP/ci-tested-tree.json"',
+        condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.sdk.result == 'success'",
     )
 
     # rust.yml, deploy-docs
