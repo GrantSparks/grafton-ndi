@@ -392,6 +392,7 @@ fn file_types_keep_their_auto_traits() {
         FileRecorder: UnwindSafe, RefUnwindSafe;
         FileApiOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
         FinishStatus: Send, Sync, UnwindSafe, RefUnwindSafe;
+        SessionEnd: Send, Sync, UnwindSafe, RefUnwindSafe;
         PlayerEvent: Send, Sync, UnwindSafe, RefUnwindSafe;
         PlayerEventKind: Send, Sync, UnwindSafe, RefUnwindSafe;
         FilePlayerOptions: Send, Sync, UnwindSafe, RefUnwindSafe;

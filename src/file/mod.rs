@@ -86,7 +86,7 @@
 //! The SDK finalizes a file asynchronously after a stop request and reports it
 //! with a file-closed event. [`FileRecorder::finish`] requests the stop, waits
 //! for that event and returns a [`FinishStatus`]; treat a recording as complete
-//! only when it is [`FinishStatus::Closed`], and inspect the [`RecordingReport`]
+//! only when it is [`SessionEnd::Closed`], and inspect the [`RecordingReport`]
 //! for errors during the session. [`RecordingReport::stopped_by_sdk`] says
 //! whether the SDK ended the session before it was asked to stop. Dropping a
 //! recorder whose session is still open requests the stop and waits within
@@ -120,7 +120,7 @@
 //!   file. When the disk fills while a session is being stopped, a write comes
 //!   up short, the library extends the file all the same and reports it closed
 //!   without an error, and [`FilePlayer::probe`] then reports a final duration
-//!   for a file whose data is not there. [`FinishStatus::Closed`] with no
+//!   for a file whose data is not there. [`SessionEnd::Closed`] with no
 //!   errors therefore means that the container was finalized, not that every
 //!   frame reached the disk. A recording that must be complete has to be
 //!   checked by reading it back.
@@ -173,7 +173,7 @@
 //!
 //! use grafton_ndi::{
 //!     file::{
-//!         FileApi, FileApiOptions, FileRecorder, FinishStatus, FileRecorderOptions, RecordingTarget,
+//!         FileApi, FileApiOptions, FileRecorder, FinishStatus, SessionEnd, FileRecorderOptions, RecordingTarget,
 //!         RecordingTimecode, SourceSpec,
 //!     },
 //!     Ndi,
@@ -189,7 +189,7 @@
 //! std::thread::sleep(Duration::from_secs(10));
 //!
 //! match recorder.finish(Duration::from_secs(5))? {
-//!     FinishStatus::Closed(report) => println!("closed {} file(s)", report.closed_files()),
+//!     FinishStatus::Ended(SessionEnd::Closed(report)) => println!("closed {} file(s)", report.closed_files()),
 //!     other => println!("not confirmed complete: {other:?}"),
 //! }
 //! # Ok(())
@@ -210,7 +210,9 @@ pub use asynchronous::{
     AsyncFileOptions, AsyncFilePlayer, AsyncFileRecorder, FileEventFuture, FileOperation,
 };
 pub use player::FilePlayer;
-pub use recorder::{FileRecorder, FinishStatus, RecorderState, RecordingReport, StopRequest};
+pub use recorder::{
+    FileRecorder, FinishStatus, RecorderState, RecordingReport, SessionEnd, StopRequest,
+};
 pub use types::*;
 
 use std::path::{Path, PathBuf};

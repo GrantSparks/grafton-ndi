@@ -120,21 +120,17 @@ request still needs events and the final report to establish its outcome.
 
 ### Finishing a recording
 
-Call `finish(timeout)` and inspect both its status and `RecordingReport`:
+Call `finish(timeout)` to request the stop. It returns
+`FinishStatus::Ended(end)` when the session ends, or `FinishStatus::TimedOut(report)`
+when the completion budget expires. Use `wait_for_finish(timeout)` to continue
+observing the session. It returns `Some(SessionEnd)` when the session ends or
+`None` when the deadline expires. After `None`, inspect `recorder.report()` for
+the current snapshot.
 
-| Status | Action |
+| Session outcome | Action |
 | --- | --- |
-| `Closed` | The SDK reported every opened file finalized. Check errors, write failures, empty files and `stopped_by_sdk` for an early end. |
-| `TimedOut` | Use `wait_for_finish` to continue waiting. |
-| `Indeterminate` | Closure could not be established from the events; waiting longer does not repair the report. `empty_files` is a lower bound counting files confirmed empty under complete tracking. Reset before restarting when file tracking is incomplete. |
-
-`finish(timeout)` requests the stop and reports that bounded completion attempt,
-including `FinishStatus::TimedOut(report)`. A later
-`wait_for_finish(timeout) -> Result<Option<FinishStatus>>` only waits: `None`
-means its deadline expired, while `Some(Closed(report))` or
-`Some(Indeterminate(report))` carries a final outcome. It never returns
-`Some(TimedOut(...))`. After `None`, inspect `recorder.report()` for the current
-session snapshot and keep waiting or choose recovery.
+| `SessionEnd::Closed(report)` | The SDK reported every opened file finalized. Check errors, write failures, empty files and `stopped_by_sdk` for an early end. |
+| `SessionEnd::Indeterminate(report)` | The events did not confirm closure. The report's `empty_files` counts files confirmed empty under complete tracking. Reset before restarting when file tracking is incomplete. |
 
 The timeout of synchronous `FileRecorder::finish` bounds the event wait, not
 the native stop call. `AsyncFileRecorder::finish` measures its timeout from
@@ -184,8 +180,8 @@ apply independently of the async application-notification queue.
 If another async clone calls `close` while a submitted `finish` or
 `wait_for_finish` is queued or running,
 the wait uses the earlier of its own deadline and `drop_wait` measured from
-the close's submission, including the native stop. A settled session reports `Closed` or `Indeterminate`
-(wrapped in `Some` for `wait_for_finish`); an unsettled one returns
+the close's submission, including the native stop. A settled session returns its `SessionEnd` through `FinishStatus::Ended` or
+`Some`, respectively. An unsettled session returns
 `InvalidState(Closed)` if that budget ends first. Neither `TimedOut` from
 `finish` nor `None` from `wait_for_finish` would be appropriate for a handle
 that cannot be waited on again. Destruction
@@ -243,7 +239,7 @@ stop requests use their separate command budget; close and abandon bypass both
 budgets. Closed/failed owners and invalid timeouts retain their precedence over
 capacity errors; when both budgets are full, `FileCommands` takes precedence.
 
-Async `wait_for_finish` returns `FileOperation<Option<FinishStatus>>`, with the
+Async `wait_for_finish` returns `FileOperation<Option<SessionEnd>>`, with the
 same `None`/`Some` distinction. After an expired wait, await
 `recorder.report()` to inspect the current report. Async `finish` retains
 `FileOperation<FinishStatus>` and its `TimedOut(report)` outcome.

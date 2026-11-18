@@ -107,13 +107,13 @@ fn refused_state_and_normal_closure_each_restore_waiter_admission() {
 
     assert!(matches!(
         block_on(recorder.finish(crate::MAX_TIMEOUT)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     assert_eq!(pending(&recorder), 0);
     assert_eq!(permits(&recorder), 0);
     assert!(matches!(
         block_on(recorder.wait_for_finish(Duration::ZERO)).unwrap(),
-        Some(FinishStatus::Closed(_))
+        Some(SessionEnd::Closed(_))
     ));
     assert_eq!(pending(&recorder), 0);
     assert_eq!(permits(&recorder), 0);

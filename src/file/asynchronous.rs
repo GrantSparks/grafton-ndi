@@ -14,7 +14,7 @@ use super::types::path_string;
 use super::{
     EventText, FileApi, FileDuration, FileInfo, FilePlayer, FilePlayerOptions, FilePosition,
     FileRecorder, FileRecorderOptions, FinishStatus, PlayerEvent, PlayerStats, RecorderEvent,
-    RecorderState, RecorderStats, RecordingReport, RecordingTarget, RecordingTimecode,
+    RecorderState, RecorderStats, RecordingReport, RecordingTarget, RecordingTimecode, SessionEnd,
     SourceFormat, SourceSpec, StateConflict, StopRequest,
 };
 use crate::{timeout::Deadline, Error, MetadataSource, QueueLimit, Result, Source, Timecode};
@@ -2211,7 +2211,7 @@ impl AsyncFilePlayer {
 ///
 /// # Finishing
 ///
-/// Await [`finish`](Self::finish) and check for [`FinishStatus::Closed`] to
+/// Await [`finish`](Self::finish) and check for [`SessionEnd::Closed`] to
 /// know a recording is complete, then await [`close`](Self::close). Neither
 /// blocks the executor.
 /// Native event loss, unreadable lifecycle evidence or a file-tracking limit
@@ -2357,7 +2357,7 @@ impl AsyncFileRecorder {
     /// [`FileRecorder::wait_for_finish`].
     ///
     /// Returns `None` when the timeout expires, or `Some` with
-    /// [`FinishStatus::Closed`] or [`FinishStatus::Indeterminate`] when the
+    /// [`SessionEnd::Closed`] or [`SessionEnd::Indeterminate`] when the
     /// session ends. The current report remains available through
     /// [`report`](Self::report), including after a timeout.
     ///
@@ -2373,7 +2373,7 @@ impl AsyncFileRecorder {
     /// Those of [`FileRecorder::wait_for_finish`], and those every
     /// [`FileOperation`] can fail with.
     #[doc(alias = "NDIlib_file_recorder_capture_event")]
-    pub fn wait_for_finish(&self, timeout: Duration) -> FileOperation<Option<FinishStatus>> {
+    pub fn wait_for_finish(&self, timeout: Duration) -> FileOperation<Option<SessionEnd>> {
         self.finish_inner(timeout, false, FinishResponse::Wait)
     }
 
@@ -3789,7 +3789,10 @@ mod tests {
         await_finish(&recorder);
         device.close();
         let outcome = block_on(finishing).unwrap();
-        assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
+            "{outcome:?}"
+        );
         block_on(recorder.close()).unwrap();
     }
 
@@ -3836,11 +3839,11 @@ mod tests {
                 if closes_file {
                     assert!(matches!(
                         block_on(finishing).unwrap(),
-                        FinishStatus::Closed(_)
+                        FinishStatus::Ended(SessionEnd::Closed(_))
                     ));
                     assert!(matches!(
                         block_on(waiting).unwrap(),
-                        Some(FinishStatus::Closed(_))
+                        Some(SessionEnd::Closed(_))
                     ));
                     assert!(device.closed_before_destroy.load(Ordering::Acquire));
                 } else {
@@ -3870,7 +3873,7 @@ mod tests {
                 }
                 assert!(matches!(
                     block_on(finishing).unwrap(),
-                    FinishStatus::Closed(_)
+                    FinishStatus::Ended(SessionEnd::Closed(_))
                 ));
                 assert_eq!(device.stops.load(Ordering::Acquire), 1);
                 assert_eq!(device.destroys.load(Ordering::Acquire), 1);
@@ -4014,7 +4017,7 @@ mod tests {
             block_on(blocked).unwrap();
             assert!(matches!(
                 block_on(FileOperation::live(finishing)).unwrap(),
-                FinishStatus::Closed(_)
+                FinishStatus::Ended(SessionEnd::Closed(_))
             ));
             block_on(closing).unwrap();
         });
@@ -4157,7 +4160,7 @@ mod tests {
         }
         assert!(matches!(
             block_on(recorder.finish(Duration::ZERO)).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
         assert_eq!(device.waits.load(Ordering::Acquire), 0);
         block_on(recorder.close()).unwrap();
@@ -4184,7 +4187,7 @@ mod tests {
             "report commands must remain available during a pending wait"
         );
         device.close();
-        let Some(FinishStatus::Closed(report)) = block_on(waiting).unwrap() else {
+        let Some(SessionEnd::Closed(report)) = block_on(waiting).unwrap() else {
             panic!("the later wait must observe confirmed closure");
         };
         assert!(report.closure_confirmed());
@@ -4202,7 +4205,7 @@ mod tests {
         );
         device.dropped_events.store(1, Ordering::Release);
         block_on(recorder.request_stop()).unwrap();
-        let Some(FinishStatus::Indeterminate(report)) =
+        let Some(SessionEnd::Indeterminate(report)) =
             block_on(recorder.wait_for_finish(Duration::ZERO)).unwrap()
         else {
             panic!("the lost SDK event prevents confirmation, not settlement");
@@ -4227,7 +4230,9 @@ mod tests {
         device.close();
         let first = block_on(first).unwrap();
         let second = block_on(second).unwrap();
-        assert!(matches!(first, FinishStatus::Closed(_)));
+        let FinishStatus::Ended(first @ SessionEnd::Closed(_)) = first else {
+            panic!("expected confirmed closure, got {first:?}");
+        };
         assert_eq!(Some(first), second);
         block_on(recorder.close()).unwrap();
     }
@@ -4249,7 +4254,7 @@ mod tests {
         device.close();
         assert!(matches!(
             block_on(retained).unwrap(),
-            Some(FinishStatus::Closed(_))
+            Some(SessionEnd::Closed(_))
         ));
         block_on(recorder.close()).unwrap();
     }
@@ -4295,7 +4300,7 @@ mod tests {
         );
         assert!(matches!(
             block_on(recorder.finish(Duration::ZERO)).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
         block_on(recorder.close()).unwrap();
     }
@@ -4699,12 +4704,12 @@ mod tests {
         check(
             true,
             |recorder| recorder.finish(Duration::from_secs(30)),
-            |outcome| matches!(outcome, FinishStatus::Closed(_)),
+            |outcome| matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
         );
         check(
             false,
             |recorder| recorder.wait_for_finish(Duration::from_secs(30)),
-            |outcome| matches!(outcome, Some(FinishStatus::Closed(_))),
+            |outcome| matches!(outcome, Some(SessionEnd::Closed(_))),
         );
     }
 
@@ -4776,7 +4781,7 @@ mod tests {
         device.close();
         let outcome = block_on(finishing).unwrap();
         assert!(
-            matches!(outcome, FinishStatus::Indeterminate(_)),
+            matches!(outcome, FinishStatus::Ended(SessionEnd::Indeterminate(_))),
             "{outcome:?}"
         );
         block_on(closing).unwrap();
@@ -4830,7 +4835,10 @@ mod tests {
         recorder.next_event(Duration::ZERO).unwrap();
         device.dropped_events.store(1, Ordering::Release);
         let outcome = recorder.finish(Duration::ZERO).unwrap();
-        assert!(matches!(outcome, FinishStatus::Indeterminate(_)));
+        assert!(matches!(
+            outcome,
+            FinishStatus::Ended(SessionEnd::Indeterminate(_))
+        ));
         assert!(matches!(
             recorder.start(&target, RecordingTimecode::Preserve),
             Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
@@ -4848,7 +4856,10 @@ mod tests {
         );
         device.dropped_events.store(1, Ordering::Release);
         let outcome = block_on(recorder.finish(Duration::ZERO)).unwrap();
-        assert!(matches!(outcome, FinishStatus::Indeterminate(_)));
+        assert!(matches!(
+            outcome,
+            FinishStatus::Ended(SessionEnd::Indeterminate(_))
+        ));
         block_on(recorder.close()).unwrap();
         assert!(device.closed_before_destroy.load(Ordering::Acquire));
     }
@@ -4870,7 +4881,7 @@ mod tests {
         device.dropped_events.store(1, Ordering::Release);
         assert!(matches!(
             recorder.finish(Duration::ZERO).unwrap(),
-            FinishStatus::Indeterminate(_)
+            FinishStatus::Ended(SessionEnd::Indeterminate(_))
         ));
         let report = recorder.report();
         assert!(matches!(
@@ -4914,7 +4925,7 @@ mod tests {
         device.dropped_events.store(1, Ordering::Release);
         assert!(matches!(
             block_on(recorder.finish(Duration::ZERO)).unwrap(),
-            FinishStatus::Indeterminate(_)
+            FinishStatus::Ended(SessionEnd::Indeterminate(_))
         ));
         let began = Instant::now();
         block_on(recorder.close()).unwrap();
@@ -4939,7 +4950,7 @@ mod tests {
             // The missing event is an open for hidden.mkv. The only known
             // path closes at stop, leaving no known path to await.
             device.dropped_events.store(1, Ordering::Release);
-            let FinishStatus::Indeterminate(report) =
+            let FinishStatus::Ended(SessionEnd::Indeterminate(report)) =
                 block_on(recorder.finish(Duration::ZERO)).unwrap()
             else {
                 panic!("losing an open must prevent confirmed closure");
@@ -4973,7 +4984,7 @@ mod tests {
             block_on(blocked).unwrap();
             assert_eq!(
                 block_on(finishing).unwrap(),
-                Some(FinishStatus::Indeterminate(report))
+                Some(SessionEnd::Indeterminate(report))
             );
             if delayed_hidden_close {
                 let limit = Instant::now() + Duration::from_secs(5);
@@ -5037,7 +5048,7 @@ mod tests {
             }
             device.push(mock::ROLLOVER, "hidden.mkv");
             device.push(mock::FILE_CLOSED, "hidden.mkv");
-            let FinishStatus::Indeterminate(report) =
+            let FinishStatus::Ended(SessionEnd::Indeterminate(report)) =
                 block_on(recorder.finish(Duration::ZERO)).unwrap()
             else {
                 panic!("lost file evidence prevents confirmed closure");
@@ -5064,7 +5075,7 @@ mod tests {
             ));
         }
         device.close();
-        let FinishStatus::Closed(report) =
+        let FinishStatus::Ended(SessionEnd::Closed(report)) =
             block_on(recorder.finish(Duration::from_secs(1))).unwrap()
         else {
             panic!("the known file closed");
@@ -5077,7 +5088,7 @@ mod tests {
             ));
             assert_eq!(
                 block_on(recorder.finish(Duration::ZERO)).unwrap(),
-                FinishStatus::Closed(report.clone())
+                FinishStatus::Ended(SessionEnd::Closed(report.clone()))
             );
         }
         let replacement = mock::Recorder::new(Closing::AtStop);
@@ -5109,7 +5120,7 @@ mod tests {
             Duration::from_millis(60),
         );
         device.dropped_events.store(1, Ordering::Release);
-        let FinishStatus::Indeterminate(report) =
+        let FinishStatus::Ended(SessionEnd::Indeterminate(report)) =
             block_on(recorder.finish(Duration::ZERO)).unwrap()
         else {
             panic!("lost native events must leave an indeterminate report");
@@ -5155,7 +5166,7 @@ mod tests {
         );
         assert!(matches!(
             block_on(recorder.finish(Duration::ZERO)).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
         block_on(recorder.close()).unwrap();
         assert_eq!(replacement.starts.load(Ordering::Acquire), 1);
@@ -5177,7 +5188,7 @@ mod tests {
         let requested = recorder.worker.control.shutdown_requested_at().unwrap();
         device.dropped_events.store(1, Ordering::Release);
         device.close();
-        let Some(FinishStatus::Indeterminate(report)) = block_on(waiting).unwrap() else {
+        let Some(SessionEnd::Indeterminate(report)) = block_on(waiting).unwrap() else {
             panic!("the remaining waiter must retain the loss verdict");
         };
         assert_eq!(report.dropped_events(), 1);
@@ -5203,7 +5214,7 @@ mod tests {
                 },
             );
             device.dropped_events.store(1, Ordering::Release);
-            let FinishStatus::Indeterminate(report) =
+            let FinishStatus::Ended(SessionEnd::Indeterminate(report)) =
                 block_on(recorder.finish(Duration::ZERO)).unwrap()
             else {
                 panic!("lost events must prevent confirmation");
@@ -5236,7 +5247,10 @@ mod tests {
             dropped.send(()).unwrap();
         });
         let outcome = block_on(finishing).unwrap();
-        assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
+            "{outcome:?}"
+        );
         drop_done.recv_timeout(Duration::from_secs(1)).unwrap();
         dropping.join().unwrap();
         assert!(device.closed_before_destroy.load(Ordering::Acquire));
@@ -5280,7 +5294,7 @@ mod tests {
         let waiting = recorder.wait_for_finish(Duration::from_secs(5)).submit();
         device.close();
         let outcome = block_on(waiting).unwrap();
-        let Some(FinishStatus::Closed(report)) = outcome else {
+        let Some(SessionEnd::Closed(report)) = outcome else {
             panic!("expected confirmed closure after the later close event: {outcome:?}")
         };
         assert!(report.closure_confirmed());
@@ -6141,7 +6155,10 @@ mod tests {
     fn an_async_finish_whose_stop_outlasts_its_wait_takes_the_queued_close() {
         let (device, recorder) = mock_recorder(Closing::DuringSlowStop(Duration::from_millis(80)));
         let outcome = block_on(recorder.finish(Duration::from_millis(10))).unwrap();
-        assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
+            "{outcome:?}"
+        );
         assert_eq!(device.stops.load(Ordering::Acquire), 1);
         block_on(recorder.close()).unwrap();
     }
@@ -6270,7 +6287,10 @@ mod tests {
         close.source_format_payload.video_track_count = 3;
         device.push_event(close);
         let outcome = block_on(finishing).unwrap();
-        assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
+            "{outcome:?}"
+        );
         // The start, pumped before the finish began, then the malformed close.
         let started = block_on(recorder.next_event(Duration::ZERO))
             .unwrap()

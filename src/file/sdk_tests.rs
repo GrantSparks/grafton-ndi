@@ -334,7 +334,7 @@ fn record_clip(api: &FileApi, source: &LiveSource, file: &PathBuf) -> RecordingR
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
     thread::sleep(Duration::from_millis(300));
     match recorder.finish(PATIENCE).unwrap() {
-        FinishStatus::Closed(report) => report,
+        FinishStatus::Ended(SessionEnd::Closed(report)) => report,
         other => panic!("the recording was not confirmed closed: {other:?}"),
     }
 }
@@ -402,7 +402,8 @@ fn the_longest_exact_event_path_records_closes_and_starts_again() {
             recorder.reported_current_file().unwrap().as_bytes(),
             target.path().to_str().unwrap().as_bytes()
         );
-        let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+        let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap()
+        else {
             panic!("the boundary-length file did not close exactly");
         };
         assert!(report.closure_confirmed());
@@ -444,7 +445,7 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
     let stats = recorder.stats().unwrap().expect("counters while recording");
     assert!(stats.video_frames_written() > 0);
 
-    let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap() else {
         panic!("the recording was not confirmed closed");
     };
     assert!(report.closure_confirmed());
@@ -488,7 +489,7 @@ fn a_rollover_requested_just_before_the_stop_still_ends_in_a_confirmed_close() {
         .rollover(&RecordingTarget::new(scratch.path("second")).unwrap())
         .unwrap();
     let outcome = recorder.finish(PATIENCE).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the session did not reach a confirmed close: {outcome:?}");
     };
     assert!(report.closed_files() >= 1);
@@ -535,7 +536,7 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
     let files = [first, second, third];
 
     let outcome = recorder.finish(PATIENCE).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the session did not reach a confirmed close: {outcome:?}\n{timeline}");
     };
     assert_eq!(report.closed_files(), 3, "{timeline}");
@@ -616,7 +617,7 @@ fn rollovers_open_the_next_file_before_closing_the_previous_file() {
                 current = timeline.await_change(&mut recorder, since, &current);
             }
             let outcome = recorder.finish(PATIENCE).unwrap();
-            let FinishStatus::Closed(report) = outcome else {
+            let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
                 panic!("{prefix} did not reach confirmed closure: {outcome:?}\n{timeline}");
             };
             assert!(report.closure_confirmed(), "{prefix}: {timeline}");
@@ -649,7 +650,7 @@ fn generated_recording_timecode_replays_its_explicit_start() {
     thread::sleep(Duration::from_millis(500));
     assert!(matches!(
         recorder.finish(PATIENCE).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     assert!(crate::file::FilePlayer::probe(&api, &file)
         .unwrap()
@@ -728,7 +729,7 @@ fn injected_metadata_is_recorded_on_the_metadata_track() {
     thread::sleep(Duration::from_millis(200));
     assert!(matches!(
         recorder.finish(PATIENCE).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     assert_eq!(
         crate::file::FilePlayer::probe(&api, &file)
@@ -818,7 +819,7 @@ fn an_async_recorder_finishes_and_closes_without_blocking() {
     .unwrap();
     thread::sleep(Duration::from_millis(800));
     let outcome = block_on(recorder.finish(PATIENCE)).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the recording was not confirmed closed: {outcome:?}");
     };
     assert_eq!(report.closed_files(), 1);
@@ -846,7 +847,7 @@ fn an_async_recorder_finishes_and_closes_without_blocking() {
     }
     assert!(matches!(
         block_on(recorder.finish(PATIENCE)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     assert!(crate::file::FilePlayer::probe(&api, &next_file)
         .unwrap()
@@ -1062,7 +1063,7 @@ fn a_session_the_library_ended_on_a_format_change_can_be_followed_by_another() {
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
     assert!(matches!(
         recorder.finish(PATIENCE).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -1114,7 +1115,7 @@ fn an_async_session_the_library_ended_on_a_format_change_can_be_followed_by_anot
     state_becomes(RecorderState::Recording);
     assert!(matches!(
         block_on(recorder.finish(PATIENCE)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     block_on(recorder.close()).unwrap();
 }
@@ -1150,7 +1151,7 @@ fn a_rollover_into_a_missing_directory_is_refused_and_the_session_goes_on() {
     assert_eq!(recorder.state(), RecorderState::Recording);
     assert!(recorder.is_recording());
     thread::sleep(Duration::from_millis(200));
-    let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap() else {
         panic!("the recording was not confirmed closed");
     };
     assert_eq!(report.closed_files(), 1);
@@ -1182,7 +1183,7 @@ fn a_file_that_received_nothing_is_reported_as_empty() {
     await_event(&mut recorder, RecorderEventKind::Rollover);
 
     // The library reports both files closed all the same.
-    let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap() else {
         panic!("the recording was not confirmed closed");
     };
     assert_eq!(report.closed_files(), 2);
@@ -1390,7 +1391,8 @@ fn an_exact_recording_ends_at_a_format_change_with_its_file_finalized() {
     assert!(report.stopped_by_sdk());
     assert_eq!(report.closed_files(), 1);
     assert_eq!(report.empty_files(), 0);
-    let FinishStatus::Closed(finished) = recorder.finish(PATIENCE).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(finished)) = recorder.finish(PATIENCE).unwrap()
+    else {
         panic!("the session had been closed");
     };
     assert!(finished.stopped_by_sdk());
@@ -1437,7 +1439,7 @@ fn an_exact_session_refuses_a_change_of_source_and_keeps_recording() {
     assert!(recorder.is_recording());
     assert_eq!(recorder.state(), RecorderState::Recording);
 
-    let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap() else {
         panic!("the recording was not confirmed closed");
     };
     assert!(!report.stopped_by_sdk());
@@ -1498,7 +1500,7 @@ fn finishing_without_a_wait_reports_the_close_the_stop_queued() {
     // The 6.4 library finalizes the file inside the stop call and queues its
     // close before returning, so no wait is needed to see it.
     let outcome = recorder.finish(Duration::ZERO).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the close was already queued: {outcome:?}");
     };
     assert!(report.closure_confirmed());

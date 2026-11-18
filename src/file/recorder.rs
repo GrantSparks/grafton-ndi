@@ -82,45 +82,36 @@ pub enum StopRequest {
 /// reached stable storage.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RecordingReport {
-    session: u64,
     phase: SessionPhase,
-    closed_files: u64,
-    empty_files: u64,
-    error_events: u64,
-    write_failures: u64,
-    dropped_events: u64,
-    last_closed_path: Option<EventText>,
+    counts: SessionReport,
 }
 
-/// Where the session a [`RecordingReport`] describes is and, once it is
-/// stopping, whether the caller asked it to stop while the SDK was still
-/// recording.
-///
-/// A ledger's session enum produces this immutable report phase together
-/// with its counts. The report's closure and stopped-by-SDK verdicts are
-/// therefore snapshots of that same session state.
+/// A ledger produces this immutable phase beside the corresponding counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SessionPhase {
-    /// No session has been started.
     NotStarted,
-    /// Recording, or waiting for its source.
     Recording,
-    /// Stopping; the last file is not yet reported closed.
     Stopping { requested: bool },
-    /// Ended, with every file the session opened reported closed.
-    Closed { requested: bool },
-    /// Ended, without that confirmation.
-    Indeterminate { requested: bool },
+    Ended(FinalPhase),
 }
 
-impl SessionPhase {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Closure {
+    Confirmed,
+    Unconfirmed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct FinalPhase {
+    closure: Closure,
+    requested: bool,
+}
+
+impl FinalPhase {
     fn state(self) -> RecorderState {
-        match self {
-            Self::NotStarted => RecorderState::Idle,
-            Self::Recording => RecorderState::Recording,
-            Self::Stopping { .. } => RecorderState::Stopping,
-            Self::Closed { .. } => RecorderState::Closed,
-            Self::Indeterminate { .. } => RecorderState::Indeterminate,
+        match self.closure {
+            Closure::Confirmed => RecorderState::Closed,
+            Closure::Unconfirmed => RecorderState::Indeterminate,
         }
     }
 }
@@ -129,7 +120,7 @@ impl RecordingReport {
     /// The session's number, counting from one for each recorder; zero when
     /// the recorder has not started a session.
     pub fn session(&self) -> u64 {
-        self.session
+        self.counts.session
     }
     /// Whether at least one file was reported closed, every reported open
     /// was matched by its close, and file tracking stayed complete.
@@ -137,14 +128,20 @@ impl RecordingReport {
     /// A session that ends before reporting any file has no confirmed
     /// closure, even when no event was lost and no cleanup remains pending.
     pub fn closure_confirmed(&self) -> bool {
-        matches!(self.phase, SessionPhase::Closed { .. })
+        matches!(
+            self.phase,
+            SessionPhase::Ended(FinalPhase {
+                closure: Closure::Confirmed,
+                ..
+            })
+        )
     }
     /// How many files were reported closed, including those closed by rollovers.
     ///
     /// The SDK reports a file closed whether or not anything was written to
     /// it; see [`empty_files`](Self::empty_files).
     pub fn closed_files(&self) -> u64 {
-        self.closed_files
+        self.counts.closed_files
     }
     /// How many closed files were confirmed to contain no audio or video.
     ///
@@ -163,26 +160,26 @@ impl RecordingReport {
     /// Always zero for a recorder that records neither audio nor video,
     /// because the SDK reports no first frame for metadata.
     pub fn empty_files(&self) -> u64 {
-        self.empty_files
+        self.counts.empty_files
     }
     /// How many open-failed and error events were seen.
     pub fn error_events(&self) -> u64 {
-        self.error_events
+        self.counts.error_events
     }
     /// How many write-failed events were seen. Not every one is fatal: a
     /// stream that appears after a file was opened is dropped until the next
     /// rollover.
     pub fn write_failures(&self) -> u64 {
-        self.write_failures
+        self.counts.write_failures
     }
     /// How many events the SDK discarded during the session because they were
     /// not taken in time.
     pub fn dropped_events(&self) -> u64 {
-        self.dropped_events
+        self.counts.dropped_events
     }
     /// The path of the file reported closed last, as the SDK gave it.
     pub fn last_closed_path(&self) -> Option<&EventText> {
-        self.last_closed_path.as_ref()
+        self.counts.last_closed_path.as_ref()
     }
     /// Whether the SDK ended the session by itself, rather than because it
     /// was asked to stop.
@@ -204,8 +201,10 @@ impl RecordingReport {
     pub fn stopped_by_sdk(&self) -> bool {
         matches!(
             self.phase,
-            SessionPhase::Closed { requested: false }
-                | SessionPhase::Indeterminate { requested: false }
+            SessionPhase::Ended(FinalPhase {
+                requested: false,
+                ..
+            })
         )
     }
 }
@@ -224,34 +223,29 @@ impl RecordingReport {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum FinishStatus {
+    /// The session ended within the completion budget.
+    Ended(SessionEnd),
+    /// `finish`'s completion budget expired before the session ended.
+    /// Call [`FileRecorder::wait_for_finish`] to keep waiting, or inspect the
+    /// recorder's current report.
+    /// An async operation interrupted by a close reports [`StateConflict::Closed`]
+    /// instead when closure cannot be established in its remaining budget.
+    TimedOut(RecordingReport),
+}
+
+/// The final outcome of a recording session.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SessionEnd {
     /// Every file the session opened is finalized. The report still records
     /// any errors during the session, and
     /// [`stopped_by_sdk`](RecordingReport::stopped_by_sdk) says whether the
     /// recording ran until it was asked to stop or the SDK ended it sooner.
     Closed(RecordingReport),
-    /// `finish`'s completion budget expired before the session ended.
-    /// Call [`FileRecorder::wait_for_finish`] to keep waiting, or inspect the
-    /// recorder's current report. `wait_for_finish` returns `None` for this
-    /// condition, keeping the report available through the recorder.
-    /// An async operation interrupted by a close reports [`StateConflict::Closed`]
-    /// instead when closure cannot be established in its remaining budget.
-    TimedOut(RecordingReport),
-    /// The session ended, but its events do not show that every file was
-    /// finalized. Waiting longer will not change this report. Incomplete file
-    /// tracking requires [`FileRecorder::reset`] before another session starts;
-    /// cleanup still consumes its remaining budget even if all known files close.
+    /// The session ended without [`RecordingReport::closure_confirmed`].
+    /// Incomplete file tracking requires [`FileRecorder::reset`] before
+    /// another session starts. See [`StateConflict::IncompleteFileTracking`].
     Indeterminate(RecordingReport),
-}
-
-impl FinishStatus {
-    /// A condition wait reports only settled outcomes; its timeout keeps the
-    /// same report in the recorder's ledger for a subsequent snapshot or wait.
-    pub(super) fn into_wait_outcome(self) -> Option<Self> {
-        match self {
-            Self::TimedOut(_) => None,
-            outcome => Some(outcome),
-        }
-    }
 }
 
 /// A file the recorder's events reported open.
@@ -387,11 +381,33 @@ pub(super) struct Settlement {
     pub(super) at: Instant,
 }
 
+/// Completion evidence for either kind of registered waiter.
+pub(super) enum WaitOutcome {
+    Ended(SessionEnd),
+    Expired(RecordingReport),
+}
+
+impl WaitOutcome {
+    pub(super) fn into_finish(self) -> FinishStatus {
+        match self {
+            Self::Ended(end) => FinishStatus::Ended(end),
+            Self::Expired(report) => FinishStatus::TimedOut(report),
+        }
+    }
+
+    pub(super) fn into_end(self) -> Option<SessionEnd> {
+        match self {
+            Self::Ended(end) => Some(end),
+            Self::Expired(_) => None,
+        }
+    }
+}
+
 /// How a registered finish wait returns its result. Synchronous waits use a
 /// stack slot; async waits use their executor-independent reply.
 pub(super) trait FinishReply {
     fn cancelled(&self) -> bool;
-    fn complete(self, result: Result<FinishStatus>);
+    fn complete(self, result: Result<WaitOutcome>);
 }
 
 /// A recording session belongs to exactly one native recorder generation.
@@ -535,7 +551,7 @@ impl<R: FinishReply> FinishWaiters<R> {
                             .filter(|_| cleanup_expired || waiter.deadline.end() <= at),
                     )
                     .map(|outcome| {
-                        if matches!(outcome, FinishStatus::TimedOut(_)) && closing() {
+                        if matches!(outcome, WaitOutcome::Expired(_)) && closing() {
                             Err(Error::InvalidState(StateConflict::Closed))
                         } else {
                             Ok(outcome)
@@ -552,19 +568,20 @@ impl<R: FinishReply> FinishWaiters<R> {
     }
 }
 
-struct LocalFinish<'a>(&'a std::cell::RefCell<Option<Result<FinishStatus>>>);
+struct LocalFinish<'a>(&'a std::cell::RefCell<Option<Result<WaitOutcome>>>);
 
 impl FinishReply for LocalFinish<'_> {
     fn cancelled(&self) -> bool {
         false
     }
-    fn complete(self, result: Result<FinishStatus>) {
+    fn complete(self, result: Result<WaitOutcome>) {
         *self.0.borrow_mut() = Some(result);
     }
 }
 
 /// Counts and paths belong to a session; its lifecycle determines the
 /// phase when producing an immutable public report.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SessionReport {
     session: u64,
     closed_files: u64,
@@ -589,28 +606,13 @@ impl SessionReport {
     }
 
     fn report(&self, phase: SessionPhase) -> RecordingReport {
-        RecordingReport {
-            session: self.session,
-            phase,
-            closed_files: self.closed_files,
-            empty_files: self.empty_files,
-            error_events: self.error_events,
-            write_failures: self.write_failures,
-            dropped_events: self.dropped_events,
-            last_closed_path: self.last_closed_path.clone(),
-        }
+        self.clone().into_report(phase)
     }
 
     fn into_report(self, phase: SessionPhase) -> RecordingReport {
         RecordingReport {
-            session: self.session,
             phase,
-            closed_files: self.closed_files,
-            empty_files: self.empty_files,
-            error_events: self.error_events,
-            write_failures: self.write_failures,
-            dropped_events: self.dropped_events,
-            last_closed_path: self.last_closed_path,
+            counts: self,
         }
     }
 }
@@ -628,22 +630,28 @@ struct OpenSession {
 }
 
 impl OpenSession {
-    fn final_phase(&self, stopping: Option<bool>) -> Option<SessionPhase> {
-        let requested = stopping.unwrap_or(false);
-        if !self.files.is_complete() {
-            Some(SessionPhase::Indeterminate { requested })
-        } else if self.files.is_empty() && self.report.closed_files > 0 {
-            Some(SessionPhase::Closed { requested })
-        } else if stopping.is_some() && self.files.is_empty() {
-            Some(SessionPhase::Indeterminate { requested })
-        } else {
-            None
-        }
+    fn all_closed(&self) -> bool {
+        !self.files.cleanup_pending() && self.report.closed_files > 0
     }
 
-    fn end(self, phase: SessionPhase) -> Session {
+    fn final_phase(&self, stopping: Option<bool>) -> Option<FinalPhase> {
+        let closure = if self.all_closed() {
+            Closure::Confirmed
+        } else if !self.files.is_complete() || (stopping.is_some() && self.files.is_empty()) {
+            Closure::Unconfirmed
+        } else {
+            return None;
+        };
+        Some(FinalPhase {
+            closure,
+            requested: stopping.unwrap_or(false),
+        })
+    }
+
+    fn end(self, phase: FinalPhase) -> Session {
         Session::Ended {
-            report: self.report.into_report(phase),
+            phase,
+            counts: self.report,
             files: self.files,
             dropped_base: self.dropped_base,
         }
@@ -665,7 +673,8 @@ enum Session {
         requested: bool,
     },
     Ended {
-        report: RecordingReport,
+        phase: FinalPhase,
+        counts: SessionReport,
         files: FileTracker,
         dropped_base: u64,
     },
@@ -746,9 +755,10 @@ impl Ledger {
                 let _ = ledger.stop_requested(requested);
                 ledger
             }
-            SessionPhase::Closed { .. } | SessionPhase::Indeterminate { .. } => Self {
+            SessionPhase::Ended(phase) => Self {
                 session: Session::Ended {
-                    report: SessionReport::new(session).into_report(phase),
+                    phase,
+                    counts: SessionReport::new(session),
                     files: FileTracker::new(),
                     dropped_base,
                 },
@@ -765,15 +775,15 @@ impl Ledger {
             Session::Stopping { data, requested } => data.report.report(SessionPhase::Stopping {
                 requested: *requested,
             }),
-            Session::Ended { report, .. } => report.clone(),
+            Session::Ended { phase, counts, .. } => counts.report(SessionPhase::Ended(*phase)),
         }
     }
 
     fn session_number(&self) -> u64 {
         match &self.session {
-            Session::Idle { last } => last.as_ref().map_or(0, |report| report.session),
+            Session::Idle { last } => last.as_ref().map_or(0, RecordingReport::session),
             Session::Open { data, .. } | Session::Stopping { data, .. } => data.report.session,
-            Session::Ended { report, .. } => report.session,
+            Session::Ended { counts, .. } => counts.session,
         }
     }
 
@@ -782,7 +792,7 @@ impl Ledger {
             Session::Idle { .. } => RecorderState::Idle,
             Session::Open { .. } => RecorderState::Recording,
             Session::Stopping { .. } => RecorderState::Stopping,
-            Session::Ended { report, .. } => report.phase.state(),
+            Session::Ended { phase, .. } => phase.state(),
         }
     }
 
@@ -850,16 +860,19 @@ impl Ledger {
     }
 
     fn all_closed(&self) -> bool {
-        self.open()
-            .is_some_and(|data| !data.files.cleanup_pending() && data.report.closed_files > 0)
+        self.open().is_some_and(OpenSession::all_closed)
     }
 
-    fn settle(&self, late: Option<&LateDrain>) -> Option<FinishStatus> {
-        match self.state() {
-            RecorderState::Closed => Some(FinishStatus::Closed(self.report())),
-            RecorderState::Indeterminate => Some(FinishStatus::Indeterminate(self.report())),
-            _ if late.is_some() => Some(FinishStatus::TimedOut(self.report())),
-            _ => None,
+    fn settle(&self, late: Option<&LateDrain>) -> Option<WaitOutcome> {
+        if let Session::Ended { phase, counts, .. } = &self.session {
+            let report = counts.report(SessionPhase::Ended(*phase));
+            let end = match phase.closure {
+                Closure::Confirmed => SessionEnd::Closed(report),
+                Closure::Unconfirmed => SessionEnd::Indeterminate(report),
+            };
+            Some(WaitOutcome::Ended(end))
+        } else {
+            late.map(|_| WaitOutcome::Expired(self.report()))
         }
     }
 
@@ -996,7 +1009,7 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 /// The SDK finalizes a file only between the stop request and its file-closed
 /// event. [`finish`](Self::finish) performs both and reports the outcome;
 /// treat a recording as complete only when it returns
-/// [`FinishStatus::Closed`]. Dropping a recorder waits up to
+/// [`SessionEnd::Closed`]. Dropping a recorder waits up to
 /// [`FileRecorderOptions::drop_wait`] while the session is open or file cleanup
 /// remains pending, including after an indeterminate outcome. Native event
 /// loss, unreadable lifecycle evidence or a tracking limit makes the file set
@@ -1411,12 +1424,12 @@ impl FileRecorder {
     /// the returned report. A malformed event is consumed too: what it showed
     /// about the session is recorded as [`next_event`](Self::next_event)
     /// records it, and the wait goes on. One that could not be read at all
-    /// makes the outcome [`FinishStatus::Indeterminate`] rather than an error.
+    /// makes the outcome [`SessionEnd::Indeterminate`] rather than an error.
     ///
     /// The wait starts once the stop has returned, and covers taking the
     /// closure's event, not the stop itself, which the SDK may carry out
     /// before it returns. Events already queued are taken even when the wait
-    /// is over, so `finish(Duration::ZERO)` reports [`FinishStatus::Closed`]
+    /// is over, so `finish(Duration::ZERO)` reports [`SessionEnd::Closed`]
     /// when the SDK finalized the file during the stop.
     ///
     /// # Errors
@@ -1441,7 +1454,7 @@ impl FileRecorder {
     /// Wait up to `timeout` for a stopping session to end.
     ///
     /// Returns `None` when the timeout expires, and `Some` with
-    /// [`FinishStatus::Closed`] or [`FinishStatus::Indeterminate`] when the
+    /// [`SessionEnd::Closed`] or [`SessionEnd::Indeterminate`] when the
     /// session ends. A timeout retains the session's report in
     /// [`report`](Self::report), and another wait can continue observing it.
     ///
@@ -1459,12 +1472,16 @@ impl FileRecorder {
     /// session has not been asked to stop. Neither is returned once the wait
     /// has begun.
     #[doc(alias = "NDIlib_file_recorder_capture_event")]
-    pub fn wait_for_finish(&mut self, timeout: Duration) -> Result<Option<FinishStatus>> {
-        self.wait_until(Deadline::after(timeout)?)
-            .map(FinishStatus::into_wait_outcome)
+    pub fn wait_for_finish(&mut self, timeout: Duration) -> Result<Option<SessionEnd>> {
+        self.settle_until(Deadline::after(timeout)?)
+            .map(WaitOutcome::into_end)
     }
 
     pub(super) fn wait_until(&mut self, deadline: Deadline) -> Result<FinishStatus> {
+        self.settle_until(deadline).map(WaitOutcome::into_finish)
+    }
+
+    fn settle_until(&mut self, deadline: Deadline) -> Result<WaitOutcome> {
         self.check_wait()?;
         let result = std::cell::RefCell::new(None);
         let mut waiters = FinishWaiters::new();
@@ -1506,7 +1523,7 @@ impl FileRecorder {
         }
     }
 
-    fn settle_wait(&self, late: Option<&LateDrain>) -> Option<FinishStatus> {
+    fn settle_wait(&self, late: Option<&LateDrain>) -> Option<WaitOutcome> {
         self.ledger.settle(late)
     }
 
@@ -1903,14 +1920,15 @@ mod tests {
     fn recording_report_debug_names_its_closed_path() {
         let path = b"take.mkv\0\0".map(|byte| byte as std::ffi::c_char);
         let report = RecordingReport {
-            session: 1,
-            phase: SessionPhase::Closed { requested: true },
-            closed_files: 1,
-            empty_files: 0,
-            error_events: 0,
-            write_failures: 0,
-            dropped_events: 0,
-            last_closed_path: Some(EventText::from_buffer(&path)),
+            phase: SessionPhase::Ended(FinalPhase {
+                closure: Closure::Confirmed,
+                requested: true,
+            }),
+            counts: SessionReport {
+                closed_files: 1,
+                last_closed_path: Some(EventText::from_buffer(&path)),
+                ..SessionReport::new(1)
+            },
         };
         let debug = format!("{report:?}");
         assert!(debug.contains("\"take.mkv\""));
@@ -2182,7 +2200,7 @@ mod tests {
         ledger.dropped(8);
         let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
-        assert_eq!(ledger.report().dropped_events, 1);
+        assert_eq!(ledger.report().dropped_events(), 1);
     }
 
     #[test]
@@ -2234,9 +2252,9 @@ mod tests {
         assert!(stop.is_some());
         assert_eq!(ledger.state(), RecorderState::Indeterminate);
         assert!(ledger.cleanup_pending());
-        assert_eq!(ledger.report().dropped_events, 0);
-        assert_eq!(ledger.report().error_events, 0);
-        assert_eq!(ledger.report().write_failures, 0);
+        assert_eq!(ledger.report().dropped_events(), 0);
+        assert_eq!(ledger.report().error_events(), 0);
+        assert_eq!(ledger.report().write_failures(), 0);
     }
 
     #[test]
@@ -2280,14 +2298,17 @@ mod tests {
         let mut ledger = session();
         let _ = ledger.observe(Started, path("take.mkv"));
         let _ = ledger.stop_requested(true);
-        assert_eq!(ledger.settle(None), None);
+        assert!(ledger.settle(None).is_none());
         assert!(matches!(
             ledger.settle(Some(&LateDrain)),
-            Some(FinishStatus::TimedOut(_))
+            Some(WaitOutcome::Expired(_))
         ));
         let _ = ledger.observe(FileClosed, path("take.mkv"));
         let _ = ledger.drained(false);
-        assert!(matches!(ledger.settle(None), Some(FinishStatus::Closed(_))));
+        assert!(matches!(
+            ledger.settle(None),
+            Some(WaitOutcome::Ended(SessionEnd::Closed(_)))
+        ));
     }
 
     #[test]
@@ -2308,7 +2329,7 @@ mod tests {
         let _ = ledger.observe(FileClosed, path("second.mkv"));
         let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        assert_eq!(ledger.report().closed_files, 2);
+        assert_eq!(ledger.report().closed_files(), 2);
     }
 
     #[test]
@@ -2361,8 +2382,8 @@ mod tests {
         let _ = ledger.observe(FileClosed, path("take.mkv"));
         let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        assert_eq!(ledger.report().error_events, 1);
-        assert_eq!(ledger.report().write_failures, 1);
+        assert_eq!(ledger.report().error_events(), 1);
+        assert_eq!(ledger.report().write_failures(), 1);
     }
 
     #[test]
@@ -2373,7 +2394,7 @@ mod tests {
         let _ = ledger.observe(FileClosed, path("first.mkv"));
         let _ = ledger.drained(false);
         assert_eq!(ledger.state(), RecorderState::Closed);
-        assert_eq!(ledger.report().error_events, 1);
+        assert_eq!(ledger.report().error_events(), 1);
     }
 
     #[test]
@@ -2399,8 +2420,8 @@ mod tests {
         assert_eq!(ledger.state(), RecorderState::Closed);
         let _ = ledger.observe(OpenFailed, path("next.mkv"));
         ledger.dropped(3);
-        assert_eq!(ledger.report().error_events, 0);
-        assert_eq!(ledger.report().dropped_events, 0);
+        assert_eq!(ledger.report().error_events(), 0);
+        assert_eq!(ledger.report().dropped_events(), 0);
         assert!(ledger.report().closure_confirmed());
     }
 
@@ -2483,6 +2504,39 @@ mod tests {
     /// The state and the report's two verdicts are read from one phase, so
     /// every phase gives one consistent combination.
     #[test]
+    fn final_reports_distinguish_confirmed_closure_from_lost_or_missing_files() {
+        for requested in [false, true] {
+            for (opened_and_closed, lost_event) in [(true, false), (true, true), (false, false)] {
+                let mut ledger = session();
+                if opened_and_closed {
+                    let _ = ledger.observe(Started, path("take.mkv"));
+                    let _ = ledger.observe(FileClosed, path("take.mkv"));
+                }
+                if lost_event {
+                    ledger.dropped(1);
+                }
+                if requested || !opened_and_closed {
+                    let _ = ledger.stop_requested(requested);
+                }
+                let _ = ledger.drained(false);
+                let confirmed = opened_and_closed && !lost_event;
+                let report = ledger.report();
+                let expected = if confirmed {
+                    SessionEnd::Closed(report)
+                } else {
+                    SessionEnd::Indeterminate(report)
+                };
+                assert_eq!(
+                    ledger.settle(None).and_then(WaitOutcome::into_end),
+                    Some(expected)
+                );
+                assert_eq!(ledger.report().closure_confirmed(), confirmed);
+                assert_eq!(ledger.report().stopped_by_sdk(), !requested);
+            }
+        }
+    }
+
+    #[test]
     fn the_state_and_the_reports_verdicts_agree_in_every_phase() {
         use SessionPhase::*;
         for (phase, state, confirmed, by_sdk) in [
@@ -2501,25 +2555,37 @@ mod tests {
                 false,
             ),
             (
-                Closed { requested: false },
+                Ended(FinalPhase {
+                    closure: Closure::Confirmed,
+                    requested: false,
+                }),
                 RecorderState::Closed,
                 true,
                 true,
             ),
             (
-                Closed { requested: true },
+                Ended(FinalPhase {
+                    closure: Closure::Confirmed,
+                    requested: true,
+                }),
                 RecorderState::Closed,
                 true,
                 false,
             ),
             (
-                Indeterminate { requested: false },
+                Ended(FinalPhase {
+                    closure: Closure::Unconfirmed,
+                    requested: false,
+                }),
                 RecorderState::Indeterminate,
                 false,
                 true,
             ),
             (
-                Indeterminate { requested: true },
+                Ended(FinalPhase {
+                    closure: Closure::Unconfirmed,
+                    requested: true,
+                }),
                 RecorderState::Indeterminate,
                 false,
                 false,

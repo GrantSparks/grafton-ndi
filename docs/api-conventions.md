@@ -67,7 +67,7 @@ FrameSync audio capture returns a frame because it can synthesize silence.
 
 `wait_for_<condition>(timeout)` returns `Result<bool>`, or `Result<Option<T>>`
 when it reports a value. `false` or `None` means the wait expired.
-For example, `wait_for_finish` returns `Option<FinishStatus>`: `None` on
+For example, `wait_for_finish` returns `Option<SessionEnd>`: `None` on
 timeout, or `Some` with a final recorder outcome. The separate bounded
 completion operation `finish` retains `FinishStatus::TimedOut(report)`;
 `report()` supplies a current snapshot after an expired wait.

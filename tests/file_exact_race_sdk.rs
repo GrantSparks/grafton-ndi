@@ -17,7 +17,7 @@ use fixture::FixtureDir;
 use grafton_ndi::{
     file::{
         FileApi, FileApiOptions, FileNaming, FileRecorderOptions, FinishStatus, RecorderEventKind,
-        RecorderState, RecordingTarget, RecordingTimecode, SourceSpec,
+        RecorderState, RecordingTarget, RecordingTimecode, SessionEnd, SourceSpec,
     },
     Error, SelectionConflict,
 };
@@ -93,7 +93,8 @@ fn exact_name_races_preserve_files_and_report_native_failures() {
                 recorder.is_recording(),
                 recorder.state()
             );
-            let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(2)).unwrap()
+            let FinishStatus::Ended(SessionEnd::Closed(report)) =
+                recorder.finish(Duration::from_secs(2)).unwrap()
             else {
                 panic!("session not closed")
             };

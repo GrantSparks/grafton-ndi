@@ -39,7 +39,10 @@ fn a_native_finish_reports_confirmed_closure_when_another_clone_closes_it() {
     // Close immediately: the finish may still be queued when cleanup starts.
     let closing = other.close().submit();
     let outcome = block_on(finishing).unwrap();
-    assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+    assert!(
+        matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
+        "{outcome:?}"
+    );
     block_on(closing).unwrap();
     assert!(crate::file::FilePlayer::probe(&api, &path)
         .unwrap()

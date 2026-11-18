@@ -34,6 +34,7 @@ impl WaitPath {
                     .into_inner()
                     .expect("the expired wait was settled")
                     .unwrap()
+                    .into_finish()
             }
         }
     }
@@ -93,7 +94,7 @@ fn synchronous_and_registered_waits_redrain_a_closure_queued_after_an_earlier_em
         let before = device.captures.load(Ordering::Acquire);
         let outcome = path.finish(&mut recorder, deadline);
         assert!(
-            matches!(outcome, FinishStatus::Closed(_)),
+            matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
             "{path:?}: {outcome:?}"
         );
         assert_eq!(
@@ -178,7 +179,7 @@ fn cleanup_stops_on_its_256th_late_event_and_settles_every_waiter() {
     assert_eq!(delivered, STALE_EVENT_LIMIT);
     assert!(waiters.is_empty());
     for result in [first.into_inner(), later.into_inner()] {
-        assert!(matches!(result, Some(Ok(FinishStatus::TimedOut(_)))));
+        assert!(matches!(result, Some(Ok(WaitOutcome::Expired(_)))));
     }
     assert!(recorder.next_event(Duration::ZERO).unwrap().is_some());
     recorder.abandon();
@@ -219,7 +220,7 @@ fn cleanup_spent_during_a_due_batch_also_settles_its_later_waiters() {
     assert_eq!(device.captures.load(Ordering::Acquire) - before, 1);
     assert!(waiters.is_empty());
     for result in [first.into_inner(), later.into_inner()] {
-        assert!(matches!(result, Some(Ok(FinishStatus::TimedOut(_)))));
+        assert!(matches!(result, Some(Ok(WaitOutcome::Expired(_)))));
     }
     recorder.abandon();
 }

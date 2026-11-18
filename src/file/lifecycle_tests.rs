@@ -48,7 +48,7 @@ fn an_active_or_stopping_session_refuses_start_until_its_known_file_closes() {
     device.close();
     assert!(matches!(
         recorder.finish(Duration::ZERO).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -70,7 +70,7 @@ fn generated_session_timecodes_reach_the_native_start_unchanged() {
         assert_eq!(device.starts.load(Ordering::Acquire), 1);
         assert!(matches!(
             recorder.finish(Duration::ZERO).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
     }
 }
@@ -129,7 +129,7 @@ fn a_timeout_keeps_the_recorder_and_a_later_close_completes_without_a_second_sto
     device.push(FILE_CLOSED, TAKE);
     assert!(matches!(
         recorder.wait_for_finish(Duration::from_secs(1)).unwrap(),
-        Some(FinishStatus::Closed(_))
+        Some(SessionEnd::Closed(_))
     ));
     assert_eq!(recorder.request_stop(), StopRequest::AlreadyClosed);
     drop(recorder);
@@ -141,7 +141,9 @@ fn a_timeout_keeps_the_recorder_and_a_later_close_completes_without_a_second_sto
 fn finish_waits_for_a_close_that_follows_the_stop() {
     let device = mock::Recorder::new(Closing::After(Duration::from_millis(100)));
     let mut recorder = recording_on(&device);
-    let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(5)).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) =
+        recorder.finish(Duration::from_secs(5)).unwrap()
+    else {
         panic!("the close arrived within the wait");
     };
     assert!(report.closure_confirmed());
@@ -161,7 +163,7 @@ fn a_rollover_requested_just_before_the_stop_does_not_hold_the_session_open() {
     recorder.rollover(&target("second")).unwrap();
     let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
     assert!(
-        matches!(outcome, FinishStatus::Closed(_)),
+        matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
         "the session never reached a final state: {outcome:?}"
     );
 }
@@ -175,7 +177,7 @@ fn a_source_switch_just_before_the_stop_does_not_hold_the_session_open() {
         .unwrap();
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -195,7 +197,7 @@ fn a_completed_rollover_is_followed_in_the_order_the_sdk_reports_it() {
     );
     recorder.request_stop();
     device.push(FILE_CLOSED, "second.mkv");
-    let Some(FinishStatus::Closed(report)) =
+    let Some(SessionEnd::Closed(report)) =
         recorder.wait_for_finish(Duration::from_secs(1)).unwrap()
     else {
         panic!("both files were reported closed");
@@ -244,7 +246,7 @@ fn resetting_an_unconfirmed_session_preserves_its_report_and_isolates_late_event
     assert_eq!(recorder.report().closed_files(), 0);
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     drop(recorder);
     assert_eq!(replacement.destroys.load(Ordering::Acquire), 1);
@@ -270,7 +272,7 @@ fn a_failed_reset_keeps_the_old_recorder_and_its_finalization_pending() {
     old.push(FILE_CLOSED, TAKE);
     assert!(matches!(
         recorder.wait_for_finish(Duration::from_secs(1)).unwrap(),
-        Some(FinishStatus::Closed(_))
+        Some(SessionEnd::Closed(_))
     ));
 }
 
@@ -295,7 +297,9 @@ fn an_indeterminate_report_counts_only_files_confirmed_empty_before_loss() {
         }
         device.push(ROLLOVER, "hidden.mkv");
         device.push(FILE_CLOSED, "hidden.mkv");
-        let FinishStatus::Indeterminate(report) = recorder.finish(Duration::ZERO).unwrap() else {
+        let FinishStatus::Ended(SessionEnd::Indeterminate(report)) =
+            recorder.finish(Duration::ZERO).unwrap()
+        else {
             panic!("lost file evidence prevents confirmed closure");
         };
         assert_eq!(report.empty_files(), u64::from(empty_before_loss));
@@ -312,13 +316,12 @@ fn lost_sdk_events_end_the_session_as_indeterminate() {
     device.dropped_events.store(1, Ordering::Release);
     let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
     assert!(
-        matches!(outcome, FinishStatus::Indeterminate(_)),
+        matches!(outcome, FinishStatus::Ended(SessionEnd::Indeterminate(_))),
         "{outcome:?}"
     );
     assert!(!recorder.report().closure_confirmed());
     assert_eq!(recorder.report().dropped_events(), 1);
-    let Some(FinishStatus::Indeterminate(report)) =
-        recorder.wait_for_finish(Duration::ZERO).unwrap()
+    let Some(SessionEnd::Indeterminate(report)) = recorder.wait_for_finish(Duration::ZERO).unwrap()
     else {
         panic!("a settled session must remain an indeterminate outcome");
     };
@@ -348,7 +351,7 @@ fn lost_sdk_events_end_the_session_as_indeterminate() {
         .unwrap();
     assert!(matches!(
         recorder.finish(Duration::ZERO).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     drop(recorder);
     assert_eq!(replacement.stops.load(Ordering::Acquire), 1);
@@ -370,7 +373,9 @@ fn recording_with_a_lost_open(
     );
     device.dropped_events.store(1, Ordering::Release);
     device.push(FILE_CLOSED, TAKE);
-    let FinishStatus::Indeterminate(report) = recorder.finish(Duration::ZERO).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Indeterminate(report)) =
+        recorder.finish(Duration::ZERO).unwrap()
+    else {
         panic!("the lost open event prevents confirmation of closure");
     };
     assert_eq!(report.closed_files(), 1);
@@ -535,7 +540,7 @@ fn complete_tracking_needs_no_cleanup_after_every_file_is_confirmed_closed() {
     let mut recorder = recording_on(&device);
     assert!(matches!(
         recorder.finish(Duration::ZERO).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     device.push(mock::OPEN_FAILED, "outside-the-session.mkv");
     let captures = device.captures.load(Ordering::Acquire);
@@ -552,7 +557,7 @@ fn evidence_lost_during_the_stale_event_drain_refuses_the_next_native_start() {
         let mut recorder = recording_on(&device);
         assert!(matches!(
             recorder.finish(Duration::ZERO).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
         let report = recorder.report();
         match evidence {
@@ -575,7 +580,7 @@ fn evidence_lost_during_the_stale_event_drain_refuses_the_next_native_start() {
         assert_eq!(recorder.report(), report, "final reports stay immutable");
         assert_eq!(
             recorder.finish(Duration::ZERO).unwrap(),
-            FinishStatus::Closed(report.clone())
+            FinishStatus::Ended(SessionEnd::Closed(report.clone()))
         );
         assert!(matches!(
             recorder.start(&target("restart-after-finish"), RecordingTimecode::Preserve),
@@ -604,7 +609,7 @@ fn evidence_lost_during_the_stale_event_drain_refuses_the_next_native_start() {
         );
         assert!(matches!(
             recorder.finish(Duration::ZERO).unwrap(),
-            FinishStatus::Closed(_)
+            FinishStatus::Ended(SessionEnd::Closed(_))
         ));
         drop(recorder);
         assert_eq!(replacement.stops.load(Ordering::Acquire), 1);
@@ -637,7 +642,7 @@ fn a_malformed_close_event_still_closes_the_session() {
     );
     assert!(matches!(
         recorder.wait_for_finish(Duration::from_millis(50)).unwrap(),
-        Some(FinishStatus::Closed(_))
+        Some(SessionEnd::Closed(_))
     ));
 }
 
@@ -685,7 +690,7 @@ fn an_event_larger_than_this_crate_expects_is_rejected_and_taints_the_session() 
     );
     let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
     assert!(
-        matches!(outcome, FinishStatus::Indeterminate(_)),
+        matches!(outcome, FinishStatus::Ended(SessionEnd::Indeterminate(_))),
         "{outcome:?}"
     );
     recorder.abandon();
@@ -708,7 +713,7 @@ fn a_malformed_close_taken_by_finish_still_closes_the_session() {
     // Queued before the wait, so the wait itself takes it.
     device.push_event(malformed(FILE_CLOSED));
     let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the close was taken, malformed or not: {outcome:?}");
     };
     assert!(report.closure_confirmed());
@@ -723,7 +728,7 @@ fn a_malformed_event_during_finish_does_not_end_the_wait_for_the_close() {
     let mut recorder = recording_on(&device);
     device.push_event(malformed(mock::FIRST_FRAME));
     let outcome = recorder.finish(Duration::from_secs(5)).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the wait ended before the close: {outcome:?}");
     };
     // What the malformed event showed was kept: the file had a first frame.
@@ -739,7 +744,7 @@ fn an_unreadable_event_during_finish_makes_the_outcome_indeterminate() {
     device.oversize_next_event.store(true, Ordering::Release);
     let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
     assert!(
-        matches!(outcome, FinishStatus::Indeterminate(_)),
+        matches!(outcome, FinishStatus::Ended(SessionEnd::Indeterminate(_))),
         "{outcome:?}"
     );
     assert!(!recorder.report().closure_confirmed());
@@ -856,7 +861,7 @@ fn a_target_in_a_directory_that_does_not_exist_is_refused_before_the_sdk_sees_it
     assert_eq!(device.rollovers.load(Ordering::Acquire), 1);
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -872,7 +877,7 @@ fn a_file_closed_before_its_first_frame_is_reported_as_empty() {
     assert_eq!(recorder.report().empty_files(), 0);
     recorder.request_stop();
     device.push(FILE_CLOSED, "second.mkv");
-    let Some(FinishStatus::Closed(report)) =
+    let Some(SessionEnd::Closed(report)) =
         recorder.wait_for_finish(Duration::from_secs(1)).unwrap()
     else {
         panic!("both files were reported closed");
@@ -888,7 +893,9 @@ fn a_metadata_only_recording_reports_no_empty_files() {
     let options = FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
         .tracks(MediaTypes::METADATA);
     let mut recorder = recording_with(&device, options);
-    let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(1)).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) =
+        recorder.finish(Duration::from_secs(1)).unwrap()
+    else {
         panic!("the file was reported closed");
     };
     assert_eq!(report.closed_files(), 1);
@@ -1067,7 +1074,7 @@ fn finishing_a_session_the_sdk_is_ending_itself_still_tells_it_to_stop() {
     assert_eq!(device.stops.load(Ordering::Acquire), 1);
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     recorder
         .start(&target("second"), RecordingTimecode::Preserve)
@@ -1096,7 +1103,7 @@ fn a_malformed_stale_event_is_consumed_before_the_native_start() {
     assert_eq!(recorder.report().error_events(), 0);
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -1155,7 +1162,7 @@ fn a_refused_start_is_not_counted_in_any_session() {
         .unwrap();
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     refuse_start(&mut recorder);
     let report = recorder.report();
@@ -1172,7 +1179,7 @@ fn the_source_can_be_changed_after_a_session_that_ended_unconfirmed() {
     device.dropped_events.store(1, Ordering::Release);
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Indeterminate(_)
+        FinishStatus::Ended(SessionEnd::Indeterminate(_))
     ));
     // Source selection is still allowed, although another start requires reset.
     recorder
@@ -1191,13 +1198,13 @@ fn waiting_on_a_final_report_preserves_queued_out_of_session_events() {
     let mut recorder = recording_on(&device);
     assert!(matches!(
         recorder.finish(Duration::ZERO).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
     device.push(mock::OPEN_FAILED, "later.mkv");
     let before = device.captures.load(Ordering::Acquire);
     assert!(matches!(
         recorder.wait_for_finish(Duration::ZERO).unwrap(),
-        Some(FinishStatus::Closed(_))
+        Some(SessionEnd::Closed(_))
     ));
     assert_eq!(device.captures.load(Ordering::Acquire), before);
     assert_eq!(
@@ -1211,7 +1218,7 @@ fn finishing_without_a_wait_reports_a_close_the_stop_already_queued() {
     let device = mock::Recorder::new(Closing::AtStop);
     let mut recorder = recording_on(&device);
     let outcome = recorder.finish(Duration::ZERO).unwrap();
-    let FinishStatus::Closed(report) = outcome else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
         panic!("the close was queued before the wait began: {outcome:?}");
     };
     assert!(report.closure_confirmed());
@@ -1228,7 +1235,10 @@ fn a_wait_that_ends_during_a_slow_stop_still_takes_the_queued_close() {
     recorder.request_stop();
     assert!(deadline.is_expired());
     let outcome = recorder.wait_until(deadline).unwrap();
-    assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+    assert!(
+        matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
+        "{outcome:?}"
+    );
 }
 
 #[test]
@@ -1241,7 +1251,10 @@ fn finish_starts_its_wait_once_the_stop_has_returned() {
     ));
     let mut recorder = recording_on(&device);
     let outcome = recorder.finish(Duration::from_millis(250)).unwrap();
-    assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+    assert!(
+        matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
+        "{outcome:?}"
+    );
 }
 
 #[test]
@@ -1279,7 +1292,7 @@ fn a_timeout_out_of_range_is_refused_before_the_stop() {
     assert_eq!(recorder.state(), RecorderState::Recording);
     assert!(matches!(
         recorder.finish(crate::MAX_TIMEOUT).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -1324,7 +1337,9 @@ fn a_session_the_sdk_ended_is_reported_as_stopped_by_it() {
     take_events(&mut recorder);
     assert!(!recorder.report().stopped_by_sdk(), "an open session");
     device.end_session_itself();
-    let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(1)).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) =
+        recorder.finish(Duration::from_secs(1)).unwrap()
+    else {
         panic!("the session was closed");
     };
     assert!(report.stopped_by_sdk());
@@ -1333,7 +1348,9 @@ fn a_session_the_sdk_ended_is_reported_as_stopped_by_it() {
     recorder
         .start(&target("third"), RecordingTimecode::Preserve)
         .unwrap();
-    let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(1)).unwrap() else {
+    let FinishStatus::Ended(SessionEnd::Closed(report)) =
+        recorder.finish(Duration::from_secs(1)).unwrap()
+    else {
         panic!("the session was closed");
     };
     assert!(!report.stopped_by_sdk());
@@ -1407,7 +1424,7 @@ fn unreportable_recording_paths_never_reach_native_start_or_rollover() {
     assert_eq!(recorder.state(), RecorderState::Recording);
     assert!(matches!(
         recorder.finish(Duration::ZERO).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -1513,7 +1530,7 @@ fn a_reset_to_conflicting_options_keeps_the_recorder() {
     assert_eq!(recorder.state(), RecorderState::Recording);
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 }
 
@@ -1959,7 +1976,7 @@ fn values_a_refused_call_was_given_stay_with_the_caller_to_pass_again() {
     assert_eq!(recorder.last_accepted_source(), Some(&source));
     assert!(matches!(
         recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Closed(_)
+        FinishStatus::Ended(SessionEnd::Closed(_))
     ));
 
     // A reset the SDK refuses leaves the options to try again with.
