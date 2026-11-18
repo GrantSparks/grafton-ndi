@@ -8,21 +8,21 @@ export! {
     }
 }
 
-#[cfg(fake_advanced)]
+#[cfg(all(fake_advanced, not(fake_receiver_controls)))]
 #[no_mangle]
 pub unsafe extern "C" fn NDIlib_avsync_create(_receiver: NDIlib_recv_instance_t) -> *mut std::ffi::c_void {
     log("avsync-create");
     Box::into_raw(Box::new(0u8)).cast()
 }
 
-#[cfg(fake_advanced)]
+#[cfg(all(fake_advanced, not(fake_receiver_controls)))]
 #[no_mangle]
 pub unsafe extern "C" fn NDIlib_avsync_destroy(instance: *mut std::ffi::c_void) {
     log("avsync-destroy");
     drop(unsafe { Box::from_raw(instance.cast::<u8>()) });
 }
 
-#[cfg(fake_advanced)]
+#[cfg(all(fake_advanced, not(fake_receiver_controls)))]
 #[no_mangle]
 pub unsafe extern "C" fn NDIlib_avsync_synchronize(
     _instance: *mut std::ffi::c_void,
@@ -34,7 +34,7 @@ pub unsafe extern "C" fn NDIlib_avsync_synchronize(
     -1 // NDIlib_avsync_ret_no_audio_stream_received.
 }
 
-#[cfg(fake_advanced)]
+#[cfg(all(fake_advanced, not(fake_receiver_controls)))]
 #[no_mangle]
 pub unsafe extern "C" fn NDIlib_avsync_free_audio(
     _instance: *mut std::ffi::c_void,
