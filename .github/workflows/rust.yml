@@ -30,6 +30,8 @@ env:
   CARGO_TERM_COLOR: always
   ACTIONLINT_VERSION: 1.7.12
   ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+  WINDOWS_LLVM_VERSION: 20.1.8
+  WINDOWS_LLVM_SHA256: 3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b
 
 jobs:
   # The crate builds without an NDI SDK, so everything in lint, test and cross
@@ -373,6 +375,27 @@ jobs:
       - name: Link the examples for Android
         run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/build-android.sh aarch64-linux-android
 
+  hx-pictures:
+    name: NDI HX test pictures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Generate test pictures
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+          python3 tests/support/generate_hx.py --output-dir "$RUNNER_TEMP/ndi-hx-pictures"
+      - name: Upload test pictures
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ndi-hx-pictures
+          path: |
+            ${{ runner.temp }}/ndi-hx-pictures/quadrants-420.h264
+            ${{ runner.temp }}/ndi-hx-pictures/chroma-444.hevc
+          if-no-files-found: error
+          retention-days: 1
+
   # This job needs the private SDK archives, so it runs only where the secrets
   # exist: not for pull requests from forks, and not for Dependabot, whose runs
   # are given none. The repository variable NDI_CI_RELEASED switches it on, and
@@ -387,6 +410,7 @@ jobs:
   # generated into the target directory must stay on the runner.
   sdk:
     name: sdk (${{ matrix.name }})
+    needs: hx-pictures
     if: >-
       vars.NDI_CI_RELEASED == 'true' && github.actor != 'dependabot[bot]' &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
@@ -619,18 +643,35 @@ jobs:
         if: runner.os == 'Windows' && contains(matrix.package, 'advanced')
         shell: pwsh
         run: |
-          if (!(Test-Path 'C:\Program Files\LLVM\bin\clang.exe')) { choco install llvm --version=20.1.8 -y }
-          'LIBCLANG_PATH=C:\Program Files\LLVM\bin' | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-      - name: NDI HX fixture encoder
+          $version = $env:WINDOWS_LLVM_VERSION
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-$version-win64.exe"
+          $directory = Join-Path $env:RUNNER_TEMP "llvm-$version"
+          Invoke-WebRequest "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe" -OutFile $installer
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash
+          if ($digest -ne $env:WINDOWS_LLVM_SHA256) { throw "LLVM $version SHA-256 mismatch: $digest" }
+          Write-Host "Verified LLVM $version SHA-256: $digest"
+          $process = Start-Process -Wait -PassThru -FilePath $installer -ArgumentList "/S /D=$directory"
+          if ($process.ExitCode -ne 0) { throw "LLVM installer exited $($process.ExitCode)" }
+          $env:LIBCLANG_PATH = Join-Path $directory 'bin'
+          python ci/libclang_version.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "LIBCLANG_PATH=$env:LIBCLANG_PATH" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Download test pictures
+        if: contains(matrix.package, 'advanced')
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ndi-hx-pictures
+          path: '${{ runner.temp }}/ndi-hx-pictures'
+      - name: Use the same test pictures in every Advanced row
         if: contains(matrix.package, 'advanced')
         run: |
-          if ! command -v ffmpeg >/dev/null; then
-            case "$RUNNER_OS" in
-              Linux) sudo apt-get install --yes --no-install-recommends ffmpeg ;;
-              macOS) brew install ffmpeg ;;
-              Windows) choco install ffmpeg --no-progress -y ;;
-            esac
+          pictures="$RUNNER_TEMP/ndi-hx-pictures"
+          if [ "$RUNNER_OS" = macOS ]; then
+            shasum -a 256 "$pictures/quadrants-420.h264" "$pictures/chroma-444.hevc"
+          else
+            sha256sum "$pictures/quadrants-420.h264" "$pictures/chroma-444.hevc"
           fi
+          echo "GRAFTON_NDI_HX_PICTURES=$pictures" >> "$GITHUB_ENV"
       # The only step that is given the acquisition secrets. It exports
       # NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 for the steps that follow, and copies
       # a row's `hx-driver` beside that runtime. The compatibility runs' baseline
@@ -774,7 +815,7 @@ jobs:
   required-ci:
     name: required-ci
     if: always()
-    needs: [lint, test, cross, sdk, miri]
+    needs: [lint, test, cross, hx-pictures, sdk, miri]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

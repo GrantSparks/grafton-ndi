@@ -176,14 +176,22 @@ For example, use `advanced,file` when both are installed. Unknown tokens and
 requirements that the build cannot exercise are errors. Decoder fixtures do
 not establish compatibility with every third-party stream or hardware codec.
 
-Native NDI|HX tests need Python 3 and FFmpeg with the `libx264` and `libx265`
-encoders. They generate their synthetic H.264/HEVC pictures once per test
-process in a temporary directory and remove the files after reading them.
-SDK-free tests do not need these tools. To inspect the pictures separately:
+CI generates the synthetic H.264 and HEVC pictures in a separate job and
+passes the downloaded directory to the Advanced rows as
+`GRAFTON_NDI_HX_PICTURES`. Each row logs the SHA-256 of both files.
+The Windows Advanced rows also log the version of the hash-verified libclang
+DLL from the pinned LLVM release.
+
+For local native NDI|HX tests, leave `GRAFTON_NDI_HX_PICTURES` unset to
+generate the pictures on demand with Python 3 and FFmpeg's `libx264` and
+`libx265` encoders. To generate the pictures once for reuse:
 
 ```sh
 python3 tests/support/generate_hx.py --output-dir target/test-data/ndi-hx
+export GRAFTON_NDI_HX_PICTURES="$PWD/target/test-data/ndi-hx"
 ```
+
+When you set the variable, both files must already be in that directory.
 
 ### Loopback-only test runs
 

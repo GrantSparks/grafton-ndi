@@ -50,14 +50,15 @@ TRIGGERS = {
     'publish.yml': {'push': {'tags': ['v*']}},
 }
 # The actions each job uses, in order. The sdk job has SDK files on disk, so it has no
-# cache and no artifact action; the publish job holds the registry identity.
+# cache and only downloads the test pictures; the publish job holds the registry identity.
 ACTIONS = {
     'rust.yml': {
         'lint': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache', 'actions/upload-pages-artifact'],
         'test': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
         'cross': ['actions/checkout', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
         'miri': ['actions/checkout'],
-        'sdk': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain'],
+        'hx-pictures': ['actions/checkout', 'actions/upload-artifact'],
+        'sdk': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'actions/download-artifact'],
         'required-ci': ['actions/checkout'],
         'deploy-docs': ['actions/deploy-pages'],
     },
@@ -117,7 +118,61 @@ def violations(texts):
                 found.append(f'{name}: {job} has no timeout')
     return (found + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
             + docs_violations(parsed['rust.yml']) + memory_checker_violations(parsed['rust.yml'])
-            + repeated_feature_violations(parsed['rust.yml']))
+            + repeated_feature_violations(parsed['rust.yml'])
+            + sdk_input_violations(parsed['rust.yml']))
+
+
+def sdk_input_violations(rust):
+    """The SDK job gets fixture data and a verified LLVM installer."""
+    jobs = rust['jobs']
+    sdk_job = jobs['sdk']
+    sdk_steps = {step.get('name'): step for step in sdk_job['steps']}
+    fixture_steps = {step.get('name'): step for step in jobs['hx-pictures']['steps']}
+    names = ('quadrants-420.h264', 'chroma-444.hevc')
+    directory = '${{ runner.temp }}/ndi-hx-pictures'
+    upload = fixture_steps.get('Upload test pictures', {})
+    download = sdk_steps.get('Download test pictures', {})
+    found = (differs('rust.yml: SDK picture dependency', sdk_job.get('needs'), 'hx-pictures')
+             + differs('rust.yml: SDK picture upload', upload.get('with'), {
+                 'name': 'ndi-hx-pictures', 'path': '\n'.join(f'{directory}/{name}' for name in names),
+                 'if-no-files-found': 'error', 'retention-days': '1'})
+             + differs('rust.yml: SDK picture download', download.get('with'), {
+                 'name': 'ndi-hx-pictures', 'path': directory})
+             + differs('rust.yml: SDK picture download condition', download.get('if'),
+                       "contains(matrix.package, 'advanced')"))
+    if download and sdk_job['steps'].index(download) > sdk_job['steps'].index(sdk_steps['Provision the SDK']):
+        found.append('rust.yml: SDK pictures must be downloaded before provisioning')
+
+    permitted = {
+        'bubblewrap libavahi-client3',
+        'libclang-19-dev',
+        'gcc-multilib libc6-dev:i386 libavahi-client3:i386',
+        'valgrind',
+    }
+    installs = re.compile(r'\b(apt-get|apt|brew|choco|winget|pip3?|npm|cargo|dnf|yum|pacman)\s+install\b([^\n]*)')
+    for step in sdk_steps.values():
+        for manager, arguments in installs.findall(step.get('run', '')):
+            match = re.fullmatch(r' --yes --no-install-recommends (.+)', arguments)
+            if manager != 'apt-get' or not match or match[1] not in permitted:
+                found.append(f'rust.yml: SDK package install in {step.get("name")}: {manager} install{arguments}')
+
+    pin = rust.get('env', {})
+    if (not re.fullmatch(r'\d+\.\d+\.\d+', pin.get('WINDOWS_LLVM_VERSION', ''))
+            or not re.fullmatch(r'[0-9a-f]{64}', pin.get('WINDOWS_LLVM_SHA256', ''))):
+        found.append('rust.yml: Windows libclang needs a version and SHA-256 pin')
+    script = sdk_steps.get('Windows libclang', {}).get('run', '').splitlines()
+    hash_gate = [
+        '$digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash',
+        'if ($digest -ne $env:WINDOWS_LLVM_SHA256) { throw "LLVM $version SHA-256 mismatch: $digest" }',
+    ]
+    checks = hash_gate + [
+        '$process = Start-Process -Wait -PassThru -FilePath $installer -ArgumentList "/S /D=$directory"',
+        'python ci/libclang_version.py',
+    ]
+    positions = [script.index(line) if line in script else -1 for line in checks]
+    if -1 in positions or positions != sorted(positions):
+        found.append('rust.yml: Windows libclang must verify the installer hash before running it')
+    return found
 
 
 def docs_violations(docs):
@@ -606,7 +661,7 @@ WRONG_EDITS = (
     ('a job the gate does not wait for', 'rust.yml', '  required-ci:\n',
      '  docs:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n    steps:\n      - run: exit 1\n\n  required-ci:\n',
      'required-ci waits for'),
-    ('the gate no longer waits for sdk', 'rust.yml', '    needs: [lint, test, cross, sdk, miri]\n',
+    ('the gate no longer waits for sdk', 'rust.yml', '    needs: [lint, test, cross, hx-pictures, sdk, miri]\n',
      '    needs: [lint, test, cross]\n', 'required-ci waits for'),
     ('the gate skipped when a job fails', 'rust.yml', '    name: required-ci\n    if: always()\n',
      '    name: required-ci\n', 'job conditions'),
@@ -626,6 +681,12 @@ WRONG_EDITS = (
     ('an upload from the sdk job', 'rust.yml', '      - name: Vendored bindings are current\n',
      '      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7\n'
      '        with:\n          path: target\n      - name: Vendored bindings are current\n', 'actions of sdk'),
+    ('an unreviewed SDK package install', 'rust.yml', '          sudo apt-get install --yes --no-install-recommends libclang-19-dev\n',
+     '          sudo apt-get install --yes --no-install-recommends libclang-19-dev ffmpeg\n', 'SDK package install'),
+    ('SDK no longer waits for pictures', 'rust.yml', '    needs: hx-pictures\n', '', 'SDK picture dependency'),
+    ('LLVM installer skips digest comparison', 'rust.yml',
+     '          if ($digest -ne $env:WINDOWS_LLVM_SHA256) { throw "LLVM $version SHA-256 mismatch: $digest" }\n',
+     '', 'verify the installer hash'),
     ('an action pinned by tag', 'publish.yml', 'rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18',
      'rust-lang/crates-io-auth-action@v1', 'pinned to a commit'),
     ('a job without a timeout', 'rust.yml', '    name: cross\n    runs-on: ubuntu-24.04\n    timeout-minutes: 45\n',
