@@ -3105,6 +3105,72 @@ fn configured_machine_names_are_discovered_and_cached_without_dns_restrictions()
     assert!(cache.is_empty());
 }
 
+/// Send a DCI 8K frame in the widest uncompressed format over a native link.
+#[test]
+#[cfg_attr(miri, ignore = "requires the Advanced runtime and a full DCI 8K frame")]
+fn dci_8k_nb4g_sends_and_decodes_at_full_resolution() {
+    use grafton_ndi::{frames::MAX_VIDEO_BYTES, BorrowedVideoFrame, PixelFormat};
+
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    if !ndi.capabilities().supports(RuntimeFeature::Planar444Video)
+        || !ndi.capabilities().supports(RuntimeFeature::ReceiveBest444)
+    {
+        common::unsupported("DCI 8K NB4G exchange needs Planar444Video and ReceiveBest444");
+        return;
+    }
+
+    const WIDTH: u32 = 8192;
+    const HEIGHT: u32 = 4320;
+    let _turn = sockets();
+    let sender = Sender::new(&ndi, &options("dci-8k-nb4g")).unwrap();
+    let receiver = Receiver::new(
+        &ndi,
+        &ReceiverOptions::new(loopback(&ndi, &sender.source().unwrap()))
+            .color_format(ReceiverColorFormat::Best444),
+    )
+    .unwrap();
+
+    let mut frame = VideoFrame::builder()
+        .resolution(WIDTH, HEIGHT)
+        .pixel_format(PixelFormat::Nb4g)
+        .build()
+        .unwrap();
+    assert_eq!(frame.data().len(), MAX_VIDEO_BYTES);
+    let plane_bytes = WIDTH as usize * HEIGHT as usize * size_of::<u16>();
+    for (index, plane) in frame.data_mut().chunks_exact_mut(plane_bytes).enumerate() {
+        for row in plane.chunks_exact_mut(WIDTH as usize * size_of::<u16>()) {
+            for (x, sample) in row.chunks_exact_mut(size_of::<u16>()).enumerate() {
+                let value = match index {
+                    0 => 16_384 + x as u16 * 4,
+                    1 | 2 => 32_768,
+                    _ => u16::MAX,
+                };
+                sample.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    let borrowed = BorrowedVideoFrame::builder(frame.data(), WIDTH, HEIGHT, PixelFormat::Nb4g)
+        .build()
+        .unwrap();
+    assert_eq!(borrowed.data().unwrap().len(), MAX_VIDEO_BYTES);
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        sender.send_video(&frame).unwrap();
+        if let Some(received) = receiver.capture_video_ref(SLICE).unwrap() {
+            assert_eq!((received.width(), received.height()), (WIDTH, HEIGHT));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "DCI 8K frame did not arrive: {}",
+            link(&receiver)
+        );
+    }
+}
+
 /// A real encoded picture exercises the decoder and planar pixel layout. The
 /// adjacent-pixel chroma pattern detects accidental 4:2:2/4:2:0 conversion.
 #[test]

@@ -16,8 +16,7 @@ use crate::{
 };
 pub(crate) use payload::{PacketBytes, PacketSlice};
 
-/// Maximum compressed frame size, in bytes, that this module sends or accepts.
-pub const MAX_PACKET_BYTES: usize = 256 * 1024 * 1024;
+pub use crate::media::MAX_PACKET_BYTES;
 
 const_assert!(MAX_PACKET_BYTES <= i32::MAX as usize);
 
@@ -1845,7 +1844,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         miri,
-        ignore = "the full 256 MiB extent is covered by the native test run"
+        ignore = "the full packet extent is covered by the native test run"
     )]
     fn oversized_packet_lengths_keep_their_container_causes() {
         let bytes = vec![0; MAX_PACKET_BYTES + 1];

@@ -22,7 +22,7 @@ use crate::{
 ///
 /// Width must be positive and divisible by six. Height must be positive. Rows
 /// contain at least `width / 6 * 16` bytes; their stride must be divisible by four.
-/// Both the V210 storage and equivalent P216 frame must fit the 256 MiB video cap.
+/// Both the V210 storage and equivalent P216 frame must fit [`MAX_VIDEO_BYTES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct V210Layout {
     width: u32,

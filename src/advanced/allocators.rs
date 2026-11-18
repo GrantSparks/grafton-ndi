@@ -39,7 +39,7 @@ use std::ffi::c_void;
 
 const MIB: usize = 1024 * 1024;
 
-const MAX_ALLOCATION: usize = super::packets::MAX_PACKET_BYTES;
+pub use crate::media::MAX_ALLOCATION_BYTES;
 
 /// Process-wide limits on custom receive allocation.
 ///
@@ -51,8 +51,8 @@ const MAX_ALLOCATION: usize = super::packets::MAX_PACKET_BYTES;
 /// [`AllocatorUsage::declined`] and [`AllocatorUsage::declined_allocations`].
 ///
 /// The defaults are 256 generations, 1024 allocations, 1 GiB in total, 16
-/// concurrent calls and 64 MiB per allocation, which holds an 8-bit 4:2:2
-/// frame of 8K video.
+/// concurrent calls and 64 MiB per allocation, which holds a packed
+/// 7680×4320 8-bit 4:2:2 frame.
 ///
 /// # How the limits combine
 ///
@@ -153,7 +153,7 @@ impl AllocatorLimits {
         self
     }
 
-    /// The largest single allocation, at most 256 MiB.
+    /// The largest single allocation, at most [`MAX_ALLOCATION_BYTES`].
     #[must_use]
     pub fn max_allocation_bytes(mut self, value: usize) -> Self {
         self.max_allocation_bytes = value;
@@ -169,7 +169,7 @@ impl AllocatorLimits {
         {
             return Err(limits_error(crate::InputDefect::AllocatorPositiveLimits));
         }
-        if self.max_allocation_bytes > MAX_ALLOCATION {
+        if self.max_allocation_bytes > MAX_ALLOCATION_BYTES {
             return Err(limits_error(crate::InputDefect::AllocatorAllocationLimit));
         }
         if self.max_concurrent_calls > self.max_allocations {
@@ -438,7 +438,7 @@ struct OwnedStorage {
 
 // Rounding a valid request up to its 64-byte alignment remains representable
 // in Layout's signed allocation-size bound on every supported target.
-const_assert!(MAX_ALLOCATION <= isize::MAX as usize - 63);
+const_assert!(MAX_ALLOCATION_BYTES <= isize::MAX as usize - 63);
 
 impl OwnedStorage {
     /// Allocate this validated, non-zero request aligned to 64.
@@ -975,7 +975,7 @@ impl Registry {
             self.decline(AllocationDecline::BufferRefused);
             return None;
         }
-        // At most the capacity, which is at most MAX_ALLOCATION.
+        // At most the capacity, which is at most MAX_ALLOCATION_BYTES.
         let stride = match actual.layout {
             RequestLayout::Audio(layout) => layout.sdk_channel_stride(),
             RequestLayout::Video(_) | RequestLayout::Compressed(_) => {
@@ -1622,7 +1622,7 @@ fn video_request(
             layout: RequestLayout::Compressed(AllocationFormat::CompressedVideo(fourcc)),
             width: compressed_dimension(frame.xres)?,
             height: compressed_dimension(frame.yres)?,
-            capacity_limit: MAX_ALLOCATION,
+            capacity_limit: MAX_ALLOCATION_BYTES,
         });
     }
     let pixel =
@@ -1635,7 +1635,7 @@ fn video_request(
         layout: RequestLayout::Video(pixel),
         width: layout.width(),
         height: layout.height(),
-        capacity_limit: MAX_ALLOCATION,
+        capacity_limit: MAX_ALLOCATION_BYTES,
     })
 }
 
@@ -1660,7 +1660,7 @@ fn audio_request(
             ))),
             width: compressed_dimension(frame.no_samples)?,
             height: compressed_dimension(frame.no_channels)?,
-            capacity_limit: MAX_ALLOCATION,
+            capacity_limit: MAX_ALLOCATION_BYTES,
         });
     }
     // The callback chooses a packed stride. The incoming data pointer and
@@ -1679,7 +1679,7 @@ fn audio_request(
         layout: RequestLayout::Audio(layout),
         width: layout.num_samples(),
         height: layout.num_channels(),
-        capacity_limit: MAX_ALLOCATION,
+        capacity_limit: MAX_ALLOCATION_BYTES,
     })
 }
 /// The SDK's request for video memory. `opaque` is the generation token.
@@ -1783,14 +1783,14 @@ mod tests {
                 Err(AllocationDecline::RequestNotRepresentable)
             );
         }
-        for size in [1, MAX_ALLOCATION] {
+        for size in [1, super::super::MAX_PACKET_BYTES] {
             let sdk_size = i32::try_from(size).unwrap();
             let checked = compressed_size(sdk_size).unwrap();
             assert_eq!(checked.to_usize(), size);
             assert_eq!(checked.to_sdk(), sdk_size);
         }
         assert_eq!(
-            compressed_size(i32::try_from(MAX_ALLOCATION + 1).unwrap()),
+            compressed_size(i32::try_from(super::super::MAX_PACKET_BYTES + 1).unwrap()),
             Err(AllocationDecline::RequestNotRepresentable)
         );
     }
@@ -1798,10 +1798,10 @@ mod tests {
     #[test]
     #[cfg_attr(
         miri,
-        ignore = "the full 256 MiB allocation is covered by the native test run"
+        ignore = "the maximum packet allocation is covered by the native test run"
     )]
     fn compressed_allocator_and_capture_accept_the_same_maximum_extent() {
-        let mut bytes = vec![0; MAX_ALLOCATION];
+        let mut bytes = vec![0; super::super::MAX_PACKET_BYTES];
         let size = compressed_size(i32::try_from(bytes.len()).unwrap()).unwrap();
         let mut raw = super::super::VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16)
             .unwrap()
@@ -2156,7 +2156,7 @@ mod tests {
             layout: RequestLayout::Audio(layout),
             width: (bytes / 8) as u32,
             height: 2,
-            capacity_limit: MAX_ALLOCATION,
+            capacity_limit: MAX_ALLOCATION_BYTES,
         }
     }
 
@@ -2845,7 +2845,7 @@ mod tests {
             ));
         }
         assert!(matches!(
-            reason(defaults.max_allocation_bytes(MAX_ALLOCATION + 1)),
+            reason(defaults.max_allocation_bytes(MAX_ALLOCATION_BYTES + 1)),
             crate::InputDefect::AllocatorAllocationLimit
         ));
         assert!(matches!(
@@ -2870,7 +2870,7 @@ mod tests {
             reason(
                 defaults
                     .max_concurrent_calls(32)
-                    .max_allocation_bytes(MAX_ALLOCATION)
+                    .max_allocation_bytes(MAX_ALLOCATION_BYTES)
             ),
             crate::InputDefect::AllocatorByteLimit
         ));
@@ -2890,9 +2890,9 @@ mod tests {
         // the same limits are refused there as unreachable.
         for calls in [4, 16] {
             let limits = defaults
-                .max_allocation_bytes(MAX_ALLOCATION)
+                .max_allocation_bytes(MAX_ALLOCATION_BYTES)
                 .max_concurrent_calls(calls);
-            match calls.checked_mul(MAX_ALLOCATION) {
+            match calls.checked_mul(MAX_ALLOCATION_BYTES) {
                 Some(budget) => {
                     limits.max_bytes(budget).validate().unwrap();
                 }
@@ -2903,7 +2903,7 @@ mod tests {
             }
         }
         defaults
-            .max_allocation_bytes(MAX_ALLOCATION)
+            .max_allocation_bytes(MAX_ALLOCATION_BYTES)
             .max_concurrent_calls(4)
             .validate()
             .unwrap();
@@ -3027,7 +3027,7 @@ mod tests {
             .register(|request: AllocationRequest| {
                 // Twice what the call was granted.
                 let padded = AllocationRequest {
-                    capacity_limit: MAX_ALLOCATION,
+                    capacity_limit: MAX_ALLOCATION_BYTES,
                     ..request
                 };
                 AllocationBuffer::zeroed(padded.with_stride_bytes(request.stride_bytes() * 4)?)

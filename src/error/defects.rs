@@ -1,5 +1,6 @@
 //! Allocation-free causes and the rare diagnostic payloads errors retain.
 use crate::frames::{MAX_AUDIO_BYTES, MAX_METADATA_BYTES, MAX_VIDEO_BYTES};
+use crate::media::MAX_ALLOCATION_BYTES;
 use crate::{ColorInfo, ColorPrimaries, FrameMetadataStatus, PixelFormat, TransferFunction};
 use std::time::Duration;
 use thiserror::Error;
@@ -568,8 +569,8 @@ pub enum InputDefect {
     /// Allocator limits must be positive.
     #[error("Allocator limits must be positive")]
     AllocatorPositiveLimits,
-    /// max_allocation_bytes exceeds 256 MiB.
-    #[error("max_allocation_bytes exceeds 256 MiB")]
+    /// The allocation limit exceeds the maximum supported receive allocation.
+    #[error("max_allocation_bytes exceeds {MAX_ALLOCATION_BYTES} bytes")]
     AllocatorAllocationLimit,
     /// max_concurrent_calls exceeds max_allocations, which counts every call in progress.
     #[error("max_concurrent_calls exceeds max_allocations, which counts every call in progress")]

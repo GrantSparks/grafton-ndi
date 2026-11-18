@@ -1236,7 +1236,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "the 256 MiB extent is checked by the native test run")]
+    #[cfg_attr(
+        miri,
+        ignore = "the full packet extent is checked by the native test run"
+    )]
     fn a_scatter_check_refuses_an_oversized_sum() {
         let blocks = vec![vec![0; super::super::MAX_PACKET_BYTES], vec![1]];
         assert!(matches!(

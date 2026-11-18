@@ -8,6 +8,24 @@ use std::{
 
 use crate::{AudioFormat, Error, PixelFormat, Result};
 
+/// Maximum compressed frame size, in bytes, that the crate sends or accepts.
+pub const MAX_PACKET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Maximum capacity, in bytes, for a single custom receive allocation.
+///
+/// This ceiling covers uncompressed [video](crate::frames::MAX_VIDEO_BYTES),
+/// uncompressed audio and [compressed packets](MAX_PACKET_BYTES).
+pub const MAX_ALLOCATION_BYTES: usize = {
+    let video = crate::frames::MAX_VIDEO_BYTES;
+    let audio = crate::frames::MAX_AUDIO_BYTES;
+    let uncompressed = if video > audio { video } else { audio };
+    if uncompressed > MAX_PACKET_BYTES {
+        uncompressed
+    } else {
+        MAX_PACKET_BYTES
+    }
+};
+
 // An omitted variant makes index() non-exhaustive; a duplicate cannot define
 // its index twice. Keep decoding and iteration tied to the same checked list.
 macro_rules! decoded_variants {

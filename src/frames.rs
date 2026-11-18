@@ -242,6 +242,22 @@ crate::media::decoded_variants!(PixelFormat:
 );
 
 impl PixelFormat {
+    /// Packed storage bytes per pixel across all planes, rounded up for 4:2:0.
+    const fn packed_bytes_per_pixel_ceil(self) -> usize {
+        let info = self.info();
+        let first_plane = info.bytes_per_pixel() as usize;
+        match info.category() {
+            FormatCategory::PackedAlpha
+            | FormatCategory::Planar420
+            | FormatCategory::SemiPlanar420 => first_plane + first_plane.div_ceil(2),
+            FormatCategory::Packed
+            | FormatCategory::SemiPlanar422
+            | FormatCategory::SemiPlanar422Alpha
+            | FormatCategory::Planar444
+            | FormatCategory::Planar444Alpha => first_plane * info.plane_count(),
+        }
+    }
+
     /// The complete readable allocation size for sending this layout.
     ///
     /// `line_stride_bytes` is `None` for tightly packed rows; explicit values
@@ -2671,8 +2687,31 @@ impl AudioFormat {
     }
 }
 
-/// Maximum allowed size for supported video frame data (256 MiB).
-pub(crate) const MAX_VIDEO_BYTES: usize = 256 * 1024 * 1024;
+const DCI_8K_WIDTH: u32 = 8192;
+const DCI_8K_HEIGHT: u32 = 4320;
+
+const fn widest_pixel_bytes() -> usize {
+    let mut widest = 0;
+    let mut index = 0;
+    while index < PixelFormat::ALL.len() {
+        let bytes = PixelFormat::ALL[index].packed_bytes_per_pixel_ceil();
+        if bytes > widest {
+            widest = bytes;
+        }
+        index += 1;
+    }
+    widest
+}
+
+// Revisit the frame and allocator limits when a wider format is introduced.
+const _: () = assert!(widest_pixel_bytes() == PixelFormat::Nb4g.packed_bytes_per_pixel_ceil());
+
+/// Maximum extent in bytes of an uncompressed video frame, excluding SDK send tail room.
+///
+/// Sized to admit a tightly packed DCI 8K frame in every supported
+/// [pixel format](PixelFormat), including 16-bit planar NB4G.
+pub const MAX_VIDEO_BYTES: usize =
+    DCI_8K_WIDTH as usize * DCI_8K_HEIGHT as usize * widest_pixel_bytes();
 
 /// Maximum allowed size for audio frame data (64 MiB).
 /// Comfortably above typical NDI audio frames while preventing unbounded allocations.
@@ -5627,11 +5666,96 @@ mod tests {
         ));
     }
 
-    /// Test that MAX_VIDEO_BYTES constant is properly defined
     #[test]
-    fn test_max_video_bytes_constant() {
-        // Verify the crate resource cap is set to 256 MiB
-        assert_eq!(MAX_VIDEO_BYTES, 256 * 1024 * 1024);
+    fn dci_8k_fits_every_supported_pixel_format() {
+        for format in PixelFormat::ALL {
+            let stride = format.line_stride_bytes(DCI_8K_WIDTH).unwrap();
+            let extent = format
+                .buffer_len(DCI_8K_WIDTH, DCI_8K_HEIGHT, Some(stride))
+                .unwrap();
+            let sdk_layout = ValidatedVideoLayout::from_sdk_checked(
+                format,
+                DCI_8K_WIDTH as i32,
+                DCI_8K_HEIGHT as i32,
+                stride as i32,
+            )
+            .unwrap();
+            assert_eq!(sdk_layout.data_len_bytes(), extent, "{format:?}");
+            assert!(extent <= MAX_VIDEO_BYTES, "{format:?}");
+
+            // An empty input lets each builder report its admitted extent
+            // without allocating hundreds of megabytes for the test.
+            let owned = VideoFrame::builder()
+                .resolution(DCI_8K_WIDTH, DCI_8K_HEIGHT)
+                .pixel_format(format)
+                .data(Vec::new())
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(owned.error(), Error::InvalidFrame(
+                crate::FrameDefect::VideoDataLength { actual: 0, expected }
+            ) if *expected == extent),
+                "{format:?}: {owned}"
+            );
+            let borrowed = BorrowedVideoFrame::builder(&[], DCI_8K_WIDTH, DCI_8K_HEIGHT, format)
+                .line_stride_bytes(stride)
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(borrowed, Error::InvalidFrame(
+                crate::FrameDefect::VideoBufferTooSmall { actual: 0, minimum, .. }
+            ) if minimum == extent),
+                "{format:?}: {borrowed}"
+            );
+        }
+    }
+
+    #[test]
+    fn nb4g_dci_8k_sets_the_video_extent_limit() {
+        let format = PixelFormat::Nb4g;
+        let stride = format.line_stride_bytes(DCI_8K_WIDTH).unwrap();
+        assert_eq!(
+            format
+                .buffer_len(DCI_8K_WIDTH, DCI_8K_HEIGHT, Some(stride))
+                .unwrap(),
+            MAX_VIDEO_BYTES
+        );
+
+        let height = DCI_8K_HEIGHT + 1;
+        let extent = MAX_VIDEO_BYTES + stride * format.info().plane_count();
+        let expected = crate::LayoutDefect::VideoBytes((extent as u64).into());
+        let matches_extent = |error: &Error| {
+            matches!(error, Error::InvalidFrame(
+            crate::FrameDefect::Layout(cause)
+        ) if *cause == expected)
+        };
+        let sdk_layout = ValidatedVideoLayout::from_sdk_checked(
+            format,
+            DCI_8K_WIDTH as i32,
+            height as i32,
+            stride as i32,
+        );
+        assert_eq!(sdk_layout.unwrap_err(), expected);
+        assert!(matches_extent(
+            &format
+                .buffer_len(DCI_8K_WIDTH, height, Some(stride))
+                .unwrap_err()
+        ));
+        assert!(matches_extent(
+            VideoFrame::builder()
+                .resolution(DCI_8K_WIDTH, height)
+                .pixel_format(format)
+                .data(Vec::new())
+                .build()
+                .unwrap_err()
+                .error()
+        ));
+        assert!(matches_extent(
+            &BorrowedVideoFrame::builder(&[], DCI_8K_WIDTH, height, format)
+                .line_stride_bytes(stride)
+                .build()
+                .unwrap_err()
+        ));
     }
 
     /// Test that MAX_AUDIO_BYTES constant is properly defined

@@ -4,6 +4,7 @@
 //! reordered fields or lost context cannot silently preserve a generic message.
 
 use super::*;
+use crate::media::MAX_ALLOCATION_BYTES;
 use crate::{ColorInfo, FrameMetadataStatus, PixelFormat, TransferFunction};
 use std::time::Duration;
 
@@ -178,6 +179,7 @@ fn frame_defect_diagnostics_preserve_their_text() {
 
 #[test]
 fn input_defect_diagnostics_preserve_their_text() {
+    let allocator_limit = format!("max_allocation_bytes exceeds {MAX_ALLOCATION_BYTES} bytes");
     let cases = [
         ("Layout", InputDefect::Layout(LayoutDefect::VideoZeroStride), "Video line stride must be positive, got 0"),
         ("ListElement", InputDefect::ListElement { setting: "groups", index: 2 }, "groups element 2 must be nonempty and contain neither a comma nor a NUL"),
@@ -196,7 +198,7 @@ fn input_defect_diagnostics_preserve_their_text() {
         ("SessionCounterExhausted", InputDefect::SessionCounterExhausted, "the session counter is exhausted"),
         ("RecorderGenerationExhausted", InputDefect::RecorderGenerationExhausted, "the recorder generation is exhausted"),
         ("AllocatorPositiveLimits", InputDefect::AllocatorPositiveLimits, "Allocator limits must be positive"),
-        ("AllocatorAllocationLimit", InputDefect::AllocatorAllocationLimit, "max_allocation_bytes exceeds 256 MiB"),
+        ("AllocatorAllocationLimit", InputDefect::AllocatorAllocationLimit, &allocator_limit),
         ("AllocatorConcurrentLimit", InputDefect::AllocatorConcurrentLimit, "max_concurrent_calls exceeds max_allocations, which counts every call in progress"),
         ("AllocatorByteLimit", InputDefect::AllocatorByteLimit, "max_bytes is less than max_concurrent_calls allocations of max_allocation_bytes"),
         ("CompressedAllocationStride", InputDefect::CompressedAllocationStride, "Compressed allocations have a byte size, not a configurable stride"),
