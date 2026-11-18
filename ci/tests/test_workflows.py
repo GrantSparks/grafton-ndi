@@ -72,7 +72,6 @@ ACTIONS = {
 }
 PUBLISH_NEEDS = {'release': None, 'ci': 'release', 'verify': 'ci', 'publish': 'verify'}
 OUTSIDE_THE_CHECKOUT = '${{ runner.temp }}'
-MANIFEST = '--manifest-path "$GITHUB_WORKSPACE/Cargo.toml"'
 
 
 def read_workflows():
@@ -86,6 +85,11 @@ def cargo_manifest():
 def msrv_version(manifest):
     value = manifest['package']['rust-version']
     return value + '.0' if value.count('.') == 1 else value
+
+
+def workflow_obligations(manifest):
+    return workflows.obligations(msrv_version(manifest), set(manifest['features']) - {'default'},
+                                 sdk_test_scope.MIRI_GROUPS)
 
 
 def platform_coverage(text):
@@ -136,12 +140,13 @@ def violations(texts):
                     found += differs(f'{name}: toolchain of {job}', step.get('with', {}).get('toolchain'), pinned_release)
             if 'runs-on' in body and not re.fullmatch(r'\d+', body.get('timeout-minutes', '')):
                 found.append(f'{name}: {job} has no timeout')
-    return (found + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
+    manifest = cargo_manifest()
+    return (found + workflows.obligation_violations(parsed, workflow_obligations(manifest))
+            + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
             + docs_violations(parsed['rust.yml']) + memory_checker_violations(parsed['rust.yml'])
             + repeated_feature_violations(parsed['rust.yml'])
-            + test_failure_reporting_violations(parsed['rust.yml'])
             + sdk_input_violations(parsed['rust.yml'])
-            + source_consistency_violations(parsed, cargo_manifest(), sdk.load_pins(),
+            + source_consistency_violations(parsed, manifest, sdk.load_pins(),
                                             (ROOT / 'docs/setup.md').read_text(encoding='utf-8')))
 
 
@@ -151,18 +156,10 @@ def source_consistency_violations(parsed, manifest, pins, setup):
     lint = {step.get('name'): step for step in jobs['lint']['steps']}
     sdk_steps = {step.get('name'): step for step in jobs['sdk']['steps']}
     minimum = msrv_version(manifest)
-    expected = (
-        ('Minimum supported Rust version', lint, '', '--workspace '),
-        ('Lint and document the Advanced implementation', sdk_steps, ' --target "$TARGET"', ''),
-    )
     found = []
-    for name, steps, target, workspace in expected:
+    for name, steps in (('Minimum supported Rust version', lint),
+                        ('Lint and document the Advanced implementation', sdk_steps)):
         step = steps.get(name, {})
-        script = step.get('run', '').splitlines()
-        commands = (f'rustup toolchain install {minimum} --profile minimal{target}',
-                    f'cargo +{minimum} check --locked {workspace}--all-targets{target} --all-features')
-        if any(command not in script for command in commands):
-            found.append(f'rust.yml: {name} must install and check Cargo.toml rust-version {minimum}')
         if step.get('env', {}).get('RUSTFLAGS') != '-D warnings':
             found.append(f'rust.yml: {name} must deny warnings on Cargo.toml rust-version {minimum}')
     for workflow, body in parsed.items():
@@ -212,35 +209,10 @@ def sdk_input_violations(rust):
     if download and sdk_job['steps'].index(download) > sdk_job['steps'].index(sdk_steps['Provision the SDK']):
         found.append('rust.yml: SDK pictures must be downloaded before provisioning')
 
-    permitted = {
-        'bubblewrap libavahi-client3',
-        'libclang-19-dev',
-        'gcc-multilib libc6-dev:i386 libavahi-client3:i386',
-        'valgrind',
-    }
-    installs = re.compile(r'\b(apt-get|apt|brew|choco|winget|pip3?|npm|cargo|dnf|yum|pacman)\s+install\b([^\n]*)')
-    for step in sdk_steps.values():
-        for manager, arguments in installs.findall(step.get('run', '')):
-            match = re.fullmatch(r' --yes --no-install-recommends (.+)', arguments)
-            if manager != 'apt-get' or not match or match[1] not in permitted:
-                found.append(f'rust.yml: SDK package install in {step.get("name")}: {manager} install{arguments}')
-
     pin = rust.get('env', {})
     if (not re.fullmatch(r'\d+\.\d+\.\d+', pin.get('WINDOWS_LLVM_VERSION', ''))
             or not re.fullmatch(r'[0-9a-f]{64}', pin.get('WINDOWS_LLVM_SHA256', ''))):
         found.append('rust.yml: Windows libclang needs a version and SHA-256 pin')
-    script = sdk_steps.get('Windows libclang', {}).get('run', '').splitlines()
-    hash_gate = [
-        '$digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash',
-        'if ($digest -ne $env:WINDOWS_LLVM_SHA256) { throw "LLVM $version SHA-256 mismatch: $digest" }',
-    ]
-    checks = hash_gate + [
-        '$process = Start-Process -Wait -PassThru -FilePath $installer -ArgumentList "/S /D=$directory"',
-        'python ci/libclang_version.py',
-    ]
-    positions = [script.index(line) if line in script else -1 for line in checks]
-    if -1 in positions or positions != sorted(positions):
-        found.append('rust.yml: Windows libclang must verify the installer hash before running it')
     return found
 
 
@@ -260,7 +232,7 @@ def docs_violations(docs):
                       ['latest'])
             + differs('rust.yml: Pages tip check token', tip.get('env'), {'GH_TOKEN': '${{ github.token }}'})
             + differs('rust.yml: Pages deployment tip guard', deployment.get('if'), "steps.latest.outputs.deploy == 'true'")
-            + rustdoc_feature_violations(jobs['lint']['steps']) + implementation_coverage_violations(docs))
+            + rustdoc_feature_violations(jobs['lint']['steps']) + sdk_matrix_violations(docs))
 
 
 def rustdoc_feature_violations(steps):
@@ -271,27 +243,13 @@ def rustdoc_feature_violations(steps):
 
     found = differs('rust.yml: rustdoc feature combinations', feature_loops(rustdoc), feature_loops(clippy))
     found += differs('rust.yml: rustdoc denies warnings', rustdoc.get('env'), {'RUSTDOCFLAGS': '-D warnings'})
-    if 'cargo doc --locked --no-deps --no-default-features ${features:+--features "$features"}' not in rustdoc.get('run', ''):
-        found.append('rust.yml: rustdoc feature combinations do not build their selected features')
     names = [step.get('name') for step in steps]
     if 'Rustdoc feature combinations' not in names or names.index('Rustdoc feature combinations') >= names.index('Rustdoc'):
         found.append('rust.yml: all-features rustdoc must be built last for checking and publication')
     return found
 
 
-REPEATED_FEATURE_TESTS = (
-    ('Tests, default features', 'cargo test --locked --no-fail-fast', 'default'),
-    ('Tests, File API without Advanced wrappers',
-     'cargo test --locked --no-fail-fast --no-default-features --features file-io', 'file'),
-)
-
-
-def scoped_commands(command, stem):
-    return (
-        f'{command} -- --list > "$scope_dir/{stem}-tests.txt"',
-        f'python ci/sdk_test_scope.py --scope fixed-graph --inventory "$scope_dir/{stem}-tests.txt" --output "$scope_dir/{stem}-skips.txt"',
-        f'{command} -- "${{scope_args[@]}}"',
-    )
+REPEATED_FEATURE_TESTS = ('Tests, default features', 'Tests, File API without Advanced wrappers')
 
 
 def repeated_feature_violations(rust):
@@ -299,24 +257,12 @@ def repeated_feature_violations(rust):
     steps = rust['jobs']['test']['steps']
     names = [step.get('name') for step in steps]
     owner = next((step for step in steps if step.get('name') == 'Tests, all features'), {})
-    found = differs('rust.yml: fixed compiler owner', owner.get('run'), 'cargo test --locked --no-fail-fast --all-features')
-    if 'if' in owner:
-        found.append('rust.yml: fixed compiler owner must run on every test host')
-    for name, command, stem in REPEATED_FEATURE_TESTS:
+    found = []
+    for name in REPEATED_FEATURE_TESTS:
         step = next((step for step in steps if step.get('name') == name), {})
-        if 'if' in step:
-            found.append(f'rust.yml: repeated feature step {name} must run on every test host')
         for setting in ('env', 'working-directory'):
             if step.get(setting) != owner.get(setting):
                 found.append(f'rust.yml: repeated feature step {name} changes fixed compiler inputs: {setting}')
-        lines = [line.strip() for line in step.get('run', '').splitlines()]
-        required = (*scoped_commands(command, stem),
-                    'scope_dir="${RUNNER_TEMP:-target/ci}"', 'mkdir -p "$scope_dir"',
-                    'scope_args=()',
-                    f'while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/{stem}-skips.txt"')
-        for line in required:
-            if lines.count(line) != 1:
-                found.append(f'rust.yml: repeated feature step {name} lacks one guarded scope operation: {line}')
         if name not in names or 'Tests, all features' not in names or names.index(name) <= names.index('Tests, all features'):
             found.append(f'rust.yml: repeated feature step {name} has no earlier fixed compiler owner')
     return found
@@ -330,32 +276,33 @@ def local_recipe_violations(rust, readme):
              for line in recipe.splitlines()]
     found = []
     checks = (
-        ('lint', 'CI scripts and workflows', 'python -m unittest discover -s ci/tests'),
-        ('lint', 'Format', 'cargo fmt --all -- --check'),
-        ('lint', 'Clippy', 'cargo clippy --locked --workspace --all-targets --all-features -- -D warnings'),
-        ('lint', 'Clippy', 'cargo clippy --locked --all-targets --no-default-features ${features:+--features "$features"} -- -D warnings'),
-        ('lint', 'Bindings generator tests', 'cargo test --locked --package xtask'),
-        ('lint', 'Rustdoc feature combinations', 'cargo doc --locked --no-deps --no-default-features ${features:+--features "$features"}'),
-        ('lint', 'Rustdoc', 'cargo doc --locked --no-deps --all-features'),
-        ('lint', 'Documentation links and examples', 'python ci/docs.py --compile --rustdoc target/doc'),
-        ('test', 'Tests, all features', 'cargo test --locked --no-fail-fast --all-features'),
-    ) + tuple(('test', name, scoped)
-              for name, command, stem in REPEATED_FEATURE_TESTS
-              for scoped in scoped_commands(command, stem))
+        ('lint', 'CI scripts and workflows', ('python ',)),
+        ('lint', 'Format', ('cargo ',)),
+        ('lint', 'Clippy', ('cargo ',)),
+        ('lint', 'Bindings generator tests', ('cargo ',)),
+        ('lint', 'Rustdoc feature combinations', ('cargo ',)),
+        ('lint', 'Rustdoc', ('cargo ',)),
+        ('lint', 'Documentation links and examples', ('python ',)),
+        ('test', 'Tests, all features', ('cargo ',)),
+        *(('test', name, ('cargo ', 'python ')) for name in REPEATED_FEATURE_TESTS),
+    )
     positions = []
-    for job, name, command in checks:
+    for job, name, prefixes in checks:
         step = next((step for step in rust['jobs'][job]['steps'] if step.get('name') == name), {})
-        if command not in [line.strip() for line in step.get('run', '').splitlines()]:
-            found.append(f'rust.yml: local recipe step {name} no longer runs {command}')
-        if command.startswith('cargo doc '):
-            if f'RUSTDOCFLAGS="-D warnings" {command}' not in [line.strip() for line in recipe.splitlines()]:
-                found.append(f'ci/README.md: local recipe rustdoc does not deny warnings: {command}')
-            if step.get('env') != {'RUSTDOCFLAGS': '-D warnings'}:
-                found.append(f'rust.yml: local recipe step {name} does not deny warnings')
-        if command not in lines:
-            found.append(f'ci/README.md: local recipe omits {command}')
-        else:
-            positions.append(lines.index(command))
+        commands = [line for _, _, line in workflows.shell_statements(step.get('run', ''))
+                    if line.startswith(prefixes)]
+        if not commands:
+            found.append(f'rust.yml: local recipe step {name} has no documented command')
+        for command in commands:
+            if command.startswith('cargo doc '):
+                if f'RUSTDOCFLAGS="-D warnings" {command}' not in [line.strip() for line in recipe.splitlines()]:
+                    found.append(f'ci/README.md: local recipe rustdoc does not deny warnings: {command}')
+                if step.get('env') != {'RUSTDOCFLAGS': '-D warnings'}:
+                    found.append(f'rust.yml: local recipe step {name} does not deny warnings')
+            if command not in lines:
+                found.append(f'ci/README.md: local recipe omits {command}')
+            else:
+                positions.append(lines.index(command))
     if positions != sorted(positions):
         found.append('ci/README.md: local recipe steps differ from lint and test order')
     expected = []
@@ -389,18 +336,6 @@ def memcheck_recipe_violations(rust, readme):
             expected.append(shlex.split(line))
         if not actual or actual != expected:
             found.append(f'ci/README.md: {name} recipe differs from the workflow')
-    return found
-
-
-def test_failure_reporting_violations(rust):
-    found = []
-    for job in ('test', 'sdk'):
-        for step in rust['jobs'][job]['steps']:
-            for command in step.get('run', '').splitlines():
-                if command.strip().startswith('cargo test '):
-                    args = shlex.split(command)
-                    if '--no-fail-fast' not in args[:args.index('--') if '--' in args else len(args)]:
-                        found.append(f'rust.yml: {job} step {step.get("name")} must report all test binaries')
     return found
 
 
@@ -545,106 +480,13 @@ def sdk_matrix_violations(rust):
     return found
 
 
-def implementation_coverage_violations(rust):
-    """Real Advanced code and both compatibility editions must be checked."""
-    named = {step.get('name'): step for step in rust['jobs']['sdk']['steps']}
-    advanced = named.get('Lint and document the Advanced implementation', {})
-    found = sdk_matrix_violations(rust)
-    found += differs('rust.yml: Advanced implementation owner', advanced.get('if'),
-                     when("matrix.role == 'primary' && contains(matrix.package, 'advanced')"))
-    for role, name in (
-        ('current-headers', 'Current Advanced headers with baseline runtimes'),
-        ('baseline-headers', 'Baseline SDK builds with the current Advanced runtime'),
-    ):
-        step = named.get(name, {})
-        script = step.get('run', '')
-        found += differs(f'rust.yml: {name} scheduling role', step.get('if'), when(f"matrix.role == '{role}'"))
-        for required in ('failed=0', '--all-features -- "${skip_args[@]}" || failed=1', 'exit "$failed"'):
-            if required not in script:
-                found.append(f'rust.yml: {name} does not accumulate compatibility failures')
-        headers = 'advanced' if role == 'current-headers' else '"$edition"'
-        required = ('--all-features -- --list > "$inventory"',
-                    'python ci/sdk_test_scope.py --inventory "$inventory" --target "$TARGET" '
-                    f'--headers {headers} --output "$skip_file"',
-                    'while IFS= read -r argument; do skip_args+=("$argument"); done < "$skip_file"')
-        if any(command not in script for command in required):
-            found.append(f'rust.yml: {name} lacks validated runtime-independent selection')
-    for name in ('Tests against the real runtime, all features',
-                 'Tests against the real runtime, no default features'):
-        step = named.get(name, {})
-        found += differs(f'rust.yml: {name} primary owner', step.get('if'), when("matrix.role == 'primary'"))
-        script = step.get('run', '')
-        if '--skip' in script:
-            found.append(f'rust.yml: {name} omits the primary configuration checks')
-        if name.endswith('all features'):
-            required = ('if [ "${{ matrix.test-scope }}" = synthetic-headers ]; then',
-                        '--all-features -- --list > "$inventory"',
-                        'python ci/sdk_test_scope.py --scope synthetic-headers --inventory "$inventory" --output "$skip_file"',
-                        'cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}"')
-            if any(command not in script for command in required):
-                found.append('rust.yml: primary SDK synthetic-header scope lacks its validated owner selection')
-        elif 'sdk_test_scope' in script or 'skip_args' in script:
-            found.append('rust.yml: default SDK configuration omits full primary checks')
-    return found
-
-
 def memory_checker_violations(rust):
-    """Both interpreters and live padding checks must fail required jobs."""
-    jobs = rust['jobs']
-    miri = jobs.get('miri', {})
-    steps = {step.get('name'): step for step in miri.get('steps', [])}
-    setup = steps.get('Pinned Miri toolchain', {}).get('run', '')
-    run = steps.get('Initialized rows, metadata and synthetic native guards', {}).get('run', '')
-    found = differs('rust.yml: Miri aliasing models',
+    """The workflow schedules both Miri models."""
+    miri = rust['jobs'].get('miri', {})
+    return (differs('rust.yml: Miri aliasing models',
                     miri.get('strategy', {}).get('matrix', {}).get('model'), ['stacked', 'tree'])
-    found += differs('rust.yml: Miri model selection', miri.get('env', {}).get('MIRIFLAGS'),
-                     "${{ matrix.model == 'tree' && '-Zmiri-tree-borrows' || '' }}")
-    for command in ('rustup toolchain install nightly-2026-11-10 --profile minimal --component miri,rust-src',
-                    'cargo +nightly-2026-11-10 miri setup'):
-        if command not in setup:
-            found.append('rust.yml: Miri setup does not pin the checked nightly and components')
-    command = 'cargo +nightly-2026-11-10 miri test --locked --lib --features advanced,file-io,image-encoding,tokio'
-    for selection in ('-- --exact "${tests[@]}" --test-threads=1', '-- --list > "$inventory"'):
-        if f'{command} {selection}' not in run:
-            found.append('rust.yml: Miri does not list fixtures and execute exact serial selections')
-    if run.count('-- --list') != 1:
-        found.append('rust.yml: Miri must read one interpreted test inventory')
-    group_loop = 'for group in ' + ' '.join(sdk_test_scope.MIRI_GROUPS) + '; do'
-    if group_loop not in run:
-        found.append('rust.yml: Miri must run each audited selection group')
-    if 'python3 ci/sdk_test_scope.py select --group "$group" --inventory "$inventory" --output "$selection"' not in run:
-        found.append('rust.yml: Miri lacks the inventory selection guard')
-
-    test = next((step for step in jobs['test']['steps']
-                 if step.get('name') == 'Memcheck over scripted capture and encoder padding'), {})
-    sdk = next((step for step in jobs['sdk']['steps']
-                if step.get('name') == 'Memcheck over SDK padding'), {})
-    found += differs('rust.yml: scripted Memcheck condition', test.get('if'), "runner.os == 'Linux'")
-    found += differs('rust.yml: SDK Memcheck condition', sdk.get('if'),
-                     when("matrix.name == 'linux-x64 standard-6.3.2'"))
-    for owner, step in (('test', test), ('sdk', sdk)):
-        command = step.get('run', '')
-        if '--suppressions=' in command:
-            found.append(f'rust.yml: {owner} Memcheck must report unsuppressed errors')
-        for required in ('valgrind', '--tool=memcheck', '--error-exitcode=99'):
-            if required not in command:
-                found.append(f'rust.yml: {owner} Memcheck does not fail on detector errors')
-        if owner not in jobs['required-ci'].get('needs', []):
-            found.append(f'rust.yml: {owner} Memcheck is not required')
-    for required in ('--trace-children=yes', '--trace-children-skip=', '--test mixed_capture_boundary',
-                     '--test frame_metadata_boundary'):
-        if required not in test.get('run', ''):
-            found.append('rust.yml: scripted Memcheck omits active SDK-free fixtures or their child processes')
-    for owner, step, group in (('test', test, 'encoder-padding'), ('sdk', sdk, 'sdk-padding')):
-        if (f'python3 ci/sdk_test_scope.py select --group {group} --inventory "$inventory" --output "$selection"' not in step.get('run', '')
-                or '-- --exact "${tests[@]}" --test-threads=1' not in step.get('run', '')):
-            found.append(f'rust.yml: {owner} Memcheck lacks guarded exact selections')
-    for required in ('ci/offline/linux.sh', '--test video_padding_sdk', '--features image-encoding'):
-        if required not in sdk.get('run', ''):
-            found.append('rust.yml: live Memcheck omits SDK padding or loopback isolation')
-    if 'miri' not in jobs['required-ci'].get('needs', []):
-        found.append('rust.yml: Miri is not required')
-    return found
+            + differs('rust.yml: Miri model selection', miri.get('env', {}).get('MIRIFLAGS'),
+                      "${{ matrix.model == 'tree' && '-Zmiri-tree-borrows' || '' }}"))
 
 
 def gate_violations(rust):
@@ -654,8 +496,8 @@ def gate_violations(rust):
     step = gate['steps'][-1]
     return (differs('rust.yml: jobs required-ci waits for', sorted(gate.get('needs') or []),
                     sorted(set(jobs) - {'required-ci', 'deploy-docs'}))
-            + differs('rust.yml: the gate step', (step.get('run'), step.get('env')), ('python3 ci/gate.py', {
-                'RESULTS': '${{ toJSON(needs) }}', 'SDK_EXPECTED': f'${{{{ {SECRETS_AVAILABLE} }}}}'}))
+            + differs('rust.yml: the gate step', step.get('env'), {
+                'RESULTS': '${{ toJSON(needs) }}', 'SDK_EXPECTED': f'${{{{ {SECRETS_AVAILABLE} }}}}'})
             + differs('rust.yml: the step given the secrets',
                       [(item.get('name'), item['env']) for item in jobs['sdk']['steps']
                        if any('secrets' in value.lower() for value in (item.get('env') or {}).values())],
@@ -667,39 +509,23 @@ def publish_violations(publish):
     jobs = publish['jobs']
     job = jobs['publish']
     scripts = [step for step in job['steps'] if 'run' in step]
-    text = '\n'.join(step['run'] for step in scripts)
-    cargo = re.findall(r'^\s*cargo (\w+)(.*)$', text, re.MULTILINE)
     found = (differs('publish.yml: job order', {name: body.get('needs') for name, body in jobs.items()}, PUBLISH_NEEDS)
              + differs('publish.yml: secrets passed to CI', jobs['ci'].get('secrets'), PASSED_SECRETS)
              + differs('publish.yml: environment of publish', job.get('environment'), 'crates-io')
              + differs('publish.yml: values publish takes from verify', job.get('env'), {
                  'VERIFIED_SHA256': '${{ needs.verify.outputs.sha256 }}',
                  'VERIFIED_TOOLCHAIN': '${{ needs.verify.outputs.toolchain }}'})
-             + differs('publish.yml: cargo commands in publish', [command for command, _ in cargo], ['package', 'publish'])
              + differs('publish.yml: where the registry token goes',
                        {place: value for place, value in workflows.entries(publish) if 'steps.auth' in value.lower()},
                        {'jobs.publish.steps[Publish].env.CARGO_REGISTRY_TOKEN': '${{ steps.auth.outputs.token }}'}))
     # Cargo reads configuration from the working directory upwards, so it must not start in the checkout.
     found += [f'publish.yml: step {step["name"]!r} of publish runs in the checkout'
               for step in scripts if step.get('working-directory') != OUTSIDE_THE_CHECKOUT]
-    found += [f'publish.yml: cargo {command} in publish lacks {option}' for command, arguments in cargo
-              for option in ('--locked', '--no-verify', MANIFEST) if option not in arguments]
-    if text.count('GITHUB_WORKSPACE') != len(cargo) or re.search(r'python|(^|[\s"\'=])(ci|scripts|xtask)/', text):
-        found.append('publish.yml: publish reads or runs something from the checkout besides the manifest')
-    # The verified digest is compared with the digest of the one named file, not with a file of digests.
-    for needed in ('[[ "$VERIFIED_SHA256" =~ ^[0-9a-f]{64}$ ', '[ "$actual" != "$VERIFIED_SHA256" ]',
-                   'actual=$(sha256sum "$CARGO_TARGET_DIR/package/grafton-ndi-${GITHUB_REF_NAME#v}.crate" | cut'):
-        if needed not in text:
-            found.append(f'publish.yml: publish no longer contains {needed!r}')
     return found
 
 
 # Plausible wrong edits: (name, workflow, text to replace, replacement, words the report must contain).
 WRONG_EDITS = (
-    ('compatibility failure stops later editions', 'rust.yml',
-     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}" || failed=1\n          done\n          exit "$failed"\n      # A Standard',
-     '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}"\n          done\n          exit "$failed"\n      # A Standard',
-     'accumulate compatibility failures'),
     ('toolchain differs from contributor pin', 'publish.yml', '          toolchain: 1.100.0\n',
      '          toolchain: 1.99.1\n', 'toolchain of verify'),
     ('Pages deploy without CI', 'rust.yml', '    needs: required-ci\n', '', 'job order'),
@@ -754,12 +580,7 @@ WRONG_EDITS = (
     ('an upload from the sdk job', 'rust.yml', '      - name: Vendored bindings are current\n',
      '      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7\n'
      '        with:\n          path: target\n      - name: Vendored bindings are current\n', 'actions of sdk'),
-    ('an unreviewed SDK package install', 'rust.yml', '          sudo apt-get install --yes --no-install-recommends libclang-19-dev\n',
-     '          sudo apt-get install --yes --no-install-recommends libclang-19-dev ffmpeg\n', 'SDK package install'),
     ('SDK no longer waits for pictures', 'rust.yml', '    needs: hx-pictures\n', '', 'SDK picture dependency'),
-    ('LLVM installer skips digest comparison', 'rust.yml',
-     '          if ($digest -ne $env:WINDOWS_LLVM_SHA256) { throw "LLVM $version SHA-256 mismatch: $digest" }\n',
-     '', 'verify the installer hash'),
     ('an action pinned by tag', 'publish.yml', 'rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18',
      'rust-lang/crates-io-auth-action@v1', 'pinned to a commit'),
     ('a job without a timeout', 'rust.yml', '    name: cross\n    runs-on: ubuntu-24.04\n    timeout-minutes: 45\n',
@@ -777,18 +598,6 @@ WRONG_EDITS = (
     ('cargo publish started in the checkout', 'publish.yml',
      '      - name: Publish\n        working-directory: ${{ runner.temp }}\n', '      - name: Publish\n',
      'runs in the checkout'),
-    ('cargo publish without the manifest path', 'publish.yml',
-     'cargo publish --locked --no-verify --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"',
-     'cd "$GITHUB_WORKSPACE" && cargo publish --locked --no-verify', 'cargo commands in publish'),
-    ('publish builds the crate', 'publish.yml', 'cargo publish --locked --no-verify', 'cargo publish --locked',
-     'lacks --no-verify'),
-    ('publish runs a repository script', 'publish.yml', '          rustup toolchain install "$VERIFIED_TOOLCHAIN"',
-     '          python3 "$GITHUB_WORKSPACE/ci/release.py" "$GITHUB_REF_NAME"\n'
-     '          rustup toolchain install "$VERIFIED_TOOLCHAIN"', 'from the checkout'),
-    ('the digest checked against a file of digests', 'publish.yml', 'if [ "$actual" != "$VERIFIED_SHA256" ]; then',
-     'if ! sha256sum --check SHA256SUMS; then', 'no longer contains'),
-    ('the digest taken unchecked', 'publish.yml', '[[ "$VERIFIED_SHA256" =~ ^[0-9a-f]{64}$ && ', '[[ ',
-     'no longer contains'),
     ('the registry token to another step', 'publish.yml',
      '      - name: Re-create the verified package\n        working-directory: ${{ runner.temp }}\n',
      '      - name: Re-create the verified package\n        working-directory: ${{ runner.temp }}\n'
@@ -811,6 +620,85 @@ class Rules(unittest.TestCase):
                 self.assertEqual(texts[workflow].count(old), 1, 'the edit no longer applies to the workflow')
                 report = violations({**texts, workflow: texts[workflow].replace(old, new)})
                 self.assertTrue(any(expected in line for line in report), report)
+
+    def test_every_decisive_command_is_protected_from_removal_extra_arguments_and_bypass(self):
+        parsed = {name: workflows.load(text) for name, text in read_workflows().items()}
+        table = workflow_obligations(cargo_manifest())
+        self.assertEqual(workflows.obligation_violations(parsed, table), [])
+        for key, obligation in table.items():
+            workflow, job, name = key
+            step = next(step for step in parsed[workflow]['jobs'][job]['steps']
+                        if step.get('name') == name)
+            for change, statement, script in workflows.command_mutations(step['run'], obligation.shell):
+                with self.subTest(step=name, change=change, statement=statement):
+                    report = workflows.step_violations(key, {**step, 'run': script}, obligation)
+                    self.assertTrue(any(name in error for error in report), report)
+
+    def test_every_run_step_has_one_obligation(self):
+        parsed = {name: workflows.load(text) for name, text in read_workflows().items()}
+        table = workflow_obligations(cargo_manifest())
+        steps = parsed['rust.yml']['jobs']['cross']['steps']
+        steps.append({'name': 'Unclassified', 'run': 'true'})
+        steps.append(dict(steps[-2]))
+        name = 'Clippy for every dynamically loaded target'
+        steps.remove(next(step for step in steps if step.get('name') == name))
+        report = workflows.obligation_violations(parsed, table)
+        for expected in ('Unclassified: no workflow obligation', 'Link the examples for Android: repeated run step',
+                         f'{name}: missing step for workflow obligation'):
+            self.assertTrue(any(expected in error for error in report), report)
+
+
+class ExecutionPolicies(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.jobs = workflows.load(read_workflows()['rust.yml'])['jobs']
+
+    def run_step(self, job, name, tools, *, directory=ROOT, **extra_env):
+        step = next(step for step in self.jobs[job]['steps'] if step.get('name') == name)
+        return subprocess.run(['bash', '-eo', 'pipefail', '-c', tools + '\n' + step['run']],
+                              cwd=directory, env={**os.environ, **extra_env}, text=True, capture_output=True)
+
+    def test_cross_checks_later_targets_after_a_failure(self):
+        tools = """rustup() { true; }
+cargo() {
+  while [ "$1" != --target ]; do shift; done
+  printf '%s\n' "$2"
+  [ "$2" != fail ]
+}
+"""
+        result = self.run_step('cross', 'Clippy for every dynamically loaded target', tools,
+                               TARGETS='first fail last')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['first', 'fail', 'last', '::error::clippy failed for: fail'])
+
+    def test_isolation_fails_if_only_the_online_check_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = Path(directory) / 'ci/offline/linux.sh'
+            runner.parent.mkdir(parents=True)
+            runner.write_text('#!/bin/bash\nprintf "isolated %s\\n" "$*"\nexit 15\n')
+            runner.chmod(0o755)
+            tools = 'python() { printf "online %s\\n" "$*"; }'
+            result = self.run_step('sdk', 'Test runner leaves loopback networking only', tools,
+                                   directory=directory, RUNNER_OS='Linux')
+        self.assertEqual(result.returncode, 15, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['online ci/offline/check.py --online',
+                                                      'isolated python3 ci/offline/check.py'])
+
+    def test_sdk_memcheck_fails_before_running_an_empty_inventory(self):
+        tools = """sudo() { true; }
+cargo() {
+  case " $* " in
+    *" --list "*) echo '0 tests, 0 benchmarks' ;;
+    *) echo 'unexpected test invocation'; exit 99 ;;
+  esac
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_step('sdk', 'Memcheck over SDK padding', tools,
+                                   TARGET='x86_64-unknown-linux-gnu', RUNNER_TEMP=directory)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("test selection group 'sdk-padding' inventory differs", result.stderr)
+        self.assertNotIn('unexpected test invocation', result.stdout)
 
     def test_reader_refuses_yaml_it_cannot_see_through(self):
         self.assertEqual(workflows.load('a:\n  - b: c\n    d: [e, \'f\']  # g\n  - h\ni: >-\n  j\n  k\nl: |\n  m\n  # n\n'),
@@ -914,10 +802,6 @@ class SdkJob(unittest.TestCase):
             driver, package = self.pins[row['hx-driver']], self.pins[row['package']]
             self.assertEqual((driver['platform'], driver['version']), (package['platform'], package['version']))
             self.assertIn(row['target'], sdk.DRIVERS[driver['driver']].directories)
-        provision = next(step for step in self.job['steps'] if step.get('name') == 'Provision the SDK')['run']
-        self.assertIn('if [ -n "${{ matrix.hx-driver }}" ]; then\n  python ci/sdk.py install-driver '
-                      '"${{ matrix.hx-driver }}" --sdk "$RUNNER_TEMP/ndi-sdk" --target "$TARGET"\nfi', provision)
-
     def test_each_step_promises_exactly_what_its_build_can_check(self):
         """A promise no test in the build can check fails that build; a missing one lets tests skip."""
         for row in self.primary:
@@ -928,17 +812,6 @@ class SdkJob(unittest.TestCase):
                     # `1` is implied by every other entry, so it is spelt out only when it stands alone.
                     self.assertEqual(set(promise.split(',')) | {'1'},
                                      checkable(target, pin, all_features=all_features, driver=driver))
-        command = 'cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast '
-        for name, flags, environment in (
-            ('Tests against the real runtime, all features', '--all-features',
-             {'GRAFTON_NDI_REQUIRE_RUNTIME': '${{ matrix.require }}'}),
-            ('Tests against the real runtime, no default features', '--no-default-features',
-             {'GRAFTON_NDI_REQUIRE_RUNTIME': "${{ matrix.require-no-default || '1' }}"}),
-        ):
-            step = next(step for step in self.job['steps'] if step.get('name') == name)
-            self.assertEqual(step['env'], environment)
-            self.assertIn(command + flags, step['run'])
-
     def test_a_failing_step_does_not_hide_the_steps_after_it(self):
         """Every step after the isolation check runs whenever that check passed, so one run reports everything
         that is wrong with a row; none runs when the runner was not shown to isolate."""
@@ -972,9 +845,6 @@ class SdkJob(unittest.TestCase):
             with self.subTest(step=step['name']):
                 self.assertRegex(step.get('timeout-minutes', ''), r'^\d+$')
                 self.assertLess(int(step['timeout-minutes']), job)
-                if 'continue-on-error' not in step:
-                    self.assertIn('--no-fail-fast', step['run'])
-
     def test_compatibility_runs_use_independent_headers_and_runtime_identity(self):
         rows = [row for row in self.rows if 'compatibility' in row]
         self.assertEqual({self.pins[row['compatibility']]['platform'] for row in rows},
@@ -989,26 +859,6 @@ class SdkJob(unittest.TestCase):
                             sdk.version_tuple(self.pins[row['package']]['version']))
             self.assertEqual(self.pins[row['compatibility']]['platform'],
                              self.pins[row['package']]['platform'])
-        steps = [step for step in self.job['steps'] if step.get('if') in {when("matrix.role == 'current-headers'"),
-                                                 when("matrix.role == 'baseline-headers'")}]
-        self.assertEqual(len(steps), 2)
-        for step in steps:
-            self.assertNotIn('env', step)
-            self.assertIn('export GRAFTON_NDI_REQUIRE_RUNTIME=', step['run'])
-            self.assertIn('cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features',
-                          step['run'])
-            self.assertIn('ndi-compat-$edition.env', step['run'])
-            self.assertIn('for edition in standard advanced; do', step['run'])
-        self.assertIn('export NDI_SDK_DIR="${{ steps.sdk.outputs.NDI_SDK_DIR }}"', steps[0]['run'])
-        for name, source in [('GRAFTON_NDI_PEER_RUNTIME', 'GRAFTON_NDI_EXPECTED_RUNTIME'),
-                             ('GRAFTON_NDI_PEER_VERSION', 'GRAFTON_NDI_EXPECTED_VERSION'),
-                             ('GRAFTON_NDI_PEER_EDITION', 'GRAFTON_NDI_EXPECTED_EDITION')]:
-            self.assertIn(f'export {name}="${{{{ steps.sdk.outputs.{source} }}}}"', steps[0]['run'])
-            self.assertIn(f'export {name}="${source}"', steps[1]['run'])
-        for name in ('NDI_RUNTIME_DIR_V6', 'GRAFTON_NDI_EXPECTED_VERSION',
-                     'GRAFTON_NDI_EXPECTED_EDITION', 'GRAFTON_NDI_EXPECTED_RUNTIME'):
-            self.assertIn(f'export {name}="${{{{ steps.sdk.outputs.{name} }}}}"', steps[1]['run'])
-
     def test_compatibility_loops_run_the_second_edition_after_a_failure(self):
         steps = [step for step in self.job['steps'] if step.get('if') in {
             when("matrix.role == 'current-headers'"), when("matrix.role == 'baseline-headers'")}]
@@ -1083,41 +933,6 @@ class SdkJob(unittest.TestCase):
             with self.subTest(mutation=mutation):
                 self.assertTrue(any(expected in line for line in sdk_matrix_violations(changed)))
 
-    def test_compatibility_selection_guards_require_inventory_and_scoped_arguments(self):
-        rust = workflows.load(self.texts['rust.yml'])
-        self.assertEqual(implementation_coverage_violations(rust), [])
-        names = ('Current Advanced headers with baseline runtimes',
-                 'Baseline SDK builds with the current Advanced runtime')
-        for name in names:
-            for old, new in (
-                ('-- --list > "$inventory"', '> "$inventory"'),
-                ('python ci/sdk_test_scope.py', 'python ci/misspelled.py'),
-                ('--target "$TARGET" --headers', '--headers'),
-                ('done < "$skip_file"', 'done < /dev/null'),
-                ('--all-features -- "${skip_args[@]}" || failed=1', '--all-features || failed=1'),
-            ):
-                changed = copy.deepcopy(rust)
-                step = next(step for step in changed['jobs']['sdk']['steps'] if step.get('name') == name)
-                self.assertIn(old, step['run'])
-                step['run'] = step['run'].replace(old, new)
-                with self.subTest(step=name, removed=old):
-                    self.assertTrue(implementation_coverage_violations(changed))
-        changed = copy.deepcopy(rust)
-        step = next(step for step in changed['jobs']['sdk']['steps']
-                    if step.get('name') == 'Tests against the real runtime, all features')
-        step['run'] += ' --skip compile_contracts'
-        self.assertTrue(any('omits the primary' in line for line in implementation_coverage_violations(changed)))
-        for old, new in (
-            ('if [ "${{ matrix.test-scope }}" = synthetic-headers ]; then', 'if true; then'),
-            ('--scope synthetic-headers --inventory', '--scope runtime --inventory'),
-        ):
-            changed = copy.deepcopy(rust)
-            step = next(step for step in changed['jobs']['sdk']['steps']
-                        if step.get('name') == 'Tests against the real runtime, all features')
-            step['run'] = step['run'].replace(old, new)
-            self.assertTrue(any('validated owner selection' in line
-                                for line in implementation_coverage_violations(changed)))
-
     def test_each_compatibility_pass_promises_exactly_what_it_can_check(self):
         """The first step builds with the row's headers against each baseline runtime, the second with each
         baseline's headers against the row's runtime; a Standard baseline has no headers a build reads. Only
@@ -1174,44 +989,11 @@ class MemoryCheckers(unittest.TestCase):
             self.assertNotIn('obj:', block)
             self.assertIn('Memcheck:Addr8', block)
 
-    def test_missing_detector_configuration_is_reported(self):
+    def test_missing_aliasing_model_is_reported(self):
         rust = workflows.load(read_workflows()['rust.yml'])
         self.assertEqual(memory_checker_violations(rust), [])
-        variants = []
-        missing_model = copy.deepcopy(rust)
-        missing_model['jobs']['miri']['strategy']['matrix']['model'].remove('tree')
-        variants.append((missing_model, 'aliasing models'))
-        unpinned = copy.deepcopy(rust)
-        unpinned['jobs']['miri']['steps'][1]['run'] = 'cargo +nightly miri setup'
-        variants.append((unpinned, 'pin the checked nightly'))
-        for job in ('test', 'sdk'):
-            ineffective = copy.deepcopy(rust)
-            step = next(step for step in ineffective['jobs'][job]['steps']
-                        if step.get('name', '').startswith('Memcheck over '))
-            step['run'] = step['run'].replace('--error-exitcode=99', '')
-            variants.append((ineffective, 'fail on detector errors'))
-        for job, name, group in (
-            ('miri', 'Initialized rows, metadata and synthetic native guards', '"$group"'),
-            ('test', 'Memcheck over scripted capture and encoder padding', 'encoder-padding'),
-            ('sdk', 'Memcheck over SDK padding', 'sdk-padding'),
-        ):
-            missing_guard = copy.deepcopy(rust)
-            step = next(step for step in missing_guard['jobs'][job]['steps'] if step.get('name') == name)
-            step['run'] = step['run'].replace(f'select --group {group}', 'select')
-            variants.append((missing_guard, 'selection guard' if job == 'miri' else 'guarded exact selections'))
-        for change in ('remove', 'repeat'):
-            broken_inventory = copy.deepcopy(rust)
-            step = broken_inventory['jobs']['miri']['steps'][2]
-            inventory = next(line for line in step['run'].splitlines() if '-- --list' in line)
-            step['run'] = step['run'].replace(inventory, '' if change == 'remove' else inventory + '\n' + inventory)
-            message = 'list fixtures' if change == 'remove' else 'one interpreted test inventory'
-            variants.append((broken_inventory, message))
-        ungated = copy.deepcopy(rust)
-        ungated['jobs']['required-ci']['needs'].remove('miri')
-        variants.append((ungated, 'Miri is not required'))
-        for broken, expected in variants:
-            with self.subTest(expected=expected):
-                self.assertTrue(any(expected in error for error in memory_checker_violations(broken)))
+        rust['jobs']['miri']['strategy']['matrix']['model'].remove('tree')
+        self.assertTrue(any('aliasing models' in error for error in memory_checker_violations(rust)))
 
 
 class Repository(unittest.TestCase):
@@ -1268,10 +1050,7 @@ class Repository(unittest.TestCase):
         self.assertTrue(any('Cargo.toml rust-version' in error for error in violations_for(workflow=changed_msrv)))
         advanced_step['run'] = advanced_step['run'].replace(min_version, next_version + '.0')
         self.assertEqual(violations_for(workflow=changed_msrv, cargo=new_manifest), [])
-        advanced_step['run'] = '\n'.join(line for line in advanced_step['run'].splitlines()
-                                         if not line.startswith('cargo +'))
-        self.assertTrue(any('Cargo.toml rust-version' in error
-                            for error in violations_for(workflow=changed_msrv, cargo=new_manifest)))
+        self.assertEqual(workflows.obligation_violations(changed_msrv, workflow_obligations(new_manifest)), [])
 
         new_feature = copy.deepcopy(manifest)
         new_feature['features']['metrics'] = []
@@ -1300,11 +1079,6 @@ class Repository(unittest.TestCase):
             'GRAFTON_NDI_SIZES': '64x64', 'GRAFTON_NDI_FORMATS': 'Bgra',
             'GRAFTON_NDI_CONTENTS': 'photographic', 'GRAFTON_NDI_OUTPUTS': 'jpeg85',
         })
-        self.assertIn('cargo test --locked --no-fail-fast --release --all-features --lib -- --ignored --list', step['run'])
-        self.assertIn('python3 ci/sdk_test_scope.py select --group measurements', step['run'])
-        self.assertIn('cargo test --locked --no-fail-fast --release --all-features --lib -- --ignored --exact "${tests[@]}" --test-threads=1',
-                      step['run'])
-
     def test_vendored_bindings_cover_exactly_the_supported_platform_targets(self):
         setup = (ROOT / 'docs/setup.md').read_text(encoding='utf-8')
         supported = set(platform_coverage(setup))
@@ -1315,18 +1089,6 @@ class Repository(unittest.TestCase):
         checked = [primary, *re.findall(r'"([^"]+)"', equivalents)]
         self.assertEqual(len(checked), len(set(checked)), 'ABI targets must not repeat')
         self.assertEqual(set(checked), supported)
-
-    def test_bindings_check_selects_the_visionos_capable_linux_libclang(self):
-        sdk_job = workflows.load(read_workflows()['rust.yml'])['jobs']['sdk']
-        install = next(step for step in sdk_job['steps'] if step.get('name') == 'Linux libclang')
-        self.assertIn('libclang-19-dev', install['run'])
-        self.assertIn("echo 'LIBCLANG_PATH=/usr/lib/llvm-19/lib' >> \"$GITHUB_ENV\"", install['run'])
-
-    def test_semver_check_runs_where_no_secret_is(self):
-        texts = read_workflows()
-        lint = workflows.load(texts['rust.yml'])['jobs']['lint']
-        self.assertIn('python ci/semver.py', [step.get('run') for step in lint['steps']])
-        self.assertNotIn('semver-checks', ''.join(texts.values()))
 
     def test_workflows_name_only_features_the_crate_has(self):
         features = set(cargo_manifest()['features']) - {'default'}
@@ -1413,31 +1175,14 @@ class RepeatedFeatureScopes(unittest.TestCase):
     def test_fixed_compiler_owner_and_selection_cannot_be_removed(self):
         rust = workflows.load(read_workflows()['rust.yml'])
         self.assertEqual(repeated_feature_violations(rust), [])
-        for name, command, stem in REPEATED_FEATURE_TESTS:
-            for operation in (*scoped_commands(command, stem), 'scope_args=()',
-                              f'while IFS= read -r argument; do scope_args+=("$argument"); done < "$scope_dir/{stem}-skips.txt"'):
-                with self.subTest(step=name, missing=operation):
-                    broken = copy.deepcopy(rust)
-                    step = next(step for step in broken['jobs']['test']['steps'] if step.get('name') == name)
-                    step['run'] = step['run'].replace(operation, '')
-                    self.assertTrue(repeated_feature_violations(broken))
+        for name in REPEATED_FEATURE_TESTS:
             for setting, value in (('env', {'NDI_SDK_DIR': 'a-different-header-build'}),
-                                   ('working-directory', 'another-workspace'),
-                                   ('if', 'false'), ('if', False)):
+                                   ('working-directory', 'another-workspace')):
                 with self.subTest(step=name, changed=setting):
                     broken = copy.deepcopy(rust)
                     step = next(step for step in broken['jobs']['test']['steps'] if step.get('name') == name)
                     step[setting] = value
                     self.assertTrue(repeated_feature_violations(broken))
-        for condition in (None, 'false'):
-            broken = copy.deepcopy(rust)
-            steps = broken['jobs']['test']['steps']
-            owner = next(step for step in steps if step.get('name') == 'Tests, all features')
-            if condition is None:
-                owner['run'] += ' -- --skip native_loans_and_slot_keys_require_their_owner'
-            else:
-                owner['if'] = condition
-            self.assertTrue(repeated_feature_violations(broken))
         broken = copy.deepcopy(rust)
         steps = broken['jobs']['test']['steps']
         owner = next(step for step in steps if step.get('name') == 'Tests, all features')
@@ -1469,7 +1214,7 @@ case " $* " in
 esac
 ''')
             cargo.chmod(0o755)
-            for name, command, stem in REPEATED_FEATURE_TESTS:
+            for name in REPEATED_FEATURE_TESTS:
                 step = next(step for step in rust['jobs']['test']['steps'] if step.get('name') == name)
                 for missing in ('', fixed[0]):
                     with self.subTest(step=name, missing=missing):
@@ -1488,7 +1233,7 @@ esac
                         else:
                             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                             self.assertEqual(len(calls), 2)
-                            expected = shlex.split(command)[1:] + ['--']
+                            expected = shlex.split(calls[0])[:shlex.split(calls[0]).index('--') + 1]
                             for test in sorted(fixed):
                                 expected += ['--skip', test]
                             self.assertEqual(shlex.split(calls[-1]), expected)
