@@ -630,7 +630,7 @@ impl FileRecorder {
                 break;
             }
         }
-        debug_assert!(waiters.is_empty(), "a completed drain settles every waiter");
+        debug_invariant!(waiters.is_empty(), "a completed drain settles every waiter");
     }
 
     /// Stop and destroy the recorder at once, without waiting for the SDK to

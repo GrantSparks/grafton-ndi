@@ -52,7 +52,8 @@
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::unreachable,
-        clippy::panic
+        clippy::panic,
+        clippy::disallowed_macros
     )
 )]
 // Android has no native thread-locals, so std expands `thread_local!` through
@@ -81,6 +82,16 @@ macro_rules! const_assert {
     ($($assertion:tt)+) => {
         const_assert!({ assert!($($assertion)+) });
     };
+}
+
+macro_rules! debug_invariant {
+    ($($args:tt)+) => {{
+        // Clippy sees the release assert macro inside std's debug expansion.
+        #[allow(clippy::disallowed_macros, reason = "this check runs only with debug assertions enabled")]
+        {
+            std::debug_assert!($($args)+);
+        }
+    }};
 }
 
 mod capture;
@@ -207,3 +218,7 @@ mod runtime_binding_contract;
 #[cfg(ndi_test_frame_source)]
 #[path = "../tests/ui/internal/frame_source.rs"]
 mod frame_source_contract;
+
+#[cfg(ndi_test_assertion_policy)]
+#[path = "../tests/ui/internal/assertion_policy.rs"]
+mod assertion_policy_contract;

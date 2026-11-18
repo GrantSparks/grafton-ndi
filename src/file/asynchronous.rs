@@ -1447,10 +1447,10 @@ impl Drop for Place {
     fn drop(&mut self) {
         if self.reserve {
             let previous = self.admission.state.fetch_and(!1, Ordering::AcqRel);
-            debug_assert_ne!(previous & 1, 0);
+            debug_invariant!(previous & 1 != 0);
         } else {
             let previous = self.admission.state.fetch_sub(2, Ordering::AcqRel);
-            debug_assert_ne!(previous >> 1, 0);
+            debug_invariant!(previous >> 1 != 0);
         }
     }
 }

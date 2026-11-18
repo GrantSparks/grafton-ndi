@@ -204,7 +204,7 @@ fn validate_metadata_prefix(raw: &NDIlib_metadata_frame_t) -> Result<usize> {
 }
 
 fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<()> {
-    debug_assert!(len_with_nul > 0, "metadata includes its terminator");
+    debug_invariant!(len_with_nul > 0, "metadata includes its terminator");
 
     if len_with_nul > MAX_METADATA_BYTES {
         return Err(Error::InvalidFrame(crate::FrameDefect::MetadataTooLarge {

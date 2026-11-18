@@ -389,7 +389,7 @@ impl State {
                 frame.into_frame(),
             ));
         };
-        debug_assert!(self.free.len() + self.retained() <= self.options.frames);
+        debug_invariant!(self.free.len() + self.retained() <= self.options.frames);
         let Some(slot_key) = self.free.pop() else {
             return Err(Rejected::new(
                 Error::QueueFull(QueueLimit::Frames),

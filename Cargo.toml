@@ -30,6 +30,7 @@ include = [
     "/build_support.rs",
     "/README.md",
     "/CHANGELOG.md",
+    "/clippy.toml",
     "/LICENSE",
 ]
 

@@ -420,7 +420,7 @@ pub(super) fn validate_video_width(width: i64) -> LayoutResult<()> {
 }
 
 pub(super) fn validate_video_data_len(data_len_bytes: u64) -> LayoutResult<()> {
-    debug_assert!(
+    debug_invariant!(
         data_len_bytes > 0,
         "validated dimensions and stride are positive"
     );
@@ -576,7 +576,7 @@ fn video_plane_layouts(
             row_count,
         };
         offset += row_stride * row_count;
-        debug_assert!(active_row_bytes <= row_stride);
+        debug_invariant!(active_row_bytes <= row_stride);
     }
     // The complete storage extent and each partial sum fit MAX_VIDEO_BYTES.
     // Active rows fit their strides, so payload products and sums fit too.
@@ -914,7 +914,7 @@ impl ValidatedAudioLayout {
         // packed() preserves that proof when removing inter-channel padding.
         let start = channel * self.channel_stride_samples();
         let end = start + self.no_samples();
-        debug_assert!(end <= self.sample_count);
+        debug_invariant!(end <= self.sample_count);
         Some(start..end)
     }
 

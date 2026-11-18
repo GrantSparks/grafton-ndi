@@ -1019,7 +1019,7 @@ pub(crate) mod in_flight {
                 // Retain native pointees even if a future owner forgets proof.
                 mem::forget(frame);
                 if !std::thread::panicking() {
-                    debug_assert!(
+                    debug_invariant!(
                         false,
                         "in-flight frame dropped without synchronization or destruction"
                     );

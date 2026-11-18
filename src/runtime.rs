@@ -622,7 +622,7 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
                 self.cv.notify_all();
             }
             other => {
-                debug_assert!(false, "release() called while runtime was {other:?}");
+                debug_invariant!(false, "release() called while runtime was {other:?}");
             }
         }
     }
