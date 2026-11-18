@@ -313,12 +313,15 @@ fn the_sdk_converts_with_bt709_at_every_size_whatever_the_tag_says() {
                  differs by {interior:.2}; the frame differs by up to {largest}, {mean:.3} on \
                  average"
             );
-            if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-                assert_eq!(
-                    (largest, mean),
-                    (0, 0.0),
-                    "{case}: the loopback transport was lossless for this frame on Linux x86-64"
-                );
+            // Linux x86-64 previously delivered byte-identical UYVY in
+            // this fixture. On other targets report an observed difference
+            // when only the patch-integrity check can be used.
+            if largest != 0 && !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                common::unsupported(&format!(
+                    "lossless UYVY loopback for {case}, maximum difference {largest}, mean {mean:.3}"
+                ));
+            } else {
+                assert_eq!((largest, mean), (0, 0.0), "{case}: lossless UYVY loopback");
             }
             // The tag reaches both receivers unchanged.
             assert_eq!(
