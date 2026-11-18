@@ -175,6 +175,7 @@ OS_ONLY = {
 HEADER_TEST = 'partial_advanced_headers_disable_only_the_missing_declarations'
 # A compiler-only or truncated inventory must not masquerade as the full suite.
 NATIVE_WITNESS = 'handles_keep_runtime_alive_until_last_drop_and_allow_reinitialization'
+PEER_WITNESS = 'different_sdk_versions_exchange_video_audio_and_metadata'
 FIXED_GRAPH = (
     'attached_modes_fail_the_internal_capture_entry_points',
     'frame_parts_require_the_matching_descriptor_validator',
@@ -283,12 +284,14 @@ def expected_tests(target=None, headers=None, scope='runtime'):
                   and (name not in OS_ONLY or TARGET_OSES[target] in OS_ONLY[name]))
 
 
-def skip_arguments(inventory, target=None, headers=None, scope='runtime'):
+def skip_arguments(inventory, target=None, headers=None, scope='runtime', *, require_peer=False):
     """Return safe global libtest --skip arguments; retain every unknown test."""
     names = [line[:-6] for line in inventory.splitlines() if line.endswith(': test')]
     expected = expected_tests(target, headers, scope)
     if names.count(NATIVE_WITNESS) != 1:
         raise ValueError(f'inventory must contain one native lifecycle test: {NATIVE_WITNESS}')
+    if require_peer and (names.count(PEER_WITNESS) != 1 or any(name in PEER_WITNESS for name in expected)):
+        raise ValueError(f'inventory must retain one cross-SDK peer exchange: {PEER_WITNESS}')
     for name in expected:
         # Libtest --skip matches substrings globally, across all test binaries
         # and doctests. Count occurrences as well as distinct spellings.
@@ -390,13 +393,16 @@ def main(argv=None):
     parser.add_argument('--scope', choices=SCOPES, default='runtime')
     parser.add_argument('--target', choices=TARGET_OSES)
     parser.add_argument('--headers', choices=('standard', 'advanced'))
+    parser.add_argument('--require-peer', action='store_true',
+                        help='require one unfiltered cross-SDK transport test')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
     if args.scope == 'runtime' and (args.target is None or args.headers is None):
         parser.error('runtime scope requires --target and --headers')
     try:
         inventory = args.inventory.read_text(encoding='utf-8')
-        arguments = skip_arguments(inventory, args.target, args.headers, args.scope)
+        arguments = skip_arguments(inventory, args.target, args.headers, args.scope,
+                                   require_peer=args.require_peer)
         write_arguments(args.output, arguments)
     except (OSError, ValueError) as error:
         parser.error(str(error))

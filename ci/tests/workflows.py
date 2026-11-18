@@ -219,7 +219,7 @@ def step_violations(key, step, obligation):
     if step.get('shell') != obligation.shell:
         problems.append(f'{name}: execution shell no longer matches the obligation')
     runtime = (step.get('env') or {}).get('GRAFTON_NDI_REQUIRE_RUNTIME')
-    expected_runtime = None if obligation.runtime == 'exported per edition' else obligation.runtime
+    expected_runtime = None if obligation.runtime == 'peer exported per edition' else obligation.runtime
     if runtime != expected_runtime:
         problems.append(f'{name}: runtime requirement differs from the obligation: {expected_runtime!r}')
     expected = argument_vectors(obligation.script)
@@ -623,21 +623,21 @@ def obligations(msrv, features, miri_groups):
         inventory="$RUNNER_TEMP/ndi-current-headers-tests.txt"
         skip_file="$RUNNER_TEMP/ndi-current-headers-skips.txt"
         cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- --list > "$inventory"
-        python ci/sdk_test_scope.py --inventory "$inventory" --target "$TARGET" --headers advanced --output "$skip_file"
+        python ci/sdk_test_scope.py --inventory "$inventory" --target "$TARGET" --headers advanced --require-peer --output "$skip_file"
         skip_args=()
         while IFS= read -r argument; do skip_args+=("$argument"); done < "$skip_file"
         failed=0
         for edition in standard advanced; do
           while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
           export NDI_SDK_DIR="${{ steps.sdk.outputs.NDI_SDK_DIR }}"
-          if [ "$edition" = advanced ]; then export GRAFTON_NDI_REQUIRE_RUNTIME=advanced; else export GRAFTON_NDI_REQUIRE_RUNTIME=1; fi
+          if [ "$edition" = advanced ]; then export GRAFTON_NDI_REQUIRE_RUNTIME=advanced,peer; else export GRAFTON_NDI_REQUIRE_RUNTIME=1,peer; fi
           cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}" || failed=1
         done
         exit "$failed"
         ''',
         failure='accumulate',
         selection='validated-skips',
-        runtime='exported per edition',
+        runtime='peer exported per edition',
         condition="${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.role == 'current-headers' }}",
     )
     table['rust.yml', 'sdk', 'Baseline SDK builds with the current Advanced runtime'] = Obligation(
@@ -655,11 +655,11 @@ def obligations(msrv, features, miri_groups):
           require="${{ matrix.require }}"
           require="${require/,h264-decoder/}"; require="${require/,hevc-444-decoder/}"
           if [ "$edition" = standard ]; then require="${require/advanced/1}"; fi
-          export GRAFTON_NDI_REQUIRE_RUNTIME="$require"
+          export GRAFTON_NDI_REQUIRE_RUNTIME="$require,peer"
           inventory="$RUNNER_TEMP/ndi-baseline-$edition-tests.txt"
           skip_file="$RUNNER_TEMP/ndi-baseline-$edition-skips.txt"
           cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- --list > "$inventory" || { failed=1; continue; }
-          python ci/sdk_test_scope.py --inventory "$inventory" --target "$TARGET" --headers "$edition" --output "$skip_file" || { failed=1; continue; }
+          python ci/sdk_test_scope.py --inventory "$inventory" --target "$TARGET" --headers "$edition" --require-peer --output "$skip_file" || { failed=1; continue; }
           skip_args=()
           while IFS= read -r argument; do skip_args+=("$argument"); done < "$skip_file"
           cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}" || failed=1
@@ -668,7 +668,7 @@ def obligations(msrv, features, miri_groups):
         ''',
         failure='accumulate',
         selection='validated-skips',
-        runtime='exported per edition',
+        runtime='peer exported per edition',
         condition="${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.role == 'baseline-headers' }}",
     )
 

@@ -134,6 +134,13 @@ class RuntimeTestScopeTests(unittest.TestCase):
                     self.assertEqual(remaining, list(NATIVE))
                     self.assertGreater(len(skips), 0)
 
+    def test_compatibility_inventory_must_retain_the_promised_peer_exchange(self):
+        text = inventory(extra=(*NATIVE, scope.PEER_WITNESS))
+        self.assertTrue(scope.skip_arguments(text, LINUX, 'standard', require_peer=True))
+        for unavailable in (inventory(), text + listed(scope.PEER_WITNESS)):
+            with self.assertRaisesRegex(ValueError, 'retain one cross-SDK peer exchange'):
+                scope.skip_arguments(unavailable, LINUX, 'standard', require_peer=True)
+
     def test_an_empty_or_compiler_only_inventory_is_refused(self):
         for text in ('', '0 tests, 0 benchmarks\n', inventory(extra=())):
             with self.subTest(text=text[:30]):

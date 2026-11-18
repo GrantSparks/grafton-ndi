@@ -709,7 +709,7 @@ cargo() {
                 workflows.load(text)
 
 
-def checkable(target, pin, *, all_features, headers=None, driver=None, decoders=True):
+def checkable(target, pin, *, all_features, headers=None, driver=None, decoders=True, peer=None):
     """What tests can check in a build for `target` running against the package `pin`.
 
     `headers` is the package the build reads its headers from, `pin` itself
@@ -727,6 +727,7 @@ def checkable(target, pin, *, all_features, headers=None, driver=None, decoders=
     frames instead of HEVC 4:4:4, so the HEVC test runs there without being
     counted.
     `decoders=False` leaves both out, as the compatibility runs do.
+    `peer` supplies a second pinned runtime for their transport exchange.
     """
     platform, advanced = pin['platform'], pin['edition'] == 'advanced'
     declared = (headers or pin)['edition'] == 'advanced'
@@ -736,6 +737,8 @@ def checkable(target, pin, *, all_features, headers=None, driver=None, decoders=
     decoder = decoders and (platform == 'apple' or driven)
     h264 = decoder or (decoders and platform == 'windows')
     found = {'1'}
+    if peer is not None and peer['platform'] == platform and peer['version'] != pin['version']:
+        found.add('peer')
     if platform == 'linux' and current:
         found.add('discovery-server')
     if all_features and advanced and declared:
@@ -755,7 +758,8 @@ def exported_promises(step, require):
     Bash runs the step's loop with only its lines that set the promise, `matrix.require` replaced by `require`.
     """
     lines = [line for line in step['run'].splitlines()
-             if line.lstrip().startswith('for edition in') or 'require' in line.lower()]
+             if line.lstrip().startswith('for edition in')
+             or re.search(r'(?:^|[ ;])(?:export )?(?:GRAFTON_NDI_REQUIRE_RUNTIME|require)=', line)]
     script = '\n'.join(lines + ['  echo "$edition $GRAFTON_NDI_REQUIRE_RUNTIME"', 'done'])
     script = script.replace('${{ matrix.require }}', require)
     if '${{' in script:
@@ -946,12 +950,12 @@ class SdkJob(unittest.TestCase):
             baselines = {'standard': self.pins[row['compatibility']], 'advanced': self.pins[row['compatibility-advanced']]}
             with self.subTest(row=row['name'], step=baseline_runtimes['name']):
                 self.assertEqual(exported_promises(baseline_runtimes, row['require']),
-                                 {edition: checkable(target, pin, all_features=True, headers=current, decoders=False)
+                                 {edition: checkable(target, pin, all_features=True, headers=current, decoders=False, peer=current)
                                   for edition, pin in baselines.items()})
             with self.subTest(row=row['name'], step=baseline_headers['name']):
                 self.assertEqual(exported_promises(baseline_headers, row['require']),
                                  {edition: checkable(target, current, all_features=True, headers=pin, driver=driver,
-                                                     decoders=False)
+                                                     decoders=False, peer=pin)
                                   for edition, pin in baselines.items()})
 
 class MemoryCheckers(unittest.TestCase):

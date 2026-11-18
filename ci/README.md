@@ -196,12 +196,15 @@ GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --locked --all-features --config ci/off
 | `1` | NDI runtime; implied by every other token |
 | `advanced` | Advanced runtime and compiled Advanced declarations |
 | `file` | Usable separate File library, with `file-io` enabled |
+| `peer` | A second pinned SDK for cross-version transport, selected with `GRAFTON_NDI_PEER_RUNTIME`, `GRAFTON_NDI_PEER_VERSION` and `GRAFTON_NDI_PEER_EDITION` |
 | `discovery-server` | Compatible runtime and SDK Discovery Server, on Linux |
 | `h264-decoder` | Implies `advanced`; runtime can decode the H.264 fixture |
 | `hevc-444-decoder` | Implies `advanced`; runtime can decode the HEVC 4:4:4 fixture with the 6.4 Best444 receiver |
 
 For example, use `advanced,file` when both are installed. Unknown tokens and
-requirements that the build cannot exercise are errors. Decoder fixtures do
+requirements that the build cannot exercise are errors. The compatibility
+steps promise `peer` and verify that their test inventory includes the exchange.
+Decoder fixtures do
 not establish compatibility with every third-party stream or hardware codec.
 
 CI generates the synthetic H.264 and HEVC pictures in a separate job and
