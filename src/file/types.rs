@@ -14,6 +14,8 @@ use crate::{
     StreamTier, Timecode,
 };
 
+mod expanded_path;
+
 /// Why an operation is not permitted in the current state, carried by
 /// [`Error::InvalidState`].
 ///
@@ -630,6 +632,18 @@ const EXACT_PATTERN: &str = "{prefix}";
 // A terminated string filling the event field could have been truncated.
 const RECORDER_PATH_LIMIT: usize = NDIlib_file_recorder_event_path_max_size as usize - 2;
 const INDEX_DIGITS: usize = u64::MAX.ilog10() as usize + 1;
+const MAX_INDEX_WIDTH: usize = 1024;
+const FIRST_INDEX: &str = {
+    const DIGITS: [u8; MAX_INDEX_WIDTH] = {
+        let mut digits = [b'0'; MAX_INDEX_WIDTH];
+        digits[MAX_INDEX_WIDTH - 1] = b'1';
+        digits
+    };
+    match std::str::from_utf8(&DIGITS) {
+        Ok(text) => text,
+        Err(_) => panic!("index padding must be ASCII"),
+    }
+};
 
 /// One part of a filename pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -660,7 +674,7 @@ fn pattern_parts(pattern: &str) -> Result<Vec<PatternPart>> {
             (!width.is_empty() && width.bytes().all(|b| b.is_ascii_digit()))
                 .then(|| width.parse::<u16>().ok())
                 .flatten()
-                .filter(|n| (1..=1024).contains(n))
+                .filter(|&n| (1..=MAX_INDEX_WIDTH).contains(&usize::from(n)))
         };
         parts.push(match token {
             "prefix" => PatternPart::Prefix,
@@ -753,32 +767,34 @@ impl NamePattern {
         self.exact
     }
 
-    /// The file the pattern names for `target`: the exact file, or for an
-    /// indexed pattern the one with index 1, which locates its directory.
-    ///
-    /// A pattern that leaves the path relative is resolved, as the SDK
-    /// resolves it, against the current directory.
-    pub(super) fn first_file(&self, target: &RecordingTarget) -> Result<PathBuf> {
-        let prefix = target.prefix.as_str();
+    fn first_file_pieces<'a>(
+        &'a self,
+        target: &'a RecordingTarget,
+    ) -> impl Iterator<Item = &'a str> + Clone {
         let pattern = self
             .pattern
             .as_ref()
             .map_or(DEFAULT_PATTERN, FileText::as_str);
-        let mut name = String::new();
-        for part in &self.parts {
-            match part {
-                PatternPart::Text(range) => name.push_str(&pattern[range.clone()]),
-                PatternPart::Prefix => name.push_str(prefix),
-                PatternPart::Index(width) => {
-                    name.push_str(&format!("{:0width$}", 1, width = *width))
-                }
-            }
-        }
-        let file = PathBuf::from(name);
-        Ok(if file.is_absolute() {
-            file
-        } else {
-            std::path::absolute(file)?
+        self.parts.iter().map(move |part| match part {
+            PatternPart::Text(range) => &pattern[range.clone()],
+            PatternPart::Prefix => target.prefix.as_str(),
+            PatternPart::Index(width) => &FIRST_INDEX[MAX_INDEX_WIDTH - (*width).max(1)..],
+        })
+    }
+
+    /// The exact filename or the one with index 1, resolved the way the SDK
+    /// resolves it. Check its length and the reserve for later indexes before
+    /// allocating a filename that would exceed the event field.
+    fn first_file(&self, target: &RecordingTarget) -> Result<PathBuf> {
+        let keep = RECORDER_PATH_LIMIT.saturating_sub(self.index_digits_reserved);
+        let expanded_path::ExpandedPath { bytes, path } =
+            expanded_path::absolute(self.first_file_pieces(target), keep)?;
+        path.ok_or_else(|| {
+            Error::InvalidInput(crate::InputDefect::RecordingPathTooLong {
+                maximum_bytes: RECORDER_PATH_LIMIT,
+                longest_bytes: bytes.saturating_add(self.index_digits_reserved),
+                index_digits_reserved: self.index_digits_reserved,
+            })
         })
     }
 
@@ -792,24 +808,6 @@ impl NamePattern {
     /// can still go on. Nothing is created.
     pub(super) fn check(&self, target: &RecordingTarget) -> Result<()> {
         let file = self.first_file(target)?;
-        let longest_bytes = file
-            .to_str()
-            .ok_or({
-                Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
-                    what: "recording file path",
-                })
-            })?
-            .len()
-            .saturating_add(self.index_digits_reserved);
-        if longest_bytes > RECORDER_PATH_LIMIT {
-            return Err(Error::InvalidInput(
-                crate::InputDefect::RecordingPathTooLong {
-                    maximum_bytes: RECORDER_PATH_LIMIT,
-                    longest_bytes,
-                    index_digits_reserved: self.index_digits_reserved,
-                },
-            ));
-        }
         check_directory(file.parent().unwrap_or(&file))?;
         match std::fs::symlink_metadata(&file) {
             Ok(_) if self.exact => Err(Error::Io(std::io::Error::new(
@@ -2611,6 +2609,57 @@ mod tests {
             exact.check(&RecordingTarget::new(directory.join(format!("{name}x"))).unwrap()),
             Err(Error::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn oversized_recording_patterns_do_not_allocate_their_expansion() {
+        let directory = crate::test_support::FixtureDir::create("pattern-expansion");
+        let target = RecordingTarget::new(directory.join("caméra")).unwrap();
+        let prefix_bytes = target.path().to_str().unwrap().len();
+        for tokens in [5, 32, 128] {
+            let pattern = format!("{{prefix}}_{{index}}{}", "{index:1024}".repeat(tokens));
+            let pattern = NamePattern::new(Some(&pattern)).unwrap();
+            let (result, peak) = crate::test_alloc::peak_bytes(|| pattern.check(&target));
+            assert_eq!(
+                invalid_cause(result),
+                crate::InputDefect::RecordingPathTooLong {
+                    maximum_bytes: RECORDER_PATH_LIMIT,
+                    longest_bytes: prefix_bytes + 1 + 20 + tokens * 1024,
+                    index_digits_reserved: 19,
+                }
+            );
+            assert!(
+                peak <= RECORDER_PATH_LIMIT,
+                "{tokens} tokens used {peak} bytes"
+            );
+        }
+
+        let repeated = "{prefix}".repeat(RECORDER_PATH_LIMIT / prefix_bytes + 1);
+        let pattern = NamePattern::new(Some(&repeated)).unwrap();
+        let (result, peak) = crate::test_alloc::peak_bytes(|| pattern.check(&target));
+        assert_eq!(
+            invalid_cause(result),
+            crate::InputDefect::RecordingPathTooLong {
+                maximum_bytes: RECORDER_PATH_LIMIT,
+                longest_bytes: prefix_bytes * (RECORDER_PATH_LIMIT / prefix_bytes + 1),
+                index_digits_reserved: 0,
+            }
+        );
+        assert!(
+            peak <= RECORDER_PATH_LIMIT,
+            "repeated prefixes used {peak} bytes"
+        );
+    }
+
+    #[test]
+    fn recording_pattern_can_shrink_when_resolved() {
+        let target = RecordingTarget::new("unused").unwrap();
+        let relative = "a/.//./b/../caméra_001.mkv";
+        let leading_dots = "./".repeat(RECORDER_PATH_LIMIT);
+        let pattern = format!("{leading_dots}a/.//./b/../caméra_{{index:03}}.mkv");
+        let pattern = NamePattern::new(Some(&pattern)).unwrap();
+        let expected = std::path::absolute(relative).unwrap();
+        assert_eq!(pattern.first_file(&target).unwrap(), expected);
     }
 
     #[test]
