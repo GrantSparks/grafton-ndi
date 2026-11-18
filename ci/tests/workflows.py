@@ -485,6 +485,9 @@ def obligations(msrv, features, miri_groups):
     # rust.yml, sdk
     table['rust.yml', 'sdk', 'Linux prerequisites'] = Obligation(
         r'''
+        if [ "$SDK_MATRIX_NAME" = 'linux-x64 standard-6.3.2' ]; then
+          sudo sed -Ei '/^URIs:/s#(mirror\+file:/etc/apt/apt-mirrors\.txt|https?://[[:alnum:]-]+\.ec2\.archive\.ubuntu\.com/ubuntu/?)([[:space:]]|$)#https://archive.ubuntu.com/ubuntu/\2#' /etc/apt/sources.list.d/ubuntu.sources
+        fi
         sudo apt-get update
         sudo apt-get install --yes --no-install-recommends bubblewrap libavahi-client3
         if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then

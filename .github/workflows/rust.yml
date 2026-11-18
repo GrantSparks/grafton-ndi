@@ -504,7 +504,13 @@ jobs:
           components: clippy, rustfmt
       - name: Linux prerequisites
         if: runner.os == 'Linux'
+        env:
+          SDK_MATRIX_NAME: ${{ matrix.name }}
         run: |
+          if [ "$SDK_MATRIX_NAME" = 'linux-x64 standard-6.3.2' ]; then
+            # Use the primary archive for the Valgrind install in the timed Memcheck step.
+            sudo sed -Ei '/^URIs:/s#(mirror\+file:/etc/apt/apt-mirrors\.txt|https?://[[:alnum:]-]+\.ec2\.archive\.ubuntu\.com/ubuntu/?)([[:space:]]|$)#https://archive.ubuntu.com/ubuntu/\2#' /etc/apt/sources.list.d/ubuntu.sources
+          fi
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends bubblewrap libavahi-client3
           # Ubuntu 24.04 denies the unprivileged user namespace that bwrap needs.
