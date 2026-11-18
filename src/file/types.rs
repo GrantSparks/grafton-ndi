@@ -14,8 +14,6 @@ use crate::{
     StreamTier, Timecode,
 };
 
-mod expanded_path;
-
 /// Why an operation is not permitted in the current state, carried by
 /// [`Error::InvalidState`].
 ///
@@ -287,12 +285,12 @@ pub(super) struct ResolvedPlayerOptions {
 /// candidate. See [`Self::Exact`] for the tested exclusive-open behavior
 /// and the limits of this check.
 ///
-/// Every absolute output path must fit exactly in the recorder's event field:
-/// at most 4094 UTF-8 bytes with the current SDK. Preflight reserves at least
-/// 20 digits for each index token, including future rollovers, and refuses
-/// longer paths with [`Error::InvalidInput`]. It also refuses a resolved path
-/// that is not lossless UTF-8, including a relative pattern resolved against
-/// a non-UTF-8 current directory.
+/// The expanded filename must be absolute. It must fit exactly in the
+/// recorder's event field, at most 4094 UTF-8 bytes with the current SDK.
+/// Preflight counts the spelling the SDK will use, including redundant
+/// separators and `.` components, and reserves at least 20 digits for each
+/// index token to cover future rollovers. Start and rollover refuse relative
+/// or oversized filenames with [`Error::InvalidInput`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum FileNaming {
@@ -345,6 +343,10 @@ pub enum FileNaming {
     /// directory must exist. Index tokens must be in the file name: directories
     /// may come only from literal text and `{prefix}`. A pattern placing an
     /// index in a directory is refused when the recorder is created.
+    ///
+    /// Use `{prefix}{index}.mkv` with `RecordingTarget::new("take")` to
+    /// write `take1.mkv` in the directory in effect when the target is built.
+    /// A pattern may also contain a literal absolute path.
     ///
     /// A pattern without `{index}` or `{index:N}` names its file exactly,
     /// with every rule of [`Exact`](Self::Exact).
@@ -782,20 +784,33 @@ impl NamePattern {
         })
     }
 
-    /// The exact filename or the one with index 1, resolved the way the SDK
-    /// resolves it. Check its length and the reserve for later indexes before
-    /// allocating a filename that would exceed the event field.
+    /// Expand the exact filename or the one with index 1. Check its raw byte
+    /// length and the reserve for later indexes before allocating it.
     fn first_file(&self, target: &RecordingTarget) -> Result<PathBuf> {
-        let keep = RECORDER_PATH_LIMIT.saturating_sub(self.index_digits_reserved);
-        let expanded_path::ExpandedPath { bytes, path } =
-            expanded_path::absolute(self.first_file_pieces(target), keep)?;
-        path.ok_or_else(|| {
-            Error::InvalidInput(crate::InputDefect::RecordingPathTooLong {
-                maximum_bytes: RECORDER_PATH_LIMIT,
-                longest_bytes: bytes.saturating_add(self.index_digits_reserved),
-                index_digits_reserved: self.index_digits_reserved,
-            })
-        })
+        let pieces = self.first_file_pieces(target);
+        let bytes = pieces
+            .clone()
+            .fold(0usize, |total, piece| total.saturating_add(piece.len()));
+        let longest_bytes = bytes.saturating_add(self.index_digits_reserved);
+        if longest_bytes > RECORDER_PATH_LIMIT {
+            return Err(Error::InvalidInput(
+                crate::InputDefect::RecordingPathTooLong {
+                    maximum_bytes: RECORDER_PATH_LIMIT,
+                    longest_bytes,
+                    index_digits_reserved: self.index_digits_reserved,
+                },
+            ));
+        }
+
+        let mut name = String::with_capacity(bytes);
+        pieces.for_each(|piece| name.push_str(piece));
+        let path = PathBuf::from(name);
+        if !path.is_absolute() {
+            return Err(Error::InvalidInput(
+                crate::InputDefect::RecordingPathNotAbsolute,
+            ));
+        }
+        Ok(path)
     }
 
     /// Confirm that the SDK can create the file this pattern gives `target`:
@@ -2030,16 +2045,46 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_drive_relative_patterns_name_absolute_files() {
+    fn windows_recording_patterns_require_a_rooted_drive_or_unc_path() {
         let target = RecordingTarget::new("take").unwrap();
-        for pattern in [r"C:take_{index:03}.mkv", r"\take_{index:03}.mkv"] {
-            let file = NamePattern::new(Some(pattern))
-                .unwrap()
-                .first_file(&target)
-                .unwrap();
-            assert!(file.is_absolute(), "{file:?}");
-            assert!(file.ends_with("take_001.mkv"));
+        for pattern in [
+            r"C:take_{index:03}.mkv",
+            r"C:folder\take_{index:03}.mkv",
+            r"\take_{index:03}.mkv",
+            "/take_{index:03}.mkv",
+        ] {
+            let naming = NamePattern::new(Some(pattern)).unwrap();
+            assert_eq!(
+                invalid_cause(naming.first_file(&target)),
+                crate::InputDefect::RecordingPathNotAbsolute,
+                "{pattern}"
+            );
         }
+        for (pattern, expected) in [
+            (
+                r"C:\recordings\.\take{index}.mkv",
+                r"C:\recordings\.\take1.mkv",
+            ),
+            (
+                "C://recordings/./take{index}.mkv",
+                "C://recordings/./take1.mkv",
+            ),
+            (r"\\host\share\take{index}.mkv", r"\\host\share\take1.mkv"),
+        ] {
+            let naming = NamePattern::new(Some(pattern)).unwrap();
+            assert_eq!(naming.first_file(&target).unwrap().to_str(), Some(expected));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_recording_patterns_preserve_literal_absolute_paths() {
+        let target = RecordingTarget::new("take").unwrap();
+        let naming = NamePattern::new(Some("//recordings/./take{index}.mkv")).unwrap();
+        assert_eq!(
+            naming.first_file(&target).unwrap().to_str(),
+            Some("//recordings/./take1.mkv")
+        );
     }
 
     #[test]
@@ -2652,48 +2697,55 @@ mod tests {
     }
 
     #[test]
-    fn recording_pattern_can_shrink_when_resolved() {
-        let target = RecordingTarget::new("unused").unwrap();
-        let relative = "a/.//./b/../caméra_001.mkv";
-        let leading_dots = "./".repeat(RECORDER_PATH_LIMIT);
-        let pattern = format!("{leading_dots}a/.//./b/../caméra_{{index:03}}.mkv");
-        let pattern = NamePattern::new(Some(&pattern)).unwrap();
-        let expected = std::path::absolute(relative).unwrap();
-        assert_eq!(pattern.first_file(&target).unwrap(), expected);
+    fn only_the_expanded_recording_pattern_determines_absoluteness() {
+        let target = RecordingTarget::new("take").unwrap();
+        for pattern in ["take{index}.mkv", "./take.mkv", "relative/{prefix}.mkv"] {
+            let naming = NamePattern::new(Some(pattern)).unwrap();
+            assert_eq!(
+                invalid_cause(naming.check(&target)),
+                crate::InputDefect::RecordingPathNotAbsolute,
+                "{pattern}"
+            );
+        }
+
+        let naming = NamePattern::new(Some("{prefix}//./caméra{index:03}.mkv")).unwrap();
+        let expected = format!("{}//./caméra001.mkv", target.path().to_str().unwrap());
+        assert_eq!(
+            naming.first_file(&target).unwrap().to_str(),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
-    // This reproducer needs Linux's byte-oriented directory names. The macOS
-    // CI filesystem rejects the invalid UTF-8 name before a process can use it.
-    #[cfg(target_os = "linux")]
-    fn non_utf8_output_paths_are_refused_without_panicking() {
-        const CHILD: &str = "GRAFTON_NDI_TEST_NON_UTF8_RECORDING_CWD";
-        if std::env::var_os(CHILD).is_some() {
-            let target = RecordingTarget::new("/grafton-ndi-valid-target").unwrap();
-            assert!(matches!(
-                NamePattern::new(Some("take_{index}.mkv"))
-                    .unwrap()
-                    .check(&target),
-                Err(Error::InvalidInput(crate::InputDefect::PathNotUtf8 {
-                    what: "recording file path"
-                }))
-            ));
-            return;
-        }
+    fn recording_path_limit_counts_the_raw_expanded_spelling() {
+        let target = RecordingTarget::new("take").unwrap();
+        let prefix = target.path().to_str().unwrap();
+        let remaining = RECORDER_PATH_LIMIT - prefix.len() - 1 - ".mkv".len();
+        let dots = "./".repeat((remaining - 1) / 2);
+        let basename = "x".repeat(remaining - dots.len());
+        let suffix = format!("{dots}{basename}.mkv");
+        let full = format!("{prefix}/{suffix}");
+        assert_eq!(full.len(), RECORDER_PATH_LIMIT);
+        let literal = format!("{{prefix}}/{suffix}");
+        let naming = NamePattern::new(Some(&literal)).unwrap();
+        assert_eq!(
+            naming.first_file(&target).unwrap().to_str(),
+            Some(full.as_str())
+        );
 
-        // Changing the working directory only in a child avoids racing other
-        // tests. A pattern omitting {prefix} resolves relative to that directory.
-        use std::os::unix::ffi::OsStringExt;
-        let directory = crate::test_support::FixtureDir::create("non-utf8-output");
-        let non_utf8 = directory.join(std::ffi::OsString::from_vec(vec![0xff]));
-        std::fs::create_dir(&non_utf8).unwrap();
-        let output = crate::test_support::TestChild::new(
-            "file::types::tests::non_utf8_output_paths_are_refused_without_panicking",
-        )
-        .env(CHILD, "1")
-        .current_dir(non_utf8)
-        .run();
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        let oversized = crate::InputDefect::RecordingPathTooLong {
+            maximum_bytes: RECORDER_PATH_LIMIT,
+            longest_bytes: RECORDER_PATH_LIMIT + 1,
+            index_digits_reserved: 0,
+        };
+        let relative_dots = "./".repeat((RECORDER_PATH_LIMIT + 1 - "x.mkv".len()) / 2);
+        for pattern in [format!("{literal}x"), format!("{relative_dots}x.mkv")] {
+            let naming = NamePattern::new(Some(&pattern)).unwrap();
+            let (result, allocations) =
+                crate::test_alloc::allocation_count(|| naming.first_file(&target));
+            assert_eq!(invalid_cause(result), oversized);
+            assert_eq!(allocations, 0);
+        }
     }
 
     #[test]

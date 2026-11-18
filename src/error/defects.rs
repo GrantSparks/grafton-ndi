@@ -764,6 +764,9 @@ pub enum InputDefect {
         /// The frame's transfer, if given.
         transfer: Option<TransferFunction>,
     },
+    /// The expanded SDK filename is relative on this platform.
+    #[error("the expanded recording file path must be absolute. Use {{prefix}} with a RecordingTarget or supply an absolute pattern")]
+    RecordingPathNotAbsolute,
     /// recording file path may reach {longest_bytes} UTF-8 bytes, exceeding the {maximum_bytes}-byte event path limit ({index_digits_reserved} digits reserved for index growth).
     #[error("recording file path may reach {longest_bytes} UTF-8 bytes, exceeding the {maximum_bytes}-byte event path limit ({index_digits_reserved} digits reserved for index growth)")]
     RecordingPathTooLong {
