@@ -10,7 +10,7 @@ use crate::{
 };
 use std::fmt::{self, Debug};
 
-use crate::advanced::send::{first_block, ScatterStorage};
+use crate::advanced::send::ScatterStorage;
 #[cfg(doc)]
 use crate::advanced::MAX_SCATTER_BLOCKS;
 #[cfg(ndi_has_advanced_scatter_send)]
@@ -49,7 +49,7 @@ pub(crate) enum PacketContent<'a> {
     Scatter {
         first: &'a [u8],
         total: PacketLen,
-        blocks: &'a [Vec<u8>],
+        rest: &'a [Vec<u8>],
     },
 }
 
@@ -72,7 +72,9 @@ impl PacketContent<'_> {
     fn bytes_at<const N: usize>(&self, offset: usize) -> Option<[u8; N]> {
         match self {
             Self::Contiguous(packet) => packet.as_slice().get(offset..)?.first_chunk().copied(),
-            Self::Scatter { blocks, .. } => crate::advanced::send::bytes_at(blocks, offset),
+            Self::Scatter { first, rest, .. } => {
+                crate::advanced::send::bytes_at(first, rest, offset)
+            }
         }
     }
 }
@@ -724,26 +726,25 @@ impl<F: PacketFormat> ScatterFrame<F> {
     /// exceeds [`MAX_PACKET_BYTES`], or the packet is not sendable in this format.
     pub fn new(
         format: F,
-        blocks: Vec<Vec<u8>>,
+        mut blocks: Vec<Vec<u8>>,
     ) -> std::result::Result<Self, Rejected<Vec<Vec<u8>>>> {
-        let check = || {
-            let sizes = ScatterStorage::check(&blocks)?;
-            let first = first_block(&blocks, format.header_bytes())?;
+        let mut check = || {
+            let checked = ScatterStorage::check(&mut blocks, format.header_bytes())?;
             let packet = PacketContent::Scatter {
-                first,
-                total: sizes.total,
-                blocks: &blocks,
+                first: checked.first,
+                total: checked.total,
+                rest: checked.rest,
             };
             let extents = format.admit(packet, Use::Send)?;
-            Ok((sizes, extents))
-        };
-        match check() {
-            Ok((sizes, extents)) => Ok(Self {
+            Ok(Self {
                 format,
-                storage: ScatterStorage::new(blocks, sizes),
+                storage: checked.into_storage(),
                 extents,
                 extras: FrameExtras::default(),
-            }),
+            })
+        };
+        match check() {
+            Ok(frame) => Ok(frame),
             Err(error) => Err(Rejected::new(error, blocks)),
         }
     }

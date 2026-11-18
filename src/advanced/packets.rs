@@ -1642,7 +1642,7 @@ mod tests {
                     PacketContent::Scatter {
                         first: &blocks[0],
                         total: packet.len(),
-                        blocks: &blocks,
+                        rest: &blocks[1..],
                     },
                     purpose,
                 );

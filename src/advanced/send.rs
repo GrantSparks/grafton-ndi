@@ -39,7 +39,8 @@ mod scatter_completion_tests;
 /// and keeps the addresses of the blocks and of both arrays while an
 /// asynchronous send is pending.
 pub(super) struct ScatterStorage {
-    blocks: Box<[AliasableVec<u8>]>,
+    first: AliasableVec<u8>,
+    rest: Box<[AliasableVec<u8>]>,
     #[cfg(any(test, ndi_has_advanced_scatter_send))]
     pointers: BlockPointers,
     #[cfg(any(test, ndi_has_advanced_scatter_send))]
@@ -48,18 +49,57 @@ pub(super) struct ScatterStorage {
     // reads this array; it writes only the packet blocks.
     sizes: AliasableBox<[Option<PacketLen>]>,
     total: PacketLen,
-    #[cfg(ndi_has_advanced_scatter_send)]
-    first: PacketLen,
 }
 
-/// One validation pass supplies every extent the scatter descriptors need.
-pub(super) struct ScatterSizes {
+/// The exact blocks and extents established together by the shape check.
+pub(super) struct CheckedScatter<'a> {
+    pub(super) first: &'a mut Vec<u8>,
+    pub(super) rest: &'a mut [Vec<u8>],
     pub(super) total: PacketLen,
     #[cfg(any(test, ndi_has_advanced_scatter_send))]
     sizes: Box<[Option<PacketLen>]>,
-    #[cfg(ndi_has_advanced_scatter_send)]
-    first: PacketLen,
 }
+
+impl CheckedScatter<'_> {
+    /// Move the accepted blocks without copying their contents.
+    pub(super) fn into_storage(self) -> ScatterStorage {
+        ScatterStorage::new(
+            AliasableVec::new(std::mem::take(self.first)),
+            self.rest
+                .iter_mut()
+                .map(std::mem::take)
+                .map(AliasableVec::new)
+                .collect(),
+            self.total,
+            #[cfg(any(test, ndi_has_advanced_scatter_send))]
+            self.sizes,
+        )
+    }
+}
+
+/// A scatter frame always starts with one block followed by at most
+/// `MAX_SCATTER_BLOCKS - 1` more, so the combined iterator has an exact size.
+struct ScatterBlocks<'a> {
+    first: Option<&'a [u8]>,
+    rest: std::slice::Iter<'a, AliasableVec<u8>>,
+}
+
+impl<'a> Iterator for ScatterBlocks<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.first
+            .take()
+            .or_else(|| self.rest.next().map(|block| &**block))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = usize::from(self.first.is_some()) + self.rest.len();
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for ScatterBlocks<'_> {}
 
 /// Addresses lent to the SDK, never dereferenced by Rust.
 #[cfg(any(test, ndi_has_advanced_scatter_send))]
@@ -92,22 +132,20 @@ impl Clone for ScatterStorage {
     /// Copies of the blocks, with arrays that describe the copies.
     fn clone(&self) -> Self {
         Self::new(
-            self.blocks().map(<[u8]>::to_vec).collect(),
-            ScatterSizes {
-                total: self.total,
-                #[cfg(any(test, ndi_has_advanced_scatter_send))]
-                sizes: Box::from(&*self.sizes),
-                #[cfg(ndi_has_advanced_scatter_send)]
-                first: self.first,
-            },
+            self.first.clone(),
+            self.rest.clone(),
+            self.total,
+            #[cfg(any(test, ndi_has_advanced_scatter_send))]
+            Box::from(&*self.sizes),
         )
     }
 }
 
 impl ScatterStorage {
     pub(super) fn retained_bytes(&self) -> usize {
-        let bytes = self.blocks.iter().fold(
-            self.blocks.len() * size_of::<AliasableVec<u8>>(),
+        let block_headers = (self.rest.len() + 1) * size_of::<AliasableVec<u8>>();
+        let bytes = self.rest.iter().fold(
+            block_headers.saturating_add(self.first.capacity()),
             |total, block| total.saturating_add(block.capacity()),
         );
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
@@ -120,10 +158,11 @@ impl ScatterStorage {
     }
 
     /// Check each block and the sum once, retaining every checked extent.
-    pub(super) fn check(blocks: &[Vec<u8>]) -> Result<ScatterSizes> {
+    pub(super) fn check(blocks: &mut [Vec<u8>], header_bytes: usize) -> Result<CheckedScatter<'_>> {
+        let count = blocks.len();
         let (first, rest) = blocks
-            .split_first()
-            .filter(|_| blocks.len() <= MAX_SCATTER_BLOCKS)
+            .split_first_mut()
+            .filter(|_| count <= MAX_SCATTER_BLOCKS)
             .ok_or_else(|| invalid_frame(crate::FrameDefect::ScatterBlockCount))?;
         let checked = |block: &Vec<u8>| {
             PacketLen::new(block.len()).ok_or_else(|| {
@@ -134,13 +173,13 @@ impl ScatterStorage {
                 })
             })
         };
-        let first = checked(first)?;
-        let mut total = first;
+        let first_size = checked(first)?;
+        let mut total = first_size;
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
-        let mut sizes = Vec::with_capacity(blocks.len() + 1);
+        let mut sizes = Vec::with_capacity(count + 1);
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
-        sizes.push(Some(first));
-        for block in rest {
+        sizes.push(Some(first_size));
+        for block in rest.iter() {
             let size = checked(block)?;
             total = total
                 .checked_add(size)
@@ -148,40 +187,48 @@ impl ScatterStorage {
             #[cfg(any(test, ndi_has_advanced_scatter_send))]
             sizes.push(Some(size));
         }
+        if first.len() < header_bytes {
+            return Err(invalid_frame(crate::FrameDefect::ScatterHeader));
+        }
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
         sizes.push(None);
-        Ok(ScatterSizes {
+        Ok(CheckedScatter {
+            first,
+            rest,
             total,
             #[cfg(any(test, ndi_has_advanced_scatter_send))]
             sizes: sizes.into_boxed_slice(),
-            #[cfg(ndi_has_advanced_scatter_send)]
-            first,
         })
     }
 
-    /// Take ownership of the blocks and the extents that `check` accepted.
-    pub(super) fn new(blocks: Vec<Vec<u8>>, checked: ScatterSizes) -> Self {
-        let blocks: Box<[_]> = blocks.into_iter().map(AliasableVec::new).collect();
+    /// Take ownership of exactly the blocks and extents admitted together.
+    fn new(
+        first: AliasableVec<u8>,
+        rest: Box<[AliasableVec<u8>]>,
+        total: PacketLen,
+        #[cfg(any(test, ndi_has_advanced_scatter_send))] sizes: Box<[Option<PacketLen>]>,
+    ) -> Self {
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
-        let mut blocks = blocks;
+        let (mut first, mut rest) = (first, rest);
         // The SDK writes through these, whatever its declaration says.
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
         let pointers = AliasableBox::new(
-            blocks
-                .iter_mut()
-                .map(|block| block.as_mut_ptr().cast::<u8>().cast_const())
+            std::iter::once(&mut first)
+                .chain(rest.iter_mut())
+                .map(|block| block.as_mut_ptr().cast_const())
                 .chain(std::iter::once(ptr::null()))
                 .collect(),
         );
         #[cfg(any(test, ndi_has_advanced_scatter_send))]
-        let sizes = AliasableBox::new(checked.sizes);
+        let sizes = AliasableBox::new(sizes);
         #[cfg(ndi_has_advanced_scatter_send)]
         let list = AliasableBox::new(Box::new(FrameScatter {
             p_data_blocks: pointers.as_ptr().cast(),
             p_data_blocks_size: sizes.as_ptr().cast(),
         }));
         Self {
-            blocks,
+            first,
+            rest,
             #[cfg(any(test, ndi_has_advanced_scatter_send))]
             pointers: BlockPointers {
                 array: pointers,
@@ -190,9 +237,7 @@ impl ScatterStorage {
             },
             #[cfg(any(test, ndi_has_advanced_scatter_send))]
             sizes,
-            total: checked.total,
-            #[cfg(ndi_has_advanced_scatter_send)]
-            first: checked.first,
+            total,
         }
     }
 
@@ -210,19 +255,25 @@ impl ScatterStorage {
 
     #[cfg(ndi_has_advanced_scatter_send)]
     pub(super) fn lend_first_block(&mut self) -> (*mut u8, i32) {
-        (self.blocks[0].as_mut_ptr(), self.first.to_sdk())
+        // SAFETY: construction always supplies one positive size for the
+        // first block and the allocated, aligned array containing that size
+        // stays live. The SDK only reads this array, in the native i32 layout.
+        let size = unsafe { self.sizes.as_ptr().cast::<i32>().read() };
+        (self.first.as_mut_ptr(), size)
     }
 
     pub(super) fn blocks(&self) -> impl ExactSizeIterator<Item = &[u8]> {
-        self.blocks.iter().map(|block| &**block)
+        ScatterBlocks {
+            first: Some(&self.first),
+            rest: self.rest.iter(),
+        }
     }
 
     pub(super) fn into_blocks(self) -> Vec<Vec<u8>> {
-        self.blocks
-            .into_vec()
-            .into_iter()
-            .map(AliasableVec::into_vec)
-            .collect()
+        let mut blocks = Vec::with_capacity(self.rest.len() + 1);
+        blocks.push(self.first.into_vec());
+        blocks.extend(self.rest.into_vec().into_iter().map(AliasableVec::into_vec));
+        blocks
     }
 
     pub(super) fn copy_contiguous(&self, extents: Option<EnvelopeExtents>) -> PacketBytes {
@@ -234,19 +285,17 @@ impl ScatterStorage {
     }
 }
 
-/// The first block of a scatter frame, which must hold the whole of the
-/// frame's header of `header_bytes` bytes.
-pub(super) fn first_block(blocks: &[Vec<u8>], header_bytes: usize) -> Result<&[u8]> {
-    let first = &blocks[0];
-    if first.len() < header_bytes {
-        return Err(invalid_frame(crate::FrameDefect::ScatterHeader));
-    }
-    Ok(first)
-}
-
-/// The `N` bytes at `offset` of a frame held in `blocks`, if it has them.
-pub(super) fn bytes_at<const N: usize>(blocks: &[Vec<u8>], offset: usize) -> Option<[u8; N]> {
-    let mut bytes = blocks.iter().flatten().skip(offset).copied();
+/// The `N` bytes at `offset` of a frame held in several blocks.
+pub(super) fn bytes_at<const N: usize>(
+    first: &[u8],
+    rest: &[Vec<u8>],
+    offset: usize,
+) -> Option<[u8; N]> {
+    let mut bytes = first
+        .iter()
+        .chain(rest.iter().flatten())
+        .skip(offset)
+        .copied();
     let mut value = [0; N];
     for byte in &mut value {
         *byte = bytes.next()?;
@@ -1007,8 +1056,9 @@ mod tests {
 
     #[test]
     fn a_scatter_check_retains_every_extent_and_the_terminator() {
-        let blocks = vec![vec![1; 44], vec![2; 3], vec![3; 2]];
-        let checked = ScatterStorage::check(&blocks).unwrap();
+        let mut blocks = vec![vec![1; 44], vec![2; 3], vec![3; 2]];
+        let first_pointer = blocks[0].as_ptr();
+        let checked = ScatterStorage::check(&mut blocks, 44).unwrap();
         assert_eq!(checked.total.to_usize(), 49);
         assert_eq!(
             checked
@@ -1018,15 +1068,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some(44), Some(3), Some(2), None]
         );
-        #[cfg(ndi_has_advanced_scatter_send)]
-        assert_eq!(checked.first.to_usize(), 44);
-        for (blocks, cause) in [
+        assert_eq!(checked.first.len(), 44);
+        assert_eq!(checked.first.as_ptr(), first_pointer);
+        for (mut blocks, cause) in [
             (vec![], crate::FrameDefect::ScatterBlockCount),
             (vec![vec![]], crate::FrameDefect::EmptyScatterBlock),
             (vec![vec![1], vec![]], crate::FrameDefect::EmptyScatterBlock),
+            (vec![vec![1], vec![2]], crate::FrameDefect::ScatterHeader),
         ] {
             assert!(
-                matches!(ScatterStorage::check(&blocks), Err(crate::Error::InvalidFrame(actual)) if actual == cause)
+                matches!(ScatterStorage::check(&mut blocks, 44), Err(crate::Error::InvalidFrame(actual)) if actual == cause)
             );
         }
         let max = PacketLen::new(super::super::MAX_PACKET_BYTES).unwrap();
@@ -1039,9 +1090,9 @@ mod tests {
         ignore = "the full packet extent is checked by the native test run"
     )]
     fn a_scatter_check_refuses_an_oversized_sum() {
-        let blocks = vec![vec![0; super::super::MAX_PACKET_BYTES], vec![1]];
+        let mut blocks = vec![vec![0; super::super::MAX_PACKET_BYTES], vec![1]];
         assert!(matches!(
-            ScatterStorage::check(&blocks),
+            ScatterStorage::check(&mut blocks, 44),
             Err(crate::Error::InvalidFrame(crate::FrameDefect::ScatterSize))
         ));
     }
@@ -1108,8 +1159,7 @@ mod tests {
         let moved = Box::new(frame);
         for (block, pointer) in moved
             .storage_for_test()
-            .blocks
-            .iter()
+            .blocks()
             .zip(moved.storage_for_test().pointers.array.iter())
         {
             assert_eq!(block.as_ptr().cast::<u8>(), *pointer);
@@ -1210,13 +1260,12 @@ mod tests {
         );
         let blocks = copy
             .storage_for_test()
-            .blocks
-            .iter()
+            .blocks()
             .zip(copy.storage_for_test().pointers.array.iter());
-        for ((block, pointer), original) in blocks.zip(frame.storage_for_test().blocks.iter()) {
+        for ((block, pointer), original) in blocks.zip(frame.storage_for_test().blocks()) {
             assert_eq!(block.as_ptr().cast::<u8>(), *pointer);
             assert_ne!(block.as_ptr(), original.as_ptr());
-            assert_eq!(**block, **original);
+            assert_eq!(block, original);
         }
         assert_eq!(
             &*copy.storage_for_test().sizes,
@@ -1383,12 +1432,13 @@ mod tests {
 
     #[test]
     fn bytes_are_found_wherever_the_blocks_put_them() {
-        let blocks = vec![vec![0, 1], vec![2], vec![3, 4, 5]];
-        assert_eq!(bytes_at(&blocks, 0), Some([0, 1]));
-        assert_eq!(bytes_at(&blocks, 1), Some([1, 2, 3]));
-        assert_eq!(bytes_at(&blocks, 4), Some([4, 5]));
-        assert_eq!(bytes_at::<2>(&blocks, 5), None);
-        assert_eq!(bytes_at::<1>(&blocks, 6), None);
+        let blocks = [vec![0, 1], vec![2], vec![3, 4, 5]];
+        let (first, rest) = blocks.split_first().unwrap();
+        assert_eq!(bytes_at(first, rest, 0), Some([0, 1]));
+        assert_eq!(bytes_at(first, rest, 1), Some([1, 2, 3]));
+        assert_eq!(bytes_at(first, rest, 4), Some([4, 5]));
+        assert_eq!(bytes_at::<2>(first, rest, 5), None);
+        assert_eq!(bytes_at::<1>(first, rest, 6), None);
     }
 
     #[test]
@@ -1622,16 +1672,20 @@ mod tests {
 
     #[cfg(ndi_has_advanced_scatter_send)]
     #[test]
-    fn scatter_construction_allocates_arrays_and_one_frame_owned_list() {
+    fn scatter_construction_allocates_only_block_headers_and_native_descriptors() {
         let (format, bytes) = h264();
-        // Exclude shrinking the caller's spare outer-vector capacity from the
-        // frame's two arrays and one stable-list allocation.
-        let blocks = split(&bytes, &[44]).into_boxed_slice().into_vec();
-        let (frame, allocations) = crate::test_alloc::allocation_count(|| {
-            ScatterFrame::<VideoPacketFormat>::new(format, blocks).unwrap()
-        });
-        assert_eq!(allocations, 3, "pointer array, size array and stable list");
-        assert_eq!(frame.total_bytes(), bytes.len());
+        for (cuts, allocations) in [(&[][..], 3), (&[44][..], 4)] {
+            let blocks = split(&bytes, cuts);
+            let pointers: Vec<_> = blocks.iter().map(Vec::as_ptr).collect();
+            let (frame, called) =
+                crate::test_alloc::allocation_count(|| ScatterFrame::new(format, blocks).unwrap());
+            assert_eq!(
+                called, allocations,
+                "two arrays, one stable list, and the remaining block headers"
+            );
+            assert_eq!(frame.total_bytes(), bytes.len());
+            assert!(frame.blocks().map(<[u8]>::as_ptr).eq(pointers));
+        }
     }
 
     #[test]

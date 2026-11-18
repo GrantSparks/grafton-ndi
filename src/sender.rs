@@ -513,8 +513,10 @@ pub(crate) mod in_flight {
     use super::{async_flush_frame_ptr, PreparedVideo, SendHandle, SenderResource};
     #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
     use crate::advanced::ScatterVideoLoan;
+    use crate::frames::VideoSource;
+    #[cfg(feature = "advanced")]
+    use crate::Result;
     use crate::{frames::Sendable, sys::bindings::NDIlib_video_frame_v2_t, VideoFrame};
-    use crate::{frames::VideoSource, Result};
     use std::sync::{Arc, Mutex};
 
     /// A slot paired by its owning pipeline or loan owner with its sender.
@@ -573,12 +575,11 @@ pub(crate) mod in_flight {
                 .paired(self.owner.handle())
         }
 
-        pub(super) fn send(&self, frame: Sendable<&(impl VideoSource + ?Sized)>) -> Result<()> {
+        pub(super) fn send(&self, frame: Sendable<&(impl VideoSource + ?Sized)>) {
             self.synchronize(|mut pair| {
                 let prepared = PreparedVideo::authorized(frame, pair.staging);
                 pair.stream.send(prepared);
             });
-            Ok(())
         }
 
         pub(super) fn submit(&mut self, frame: Sendable<VideoFrame>) -> Option<VideoFrame> {
@@ -1725,7 +1726,8 @@ impl Sender {
     #[doc(alias = "NDIlib_send_send_video_v2")]
     pub fn send_video(&self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
         let authorized = Sendable::borrowed(frame, self.resource().ndi())?;
-        self.native.video.send(authorized)
+        self.native.video.send(authorized);
+        Ok(())
     }
 
     /// Submit an owned frame without copying its pixel or metadata allocations.
