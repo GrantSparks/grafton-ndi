@@ -172,7 +172,7 @@ fn uniform<'a>(rows: impl Iterator<Item = &'a [u8]>) -> bool {
 /// `FrameSync` is `Sync`: one FrameSync serves video and audio captures, the
 /// input-format query and the queue depth from several threads at once, with
 /// a live source. Every call succeeds, every video frame is whole and every
-/// audio sample is one the source could have sent.
+/// audio sample is finite and has an absolute value of at most 2.0.
 #[test]
 fn one_framesync_serves_captures_from_several_threads_at_once() {
     let Some(ndi) = common::ndi() else {

@@ -382,7 +382,7 @@ fn child(scenario: &str) {
                     "{what}: {error:?}"
                 );
             }
-            assert_eq!(log(), "initialize\n");
+            assert_eq!(read_fake_log(), "initialize\n");
         }
         "advertisement_options_reach_the_sdk" => {
             let receiver = |name: &str| {

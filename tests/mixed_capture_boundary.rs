@@ -4,7 +4,10 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
+#[cfg(any(feature = "tokio", feature = "smol"))]
 common_helpers!(child, fixture, stop);
+#[cfg(not(any(feature = "tokio", feature = "smol")))]
+common_helpers!(child, fixture);
 use common::TestChild;
 
 #[path = "support/runtime_fixture.rs"]

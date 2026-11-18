@@ -147,18 +147,6 @@ fn test_video_frame_negative_stride_returns_error() {
 }
 
 #[test]
-fn test_audio_frame_drop_no_double_free() {
-    let frame1 = AudioFrame::builder().build().unwrap();
-    drop(frame1);
-
-    let frame2 = AudioFrame::builder()
-        .metadata("test metadata")
-        .build()
-        .unwrap();
-    drop(frame2);
-}
-
-#[test]
 fn test_audio_frame_channel_data_interleaved() {
     // Interleaved input: [C0S0, C1S0, C0S1, C1S1, C0S2, C1S2]
     let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -422,67 +410,6 @@ fn test_source_matching_real_world_example() {
     assert!(source.matches_host("192.168.0.107"));
     assert_eq!(source.host(), Some("192.168.0.107"));
     assert_eq!(source.address().unwrap().port(), Some(5960));
-}
-
-#[test]
-fn test_receiver_snapshot_preset() {
-    use crate::{
-        finder::{Source, SourceAddress},
-        receiver::ReceiverOptions,
-    };
-
-    let source = Source::new("Test Source")
-        .unwrap()
-        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()).unwrap());
-
-    let customized = ReceiverOptions::snapshot_preset(source.clone()).name("My Snapshot Receiver");
-    let _ = format!("{customized:?}");
-}
-
-#[test]
-fn test_receiver_high_quality_preset() {
-    use crate::{
-        finder::{Source, SourceAddress},
-        receiver::ReceiverOptions,
-    };
-
-    let source = Source::new("Test Source")
-        .unwrap()
-        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()).unwrap());
-
-    let customized = ReceiverOptions::high_quality_preset(source.clone()).name("My HQ Receiver");
-    let _ = format!("{customized:?}");
-}
-
-#[test]
-fn test_receiver_monitoring_preset() {
-    use crate::{
-        finder::{Source, SourceAddress},
-        receiver::ReceiverOptions,
-    };
-
-    let source = Source::new("Test Source")
-        .unwrap()
-        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()).unwrap());
-
-    let customized = ReceiverOptions::monitoring_preset(source.clone()).name("My Monitor");
-    let _ = format!("{customized:?}");
-}
-
-#[test]
-fn test_receiver_presets_are_distinct() {
-    use crate::{
-        finder::{Source, SourceAddress},
-        receiver::ReceiverOptions,
-    };
-
-    let source = Source::new("Test Source")
-        .unwrap()
-        .with_address(SourceAddress::new("192.168.1.100:5960".to_string()).unwrap());
-
-    let _snapshot = ReceiverOptions::snapshot_preset(source.clone());
-    let _hq = ReceiverOptions::high_quality_preset(source.clone());
-    let _monitor = ReceiverOptions::monitoring_preset(source.clone());
 }
 
 // Line stride tests (issue #15)

@@ -1,12 +1,13 @@
 //! Sending and receiver options apply format gates; AV sync uses validated timing.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
-#[cfg(feature = "advanced")]
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
 #[cfg(feature = "advanced")]
 common_helpers!(policy, prerequisites, child, fixture);
+#[cfg(not(feature = "advanced"))]
+common_helpers!(child, fixture);
 use common::TestChild;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;

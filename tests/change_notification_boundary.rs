@@ -1,12 +1,13 @@
 //! One-shot native reports must wake every concurrent observer in Rust.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
-#[cfg(feature = "advanced")]
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
 #[cfg(feature = "advanced")]
 common_helpers!(feature_policy, child, fixture);
+#[cfg(not(feature = "advanced"))]
+common_helpers!(child, fixture);
 use common::TestChild;
 
 #[path = "support/runtime_fixture.rs"]
@@ -81,6 +82,10 @@ fn shared_native_change_reports() {
             "cursor" => cursor(&ndi, || unsafe { publish() }),
             "snapshot" => snapshot_ordering(&ndi, || unsafe { publish() }),
             "cold-watch" => cold_watch(&ndi),
+            #[cfg(feature = "tokio")]
+            "cold-watch-tokio" => cold_async_watch::<grafton_ndi::asynchronous::Tokio>(&ndi),
+            #[cfg(feature = "smol")]
+            "cold-watch-smol" => cold_async_watch::<grafton_ndi::asynchronous::Smol>(&ndi),
             "failed-snapshot" => failed_snapshot(&ndi, || unsafe { publish() }, true),
             "failed-snapshot-pending" => failed_snapshot(&ndi, || unsafe { publish() }, false),
             #[cfg(feature = "tokio")]
@@ -135,10 +140,10 @@ fn shared_native_change_reports() {
         "failed-snapshot-pending",
     ];
     if cfg!(feature = "tokio") {
-        cases.extend(["async-tokio", "async-queued-tokio"]);
+        cases.extend(["async-tokio", "async-queued-tokio", "cold-watch-tokio"]);
     }
     if cfg!(feature = "smol") {
-        cases.push("async-smol");
+        cases.extend(["async-smol", "cold-watch-smol"]);
     }
     if cfg!(feature = "advanced") {
         cases.extend(["keyframe", "keyframe-cleared"]);
@@ -167,6 +172,17 @@ fn cold_watch(ndi: &Ndi) {
     let (mut watch, allocations) = test_alloc::allocation_count(|| finder.watch());
     assert_eq!(allocations, 0);
     assert_eq!(watch.current_sources().unwrap().len(), 1);
+}
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+fn cold_async_watch<R: grafton_ndi::asynchronous::AsyncRuntime>(ndi: &Ndi) {
+    let finder = Finder::new(ndi, &FinderOptions::new()).unwrap();
+    let finder = grafton_ndi::asynchronous::AsyncFinder::<R>::new(finder);
+    let before = read_fake_log();
+    let (watch, allocations) = test_alloc::allocation_count(|| finder.watch());
+    assert_eq!(allocations, 0);
+    assert_eq!(read_fake_log(), before);
+    drop(watch);
 }
 
 fn find(ndi: &Ndi, publish: impl Fn()) {

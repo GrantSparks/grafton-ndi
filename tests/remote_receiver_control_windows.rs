@@ -4,10 +4,8 @@
 #[macro_use]
 #[path = "common/mod.rs"]
 mod helpers;
-common_helpers!(runtime, prerequisites, name);
+common_helpers!(runtime, prerequisites, name, child, fixture);
 
-#[path = "support/fixture.rs"]
-mod fixture;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
@@ -47,8 +45,7 @@ fn fake_standard_runtime_refuses_remote_control_before_native_add() {
     if let Some(library) = std::env::var_os("GRAFTON_FAKE_REMOTE_CONTROL_RUNTIME") {
         let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
         exercise(&ndi);
-        let log =
-            std::fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap();
+        let log = runtime_fixture::read_fake_log();
         assert_eq!(
             log.lines()
                 .filter(|line| line.starts_with("recv-advertiser-add"))
@@ -59,29 +56,17 @@ fn fake_standard_runtime_refuses_remote_control_before_native_add() {
         return;
     }
 
-    let fixture = fixture::FixtureDir::create("fake-remote-receiver-control");
+    let fixture = common::FixtureDir::create("fake-remote-receiver-control");
     let library = runtime_fixture::FakeRuntime {
         cfgs: vec!["fake_objects", "fake_discovery"],
         version: Some("6.4.0.2"),
         ..Default::default()
     }
     .build(&fixture.path().join("fake-ndi.dll"));
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "fake_standard_runtime_refuses_remote_control_before_native_add",
-            "--nocapture",
-        ])
+    common::TestChild::new("fake_standard_runtime_refuses_remote_control_before_native_add")
         .env("GRAFTON_FAKE_REMOTE_CONTROL_RUNTIME", library)
         .env("GRAFTON_FAKE_NDI_LOG", fixture.path().join("native.log"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .run();
 }
 
 #[test]
