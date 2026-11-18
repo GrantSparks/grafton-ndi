@@ -2950,6 +2950,8 @@ impl<F> std::ops::Deref for Sendable<F> {
 }
 
 impl<F: VideoParts> Sendable<F> {
+    /// The send-capability check every uncompressed video send makes before
+    /// reaching the SDK.
     fn checked(frame: F, ndi: &crate::Ndi) -> std::result::Result<Self, (Error, F)> {
         match frame
             .layout()

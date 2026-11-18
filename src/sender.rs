@@ -116,10 +116,10 @@ struct Inner {
     keyframe_changes: crate::keyframe_changes::KeyframeChanges,
 }
 
-// A panic cannot leave metadata capture or tally half-changed: their locks
-// guard native queries, and no application code runs while held. Those locks
-// do not poison or declare this themselves, which would otherwise leave
-// senders short of `RefUnwindSafe`. The change feed uses unwind-safe standard locks.
+// The metadata gate's mutex protects a capture-lease bit that changes whole,
+// and native capture runs outside that mutex. The tally query mutex serializes
+// native queries. Neither lock holds application code. The change feed uses
+// unwind-safe standard locks.
 impl std::panic::RefUnwindSafe for Inner {}
 
 /// Exclusion spans capture through matching free, including a borrowed frame's
@@ -1423,7 +1423,7 @@ impl RawVideo<'_> {
         &mut self,
         frame: VideoFrame,
     ) -> std::result::Result<Option<VideoFrame>, Rejected<VideoFrame>> {
-        let authorized = self.sender.require_video_layout(frame)?;
+        let authorized = Sendable::new(frame, self.sender.runtime())?;
         Ok(self.sender.native.video.submit_shared(authorized))
     }
 
@@ -1762,7 +1762,7 @@ impl Sender {
         &mut self,
         frame: VideoFrame,
     ) -> std::result::Result<Option<VideoFrame>, Rejected<VideoFrame>> {
-        let authorized = self.require_video_layout(frame)?;
+        let authorized = Sendable::new(frame, self.runtime())?;
         Ok(self.native.video.submit(authorized))
     }
 
@@ -1900,15 +1900,6 @@ impl<M: SenderMode> Sender<M> {
 
     pub(crate) fn runtime(&self) -> &Ndi {
         self.resource().ndi()
-    }
-
-    /// Check that this sender's runtime can send `pixel_format`: the one
-    /// check every video send makes before anything reaches the SDK.
-    pub(crate) fn require_video_layout<F: VideoParts>(
-        &self,
-        frame: F,
-    ) -> std::result::Result<Sendable<F>, Rejected<F>> {
-        Sendable::new(frame, self.resource().ndi())
     }
 
     /// Capture metadata sent back by connected receivers.
