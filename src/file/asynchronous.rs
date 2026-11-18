@@ -3775,20 +3775,37 @@ mod tests {
 
     #[test]
     fn unpolled_finish_does_not_consume_its_wait_budget() {
-        let (device, recorder) = mock_recorder(Closing::WhenTold);
+        // Inspect the job itself before any owner can register or settle it.
+        // This makes the submission boundary observable even on a slow runner.
+        let (sender, jobs) = mpsc::channel();
+        let recorder = AsyncFileRecorder {
+            worker: Arc::new(Worker {
+                sender,
+                admission: Arc::new(Admission::new(1)),
+                finish: RecorderFinish::admission(1),
+                control: Arc::new(Control::with_outcome()),
+                events: Arc::new(EventQueue::new(1)),
+                thread: OnceLock::new(),
+            }),
+        };
         let wait = Duration::from_millis(50);
         let finishing = recorder.finish(wait);
-        thread::sleep(wait + wait);
-        assert_eq!(device.stops.load(Ordering::Acquire), 0);
-        let finishing = finishing.submit();
-        await_finish(&recorder);
-        device.close();
-        let outcome = block_on(finishing).unwrap();
-        assert!(
-            matches!(outcome, FinishStatus::Ended(SessionEnd::Closed(_))),
-            "{outcome:?}"
-        );
-        block_on(recorder.close()).unwrap();
+        assert!(matches!(jobs.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let constructed = Instant::now();
+        let submitting = loop {
+            let now = Instant::now();
+            if now > constructed {
+                break now;
+            }
+            thread::yield_now();
+        };
+        let _finishing = finishing.submit();
+        let submitted = Instant::now();
+        let Job::Finish { finish, .. } = jobs.try_recv().unwrap() else {
+            panic!("finish must enqueue a finish request");
+        };
+        assert!(finish.deadline.end() >= submitting + wait);
+        assert!(finish.deadline.end() <= submitted + wait);
     }
 
     #[test]
