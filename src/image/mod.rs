@@ -639,13 +639,12 @@ impl<'a> Plan<'a> {
             source.width.div_ceil(1 << shift),
             source.height.div_ceil(1 << shift),
         );
-        let (alpha, channels) = match info.alpha {
-            AlphaChannel::None => (false, Channels::Rgb),
-            AlphaChannel::Optional => {
-                let alpha = options.alpha.keeps_alpha();
-                (alpha, Channels::from_alpha(alpha))
-            }
-            AlphaChannel::AlwaysRgba => (options.alpha.keeps_alpha(), Channels::Rgba),
+        let alpha = info.alpha != AlphaChannel::None
+            && options.alpha.keeps_alpha()
+            && source.format.info().has_alpha();
+        let channels = match info.alpha {
+            AlphaChannel::None | AlphaChannel::Optional => Channels::from_alpha(alpha),
+            AlphaChannel::AlwaysRgba => Channels::Rgba,
         };
         let density = info
             .aspect_tag

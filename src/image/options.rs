@@ -206,10 +206,10 @@ image_format_variants!(
 ///
 /// | Output | Channels | Bits a channel |
 /// |---|---|---|
-/// | PNG, [`AlphaMode::Keep`] | RGBA; a source without alpha gets alpha 255 | 8 or 16 |
+/// | PNG, [`AlphaMode::Keep`] | RGBA if the source has alpha, otherwise RGB | 8 or 16 |
 /// | PNG, [`AlphaMode::Discard`] | RGB | 8 or 16 |
 /// | JPEG | YCbCr; alpha is dropped | 8 |
-/// | Lossless WebP | RGBA, or RGB with [`AlphaMode::Discard`] | 8 |
+/// | Lossless WebP | RGBA if the source has alpha and it is kept, otherwise RGB | 8 |
 /// | Lossy WebP | Lossy color, exact alpha unless discarded | 8 |
 ///
 /// # Color
@@ -274,8 +274,9 @@ image_format_variants!(
 /// final component row to avoid converting padding requests again.
 /// WebP encodes from one buffer, so it holds the whole converted
 /// image, unless full-size contiguous RGBA can be borrowed with alpha kept.
-/// Lossless WebP uses three channels with alpha discarded; lossy WebP
-/// uses four with opaque alpha. Both WebP formats buffer the complete encoded
+/// Lossless WebP uses three channels when the source has no alpha or alpha is
+/// discarded. Lossy WebP uses four channels, with opaque alpha in those cases.
+/// Both WebP formats buffer the complete encoded
 /// image before writing it. Codec state and encoded output take memory besides.
 /// Each concurrent encode owns its own buffers, so worker and queue limits
 /// matter alongside compressed image size.
@@ -573,8 +574,9 @@ impl SampleDepth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum AlphaMode {
-    /// Write RGBA. A source with alpha keeps it, converted to the image's
-    /// depth; one without gets alpha 255, or 65535 at 16 bits.
+    /// Keep the source's alpha, converted to the image's depth. PNG and
+    /// lossless WebP use RGBA for a source with alpha and RGB otherwise.
+    /// Lossy WebP's encoder takes RGBA, using opaque alpha for an opaque source.
     /// Colors are treated as straight (not premultiplied by alpha), and PNG
     /// and WebP store straight alpha. The [SDK frame-type reference] documents
     /// this for BGRA and RGBA. It does not specify the convention for UYVA,

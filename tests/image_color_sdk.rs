@@ -180,16 +180,18 @@ fn png_rgb(png: &[u8]) -> Vec<[u8; 3]> {
         .unwrap();
     let mut buffer = vec![0; reader.output_buffer_size().unwrap()];
     let info = reader.next_frame(&mut buffer).unwrap();
-    assert_eq!(
-        (info.color_type, info.bit_depth),
-        (png::ColorType::Rgba, png::BitDepth::Eight)
-    );
-    buffer
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&[r, g, b, _]| [r, g, b])
-        .collect()
+    assert_eq!(info.bit_depth, png::BitDepth::Eight);
+    let buffer = &buffer[..info.buffer_size()];
+    match info.color_type {
+        png::ColorType::Rgb => buffer.as_chunks::<3>().0.to_vec(),
+        png::ColorType::Rgba => buffer
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&[r, g, b, _]| [r, g, b])
+            .collect(),
+        other => panic!("unexpected PNG color type: {other:?}"),
+    }
 }
 
 /// The RGB of an RGBX or RGBA frame's active rows.

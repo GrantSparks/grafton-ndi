@@ -78,8 +78,11 @@ instead of repacking a captured frame solely for encoding.
 | `WebpLossless` | Lossless 8-bit RGB/RGBA | `alpha` |
 | `WebpLossy(quality)` | Lossy 8-bit color with exact alpha unless discarded | Quality 0–100, `webp_effort` 0–6, `webp_sharp_yuv` |
 
-JPEG drops alpha. PNG and WebP keep it by default; `AlphaMode::Discard`
-removes it. Lossy WebP quality 100 is still lossy for color. Its default effort
+JPEG drops alpha. PNG and lossless WebP use RGB for sources without alpha and
+keep existing alpha by default. `AlphaMode::Discard` removes it. Lossy WebP
+preserves existing alpha by default, and its encoder takes opaque alpha when
+the source has none or alpha is discarded. Lossy WebP quality 100 is still
+lossy for color. Its default effort
 is 4 and SharpYUV is enabled. Effort and conversion settings affect only lossy
 WebP; they impose no time or memory limit. Measure their effect on your content.
 

@@ -147,7 +147,7 @@ impl<'a, P: Sample> Reader<'a, P> {
                     plane: pixels,
                     red,
                     blue,
-                    alpha: alpha && info.has_alpha(),
+                    alpha,
                 }
             }
             PlaneRoles::Packed422 { pixels } => Layout::Packed422 {

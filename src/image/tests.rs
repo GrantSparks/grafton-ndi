@@ -412,23 +412,25 @@ fn check_against_reference(
     } else {
         65535.0
     };
+    let channels = if codes.sampling().alpha { 4 } else { 3 };
     assert_eq!(
         (
             decoded.width as usize,
             decoded.height as usize,
             decoded.channels
         ),
-        (codes.width, codes.height, 4)
+        (codes.width, codes.height, channels)
     );
     let bits = codes.sampling().bits;
     for y in 0..codes.height {
         for x in 0..codes.width {
             let [luma, cb, cr, alpha] = codes.pixel(x, y);
             let rgb = reference_rgb(matrix, range, bits, max, [luma, cb, cr]);
-            let at = (y * codes.width + x) * 4;
+            let at = (y * codes.width + x) * channels;
             for (c, want) in rgb
                 .into_iter()
                 .chain([reference_alpha(alpha, bits, max)])
+                .take(channels)
                 .enumerate()
             {
                 let got = f64::from(decoded.samples[at + c]);
@@ -641,10 +643,11 @@ fn a_chroma_impulse_covers_exactly_the_pixels_it_is_sited_on() {
                 ))
                 .unwrap(),
         );
-        let gray = &decoded.samples[..4];
+        let channels = decoded.channels;
+        let gray = &decoded.samples[..channels];
         let changed: Vec<(usize, usize)> = (0..height)
             .flat_map(|y| (0..width).map(move |x| (x, y)))
-            .filter(|&(x, y)| &decoded.samples[(y * width + x) * 4..][..4] != gray)
+            .filter(|&(x, y)| &decoded.samples[(y * width + x) * channels..][..channels] != gray)
             .collect();
         let (cx, cy) = (impulse % cw, impulse / cw);
         let expected: Vec<(usize, usize)> = (cy << s.v_shift..(cy + 1) << s.v_shift)
@@ -809,12 +812,13 @@ fn every_frame_type_encodes_the_same_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// PNG and the scalar JPEG backend keep 2.0's bytes
+// PNG and scalar JPEG output identity
 // ---------------------------------------------------------------------------
 
-/// SHA-256 of grafton-ndi 2.0's output for the RGB formats, recorded from the
-/// 2.0 encoder before it was replaced: each covers sizes 2×1, 2×2, 18×19,
-/// 64×33 and 130×67, packed and padded rows, noise and gradient content.
+/// SHA-256 of the encoded output for the RGB formats. PNG with alpha and
+/// scalar JPEG keep 2.0's bytes. Opaque PNG records the three-channel output.
+/// Each hash covers sizes 2×1, 2×2, 18×19, 64×33 and 130×67, packed and
+/// padded rows, noise and gradient content.
 const IDENTITY_HASHES: [(PixelFormat, Option<u8>, &str); 28] = [
     (
         PixelFormat::Rgba,
@@ -889,7 +893,7 @@ const IDENTITY_HASHES: [(PixelFormat, Option<u8>, &str); 28] = [
     (
         PixelFormat::Rgbx,
         None,
-        "eb701500fdaaafbd0b77f6bd736a3c6a78c5fa7188234a6fb9bb2f6b8595add4",
+        "4007f5d8854053e2721a50d9603988c64a5d695ae05975676f3235c8b63cf90b",
     ),
     (
         PixelFormat::Rgbx,
@@ -924,7 +928,7 @@ const IDENTITY_HASHES: [(PixelFormat, Option<u8>, &str); 28] = [
     (
         PixelFormat::Bgrx,
         None,
-        "ba2edbd6b06426db017932c336c0a34eef4f85ee35b6690cfa42d7061de7f91a",
+        "a8bc14eb1d951622f2b3d9693682b95fecdc8572247d4eb8a595168a626e3493",
     ),
     (
         PixelFormat::Bgrx,
@@ -1010,7 +1014,7 @@ fn identity_hash(images: impl Iterator<Item = Vec<u8>>) -> String {
 }
 
 #[test]
-fn rgb_png_and_scalar_jpeg_keep_the_bytes_of_grafton_ndi_2() {
+fn png_and_scalar_jpeg_pin_encoded_bytes() {
     // JPEG's runtime SIMD dispatch can change encoded bytes. Its contract is
     // covered by independent decoded-quality checks rather than scalar hashes.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1177,7 +1181,11 @@ fn every_png_level_and_lossless_webp_decode_to_the_converted_pixels() {
                 );
                 assert_eq!(
                     reference.channels,
-                    if alpha == AlphaMode::Keep { 4 } else { 3 }
+                    if alpha.keeps_alpha() && format.info().has_alpha() {
+                        4
+                    } else {
+                        3
+                    }
                 );
                 for level in [
                     PngCompression::Fast,
@@ -1297,6 +1305,48 @@ fn lossy_webp_reduces_every_pixel_format_and_preserves_alpha() {
                         .map(|p| u16::from(p[3]))
                         .collect();
                     assert_eq!(actual, expected, "{format:?} {downscale:?} alpha");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn keep_writes_rgb_for_opaque_sources_and_preserves_source_alpha() {
+    for format in PixelFormat::ALL {
+        let frame = VideoFrame::builder()
+            .resolution(18, 10)
+            .pixel_format(format)
+            .data(any_frame_bytes(format, 18, 10, 21))
+            .build()
+            .unwrap();
+        let source = Source::new(&frame);
+        let has_alpha = format.info().has_alpha();
+        let source_channels = if has_alpha { 4 } else { 3 };
+        for downscale in [Downscale::Off, Downscale::Half] {
+            for (codec, depth, channels) in [
+                (ImageFormat::Png, SampleDepth::Eight, source_channels),
+                (ImageFormat::Png, SampleDepth::Sixteen, source_channels),
+                (
+                    ImageFormat::WebpLossless,
+                    SampleDepth::Eight,
+                    source_channels,
+                ),
+                (ImageFormat::WebpLossy(75), SampleDepth::Eight, 4),
+            ] {
+                let keep = options(codec).depth(depth).downscale(downscale);
+                let plan = Plan::new(&source, &keep).unwrap();
+                assert_eq!(plan.alpha, has_alpha, "{format:?} {keep:?}");
+                assert_eq!(plan.channels().count(), channels, "{format:?} {keep:?}");
+                let image = frame.encode_image(&keep).unwrap();
+                if codec == ImageFormat::Png {
+                    assert_eq!(decode_png(&image).channels, channels, "{format:?} {keep:?}");
+                } else if !has_alpha {
+                    assert_eq!(decode_webp(&image).channels, 3, "{format:?} {keep:?}");
+                }
+                if !has_alpha {
+                    let discarded = frame.encode_image(&keep.alpha(AlphaMode::Discard)).unwrap();
+                    assert_eq!(image, discarded, "{format:?} {codec:?} {downscale:?}");
                 }
             }
         }
@@ -1454,9 +1504,10 @@ fn sixteen_bit_png_keeps_high_bit_depth_precision() {
             .unwrap(),
     );
     assert_eq!(decoded.bits, 16);
+    assert_eq!(decoded.channels, 3);
     let greens: Vec<u16> = decoded
         .samples
-        .as_chunks::<4>()
+        .as_chunks::<3>()
         .0
         .iter()
         .map(|p| p[1])
@@ -2241,26 +2292,28 @@ fn reduced_images_are_the_block_averages_of_the_full_image() {
             );
             let (rw, rh) = (width.div_ceil(size), height.div_ceil(size));
             assert_eq!((reduced.width as usize, reduced.height as usize), (rw, rh));
+            let channels = full.channels;
+            assert_eq!(reduced.channels, channels);
             for by in 0..rh {
                 for bx in 0..rw {
                     let pixels: Vec<&[u16]> = (by * size..((by + 1) * size).min(height))
                         .flat_map(|y| {
                             (bx * size..((bx + 1) * size).min(width)).map(move |x| (x, y))
                         })
-                        .map(|(x, y)| &full.samples[(y * width + x) * 4..][..4])
+                        .map(|(x, y)| &full.samples[(y * width + x) * channels..][..channels])
                         .collect();
                     let count = pixels.len() as u64;
-                    let alpha: u64 = pixels.iter().map(|p| u64::from(p[3])).sum();
-                    let has_alpha = matches!(
-                        format,
-                        PixelFormat::Uyva | PixelFormat::Bgra | PixelFormat::Nb4g
-                    );
-                    let expected: Vec<u16> = (0..4)
+                    let alpha: u64 = pixels
+                        .iter()
+                        .filter_map(|p| p.get(3))
+                        .map(|&alpha| u64::from(alpha))
+                        .sum();
+                    let expected: Vec<u16> = (0..channels)
                         .map(|c| {
                             let mean = |sum: u64, n: u64| ((sum + n / 2) / n) as u16;
                             if c == 3 {
                                 mean(alpha, count)
-                            } else if has_alpha && alpha > 0 {
+                            } else if alpha > 0 {
                                 mean(
                                     pixels
                                         .iter()
@@ -2274,7 +2327,7 @@ fn reduced_images_are_the_block_averages_of_the_full_image() {
                         })
                         .collect();
                     assert_eq!(
-                        &reduced.samples[(by * rw + bx) * 4..][..4],
+                        &reduced.samples[(by * rw + bx) * channels..][..channels],
                         expected,
                         "{format:?} {downscale:?} {bx},{by}"
                     );
@@ -2550,7 +2603,12 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
             ] {
                 let shift = downscale.shift();
                 let reduced = (width.div_ceil(1 << shift), height.div_ceil(1 << shift));
-                for (alpha, channels) in [(AlphaMode::Keep, 4), (AlphaMode::Discard, 3)] {
+                for alpha in [AlphaMode::Keep, AlphaMode::Discard] {
+                    let channels = if alpha.keeps_alpha() && format.info().has_alpha() {
+                        4
+                    } else {
+                        3
+                    };
                     // PNG at both depths: the pipeline allocates only the
                     // downscale sums, then one row of scratch serves every row.
                     for depth in [SampleDepth::Eight, SampleDepth::Sixteen] {
@@ -3490,11 +3548,14 @@ fn reader_format_facts_match_the_frame_layout_for_every_format() {
         };
         assert_eq!(info.sample_width().bits(), expected_bits, "{format:?}");
         assert_eq!(info.has_alpha(), expected_alpha, "{format:?}");
-        for keep in [false, true] {
+        for alpha in [AlphaMode::Keep, AlphaMode::Discard] {
             let source = Source::new(&frame);
-            let reader =
-                super::Reader::<u8>::new(&source, YuvMatrix::Bt709, YuvRange::Limited, keep);
-            assert_eq!(reader.has_alpha(), keep && info.has_alpha(), "{format:?}");
+            let plan = Plan::new(&source, &options(ImageFormat::Png).alpha(alpha)).unwrap();
+            assert_eq!(
+                plan.pixels::<u8>().reader.has_alpha(),
+                alpha.keeps_alpha() && info.has_alpha(),
+                "{format:?}"
+            );
         }
     }
 }
