@@ -15,7 +15,7 @@ use std::{
     borrow::{Borrow, Cow},
     cell::Cell,
     collections::{HashMap, HashSet},
-    ffi::{c_char, CString},
+    ffi::{c_char, CStr, CString},
     fmt::{self, Display, Formatter},
     hash::{Hash, Hasher},
     net::IpAddr,
@@ -1617,8 +1617,8 @@ impl SourceText {
         unsafe { std::str::from_utf8_unchecked(self.0.as_bytes()) }
     }
 
-    fn as_ptr(&self) -> *const c_char {
-        self.0.as_ptr()
+    fn as_c_str(&self) -> &CStr {
+        self.0.as_c_str()
     }
 
     fn storage_bytes(&self) -> usize {
@@ -1669,6 +1669,10 @@ impl SourceAddress {
     /// The exact address text, whether it names a host, IP address or URL.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+
+    pub(crate) fn as_c_str(&self) -> &CStr {
+        self.0.as_c_str()
     }
 
     /// Whether the address contains a URL scheme separator (`://`).
@@ -1828,30 +1832,6 @@ impl<'a> Borrow<dyn SourceIdentity + 'a> for SeenSource {
     }
 }
 
-#[repr(C)]
-pub(crate) struct RawSource {
-    _source: Source,
-    raw: NDIlib_source_t,
-}
-
-// SAFETY: the descriptor's pointers lead only into the strings this value
-// owns, whose heap buffers do not move when the value does, and nothing
-// writes through them. Moving it to another thread moves those strings with
-// it, as moving a `CString` does.
-unsafe impl Send for RawSource {}
-
-// SAFETY: a shared descriptor exposes only immutable pointers into the C strings
-// this value owns. Their buffers stay allocated for the shared borrow and no SDK
-// operation writes through them, so concurrent readers cannot race with mutation.
-unsafe impl Sync for RawSource {}
-
-impl RawSource {
-    /// Lend the descriptor only while its backing C strings remain owned.
-    pub(crate) fn as_raw(&self) -> &NDIlib_source_t {
-        &self.raw
-    }
-}
-
 impl Source {
     pub(crate) fn from_text(name: SourceText, address: Option<SourceAddress>) -> Self {
         Self { name, address }
@@ -1882,6 +1862,10 @@ impl Source {
     /// described by its address alone has an empty name.
     pub fn name(&self) -> &str {
         self.name.as_str()
+    }
+
+    pub(crate) fn name_c_str(&self) -> &CStr {
+        self.name.as_c_str()
     }
 
     /// The network address for connecting to this source, when known.
@@ -2008,25 +1992,6 @@ impl Source {
             )
         }?
         .ok_or_else(failed)
-    }
-
-    /// Retain the source's validated storage and lend its native descriptor.
-    /// No strings are allocated or validated again.
-    pub(crate) fn to_raw(&self) -> RawSource {
-        let source = self.clone();
-        let raw = NDIlib_source_t {
-            p_ndi_name: source.name.as_ptr(),
-            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
-                p_url_address: source
-                    .address
-                    .as_ref()
-                    .map_or(ptr::null(), |address| address.0.as_ptr()),
-            },
-        };
-        RawSource {
-            _source: source,
-            raw,
-        }
     }
 }
 
@@ -2747,39 +2712,6 @@ mod tests {
         ));
         assert_eq!(Source::new("").unwrap().name(), "");
         assert_eq!(SourceAddress::new("").unwrap().as_str(), "");
-    }
-
-    #[test]
-    fn native_source_descriptors_share_validated_storage_without_allocating() {
-        let source = Source::new("Studio (Camera)")
-            .unwrap()
-            .with_address(SourceAddress::new("192.0.2.1:5960").unwrap());
-        let (raw, allocations) = crate::test_alloc::allocation_count(|| {
-            let first = source.to_raw();
-            let second = source.to_raw();
-            assert_eq!(first.as_raw().p_ndi_name, second.as_raw().p_ndi_name);
-            // SAFETY: both descriptors initialized their address pointer.
-            unsafe {
-                assert_eq!(
-                    first.as_raw().__bindgen_anon_1.p_url_address,
-                    second.as_raw().__bindgen_anon_1.p_url_address
-                );
-            }
-            first
-        });
-        assert_eq!(allocations, 0);
-        drop(source);
-        // SAFETY: RawSource retains the immutable strings after Source is dropped.
-        unsafe {
-            assert_eq!(
-                std::ffi::CStr::from_ptr(raw.as_raw().p_ndi_name),
-                c"Studio (Camera)"
-            );
-            assert_eq!(
-                std::ffi::CStr::from_ptr(raw.as_raw().__bindgen_anon_1.p_url_address),
-                c"192.0.2.1:5960"
-            );
-        }
     }
 
     #[test]
@@ -3614,51 +3546,6 @@ mod tests {
     }
 
     #[test]
-    fn configured_and_discovered_sources_share_text_identity() {
-        use std::hash::{DefaultHasher, Hash, Hasher};
-
-        let hash = |source: &Source| {
-            let mut state = DefaultHasher::new();
-            source.hash(&mut state);
-            state.finish()
-        };
-        for text in [
-            "camera.local:8080",
-            "192.0.2.1:5960",
-            "[2001:db8::1]:5960",
-            "ndi://h:1",
-            "opaque text",
-        ] {
-            let configured = Source::new("Camera")
-                .unwrap()
-                .with_address(SourceAddress::new(text).unwrap());
-            let raw = configured.to_raw();
-            // SAFETY: RawSource lends its descriptor while retaining both C
-            // strings for this synchronous owned copy.
-            let discovered = unsafe { source_from_raw(raw.as_raw(), c"test") }.unwrap();
-            assert_eq!(configured, discovered);
-            assert_eq!(hash(&configured), hash(&discovered));
-            let address = discovered.address().unwrap();
-            assert_eq!(address.as_str(), text);
-            assert_eq!(address.is_url(), text.contains("://"));
-            // Both native union member names denote the same address pointer.
-            // SAFETY: RawSource initialized the pointer member of this union.
-            unsafe {
-                assert_eq!(
-                    raw.as_raw().__bindgen_anon_1.p_url_address,
-                    raw.as_raw().__bindgen_anon_1.p_ip_address
-                );
-                assert_eq!(
-                    std::ffi::CStr::from_ptr(raw.as_raw().__bindgen_anon_1.p_url_address)
-                        .to_str()
-                        .unwrap(),
-                    text
-                );
-            }
-        }
-    }
-
-    #[test]
     fn discovery_accumulates_distinct_name_and_address_text_in_order() {
         let first = Source::new("Camera")
             .unwrap()
@@ -4160,24 +4047,6 @@ mod tests {
             Err(Error::NativeOperationFailed {
                 operation}) if operation.name() == c"NDIlib_find_get_current_sources"
         ));
-    }
-
-    #[test]
-    fn test_try_from_raw_address_only_source() {
-        let url = CString::new("ndi://127.0.0.1:5960").unwrap();
-        let raw = NDIlib_source_t {
-            p_ndi_name: ptr::null(),
-            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
-                p_url_address: url.as_ptr(),
-            },
-        };
-        let source = unsafe { source_from_raw(&raw, c"test") }.unwrap();
-        assert!(source.name().is_empty());
-        assert!(
-            matches!(source.address(), Some(address) if address.is_url() && address.as_str() == "ndi://127.0.0.1:5960")
-        );
-        let roundtrip = source.to_raw();
-        assert!(!roundtrip.as_raw().p_ndi_name.is_null());
     }
 
     #[test]
