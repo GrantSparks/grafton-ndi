@@ -94,6 +94,9 @@ with `RecordingTarget::new("take")`. The target resolves the prefix when it is
 created, so later working-directory changes leave the recording destination
 fixed. `{index}` and `{index:N}` must be in the file name. For a target that
 names an existing directory, use a pattern such as `{prefix}/{index:03}.mkv`.
+The pattern uses the prefix text, including any trailing separator or `.`
+component. For example, `folder/.` with `{prefix}hidden.mkv` gives
+`folder/.hidden.mkv` under the frozen working directory.
 
 `start` and `rollover` require a filename component and check that the output
 directory exists and is writable. Exact naming refuses an existing file.

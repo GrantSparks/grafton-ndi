@@ -428,7 +428,14 @@ fn absolute_recording_names_survive_a_working_directory_change() {
     let source = SourceSpec::from_url(std::env::var(SOURCE_URL).unwrap()).unwrap();
     let changed_directory = PathBuf::from(changed_directory);
     let original = std::env::current_dir().unwrap();
-    let target = RecordingTarget::new("take").unwrap();
+    let separator = std::path::MAIN_SEPARATOR;
+    let relative = format!("folder{separator}.");
+    let target = RecordingTarget::new(&relative).unwrap();
+    let missing = format!("missing{separator}.");
+    let invalid_targets = [
+        RecordingTarget::new(&missing).unwrap(),
+        RecordingTarget::new(original.join(&missing)).unwrap(),
+    ];
     let recorder = |pattern| {
         let options = FileRecorderOptions::new(source.clone())
             .naming(FileNaming::Pattern(pattern))
@@ -465,14 +472,27 @@ fn absolute_recording_names_survive_a_working_directory_change() {
             index_digits_reserved: 0,
         }) if maximum_bytes == event_limit && longest_bytes == event_limit + 1
     ));
+    let mut exact = recorder("{prefix}".to_owned());
+    for invalid in &invalid_targets {
+        assert!(matches!(
+            exact.start(invalid, RecordingTimecode::Preserve),
+            Err(Error::InvalidInput(
+                crate::InputDefect::RecordingPathMissingFilename
+            ))
+        ));
+        assert_eq!(exact.state(), RecorderState::Idle);
+    }
+    drop(exact);
     assert!(std::fs::read_dir(&original).unwrap().next().is_none());
 
-    let mut recorder = recorder("{prefix}{index}.mkv".to_owned());
+    let folder = original.join("folder");
+    std::fs::create_dir(&folder).unwrap();
+    let mut recorder = recorder("{prefix}hidden{index}.mkv".to_owned());
     recorder
         .start(&target, RecordingTimecode::Preserve)
         .unwrap();
-    let first = original.join("take1.mkv");
-    let second = original.join("take2.mkv");
+    let first = folder.join(".hidden1.mkv");
+    let second = folder.join(".hidden2.mkv");
     let assert_event_path = |event_path: &EventText, expected: &Path| {
         assert_eq!(event_path.as_bytes(), expected.to_str().unwrap().as_bytes());
         assert!(!event_path.is_possibly_truncated());
@@ -483,6 +503,12 @@ fn absolute_recording_names_survive_a_working_directory_change() {
     assert_event_path(recorder.reported_current_file().unwrap(), &first);
 
     std::env::set_current_dir(&changed_directory).unwrap();
+    for invalid in &invalid_targets {
+        assert!(matches!(recorder.rollover(invalid), Err(Error::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound));
+        assert_eq!(recorder.state(), RecorderState::Recording);
+        assert!(recorder.is_recording());
+    }
     std::fs::write(changed_directory.with_file_name(FORMAT_REQUEST), []).unwrap();
     let mut timeline = Timeline::new();
     assert_eq!(timeline.await_change(&mut recorder, 0, &first), second);
