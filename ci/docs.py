@@ -1038,11 +1038,13 @@ def compile_snippets(root, snippets):
     """Compile complete Rust examples against all Cargo features, never run them."""
     if not snippets:
         return []
+    features = tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))['features']
+    optional = json.dumps(sorted(name for name in features if name != 'default'))
     with tempfile.TemporaryDirectory(prefix='grafton-ndi-docs-') as directory:
         directory = Path(directory)
         manifest = ('[package]\nname = "grafton-ndi-doc-snippets"\nversion = "0.0.0"\nedition = "2021"\n'
                     '[dependencies]\ngrafton-ndi = { path = ' + json.dumps(str(root)) + ', '
-                    'features = ["advanced", "file-io", "image-encoding", "tokio", "smol"] }\n'
+                    'features = ' + optional + ' }\n'
                     'tokio = { version = "1", features = ["macros", "rt-multi-thread"] }\n')
         (directory / 'Cargo.toml').write_text(manifest, encoding='utf-8')
         shutil.copyfile(root / 'Cargo.lock', directory / 'Cargo.lock')

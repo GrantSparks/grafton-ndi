@@ -79,6 +79,25 @@ def read_workflows():
     return {path.name: path.read_text(encoding='utf-8') for path in sorted(WORKFLOWS.glob('*.yml'))}
 
 
+def cargo_manifest():
+    return tomllib.loads((ROOT / 'Cargo.toml').read_text(encoding='utf-8'))
+
+
+def msrv_version(manifest):
+    value = manifest['package']['rust-version']
+    return value + '.0' if value.count('.') == 1 else value
+
+
+def platform_coverage(text):
+    section = text.partition('| Platform | Rust targets | Configured coverage |')[2].split('\n\n', 1)[0]
+    return {target: row.split('|')[3].strip() for row in section.splitlines() if row.startswith('|')
+            for target in re.findall(r'`([^`]+)`', row.split('|')[2])}
+
+
+def feature_loops(step):
+    return [shlex.split(loop) for loop in re.findall(r'for features in ([^;]+); do', step.get('run', ''))]
+
+
 def differs(what, actual, expected):
     return [] if actual == expected else [f'{what} is {actual!r}, not {expected!r}']
 
@@ -120,7 +139,52 @@ def violations(texts):
     return (found + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
             + docs_violations(parsed['rust.yml']) + memory_checker_violations(parsed['rust.yml'])
             + repeated_feature_violations(parsed['rust.yml'])
-            + sdk_input_violations(parsed['rust.yml']))
+            + sdk_input_violations(parsed['rust.yml'])
+            + source_consistency_violations(parsed, cargo_manifest(), sdk.load_pins(),
+                                            (ROOT / 'docs/setup.md').read_text(encoding='utf-8')))
+
+
+def source_consistency_violations(parsed, manifest, pins, setup):
+    """Compare duplicated coverage with the manifest, SDK pins and platform table."""
+    jobs = parsed['rust.yml']['jobs']
+    lint = {step.get('name'): step for step in jobs['lint']['steps']}
+    sdk_steps = {step.get('name'): step for step in jobs['sdk']['steps']}
+    minimum = msrv_version(manifest)
+    expected = (
+        ('Minimum supported Rust version', lint, '', '--workspace '),
+        ('Lint and document the Advanced implementation', sdk_steps, ' --target "$TARGET"', ''),
+    )
+    found = []
+    for name, steps, target, workspace in expected:
+        script = steps.get(name, {}).get('run', '').splitlines()
+        commands = (f'rustup toolchain install {minimum} --profile minimal{target}',
+                    f'cargo +{minimum} check --locked {workspace}--all-targets{target} --all-features')
+        if any(command not in script for command in commands):
+            found.append(f'rust.yml: {name} must install and check Cargo.toml rust-version {minimum}')
+    for workflow, body in parsed.items():
+        for job, definition in body['jobs'].items():
+            for step in definition.get('steps', []):
+                versions = re.findall(r'(?:rustup toolchain install |cargo \+)(\d+\.\d+\.\d+)\b',
+                                      step.get('run', ''))
+                if any(version != minimum for version in versions):
+                    found.append(f'{workflow}: {job} step {step.get("name")} contradicts '
+                                 f'Cargo.toml rust-version {minimum}')
+
+    expected_features = (set(manifest['features']) - {'default'}) | {'', 'advanced,file-io'}
+    for name in ('Clippy', 'Rustdoc feature combinations'):
+        loops = feature_loops(lint.get(name, {}))
+        if len(loops) != 1 or set(loops[0]) != expected_features or len(loops[0]) != len(expected_features):
+            found.append(f'rust.yml: {name} feature combinations must cover Cargo.toml features and advanced,file-io')
+
+    coverage = platform_coverage(setup)
+    dynamic = {target for target, description in coverage.items() if not description.startswith('Static build, ')}
+    # GitHub's Ubuntu 24.04 x64 runner compiles its own host through the lint job.
+    host = {'ubuntu-24.04': 'x86_64-unknown-linux-gnu'}.get(jobs['lint'].get('runs-on'))
+    targets = jobs['cross'].get('env', {}).get('TARGETS', '').split() + [host]
+    if set(targets) != dynamic or len(targets) != len(dynamic):
+        found.append('rust.yml: cross TARGETS and lint host differ from the dynamic targets in docs/setup.md')
+    found += sdk_version_violations(jobs['sdk']['strategy']['matrix']['include'], pins, coverage)
+    return found
 
 
 def sdk_input_violations(rust):
@@ -196,11 +260,7 @@ def rustdoc_feature_violations(steps):
     clippy = named.get('Clippy', {})
     rustdoc = named.get('Rustdoc feature combinations', {})
 
-    def features(step):
-        loops = re.findall(r'for features in ([^;]+); do', step.get('run', ''))
-        return [shlex.split(loop) for loop in loops]
-
-    found = differs('rust.yml: rustdoc feature combinations', features(rustdoc), features(clippy))
+    found = differs('rust.yml: rustdoc feature combinations', feature_loops(rustdoc), feature_loops(clippy))
     found += differs('rust.yml: rustdoc denies warnings', rustdoc.get('env'), {'RUSTDOCFLAGS': '-D warnings'})
     if 'cargo doc --locked --no-deps --no-default-features ${features:+--features "$features"}' not in rustdoc.get('run', ''):
         found.append('rust.yml: rustdoc feature combinations do not build their selected features')
@@ -292,7 +352,7 @@ def local_recipe_violations(rust, readme):
     expected = []
     for name in ('Clippy', 'Rustdoc feature combinations'):
         step = next((step for step in rust['jobs']['lint']['steps'] if step.get('name') == name), {})
-        expected.extend(shlex.split(loop) for loop in re.findall(r'for features in ([^;]+); do', step.get('run', '')))
+        expected.extend(feature_loops(step))
     actual = [shlex.split(loop) for loop in re.findall(r'for features in ([^;]+); do', recipe)]
     found += differs('ci/README.md: local recipe feature combinations', actual, expected)
     return found
@@ -301,23 +361,23 @@ def local_recipe_violations(rust, readme):
 # The native obligations are independent of their scheduling roles. Keep the
 # original configurations explicit so deleting a row cannot shrink coverage.
 PRIMARY_SDK_CONFIGURATIONS = {
-    ('linux-x64 standard-6.1.1', 'x86_64-unknown-linux-gnu', '6.1.1-standard-linux'),
-    ('linux-x64 standard-6.3.2', 'x86_64-unknown-linux-gnu', '6.3.2-standard-linux'),
-    ('linux-x64 advanced-6.3.2', 'x86_64-unknown-linux-gnu', '6.3.2-advanced-linux'),
-    ('linux-x64 standard-6.4', 'x86_64-unknown-linux-gnu', 'current-standard-linux'),
-    ('linux-x64 advanced-6.4', 'x86_64-unknown-linux-gnu', 'current-advanced-linux'),
-    ('linux-x86 standard-6.4', 'i686-unknown-linux-gnu', 'current-standard-linux'),
-    ('linux-arm64 standard-6.4', 'aarch64-unknown-linux-gnu', 'current-standard-linux'),
-    ('windows-x64 standard-6.3.2', 'x86_64-pc-windows-msvc', '6.3.2-standard-windows'),
-    ('windows-x64 advanced-6.3.2', 'x86_64-pc-windows-msvc', '6.3.2-advanced-windows'),
-    ('windows-x64 standard-6.4', 'x86_64-pc-windows-msvc', 'current-standard-windows'),
-    ('windows-x64 advanced-6.4', 'x86_64-pc-windows-msvc', 'current-advanced-windows'),
-    ('windows-x86 advanced-6.4', 'i686-pc-windows-msvc', 'current-advanced-windows'),
-    ('macos-arm64 standard-6.3.2', 'aarch64-apple-darwin', '6.3.2-standard-apple'),
-    ('macos-arm64 advanced-6.3.2', 'aarch64-apple-darwin', '6.3.2-advanced-apple'),
-    ('macos-arm64 standard-6.4', 'aarch64-apple-darwin', 'current-standard-apple'),
-    ('macos-arm64 advanced-6.4', 'aarch64-apple-darwin', 'current-advanced-apple'),
-    ('macos-x64 standard-6.4', 'x86_64-apple-darwin', 'current-standard-apple'),
+    ('x86_64-unknown-linux-gnu', '6.1.1-standard-linux'),
+    ('x86_64-unknown-linux-gnu', '6.3.2-standard-linux'),
+    ('x86_64-unknown-linux-gnu', '6.3.2-advanced-linux'),
+    ('x86_64-unknown-linux-gnu', 'current-standard-linux'),
+    ('x86_64-unknown-linux-gnu', 'current-advanced-linux'),
+    ('i686-unknown-linux-gnu', 'current-standard-linux'),
+    ('aarch64-unknown-linux-gnu', 'current-standard-linux'),
+    ('x86_64-pc-windows-msvc', '6.3.2-standard-windows'),
+    ('x86_64-pc-windows-msvc', '6.3.2-advanced-windows'),
+    ('x86_64-pc-windows-msvc', 'current-standard-windows'),
+    ('x86_64-pc-windows-msvc', 'current-advanced-windows'),
+    ('i686-pc-windows-msvc', 'current-advanced-windows'),
+    ('aarch64-apple-darwin', '6.3.2-standard-apple'),
+    ('aarch64-apple-darwin', '6.3.2-advanced-apple'),
+    ('aarch64-apple-darwin', 'current-standard-apple'),
+    ('aarch64-apple-darwin', 'current-advanced-apple'),
+    ('x86_64-apple-darwin', 'current-standard-apple'),
 }
 COMPATIBILITY_PACKAGES = {
     'x86_64-unknown-linux-gnu': ('current-advanced-linux', '6.1.1-standard-linux', '6.3.2-advanced-linux'),
@@ -328,18 +388,70 @@ COMPATIBILITY_ROLES = {'current-headers', 'baseline-headers'}
 # advanced_headers invokes nested Cargo for the compiler host, not the row's
 # runtime target. Windows x86 therefore shares the x64 host's synthetic fixture.
 SYNTHETIC_HEADER_OWNERS = {
-    'linux-x64 advanced-6.3.2': 'linux-x64 advanced-6.4',
-    'windows-x64 advanced-6.3.2': 'windows-x64 advanced-6.4',
-    'windows-x86 advanced-6.4': 'windows-x64 advanced-6.4',
-    'macos-arm64 advanced-6.3.2': 'macos-arm64 advanced-6.4',
+    ('x86_64-unknown-linux-gnu', '6.3.2-advanced-linux'):
+        ('x86_64-unknown-linux-gnu', 'current-advanced-linux'),
+    ('x86_64-pc-windows-msvc', '6.3.2-advanced-windows'):
+        ('x86_64-pc-windows-msvc', 'current-advanced-windows'),
+    ('i686-pc-windows-msvc', 'current-advanced-windows'):
+        ('x86_64-pc-windows-msvc', 'current-advanced-windows'),
+    ('aarch64-apple-darwin', '6.3.2-advanced-apple'):
+        ('aarch64-apple-darwin', 'current-advanced-apple'),
 }
+
+
+def sdk_row_key(row):
+    return row.get('target'), row.get('package')
+
+
+def sdk_version_violations(rows, pins, coverage):
+    """Compare SDK row and setup table versions with the installed package pins."""
+    found = []
+    actual = {}
+    architectures = {'x86_64': 'x64', 'i686': 'x86', 'aarch64': 'arm64'}
+    for row in rows:
+        target, package = sdk_row_key(row)
+        data = pins.get(package, {})
+        edition, version = data.get('edition'), data.get('version')
+        if not edition or not version or target not in sdk.RUNTIMES:
+            found.append(f'rust.yml: {row.get("name")} needs a known target and package from ci/sdk-packages.json')
+            continue
+        platform = sdk.RUNTIMES[target][0]
+        if platform != data['platform']:
+            found.append(f'rust.yml: {row.get("name")} package platform differs from ci/sdk-packages.json')
+        host = 'macos' if platform == 'apple' else platform
+        host = f'{host}-{architectures[target.split("-")[0]]}'
+        if row.get('role') == 'primary':
+            actual.setdefault(target, set()).add((edition, version))
+            label = '.'.join(version.split('.')[:2]) if package.startswith('current-') else version
+            expected = f'{host} {edition}-{label}'
+        else:
+            expected = f'{host} {row.get("role")}'
+        found += differs('rust.yml: SDK row name from ci/sdk-packages.json and target', row.get('name'), expected)
+
+    documented = {}
+    for target, description in coverage.items():
+        if not description.startswith('Runtime tests: '):
+            continue
+        versions = set()
+        for group in description.removeprefix('Runtime tests: ').split('; '):
+            match = re.fullmatch(r'(Standard and Advanced|Standard|Advanced) (\d+(?:\.\d+)+(?:, \d+(?:\.\d+)+)*)', group)
+            if not match:
+                found.append(f'docs/setup.md: invalid configured runtime coverage for {target}: {group}')
+                continue
+            editions, releases = match.groups()
+            versions.update((edition.lower(), version)
+                            for edition in editions.split(' and ') for version in releases.split(', '))
+        documented[target] = versions
+    found += differs('docs/setup.md: configured runtime coverage from SDK rows and ci/sdk-packages.json',
+                     documented, actual)
+    return found
 
 
 def sdk_matrix_violations(rust):
     """Every crossed build has exactly one primary compiler/configuration owner."""
     rows = rust['jobs']['sdk']['strategy']['matrix']['include']
     primary = [row for row in rows if row.get('role') == 'primary']
-    actual = {(row.get('name'), row.get('target'), row.get('package')) for row in primary}
+    actual = {sdk_row_key(row) for row in primary}
     found = differs('rust.yml: primary SDK configurations', actual, PRIMARY_SDK_CONFIGURATIONS)
     if len(primary) != len(actual) or len({row.get('name') for row in rows}) != len(rows):
         found.append('rust.yml: SDK row names and primary configurations must be unique')
@@ -362,18 +474,19 @@ def sdk_matrix_violations(rust):
             if len(owners) != 1:
                 found.append(f'rust.yml: {row.get("name")} header package {package} has no unique primary build owner')
     for field, owners in (
-        ('bindings', {'linux-x64 standard-6.4'}),
-        ('apple-mobile', {'macos-arm64 standard-6.4', 'macos-arm64 advanced-6.4'}),
+        ('bindings', {('x86_64-unknown-linux-gnu', 'current-standard-linux')}),
+        ('apple-mobile', {('aarch64-apple-darwin', 'current-standard-apple'),
+                          ('aarch64-apple-darwin', 'current-advanced-apple')}),
     ):
         found += differs(f'rust.yml: {field} configuration owners',
-                         {row.get('name') for row in rows if row.get(field) == 'true'}, owners)
+                         {sdk_row_key(row) for row in rows if row.get(field) == 'true'}, owners)
     found += differs('rust.yml: synthetic-header deduplication owners',
-                     {row.get('name') for row in rows if row.get('test-scope') == 'synthetic-headers'},
+                     {sdk_row_key(row) for row in rows if row.get('test-scope') == 'synthetic-headers'},
                      set(SYNTHETIC_HEADER_OWNERS))
     for row in primary:
         if row.get('test-scope') == 'synthetic-headers':
             owners = [owner for owner in primary
-                      if owner.get('name') == SYNTHETIC_HEADER_OWNERS.get(row['name'])
+                      if sdk_row_key(owner) == SYNTHETIC_HEADER_OWNERS.get(sdk_row_key(row))
                       and owner.get('runner') == row.get('runner')
                       and owner.get('package', '').startswith('current-advanced-')
                       and not owner.get('test-scope')]
@@ -393,10 +506,6 @@ def implementation_coverage_violations(rust):
     found = sdk_matrix_violations(rust)
     found += differs('rust.yml: Advanced implementation owner', advanced.get('if'),
                      when("matrix.role == 'primary' && contains(matrix.package, 'advanced')"))
-    for command in ('rustup toolchain install 1.88.0 --profile minimal --target "$TARGET"',
-                    'cargo +1.88.0 check --locked --all-targets --target "$TARGET" --all-features'):
-        if command not in advanced.get('run', ''):
-            found.append('rust.yml: Advanced implementation has no MSRV check with installed headers')
     for role, name in (
         ('current-headers', 'Current Advanced headers with baseline runtimes'),
         ('baseline-headers', 'Baseline SDK builds with the current Advanced runtime'),
@@ -539,9 +648,6 @@ def publish_violations(publish):
 
 # Plausible wrong edits: (name, workflow, text to replace, replacement, words the report must contain).
 WRONG_EDITS = (
-    ('Advanced MSRV check removed', 'rust.yml',
-     '          cargo +1.88.0 check --locked --all-targets --target "$TARGET" --all-features\n', '',
-     'MSRV check with installed headers'),
     ('compatibility failure stops later editions', 'rust.yml',
      '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}" || failed=1\n          done\n          exit "$failed"\n      # A Standard',
      '            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features -- "${skip_args[@]}"\n          done\n          exit "$failed"\n      # A Standard',
@@ -753,8 +859,9 @@ class SdkJob(unittest.TestCase):
 
     def test_a_row_installs_only_a_driver_built_for_its_runtime(self):
         rows = [row for row in self.rows if 'hx-driver' in row]
-        self.assertEqual({row['name'] for row in rows},
-                         {'linux-x64 advanced-6.4', 'linux-x64 current-headers', 'linux-x64 baseline-headers'})
+        self.assertEqual({(*sdk_row_key(row), row['role']) for row in rows},
+                         {('x86_64-unknown-linux-gnu', 'current-advanced-linux', role)
+                          for role in {'primary', *COMPATIBILITY_ROLES}})
         for row in rows:
             driver, package = self.pins[row['hx-driver']], self.pins[row['package']]
             self.assertEqual((driver['platform'], driver['version']), (package['platform'], package['version']))
@@ -908,23 +1015,23 @@ class SdkJob(unittest.TestCase):
             altered = changed['jobs']['sdk']['strategy']['matrix']['include']
             if mutation == 'duplicate owner':
                 duplicate = copy.deepcopy(next(row for row in altered
-                                               if row['name'] == 'linux-x64 advanced-6.4'))
+                                               if sdk_row_key(row) == ('x86_64-unknown-linux-gnu', 'current-advanced-linux')))
                 duplicate['name'] += ' duplicate'
                 altered.append(duplicate)
             elif mutation == 'missing owner':
-                altered.remove(next(row for row in altered if row['name'] == 'linux-x64 standard-6.1.1'))
+                altered.remove(next(row for row in altered if sdk_row_key(row) == ('x86_64-unknown-linux-gnu', '6.1.1-standard-linux')))
             elif mutation == 'unknown role':
                 altered[-1]['role'] = 'unknown'
             elif mutation == 'different baseline':
                 altered[-1]['compatibility'] = '6.1.1-standard-linux'
             elif mutation == 'mobile check removed':
-                del next(row for row in altered if row['name'] == 'macos-arm64 advanced-6.4')['apple-mobile']
+                del next(row for row in altered if sdk_row_key(row) == ('aarch64-apple-darwin', 'current-advanced-apple'))['apple-mobile']
             elif mutation == 'bindings check removed':
-                del next(row for row in altered if row['name'] == 'linux-x64 standard-6.4')['bindings']
+                del next(row for row in altered if sdk_row_key(row) == ('x86_64-unknown-linux-gnu', 'current-standard-linux'))['bindings']
             elif mutation == 'synthetic owner omitted':
-                next(row for row in altered if row['name'] == 'linux-x64 advanced-6.4')['test-scope'] = 'synthetic-headers'
+                next(row for row in altered if sdk_row_key(row) == ('x86_64-unknown-linux-gnu', 'current-advanced-linux'))['test-scope'] = 'synthetic-headers'
             else:
-                next(row for row in altered if row['name'] == 'linux-x64 standard-6.4')['test-scope'] = 'runtime'
+                next(row for row in altered if sdk_row_key(row) == ('x86_64-unknown-linux-gnu', 'current-standard-linux'))['test-scope'] = 'runtime'
             with self.subTest(mutation=mutation):
                 self.assertTrue(any(expected in line for line in sdk_matrix_violations(changed)))
 
@@ -1041,6 +1148,54 @@ class MemoryCheckers(unittest.TestCase):
 
 
 class Repository(unittest.TestCase):
+    def test_ci_detects_drift_from_manifest_packages_and_platform_table(self):
+        parsed = {name: workflows.load(text) for name, text in read_workflows().items()}
+        manifest = cargo_manifest()
+        pins = sdk.load_pins()
+        setup = (ROOT / 'docs/setup.md').read_text(encoding='utf-8')
+
+        def violations_for(workflow=parsed, cargo=manifest, packages=pins, platforms=setup):
+            return source_consistency_violations(workflow, cargo, packages, platforms)
+
+        self.assertEqual(violations_for(), [])
+        min_version = msrv_version(manifest)
+        major, minor, _ = min_version.split('.')
+        next_version = f'{major}.{int(minor) + 1}'
+        new_manifest = copy.deepcopy(manifest)
+        new_manifest['package']['rust-version'] = next_version
+        self.assertTrue(any('Cargo.toml rust-version' in error for error in violations_for(cargo=new_manifest)))
+
+        changed_msrv = copy.deepcopy(parsed)
+        lint, sdk_job = (changed_msrv['rust.yml']['jobs'][job] for job in ('lint', 'sdk'))
+        lint_step = next(step for step in lint['steps'] if step.get('name') == 'Minimum supported Rust version')
+        advanced_step = next(step for step in sdk_job['steps']
+                             if step.get('name') == 'Lint and document the Advanced implementation')
+        lint_step['run'] = lint_step['run'].replace(min_version, next_version + '.0')
+        self.assertTrue(any('Cargo.toml rust-version' in error for error in violations_for(workflow=changed_msrv)))
+        advanced_step['run'] = advanced_step['run'].replace(min_version, next_version + '.0')
+        self.assertEqual(violations_for(workflow=changed_msrv, cargo=new_manifest), [])
+        advanced_step['run'] = '\n'.join(line for line in advanced_step['run'].splitlines()
+                                         if not line.startswith('cargo +'))
+        self.assertTrue(any('Cargo.toml rust-version' in error
+                            for error in violations_for(workflow=changed_msrv, cargo=new_manifest)))
+
+        new_feature = copy.deepcopy(manifest)
+        new_feature['features']['metrics'] = []
+        errors = violations_for(cargo=new_feature)
+        self.assertEqual(sum('Cargo.toml features' in error for error in errors), 2)
+
+        cross = copy.deepcopy(parsed)
+        cross_env = cross['rust.yml']['jobs']['cross']['env']
+        cross_env['TARGETS'] = cross_env['TARGETS'].replace('armv7-unknown-linux-gnueabihf ', '')
+        self.assertTrue(any('dynamic targets in docs/setup.md' in error for error in violations_for(workflow=cross)))
+
+        new_pin = copy.deepcopy(pins)
+        new_pin['current-standard-linux']['version'] = '6.5.0.1'
+        self.assertEqual(sum('row name from ci/sdk-packages.json' in error
+                             for error in violations_for(packages=new_pin)), 3)
+        self.assertTrue(any('configured runtime coverage' in error
+                            for error in violations_for(platforms=setup.replace('6.1.1', '6.0.0'))))
+
     def test_manual_measurements_have_a_bounded_ci_invocation(self):
         rust = workflows.load(read_workflows()['rust.yml'])
         step = next(step for step in rust['jobs']['test']['steps']
@@ -1058,9 +1213,7 @@ class Repository(unittest.TestCase):
 
     def test_vendored_bindings_cover_exactly_the_supported_platform_targets(self):
         setup = (ROOT / 'docs/setup.md').read_text(encoding='utf-8')
-        table = setup.split('| Platform | Rust targets | Configured coverage |', 1)[1].split('\n\n', 1)[0]
-        supported = {target for row in table.splitlines() if row.startswith('|')
-                     for target in re.findall(r'`([^`]+)`', row.split('|')[2])}
+        supported = set(platform_coverage(setup))
         xtask = (ROOT / 'xtask/src/main.rs').read_text(encoding='utf-8')
         primary = re.search(r'const PRIMARY_TARGET: &str = "([^"]+)";', xtask).group(1)
         equivalents = re.search(r'const EQUIVALENCE_TARGETS: \[&str; \d+\] = \[(.*?)\];',
@@ -1082,14 +1235,11 @@ class Repository(unittest.TestCase):
         self.assertNotIn('semver-checks', ''.join(texts.values()))
 
     def test_workflows_name_only_features_the_crate_has(self):
-        features = set(tomllib.loads((ROOT / 'Cargo.toml').read_text(encoding='utf-8'))['features']) - {'default'}
+        features = set(cargo_manifest()['features']) - {'default'}
         named = set()
         for text in read_workflows().values():
             for match in re.findall(r'--features[ =]"?([\w,-]+)', text):
                 named.update(match.split(','))
-            for match in re.findall(r'for features in ([^;]+); do', text):
-                named.update(part for group in match.split() for part in group.strip('"').split(',') if part)
-        self.assertGreaterEqual(named, {'advanced', 'file-io'})
         self.assertLessEqual(named, features)
 
     def test_rustdoc_checks_every_linted_feature_set_and_leaves_the_full_build_last(self):
@@ -1097,14 +1247,11 @@ class Repository(unittest.TestCase):
         self.assertEqual(violations(texts), [])
         block = ('      - name: Rustdoc feature combinations\n'
                  '        env:\n          RUSTDOCFLAGS: -D warnings\n'
-                 '        run: |\n'
-                 '          for features in "" image-encoding tokio smol advanced file-io advanced,file-io; do\n')
+                 '        run: |\n')
         self.assertIn(block, texts['rust.yml'])
-        for changed, message in ((block.replace('tokio smol', 'tokio'), 'rustdoc feature combinations'),
-                                 (block.replace('-D warnings', ''), 'rustdoc denies warnings')):
-            with self.subTest(message=message):
-                broken = {**texts, 'rust.yml': texts['rust.yml'].replace(block, changed)}
-                self.assertTrue(any(message in error for error in violations(broken)))
+        changed = texts['rust.yml'].replace(block, block.replace('-D warnings', ''))
+        self.assertTrue(any('rustdoc denies warnings' in error
+                            for error in violations({**texts, 'rust.yml': changed})))
 
     def test_local_recipe_matches_lint_and_test_steps(self):
         rust = workflows.load(read_workflows()['rust.yml'])
