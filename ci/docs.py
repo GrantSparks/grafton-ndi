@@ -233,16 +233,28 @@ def public_function_at(words, start):
 
 
 def production_words(words, *, with_indices=False):
-    """Exclude inline #[cfg(test)] items as well as separate test source files."""
+    """Exclude inline #[cfg(test)] items and fields from production tokens."""
     result, indices, index = [], [], 0
     while index < len(words):
         attributes, after = token_attributes(words, index)
         if ['cfg', '(', 'test', ')'] in attributes:
             index = after
-            while index < len(words) and words[index] not in {'{', ';'}:
-                index += 1
-            if index < len(words):
-                index = token_group_end(words, index) if words[index] == '{' else index + 1
+            angle_depth = 0
+            while index < len(words):
+                token = words[index]
+                if token in {'(', '['}:
+                    index = token_group_end(words, index)
+                elif token == '<':
+                    angle_depth += 1
+                    index += 1
+                elif token == '>':
+                    angle_depth = max(0, angle_depth - 1)
+                    index += 1
+                elif angle_depth == 0 and token in {'{', ';', ','}:
+                    index = token_group_end(words, index) if token == '{' else index + 1
+                    break
+                else:
+                    index += 1
         else:
             end = after if after > index else index + 1
             result.extend(words[index:end])
