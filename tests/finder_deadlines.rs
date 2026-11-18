@@ -40,14 +40,18 @@ impl Gate {
     }
 
     fn wait(&self, file: &str) {
+        assert!(self.wait_for(file), "native gate {file} was not entered");
+    }
+
+    fn wait_for(&self, file: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !self.0.join(file).exists() {
-            assert!(
-                Instant::now() < deadline,
-                "native gate {file} was not entered"
-            );
+            if Instant::now() >= deadline {
+                return false;
+            }
             thread::sleep(Duration::from_millis(1));
         }
+        true
     }
 
     fn snapshots(&self) -> usize {
@@ -277,4 +281,130 @@ fn run_child(directory: &Path, library: &Path) {
         .env("GRAFTON_FAKE_FINDER_GATE", directory)
         .env("GRAFTON_FAKE_NDI_LOG", directory.join("calls.log"))
         .run();
+}
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+mod async_predicate {
+    use super::*;
+    use grafton_ndi::asynchronous::{AsyncFinder, AsyncRuntime};
+    use std::{
+        future::Future,
+        task::{Context, Waker},
+    };
+
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    // This is dropped when the predicate leaves the worker, so the count
+    // includes every call the worker made before and after cancellation.
+    struct Probe {
+        calls: usize,
+        finished: mpsc::Sender<usize>,
+    }
+
+    impl Probe {
+        fn called(&mut self) -> usize {
+            self.calls += 1;
+            self.calls
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let _ = self.finished.send(self.calls);
+        }
+    }
+
+    fn exercise<R: AsyncRuntime>(finder: Finder, gate: &Gate) {
+        let adapter = AsyncFinder::<R>::new(finder);
+        for during_snapshot in [true, false] {
+            gate.reset();
+            if during_snapshot {
+                gate.write("block");
+            }
+            let release_snapshot = Release(gate);
+            let snapshots = gate.snapshots();
+            let (entered, entry) = mpsc::channel();
+            let (release_predicate, resume) = mpsc::channel();
+            let (finished, complete) = mpsc::channel();
+            let mut probe = Probe { calls: 0, finished };
+            let mut wait = Box::pin(adapter.find_source(Duration::from_secs(30), move |_| {
+                if probe.called() == 1 && !during_snapshot {
+                    let _ = entered.send(());
+                    let _ = resume.recv();
+                }
+                false
+            }));
+            let poll = wait.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            let at_gate = poll.is_pending()
+                && if during_snapshot {
+                    gate.wait_for("entered")
+                } else {
+                    entry.recv_timeout(PATIENCE).is_ok()
+                };
+            drop(wait);
+            drop(release_snapshot);
+            let _ = release_predicate.send(());
+            assert!(poll.is_pending());
+            assert!(at_gate, "the blocking worker did not reach its gate");
+            assert_eq!(
+                complete.recv_timeout(PATIENCE).unwrap(),
+                usize::from(!during_snapshot)
+            );
+            assert_eq!(gate.snapshots(), snapshots + 1);
+        }
+    }
+
+    #[test]
+    fn cancelled_lookup_stops_before_the_next_predicate_call() {
+        if let Ok(runtime) = std::env::var("GRAFTON_PREDICATE_CANCEL_RUNTIME") {
+            let library = PathBuf::from(std::env::var_os("GRAFTON_FAKE_FINDER_RUNTIME").unwrap());
+            let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
+            let finder = Finder::new(&ndi, &FinderOptions::new()).unwrap();
+            let gate = Gate(PathBuf::from(
+                std::env::var_os("GRAFTON_FAKE_FINDER_GATE").unwrap(),
+            ));
+            match runtime.as_str() {
+                #[cfg(feature = "tokio")]
+                "tokio" => ::tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        exercise::<grafton_ndi::asynchronous::Tokio>(finder, &gate)
+                    }),
+                #[cfg(feature = "smol")]
+                "smol" => ::smol::block_on(async {
+                    exercise::<grafton_ndi::asynchronous::Smol>(finder, &gate)
+                }),
+                _ => panic!("unexpected async runtime: {runtime}"),
+            }
+            return;
+        }
+
+        let directory = common::FixtureDir::create("finder-predicate-cancel");
+        let library = directory.path().join("finder.so");
+        FakeRuntime {
+            cfgs: vec!["fake_finder"],
+            version: Some("6.4.0.2"),
+            ..Default::default()
+        }
+        .build(&library);
+        for (runtime, enabled) in [
+            ("tokio", cfg!(feature = "tokio")),
+            ("smol", cfg!(feature = "smol")),
+        ] {
+            if !enabled {
+                continue;
+            }
+            let gate = common::FixtureDir::create("finder-predicate-gate");
+            TestChild::new(
+                "async_predicate::cancelled_lookup_stops_before_the_next_predicate_call",
+            )
+            .env("GRAFTON_PREDICATE_CANCEL_RUNTIME", runtime)
+            .env("GRAFTON_FAKE_FINDER_RUNTIME", &library)
+            .env("GRAFTON_FAKE_FINDER_CASE", "many-short")
+            .env("GRAFTON_FAKE_FINDER_GATE", gate.path())
+            .env("GRAFTON_FAKE_NDI_LOG", gate.path().join("calls.log"))
+            .run_with_timeout(Duration::from_secs(20));
+        }
+    }
 }

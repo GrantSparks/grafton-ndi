@@ -965,24 +965,23 @@ impl Finder {
 
     /// Poll discovery until `accept` selects a value or `timeout` elapses.
     ///
-    /// After each source-list snapshot, `accept` is handed the current sources
-    /// and may return `Some` to stop immediately; otherwise this blocks on the
-    /// next source-list change and retries until the deadline. A single
+    /// After each source-list snapshot, `accept` may select a value, observe
+    /// cancellation, or continue waiting for a source-list change until the
+    /// deadline. A single
     /// [`SourceWatch::wait_for_change`] returns on the *first*
     /// change, yielding only a partial snapshot when discovery is staggered
     /// (unicast / IP-hint-only networks where responders trickle in across
     /// several notifications); polling to the deadline makes resolution robust
     /// against that while still returning the instant `accept` is satisfied.
     ///
-    /// Returns `Ok(None)` if the deadline passes without `accept` selecting a
-    /// value.
+    /// Returns `Ok(Ok(None))` if the deadline passes without a selection.
     fn poll_until_deadline<T, S: Stop, A>(
         &self,
         deadline: Deadline,
         stop: S,
         state: &mut A,
         select: impl Fn(&A, &BorrowedSource<'_>) -> Result<bool>,
-        mut accept: impl FnMut(&mut A, Vec<Source>) -> Result<Option<T>>,
+        mut accept: impl FnMut(&mut A, Vec<Source>) -> StopResult<Option<T>, S>,
     ) -> StopResult<Option<T>, S> {
         let mut watch = self.watch();
         loop {
@@ -996,8 +995,10 @@ impl Finder {
                 Ok(None) => return Ok(Ok(None)),
                 Err(stopped) => return Ok(Err(stopped)),
             };
-            if let Some(selected) = accept(state, sources)? {
-                return Ok(Ok(Some(selected)));
+            match accept(state, sources)? {
+                Ok(Some(selected)) => return Ok(Ok(Some(selected))),
+                Err(stopped) => return Ok(Err(stopped)),
+                Ok(None) => {}
             }
             if deadline.is_expired() {
                 return Ok(Ok(None));
@@ -1055,7 +1056,7 @@ impl Finder {
             stop,
             &mut (),
             |_, _| Ok(true),
-            |_, sources| Ok(sources.into_iter().find(|source| select(source))),
+            |_, sources| Ok(select_owned_source(sources, stop, &mut select)),
         )
     }
 
@@ -1091,7 +1092,7 @@ impl Finder {
             stop,
             &mut (),
             |_, source| Ok(source.name.equals(name)),
-            |_, sources| Ok(sources.into_iter().next()),
+            |_, sources| Ok(Ok(sources.into_iter().next())),
         )
     }
 
@@ -1182,11 +1183,27 @@ impl Finder {
             |(_, seen, _), source| source.selected_by(query, Some(seen)),
             |(discovered, seen, retained_bytes), sources| {
                 accumulate_sources(discovered, seen, retained_bytes, sources)?;
-                Ok(None::<()>)
+                Ok(Ok(None::<()>))
             },
         )?;
         Ok(outcome.map(|_| state.0))
     }
+}
+
+fn select_owned_source<S: Stop>(
+    sources: Vec<Source>,
+    stop: S,
+    select: &mut impl FnMut(&Source) -> bool,
+) -> std::result::Result<Option<Source>, S::Stopped> {
+    for source in sources {
+        // A callback may finish even if it cancels, but the next callback
+        // must observe that stop before invoking user code.
+        stop.check()?;
+        if select(&source) {
+            return Ok(Some(source));
+        }
+    }
+    Ok(None)
 }
 
 impl Drop for Finder {
@@ -2878,6 +2895,40 @@ mod tests {
             // allocated key. Source strings remain shared with the caller.
             assert_eq!(allocations, expected, "{host}");
             assert_eq!(cache.len(), 1);
+        }
+    }
+
+    #[test]
+    fn owned_source_selection_checks_cancellation_between_candidates() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let names = ["first", "second", "third", "fourth"];
+        let sources: Vec<_> = names
+            .into_iter()
+            .map(|name| Source::new(name).unwrap())
+            .collect();
+        for prefix in 0..names.len() {
+            let stop = AtomicBool::new(prefix == 0);
+            let mut visited = Vec::new();
+            let result = select_owned_source(sources.clone(), &stop, &mut |source| {
+                visited.push(source.name().to_owned());
+                if visited.len() == prefix {
+                    stop.store(true, Ordering::Release);
+                }
+                false
+            });
+            assert_eq!(result, Err(crate::timeout::Stopped));
+            assert_eq!(visited, names[..prefix]);
+        }
+        for (target, expected) in [(Some("third"), 3), (None, 4)] {
+            let stop = AtomicBool::new(false);
+            let mut visited = Vec::new();
+            let result = select_owned_source(sources.clone(), &stop, &mut |source| {
+                visited.push(source.name().to_owned());
+                Some(source.name()) == target
+            });
+            assert_eq!(result.unwrap().as_ref().map(Source::name), target);
+            assert_eq!(visited, names[..expected]);
         }
     }
 

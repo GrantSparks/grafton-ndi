@@ -298,9 +298,11 @@ Wrap a configured finder in `asynchronous::<runtime>::AsyncFinder::new(finder)`
 for `find_source`, `find_source_by_name` and `find_sources`. `AsyncSourceCache`
 also provides `find_sources_by_host`. These calls use the same first-poll budget and
 cancellation rule. Invalid names, host queries and timeouts are refused before
-worker submission. Predicates must be `Send + 'static`, and a running predicate
-or snapshot copy finishes. Async waits slice native calls into at most 100 ms;
-synchronous discovery keeps its whole-budget native waits.
+worker submission. Predicates must be `Send + 'static`. A running snapshot copy
+finishes, then the worker checks for cancellation before each predicate call.
+A predicate call that has passed its check can finish. Async waits slice native
+calls into at most 100 ms; synchronous discovery keeps its whole-budget native
+waits.
 
 `watch()` returns an owned `AsyncSourceWatch` that can move into a spawned task.
 Take snapshots and wait through that same cursor. Failed or dropped operations

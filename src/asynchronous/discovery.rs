@@ -115,7 +115,8 @@ impl<R: AsyncRuntime, D: SourceDiscovery> AsyncFinder<R, D> {
     /// Find the first source accepted by `select`, as [`Finder::find_source`].
     ///
     /// The predicate is owned by the blocking worker and must be `Send + 'static`.
-    /// A predicate already running finishes even after cancellation.
+    /// After its snapshot, the worker checks for cancellation before each
+    /// predicate call. A call that has passed its check may finish.
     ///
     /// # Errors
     ///
