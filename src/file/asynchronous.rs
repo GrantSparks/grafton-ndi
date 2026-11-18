@@ -783,9 +783,7 @@ impl<E: Send + 'static> EventQueue<E> {
             expiry: expiry as Weak<dyn Expire>,
             token: Arc::new(()),
             budget,
-            deadline: None,
-            timer: None,
-            taken: false,
+            state: EventWaitState::Unstarted,
         }
     }
 }
@@ -841,18 +839,27 @@ pub struct FileEventFuture<E> {
     token: Arc<()>,
     /// The caller's timeout, checked when the wait starts.
     budget: Duration,
-    /// The wait's budget, from its first poll on.
-    deadline: Option<Deadline>,
-    /// This wait's registration with the deadline timer, while it has one.
-    timer: Option<TimerKey>,
-    taken: bool,
+    state: EventWaitState,
+}
+
+enum EventWaitState {
+    Unstarted,
+    Waiting { deadline: Deadline },
+    Registered { deadline: Deadline, timer: TimerKey },
+    Done,
 }
 
 impl<E> std::fmt::Debug for FileEventFuture<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match self.state {
+            EventWaitState::Unstarted => "Unstarted",
+            EventWaitState::Waiting { .. } => "Waiting",
+            EventWaitState::Registered { .. } => "Registered",
+            EventWaitState::Done => "Done",
+        };
         f.debug_struct("FileEventFuture")
             .field("timeout", &self.budget)
-            .field("completed", &self.taken)
+            .field("state", &state)
             .finish_non_exhaustive()
     }
 }
@@ -860,11 +867,16 @@ impl<E> std::fmt::Debug for FileEventFuture<E> {
 impl<E> FileEventFuture<E> {
     /// Complete with `value`, giving up the timer registration.
     fn complete(&mut self, value: Result<Option<E>>) -> Poll<Result<Option<E>>> {
-        self.taken = true;
-        if let Some(key) = self.timer.take() {
-            TIMER.cancel(key);
-        }
+        self.finish_wait();
         Poll::Ready(value)
+    }
+
+    fn finish_wait(&mut self) {
+        if let EventWaitState::Registered { timer, .. } =
+            std::mem::replace(&mut self.state, EventWaitState::Done)
+        {
+            TIMER.cancel(timer);
+        }
     }
 
     /// Stop being the queue's waiter and return executor state for disposal
@@ -889,15 +901,24 @@ impl<E> Future for FileEventFuture<E> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        assert!(!this.taken, "a completed FileEventFuture was polled again");
         // The wait starts at the first poll, which is also where a timeout
         // out of range is reported, before anything else.
-        let deadline = match this.deadline {
-            Some(deadline) => deadline,
-            None => match Deadline::after(this.budget) {
-                Ok(deadline) => *this.deadline.insert(deadline),
+        let deadline = match this.state {
+            EventWaitState::Waiting { deadline } | EventWaitState::Registered { deadline, .. } => {
+                deadline
+            }
+            EventWaitState::Unstarted => match Deadline::after(this.budget) {
+                Ok(deadline) => {
+                    this.state = EventWaitState::Waiting { deadline };
+                    deadline
+                }
                 Err(error) => return this.complete(Err(error)),
             },
+            #[expect(
+                clippy::panic,
+                reason = "polling a completed FileEventFuture violates its documented Future contract"
+            )]
+            EventWaitState::Done => panic!("a completed FileEventFuture was polled again"),
         };
         let token = Arc::downgrade(&this.token);
         let ready = WakerSlot::poll(&this.events.0, cx.waker(), |events, register| {
@@ -943,9 +964,9 @@ impl<E> Future for FileEventFuture<E> {
         // The deadline never changes, so one registration serves every poll.
         // It is made with no queue lock held: the timer may wake this future
         // at once, which then finds itself registered as the waiter.
-        if this.timer.is_none() {
+        if matches!(this.state, EventWaitState::Waiting { .. }) {
             match TIMER.register(deadline.end(), Weak::clone(&this.expiry), token) {
-                Ok(key) => this.timer = Some(key),
+                Ok(timer) => this.state = EventWaitState::Registered { deadline, timer },
                 Err(error) => {
                     WakerSlot::discard(this.release_waiter());
                     return this.complete(Err(Error::Io(error)));
@@ -959,9 +980,7 @@ impl<E> Future for FileEventFuture<E> {
 impl<E> Drop for FileEventFuture<E> {
     fn drop(&mut self) {
         let waker = self.release_waiter();
-        if let Some(key) = self.timer.take() {
-            TIMER.cancel(key);
-        }
+        self.finish_wait();
         WakerSlot::discard(waker);
     }
 }
@@ -6217,7 +6236,7 @@ mod tests {
             matches!(&polled, Poll::Ready(Err(Error::InvalidInput(crate::InputDefect::TimeoutTooLong { requested }))) if *requested == crate::MAX_TIMEOUT + Duration::from_nanos(1)),
             "{polled:?}"
         );
-        assert!(waiting.timer.is_none());
+        assert!(matches!(waiting.state, EventWaitState::Done));
         // It took nothing and left no waiter behind.
         assert_eq!(block_on(events.wait(Duration::ZERO)).unwrap(), Some(7));
     }
@@ -6420,7 +6439,9 @@ mod tests {
             .as_mut()
             .poll(&mut Context::from_waker(&idle_waker()))
             .is_pending());
-        let key = answered.timer.expect("a pending wait is timed");
+        let EventWaitState::Registered { timer: key, .. } = answered.state else {
+            panic!("a pending wait is timed");
+        };
         assert!(registered(key));
         events.push(Ok(7));
         assert!(matches!(
@@ -6436,7 +6457,9 @@ mod tests {
             .as_mut()
             .poll(&mut Context::from_waker(&idle_waker()))
             .is_pending());
-        let key = abandoned.timer.expect("a pending wait is timed");
+        let EventWaitState::Registered { timer: key, .. } = abandoned.state else {
+            panic!("a pending wait is timed");
+        };
         assert!(registered(key));
         drop(abandoned);
         assert!(!registered(key));

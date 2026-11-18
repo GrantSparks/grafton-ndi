@@ -258,6 +258,23 @@ fn a_waiter_registered_during_clone_keeps_its_reservation_when_the_first_poll_lo
 }
 
 #[test]
+fn polling_a_completed_file_event_future_panics() {
+    let events = Arc::new(EventQueue::<u32>::new(1));
+    events.push(Ok(7));
+    let mut future = events.wait(Duration::ZERO);
+    assert!(matches!(
+        poll(&mut future, Waker::noop()),
+        Poll::Ready(Ok(Some(7)))
+    ));
+    let panic = catch_unwind(AssertUnwindSafe(|| poll(&mut future, Waker::noop())))
+        .expect_err("polling after completion must panic");
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("a completed FileEventFuture was polled again"),
+    );
+}
+
+#[test]
 fn events_and_closure_during_waker_cloning_are_observed_by_the_same_poll() {
     for close in [false, true] {
         let events = Arc::new(EventQueue::<u32>::new(1));
@@ -281,7 +298,7 @@ fn events_and_closure_during_waker_cloning_are_observed_by_the_same_poll() {
         } else {
             assert!(matches!(result, Poll::Ready(Ok(Some(7)))));
         }
-        assert!(future.timer.is_none());
+        assert!(matches!(future.state, EventWaitState::Done));
         assert_eq!(probe.clones.load(Ordering::Relaxed), 1);
     }
 }
