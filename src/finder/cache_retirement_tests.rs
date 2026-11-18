@@ -108,6 +108,7 @@ fn retirement_reclaims_keys_snapshots_strings_and_map_after_unlocking() {
                 cache.find_sources_by_host_with::<NeverStop>(
                     HostQuery::checked("camera.local").unwrap(),
                     Deadline::after(Duration::ZERO).unwrap(),
+                    None,
                     |_, _| Ok(Ok(sources)),
                 )
             });
@@ -155,16 +156,18 @@ fn snapshot_remains_live_across_retirement_and_post_transition_probes_miss() {
         let (resume_tx, resume_rx) = mpsc::channel();
         let reader_cache = Arc::clone(&cache);
         let reader = std::thread::spawn(move || {
-            reader_cache
+            let probe = reader_cache
                 .probe(HostQuery::checked("camera.local").unwrap(), |sources| {
                     started_tx.send(()).unwrap();
                     resume_rx.recv().unwrap();
                     assert_eq!(sources[0].name(), "camera.local (Camera 0)");
                     copy_sources(sources)
                 })
-                .unwrap()
-                .1
-                .unwrap()
+                .unwrap();
+            let CacheProbe::Hit(sources) = probe else {
+                panic!("the reader must observe the entry before retirement");
+            };
+            sources
         });
         started_rx.recv().unwrap();
         let (allocations, reclaimed, held, _) = observe(&cache, || {
@@ -179,12 +182,12 @@ fn snapshot_remains_live_across_retirement_and_post_transition_probes_miss() {
         // map allocation retire now. Descriptor storage survives until release.
         assert_eq!(reclaimed, 1 + usize::from(clear));
         assert!(snapshot.upgrade().is_some());
-        let (_, result, _) = cache
+        let probe = cache
             .probe(HostQuery::checked("camera.local").unwrap(), |_| {
                 panic!("a post-transition lookup must not see the retired entry")
             })
             .unwrap();
-        assert!(result.is_none());
+        assert!(matches!(probe, CacheProbe::Miss(_)));
         resume_tx.send(()).unwrap();
         let result = reader.join().unwrap();
         assert_eq!(result[0].name(), "camera.local (Camera 0)");
@@ -237,6 +240,7 @@ fn measure_cache_retirement_contention() {
                                 .find_sources_by_host_with::<NeverStop>(
                                     HostQuery::checked("steady.local").unwrap(),
                                     Deadline::after(Duration::ZERO).unwrap(),
+                                    None,
                                     |_, _| {
                                         misses += 1;
                                         Ok(Ok(vec![source.clone()]))
@@ -307,6 +311,7 @@ fn measure_cache_retirement_contention() {
                         cache.find_sources_by_host_with::<NeverStop>(
                             HostQuery::checked("refill.local").unwrap(),
                             Deadline::after(Duration::ZERO).unwrap(),
+                            None,
                             |_, _| Ok(Ok(sources)),
                         )
                     });

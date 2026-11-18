@@ -102,17 +102,15 @@
 //! * **On Linux with the NDI 6.4 File library, a rollover the library cannot
 //!   carry out ends the session.** It accepts
 //!   the request, fails to open the new file, closes the old one and stops.
-//!   [`FileRecorder::rollover`] checks the file its pattern names first, so a
-//!   missing directory or an exact file name that already exists is refused
-//!   and the session goes on; a file that cannot be opened for another reason
-//!   still ends it. An exact file name cannot roll over by itself at all; see
-//!   [`FileNaming::Exact`].
+//!   [`FileRecorder::rollover`] preflights the destination so a missing output
+//!   directory, a directory-only path, an existing exact name or an indexed
+//!   name that outgrows the filesystem limit can be refused while the session
+//!   continues. See [`FileNaming`] for the naming rules.
 //! * **On every platform with the NDI 6.4 File library, recording paths must
-//!   be reportable exactly.** Start and rollover
-//!   preflight refuse absolute output paths above 4094 UTF-8 bytes with the
-//!   current SDK, reserving at least 20 digits for each index token's growth.
-//!   This keeps closure events unambiguous, so a finalized session can close
-//!   and another session can start.
+//!   be absolute and reportable exactly.** Start and rollover preflight the
+//!   expanded path sent to the SDK. It must fit in 4094 UTF-8 bytes with the
+//!   current SDK, reserving at least 20 digits per index token. This keeps
+//!   closure events unambiguous.
 //!
 //! # Threads
 //!

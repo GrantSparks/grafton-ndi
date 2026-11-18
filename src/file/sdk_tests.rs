@@ -377,6 +377,133 @@ fn the_longest_exact_event_path_records_closes_and_starts_again() {
 }
 
 #[test]
+fn absolute_recording_names_survive_a_working_directory_change() {
+    const CHANGED_DIRECTORY: &str = "GRAFTON_NDI_TEST_RECORDING_CHANGED_DIRECTORY";
+    const SOURCE_URL: &str = "GRAFTON_NDI_TEST_RECORDING_SOURCE_URL";
+    const FORMAT_REQUEST: &str = "format-requested";
+    let Some(changed_directory) = std::env::var_os(CHANGED_DIRECTORY) else {
+        let Some((ndi, _)) = file_api() else {
+            return;
+        };
+        // Discover the sender in the test runner. The child can connect
+        // directly even when discovery is unavailable there, and can change
+        // its own working directory without racing other tests.
+        let source = LiveSource::start(&ndi, "recording-cwd");
+        let scratch = FixtureDir::create("recording-cwd");
+        let original = scratch.join("original");
+        let changed = scratch.join("changed");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&changed).unwrap();
+        let request = scratch.join(FORMAT_REQUEST);
+        let output = thread::scope(|scope| {
+            let (done, wait_for_done) = std::sync::mpsc::channel::<()>();
+            let source = &source;
+            scope.spawn(move || {
+                while !request.try_exists().unwrap() {
+                    if !matches!(
+                        wait_for_done.recv_timeout(Duration::from_millis(10)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        return;
+                    }
+                }
+                source.change_format();
+            });
+            let output = crate::test_support::TestChild::new(
+                "file::sdk_tests::absolute_recording_names_survive_a_working_directory_change",
+            )
+            .current_dir(original)
+            .env(CHANGED_DIRECTORY, changed)
+            .env(SOURCE_URL, source.spec.url().unwrap())
+            .run();
+            drop(done);
+            output
+        });
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    };
+    let Some((_ndi, api)) = file_api() else {
+        return;
+    };
+    let source = SourceSpec::from_url(std::env::var(SOURCE_URL).unwrap()).unwrap();
+    let changed_directory = PathBuf::from(changed_directory);
+    let original = std::env::current_dir().unwrap();
+    let target = RecordingTarget::new("take").unwrap();
+    let recorder = |pattern| {
+        let options = FileRecorderOptions::new(source.clone())
+            .naming(FileNaming::Pattern(pattern))
+            .proxy(false)
+            .tracks(MediaTypes::VIDEO);
+        FileRecorder::new(&api, &options).unwrap()
+    };
+    let refuse_start = |pattern| {
+        let mut recorder = recorder(pattern);
+        let result = recorder.start(&target, RecordingTimecode::Preserve);
+        assert_eq!(recorder.state(), RecorderState::Idle);
+        assert!(!recorder.is_recording());
+        assert_eq!(recorder.report().session(), 0);
+        result.unwrap_err()
+    };
+    assert!(matches!(
+        refuse_start("take{index}.mkv".to_owned()),
+        Error::InvalidInput(crate::InputDefect::RecordingPathNotAbsolute)
+    ));
+
+    // Normalizing repeated `./` used to make the checked path short enough,
+    // although the SDK emitted a path at the event field's truncation boundary.
+    let event_limit = crate::sys::bindings::NDIlib_file_recorder_event_path_max_size as usize - 2;
+    let long_relative = format!(
+        "{}x.mkv",
+        "./".repeat((event_limit + 1 - "x.mkv".len()) / 2)
+    );
+    assert_eq!(long_relative.len(), event_limit + 1);
+    assert!(matches!(
+        refuse_start(long_relative),
+        Error::InvalidInput(crate::InputDefect::RecordingPathTooLong {
+            maximum_bytes,
+            longest_bytes,
+            index_digits_reserved: 0,
+        }) if maximum_bytes == event_limit && longest_bytes == event_limit + 1
+    ));
+    assert!(std::fs::read_dir(&original).unwrap().next().is_none());
+
+    let mut recorder = recorder("{prefix}{index}.mkv".to_owned());
+    recorder
+        .start(&target, RecordingTimecode::Preserve)
+        .unwrap();
+    let first = original.join("take1.mkv");
+    let second = original.join("take2.mkv");
+    let assert_event_path = |event_path: &EventText, expected: &Path| {
+        assert_eq!(event_path.as_bytes(), expected.to_str().unwrap().as_bytes());
+        assert!(!event_path.is_possibly_truncated());
+    };
+    let started = await_event(&mut recorder, RecorderEventKind::Started);
+    assert_event_path(started.path(), &first);
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    assert_event_path(recorder.reported_current_file().unwrap(), &first);
+
+    std::env::set_current_dir(&changed_directory).unwrap();
+    std::fs::write(changed_directory.with_file_name(FORMAT_REQUEST), []).unwrap();
+    let mut timeline = Timeline::new();
+    assert_eq!(timeline.await_change(&mut recorder, 0, &first), second);
+    assert_event_path(recorder.reported_current_file().unwrap(), &second);
+
+    let outcome = recorder.finish(PATIENCE).unwrap();
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
+        panic!("the directory change made closure indeterminate: {outcome:?}\n{timeline}");
+    };
+    assert_eq!(report.closed_files(), 2);
+    assert_eq!(report.error_events(), 0);
+    assert_event_path(report.last_closed_path().unwrap(), &second);
+    assert!(first.is_file());
+    assert!(second.is_file());
+    assert!(std::fs::read_dir(changed_directory)
+        .unwrap()
+        .next()
+        .is_none());
+}
+
+#[test]
 fn a_recording_is_finalized_and_probes_with_its_video_track() {
     let Some((ndi, api)) = file_api() else {
         return;
@@ -1092,6 +1219,8 @@ fn a_rollover_into_a_missing_directory_is_refused_and_the_session_goes_on() {
     let scratch = FixtureDir::create("missing-directory");
     let source = LiveSource::start(&ndi, "missing-directory");
     let missing = || RecordingTarget::new(scratch.join("absent/take")).unwrap();
+    let directory_only = ["absent/", "absent/.", "absent/.."]
+        .map(|path| RecordingTarget::new(scratch.join(path)).unwrap());
     let not_found = |result: Result<()>| match result {
         Err(Error::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
         other => panic!("expected the directory to be reported missing: {other:?}"),
@@ -1102,23 +1231,44 @@ fn a_rollover_into_a_missing_directory_is_refused_and_the_session_goes_on() {
             .start(&missing(), RecordingTimecode::Preserve)
             .map(drop),
     );
+    for target in &directory_only {
+        let result = recorder.start(target, RecordingTimecode::Preserve);
+        assert!(
+            matches!(result, Err(Error::InvalidInput(_))),
+            "{target:?}: {result:?}"
+        );
+        assert_eq!(recorder.state(), RecorderState::Idle);
+    }
     recorder
         .start(
             &RecordingTarget::new(scratch.join("take.mkv")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
-    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    let mut timeline = Timeline::new();
+    let first = timeline.await_event(&mut recorder, 0, RecorderEventKind::FirstFrame, None);
 
     // Passed on, the library would accept this and then end the session.
     not_found(recorder.rollover(&missing()));
-    assert_eq!(recorder.state(), RecorderState::Recording);
-    assert!(recorder.is_recording());
-    thread::sleep(Duration::from_millis(200));
+    for target in &directory_only {
+        let result = recorder.rollover(target);
+        assert!(
+            matches!(result, Err(Error::InvalidInput(_))),
+            "{target:?}: {result:?}"
+        );
+        assert_eq!(recorder.state(), RecorderState::Recording);
+        assert!(recorder.is_recording());
+    }
+    let since = timeline.mark();
+    let next = scratch.join("next.mkv");
+    recorder
+        .rollover(&RecordingTarget::new(&next).unwrap())
+        .unwrap();
+    assert_eq!(timeline.await_change(&mut recorder, since, &first), next);
     let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap() else {
         panic!("the recording was not confirmed closed");
     };
-    assert_eq!(report.closed_files(), 1);
+    assert_eq!(report.closed_files(), 2);
     assert_eq!(report.error_events(), 0);
 }
 
@@ -1189,6 +1339,65 @@ fn an_indexed_rollover_uses_the_next_free_candidate() {
     assert_eq!(report.closed_files(), 2);
     assert_eq!(report.error_events(), 0);
     assert_eq!(std::fs::read(occupied).unwrap(), b"kept");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn an_indexed_rollover_that_outgrows_the_basename_limit_is_refused() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = FixtureDir::create("indexed-rollover-growth");
+    let basename = "x".repeat(250);
+    let candidate = |index| scratch.join(format!("{basename}{index}.mkv"));
+    let first = std::fs::symlink_metadata(candidate(1));
+    let tenth = std::fs::symlink_metadata(candidate(10));
+    if !matches!(first, Err(err) if err.raw_os_error() == Some(libc::ENOENT))
+        || !matches!(tenth, Err(err) if err.raw_os_error() == Some(libc::ENAMETOOLONG))
+    {
+        eprintln!("skipping indexed rollover growth: requires a 255-byte basename limit");
+        return;
+    }
+    for index in 1..=9 {
+        std::fs::write(candidate(index), [index]).unwrap();
+    }
+
+    let source = LiveSource::start(&ndi, "indexed-rollover-growth");
+    let options = exact_video(&source).naming(FileNaming::Pattern("{prefix}{index}.mkv".into()));
+    let mut recorder = FileRecorder::new(&api, &options).unwrap();
+    recorder
+        .start(
+            &RecordingTarget::new(scratch.join("first")).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    let mut timeline = Timeline::new();
+    let first = timeline.await_event(&mut recorder, 0, RecorderEventKind::FirstFrame, None);
+    let result = recorder.rollover(&RecordingTarget::new(scratch.join(&basename)).unwrap());
+    let Err(Error::Io(error)) = result else {
+        panic!("the filesystem should reject the wider basename at preflight: {result:?}");
+    };
+    assert_eq!(error.raw_os_error(), Some(libc::ENAMETOOLONG));
+    assert_eq!(recorder.state(), RecorderState::Recording);
+    assert!(recorder.is_recording());
+
+    let since = timeline.mark();
+    recorder
+        .rollover(&RecordingTarget::new(scratch.join("second")).unwrap())
+        .unwrap();
+    assert_eq!(
+        timeline.await_change(&mut recorder, since, &first),
+        scratch.join("second1.mkv")
+    );
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = recorder.finish(PATIENCE).unwrap() else {
+        panic!("the recording was not confirmed closed");
+    };
+    assert_eq!(report.closed_files(), 2);
+    assert_eq!(report.error_events(), 0);
+    assert!(!report.stopped_by_sdk());
+    for index in 1..=9 {
+        assert_eq!(std::fs::read(candidate(index)).unwrap(), [index]);
+    }
 }
 
 #[test]

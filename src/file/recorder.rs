@@ -301,10 +301,10 @@ impl FileRecorder {
     ///   [`StateConflict::IncompleteFileTracking`] after a session ends with
     ///   incomplete tracking. [`StateConflict::EarlierSessionEvents`]
     ///   when the SDK keeps reporting events of an earlier session.
-    /// * [`Error::InvalidInput`] when the resolved output path is not lossless
-    ///   UTF-8, or its longest form exceeds the recorder event's exact path
-    ///   limit (4094 UTF-8 bytes with the current SDK), reserving at least
-    ///   20 digits per index token. The SDK is not called.
+    /// * [`Error::InvalidInput`] when the expanded output path is relative,
+    ///   has no file name, or its longest form exceeds the recorder event's
+    ///   exact path limit (4094 UTF-8 bytes with the current SDK), reserving
+    ///   at least 20 digits per index token. The SDK is not called.
     /// * [`Error::Io`] when the directory of the file the pattern names
     ///   does not exist or cannot be written to, the filesystem rejects the
     ///   candidate path, or an exact file name exists (kind
@@ -791,10 +791,11 @@ impl FileRecorder {
     ///
     /// * [`Error::InvalidState`] with [`StateConflict::NotRecording`] unless
     ///   a session is recording.
-    /// * [`Error::InvalidInput`] when the resolved output path is not lossless
-    ///   UTF-8, or its longest form exceeds the recorder event's exact path
-    ///   limit (4094 UTF-8 bytes with the current SDK), reserving at least
-    ///   20 digits per index token. The SDK is not called and the session goes on.
+    /// * [`Error::InvalidInput`] when the expanded output path is relative,
+    ///   has no file name, or its longest form exceeds the recorder event's
+    ///   exact path limit (4094 UTF-8 bytes with the current SDK), reserving
+    ///   at least 20 digits per index token. The SDK is not called and the
+    ///   session goes on.
     /// * [`Error::Io`] when the directory of the file the pattern names
     ///   does not exist or cannot be written to, the filesystem rejects the
     ///   candidate path, or an exact file name exists (kind

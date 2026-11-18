@@ -567,6 +567,9 @@ pub enum InputDefect {
         "filename-pattern indexes must be in the file name; move {{index}} out of the directory"
     )]
     FilenamePatternIndexInDirectory,
+    /// The expanded recording path ends without a file name.
+    #[error("recording file path must end with a file name")]
+    RecordingPathMissingFilename,
     /// file position exceeds 64-bit ticks.
     #[error("file position exceeds 64-bit ticks")]
     FilePositionOverflow,
@@ -764,6 +767,9 @@ pub enum InputDefect {
         /// The frame's transfer, if given.
         transfer: Option<TransferFunction>,
     },
+    /// The expanded SDK filename is relative on this platform.
+    #[error("the expanded recording file path must be absolute. Use {{prefix}} with a RecordingTarget or supply an absolute pattern")]
+    RecordingPathNotAbsolute,
     /// recording file path may reach {longest_bytes} UTF-8 bytes, exceeding the {maximum_bytes}-byte event path limit ({index_digits_reserved} digits reserved for index growth).
     #[error("recording file path may reach {longest_bytes} UTF-8 bytes, exceeding the {maximum_bytes}-byte event path limit ({index_digits_reserved} digits reserved for index growth)")]
     RecordingPathTooLong {
