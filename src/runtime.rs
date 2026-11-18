@@ -61,9 +61,9 @@
 //! An explicit path must name an existing file. If it does not, the crate
 //! refuses it without calling the platform loader. The crate makes no
 //! executable, environment or platform search for an explicit path. A later
-//! explicit selection cannot
-//! undo code already run by an earlier load. Native dependencies still use
-//! platform loader rules and must also come from trusted locations. With the
+//! explicit selection cannot undo code already run by an earlier load. Native
+//! dependencies still use platform loader rules and must also come from
+//! trusted locations. With the
 //! File API, explicitly select `FileApiOptions::library_path`
 //! too, or establish that its companion and other search directories are
 //! trusted; inspect the selection through `FileApi::library_path`.

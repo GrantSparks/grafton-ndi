@@ -23,7 +23,8 @@ use grafton_ndi::{
     },
     routing::{Router, RouterOptions},
     runtime::RuntimeOptions,
-    Error, Ndi, Receiver, ReceiverOptions, ResourceKind, Sender, SenderOptions, Source,
+    Error, Finder, FinderOptions, InputDefect, Ndi, Receiver, ReceiverOptions, ResourceKind,
+    Sender, SenderOptions, Source,
 };
 use runtime_fixture::{read_fake_log, FakeRuntime};
 use std::{path::PathBuf, time::Duration};
@@ -81,6 +82,7 @@ const VARIANTS: &[Variant] = &[
         scenarios: &[
             "fixed_runtime_is_accepted",
             "creation_needs_an_address",
+            "empty_overrides_are_refused_without_native_creation",
             "advertisement_options_reach_the_sdk",
             "malformed_text_is_decoded_lossily",
             "identifiers_round_trip_exactly",
@@ -113,7 +115,9 @@ fn discovery_server_objects() {
             ..Default::default()
         };
         if variant.exports_functions {
-            runtime.cfgs.extend(["fake_objects", "fake_discovery"]);
+            runtime
+                .cfgs
+                .extend(["fake_objects", "fake_discovery", "fake_finder"]);
         }
         let library = runtime.build(&directory.join(variant.file));
         for scenario in variant.scenarios {
@@ -344,6 +348,41 @@ fn child(scenario: &str) {
                 "{}",
                 read_fake_log()
             );
+        }
+        "empty_overrides_are_refused_without_native_creation" => {
+            let advertisers = AdvertiserOptions::new().servers([] as [&str; 0]);
+            let listeners = ListenerOptions::new().server("");
+            let discovery_errors = constructor_errors(&ndi, &advertisers, &listeners);
+            for (error, what) in [
+                (
+                    Finder::new(&ndi, &FinderOptions::new().groups([] as [&str; 0])).err(),
+                    "groups",
+                ),
+                (
+                    Finder::new(&ndi, &FinderOptions::new().extra_ips([] as [&str; 0])).err(),
+                    "extra_ips",
+                ),
+                (
+                    Sender::new(&ndi, &SenderOptions::new("sender").groups([] as [&str; 0])).err(),
+                    "groups",
+                ),
+                (
+                    Router::new(&ndi, &RouterOptions::new("router").groups([] as [&str; 0])).err(),
+                    "groups",
+                ),
+            ]
+            .into_iter()
+            .chain(
+                discovery_errors
+                    .into_iter()
+                    .zip(["servers", "servers", "server", "server"]),
+            ) {
+                assert!(
+                    matches!(error, Some(Error::InvalidInput(InputDefect::Empty { what: actual })) if what == actual),
+                    "{what}: {error:?}"
+                );
+            }
+            assert_eq!(log(), "initialize\n");
         }
         "advertisement_options_reach_the_sdk" => {
             let receiver = |name: &str| {

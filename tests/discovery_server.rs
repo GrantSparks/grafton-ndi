@@ -20,6 +20,9 @@ common_helpers!(
 );
 use common::TestChild;
 
+#[path = "support/native_discovery_configuration.rs"]
+mod native_discovery_configuration;
+
 use grafton_ndi::{
     capabilities::RuntimeFeature,
     discovery_server::{
