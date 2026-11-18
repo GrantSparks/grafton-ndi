@@ -12,8 +12,9 @@ against the same item and member names.
 Documented dependency features and the README feature table are checked against
 Cargo.toml so removed or renamed features cannot remain in install instructions.
 Native table entry points need public SDK search aliases or an explicit internal
-classification. Shared receiver controls keep KVM forwards and their attributes
-in step. Generated declarations also reject underscore-prefixed parameters.
+classification. Synchronous and asynchronous methods keep the same aliases,
+and shared receiver controls keep their KVM forwards and attributes. Generated
+declarations also reject underscore-prefixed parameters.
 """
 import argparse
 from collections import Counter
@@ -351,7 +352,7 @@ def sdk_alias_violations(root):
 
 
 @dataclass(frozen=True)
-class SharedReceiverMethod:
+class SharedMethod:
     line: int
     aliases: frozenset
     must_use: frozenset
@@ -372,13 +373,8 @@ def token_angle_end(words, start):
     return len(words)
 
 
-def shared_receiver_methods(text, owner):
-    """Collect literal shared controls from generic inherent receiver impls.
-
-    Capture methods already share an inventory macro. This checks handwritten
-    controls on ReceiverMode and EventMode, excluding private methods, consuming
-    or mutable receivers, trait impls, examples, test modules and method bodies.
-    """
+def shared_methods(text, owner, *, kvm_controls=False):
+    """Collect public borrowed methods from inherent impls of a named type."""
     tokens = rust_tokens(text)
     words, indices = production_words([word for word, _ in tokens], with_indices=True)
     methods, cursor = {}, 0
@@ -397,8 +393,12 @@ def shared_receiver_methods(text, owner):
             continue
         end = token_group_end(words, body)
         header = words[cursor + 1:body]
+        target_end = declaration + 1
+        if words[target_end:target_end + 1] == ['<']:
+            target_end = token_angle_end(words, target_end)
         if (words[declaration:declaration + 1] != [owner]
-                or not {'ReceiverMode', 'EventMode'}.intersection(header)):
+                or words[target_end:target_end + 1] == ['for']
+                or (kvm_controls and not {'ReceiverMode', 'EventMode'}.intersection(header))):
             cursor = end
             continue
         member = body + 1
@@ -418,9 +418,8 @@ def shared_receiver_methods(text, owner):
                     receiver = inputs[0] if inputs else []
                     if receiver[:1] == ['&'] and receiver[1:2] == ["'"]:
                         receiver = receiver[:1] + receiver[3:]
-                    if receiver == ['&', 'self']:
-                        # Compare every alias, not only NDIlib aliases: a future
-                        # additional search term must reach the KVM view too.
+                    if (receiver == ['&', 'self'] or
+                            (not kvm_controls and receiver == ['&', 'mut', 'self'])):
                         aliases = frozenset(
                             word for attribute in attributes
                             if attribute[:3] == ['doc', '(', 'alias']
@@ -430,7 +429,7 @@ def shared_receiver_methods(text, owner):
                         must_use = frozenset(tuple(attribute) for attribute in attributes
                                              if attribute[:1] == ['must_use'])
                         offset = tokens[indices[function + 1]][1]
-                        methods[name] = SharedReceiverMethod(
+                        methods[name] = SharedMethod(
                             text.count('\n', 0, offset) + 1, aliases, must_use)
                     member = arguments_end
                     continue
@@ -443,32 +442,63 @@ def shared_receiver_methods(text, owner):
     return methods
 
 
-def kvm_forward_violations(root):
-    """Every shared Receiver control retains its KVM forward and attributes."""
-    controls = {}
-    for relative in ('src/receiver.rs', 'src/advanced/controls.rs'):
-        path = root / relative
-        if path.exists():
-            for name, method in shared_receiver_methods(path.read_text(encoding='utf-8'), 'Receiver').items():
-                controls[name] = (relative, method)
-    relative = 'src/advanced/kvm_receiver.rs'
-    path = root / relative
-    forwards = (shared_receiver_methods(path.read_text(encoding='utf-8'), 'KvmReceiver')
-                if path.exists() else {})
+@dataclass(frozen=True)
+class MethodTwins:
+    original: str
+    original_files: tuple[str, ...]
+    twin: str
+    twin_file: str
+    exclusions: dict[str, str] | None = None
+    kvm_controls: bool = False
+
+
+RECEIVER_FILES = ('src/receiver.rs', 'src/advanced/controls.rs')
+FINDER_FILES = ('src/finder.rs',)
+ASYNC_DISCOVERY = 'src/asynchronous/discovery.rs'
+ASYNC_FILE = 'src/file/asynchronous.rs'
+METHOD_TWINS = (
+    MethodTwins('Receiver', RECEIVER_FILES, 'KvmReceiver', 'src/advanced/kvm_receiver.rs',
+                KVM_CONTROL_EXCLUSIONS, kvm_controls=True),
+    MethodTwins('Finder', FINDER_FILES, 'AsyncFinder', ASYNC_DISCOVERY),
+    MethodTwins('SourceCache', FINDER_FILES, 'AsyncFinder', ASYNC_DISCOVERY),
+    MethodTwins('SourceWatch', FINDER_FILES, 'AsyncSourceWatch', ASYNC_DISCOVERY),
+    MethodTwins('Receiver', RECEIVER_FILES, 'AsyncReceiver', 'src/asynchronous.rs'),
+    MethodTwins('FilePlayer', ('src/file/player.rs',), 'AsyncFilePlayer', ASYNC_FILE),
+    MethodTwins('FileRecorder', ('src/file/recorder.rs',), 'AsyncFileRecorder', ASYNC_FILE),
+)
+
+
+def method_twin_violations(root):
+    """Same-named twins share aliases. KVM also needs every forward and its must_use."""
+    def inventory(owner, files, kvm_controls):
+        methods = {}
+        for relative in files:
+            path = root / relative
+            if path.exists():
+                methods.update((name, (relative, method)) for name, method in
+                               shared_methods(path.read_text(encoding='utf-8'), owner,
+                                              kvm_controls=kvm_controls).items())
+        return methods
+
     found = []
-    for name, (source, method) in sorted(controls.items()):
-        if name in KVM_CONTROL_EXCLUSIONS:
-            continue
-        if name not in forwards:
-            found.append(f'{source}:{method.line}: shared Receiver::{name} needs a KvmReceiver forward')
-            continue
-        forward = forwards[name]
-        for attribute in ('must_use', 'aliases'):
-            expected, actual = getattr(method, attribute), getattr(forward, attribute)
-            if expected != actual:
-                label = 'doc(alias)' if attribute == 'aliases' else attribute
-                found.append(f'{relative}:{forward.line}: KvmReceiver::{name} {label} attributes '
-                             f'differ from Receiver::{name} at {source}:{method.line}')
+    for pair in METHOD_TWINS:
+        originals = inventory(pair.original, pair.original_files, pair.kvm_controls)
+        twins = inventory(pair.twin, (pair.twin_file,), pair.kvm_controls)
+        for name, (source, original) in sorted(originals.items()):
+            if pair.exclusions and name in pair.exclusions:
+                continue
+            if name not in twins:
+                if pair.kvm_controls:
+                    found.append(f'{source}:{original.line}: shared {pair.original}::{name} '
+                                 f'needs a {pair.twin} forward')
+                continue
+            relative, twin = twins[name]
+            attributes = ('must_use', 'aliases') if pair.kvm_controls else ('aliases',)
+            for attribute in attributes:
+                if getattr(original, attribute) != getattr(twin, attribute):
+                    label = 'doc(alias)' if attribute == 'aliases' else attribute
+                    found.append(f'{relative}:{twin.line}: {pair.twin}::{name} {label} attributes '
+                                 f'differ from {pair.original}::{name} at {source}:{original.line}')
     return found
 
 
@@ -1020,7 +1050,7 @@ def main():
     found, snippets = check(ROOT)
     found.extend(readme_link_violations(ROOT))
     found.extend(sdk_alias_violations(ROOT))
-    found.extend(kvm_forward_violations(ROOT))
+    found.extend(method_twin_violations(ROOT))
     if args.rustdoc:
         found.extend(rustdoc_violations(ROOT, args.rustdoc))
         found.extend(parameter_name_violations(ROOT, args.rustdoc))

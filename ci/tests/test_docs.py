@@ -309,7 +309,7 @@ class Documentation(unittest.TestCase):
         self.write('src/receiver.rs', receiver)
         self.write('src/advanced/controls.rs', advanced)
         self.write('src/advanced/kvm_receiver.rs', kvm)
-        return docs.kvm_forward_violations(self.root)
+        return docs.method_twin_violations(self.root)
 
     def test_shared_receiver_controls_require_kvm_forwards(self):
         receiver = 'impl<M: ReceiverMode> Receiver<M> { pub fn control(&self) {} }'
@@ -390,6 +390,23 @@ class Documentation(unittest.TestCase):
         self.assertEqual(len(errors), 2)
         self.assertTrue(any('Receiver::control' in error for error in errors))
         self.assertTrue(any('Receiver::other' in error for error in errors))
+
+    def test_sync_and_async_twins_keep_all_aliases_in_both_directions(self):
+        alias = '#[doc(alias = "NDIlib_find_get_current_sources")]'
+        sync = f"impl<'a> SourceWatch<'a> {{ {alias} pub fn current_sources(&mut self) {{}} }}"
+        asynchronous = f"impl<D> AsyncSourceWatch<D> {{ {alias} pub async fn current_sources(&self) {{}} }}"
+        sync_file = 'src/finder.rs'
+        async_file = 'src/asynchronous/discovery.rs'
+        self.write(sync_file, sync)
+        self.write(async_file, asynchronous)
+        self.assertEqual(docs.method_twin_violations(self.root), [])
+        for file, text in ((sync_file, sync), (async_file, asynchronous)):
+            with self.subTest(missing_alias=file):
+                self.write(file, text.replace(alias, ''))
+                error, = docs.method_twin_violations(self.root)
+                self.assertIn('AsyncSourceWatch::current_sources doc(alias)', error)
+                self.assertIn('SourceWatch::current_sources', error)
+                self.write(file, text)
 
     def test_native_alias_coverage_follows_every_registry_and_new_files(self):
         forms = ['native_table', 'optional_tables', 'advanced_tables', 'file_families']

@@ -146,7 +146,8 @@ at most one module path. Root names do not shadow `tokio`, `smol` or `image`.
 Public parameter names form part of the documentation. They have no leading
 underscore, and common inputs consistently use `frame`, `metadata`, `source`,
 `options` and `timeout`. Public wrappers carry a `doc(alias = "NDIlib_...")`
-for their SDK entry points. The documentation checker verifies parameter
-names in generated HTML and native table alias coverage, with explicit
-reasons for entry points used only internally. Example target names use
+for their SDK entry points. Synchronous and asynchronous twins carry the same
+aliases. The documentation checker verifies alias parity, native table alias
+coverage and parameter names in generated HTML. Internal SDK entry points
+have an explicit reason for their exemption. Example target names use
 snake_case; ports of SDK samples identify the original sample in their header.

@@ -501,6 +501,7 @@ impl SourceWatch<'_> {
     /// [`Error::UnexpectedSdkResult`] for a malformed top-level descriptor array,
     /// [`Error::AllocationFailed`] when result or text storage cannot be reserved,
     /// or [`Error::ResourceLimit`] when a snapshot exceeds its copy budgets.
+    #[doc(alias = "NDIlib_find_get_current_sources")]
     pub fn current_sources(&mut self) -> Result<Vec<Source>> {
         self.snapshot(Finder::current_sources, |_| true)
     }
@@ -1018,6 +1019,8 @@ impl Finder {
     /// Returns [`Error::InvalidInput`] for a timeout above [`crate::MAX_TIMEOUT`],
     /// including immediate matches, and snapshot errors such as
     /// [`Error::ResourceLimit`]. A panic in `select` propagates outside SDK locks.
+    #[doc(alias = "NDIlib_find_get_current_sources")]
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub fn find_source(
         &self,
         timeout: Duration,
@@ -1055,6 +1058,8 @@ impl Finder {
     /// An empty name returns [`Error::InvalidInput`]; a name containing a NUL
     /// returns [`Error::InvalidCString`]. The name is checked before the timeout,
     /// including in async lookups. Other errors match [`Self::find_source`].
+    #[doc(alias = "NDIlib_find_get_current_sources")]
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub fn find_source_by_name(&self, name: &str, timeout: Duration) -> Result<Option<Source>> {
         let (name, deadline) = checked_name_lookup(name, timeout)?;
         let Ok(source) = self.find_source_by_name_until(name.as_str(), deadline, NeverStop)?;
@@ -1133,6 +1138,8 @@ impl Finder {
     /// # Ok(())
     /// # }
     /// ```
+    #[doc(alias = "NDIlib_find_get_current_sources")]
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub fn find_sources(&self, timeout: Duration) -> Result<Vec<Source>> {
         let Ok(sources) = self.find_sources_until(Deadline::after(timeout)?, NeverStop)?;
         Ok(sources)
@@ -2189,6 +2196,8 @@ impl SourceCache {
     /// discovery/resource errors propagate without filling an entry. A completed
     /// result the cache cannot store is returned uncached. IP hints must already
     /// be configured on the finder; this method does not change its scope.
+    #[doc(alias = "NDIlib_find_get_current_sources")]
+    #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
         let (query, deadline) = checked_host_lookup(host, timeout)?;
         let Ok(sources) = self.find_sources_by_host_until(query, deadline, NeverStop)?;
