@@ -377,6 +377,105 @@ fn the_longest_exact_event_path_records_closes_and_starts_again() {
 }
 
 #[test]
+fn absolute_recording_names_survive_a_working_directory_change() {
+    const CHANGED_DIRECTORY: &str = "GRAFTON_NDI_TEST_RECORDING_CHANGED_DIRECTORY";
+    let Some(changed_directory) = std::env::var_os(CHANGED_DIRECTORY) else {
+        // The child can change process-wide state without racing other tests.
+        let scratch = FixtureDir::create("recording-cwd");
+        let original = scratch.join("original");
+        let changed = scratch.join("changed");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&changed).unwrap();
+        let output = crate::test_support::TestChild::new(
+            "file::sdk_tests::absolute_recording_names_survive_a_working_directory_change",
+        )
+        .current_dir(original)
+        .env(CHANGED_DIRECTORY, changed)
+        .run();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    };
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let source = LiveSource::start(&ndi, "recording-cwd");
+    let original = std::env::current_dir().unwrap();
+    let target = RecordingTarget::new("take").unwrap();
+    let recorder = |pattern| {
+        let options = FileRecorderOptions::new(source.spec.clone())
+            .naming(FileNaming::Pattern(pattern))
+            .proxy(false)
+            .tracks(MediaTypes::VIDEO);
+        FileRecorder::new(&api, &options).unwrap()
+    };
+    let refuse_start = |pattern| {
+        let mut recorder = recorder(pattern);
+        let result = recorder.start(&target, RecordingTimecode::Preserve);
+        assert_eq!(recorder.state(), RecorderState::Idle);
+        assert!(!recorder.is_recording());
+        assert_eq!(recorder.report().session(), 0);
+        result.unwrap_err()
+    };
+    assert!(matches!(
+        refuse_start("take{index}.mkv".to_owned()),
+        Error::InvalidInput(crate::InputDefect::RecordingPathNotAbsolute)
+    ));
+
+    // Normalizing repeated `./` used to make the checked path short enough,
+    // although the SDK emitted a path at the event field's truncation boundary.
+    let event_limit = crate::sys::bindings::NDIlib_file_recorder_event_path_max_size as usize - 2;
+    let long_relative = format!(
+        "{}x.mkv",
+        "./".repeat((event_limit + 1 - "x.mkv".len()) / 2)
+    );
+    assert_eq!(long_relative.len(), event_limit + 1);
+    assert!(matches!(
+        refuse_start(long_relative),
+        Error::InvalidInput(crate::InputDefect::RecordingPathTooLong {
+            maximum_bytes,
+            longest_bytes,
+            index_digits_reserved: 0,
+        }) if maximum_bytes == event_limit && longest_bytes == event_limit + 1
+    ));
+    assert!(std::fs::read_dir(&original).unwrap().next().is_none());
+
+    let mut recorder = recorder("{prefix}{index}.mkv".to_owned());
+    recorder
+        .start(&target, RecordingTimecode::Preserve)
+        .unwrap();
+    let first = original.join("take1.mkv");
+    let second = original.join("take2.mkv");
+    let assert_event_path = |event_path: &EventText, expected: &Path| {
+        assert_eq!(event_path.as_bytes(), expected.to_str().unwrap().as_bytes());
+        assert!(!event_path.is_possibly_truncated());
+    };
+    let started = await_event(&mut recorder, RecorderEventKind::Started);
+    assert_event_path(started.path(), &first);
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    assert_event_path(recorder.reported_current_file().unwrap(), &first);
+
+    std::env::set_current_dir(&changed_directory).unwrap();
+    source.change_format();
+    let mut timeline = Timeline::new();
+    assert_eq!(timeline.await_change(&mut recorder, 0, &first), second);
+    assert_event_path(recorder.reported_current_file().unwrap(), &second);
+
+    let outcome = recorder.finish(PATIENCE).unwrap();
+    let FinishStatus::Ended(SessionEnd::Closed(report)) = outcome else {
+        panic!("the directory change made closure indeterminate: {outcome:?}\n{timeline}");
+    };
+    assert_eq!(report.closed_files(), 2);
+    assert_eq!(report.error_events(), 0);
+    assert_event_path(report.last_closed_path().unwrap(), &second);
+    assert!(first.is_file());
+    assert!(second.is_file());
+    assert!(std::fs::read_dir(changed_directory)
+        .unwrap()
+        .next()
+        .is_none());
+}
+
+#[test]
 fn a_recording_is_finalized_and_probes_with_its_video_track() {
     let Some((ndi, api)) = file_api() else {
         return;
