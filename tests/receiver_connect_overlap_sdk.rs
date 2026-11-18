@@ -54,11 +54,13 @@ use std::{
 const SLICE: Duration = Duration::from_millis(100);
 const PATIENCE: Duration = Duration::from_secs(15);
 
-fn trace(phase: std::fmt::Arguments<'_>) {
+fn diagnostics_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ENABLED
-        .get_or_init(|| std::env::var("GRAFTON_NDI_RECEIVER_DIAGNOSTICS").as_deref() == Ok("1"))
-    {
+    *ENABLED.get_or_init(|| std::env::var("GRAFTON_NDI_RECEIVER_DIAGNOSTICS").as_deref() == Ok("1"))
+}
+
+fn trace(phase: std::fmt::Arguments<'_>) {
+    if diagnostics_enabled() {
         let thread = thread::current();
         let name = thread.name().unwrap_or("worker");
         eprintln!("receiver-watchdog: {name}: {phase}");
@@ -92,13 +94,27 @@ fn margin() -> Duration {
 }
 
 fn timed<T>(operation: &str, budget: Duration, call: impl FnOnce() -> T) -> T {
-    if operation.contains("connect") {
+    thread_local! {
+        static TRACED_CALLS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    }
+    // Record a few phases per worker. A long overlap run still captures every
+    // thread's current call in the watchdog dump.
+    let traced = diagnostics_enabled()
+        && operation.contains("connect")
+        && TRACED_CALLS.with(|count| {
+            let seen = count.get();
+            if seen < 8 {
+                count.set(seen + 1);
+            }
+            seen < 8
+        });
+    if traced {
         trace(format_args!("entering {operation}"));
     }
     let began = Instant::now();
     let result = call();
     let elapsed = began.elapsed();
-    if operation.contains("connect") {
+    if traced {
         trace(format_args!("returned from {operation}"));
     }
     assert!(

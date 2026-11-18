@@ -364,6 +364,7 @@ def obligations(msrv, features, miri_groups):
     table['receiver-diagnostics.yml', 'probe', 'Repeat the reconnect case'] = Obligation(
         r'''
         for attempt in 1 2 3 4 5; do
+          echo "Receiver diagnostic attempt $attempt"
           cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features --lib -- --exact receiver::tests::reconnect_returns_while_a_capture_attempt_is_in_flight
         done
         ''',
@@ -372,6 +373,7 @@ def obligations(msrv, features, miri_groups):
     table['receiver-diagnostics.yml', 'probe', 'Repeat receiver overlap cases'] = Obligation(
         r'''
         for attempt in 1 2 3; do
+          echo "Receiver diagnostic attempt $attempt"
           cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features --test receiver_connect_overlap_sdk
         done
         ''',
