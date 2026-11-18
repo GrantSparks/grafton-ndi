@@ -23,6 +23,9 @@ use crate::{Error, Result};
 /// 6.4 SDK, the SDK passes the element through unchanged to receivers in
 /// every color format, YUV and RGB, but does not apply it: it converts
 /// between YUV and RGB with BT.709 coefficients whatever the element says.
+///
+/// Document type declarations are skipped without expanding entities or
+/// loading external definitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ColorInfo {
     primaries: Option<ColorPrimaries>,
@@ -201,8 +204,9 @@ const QUOTED_LIMIT: usize = 40;
 /// Returns `Ok(None)` when there is no metadata or no element, and the color
 /// description when every element in the text gives the same one. The
 /// element may stand anywhere in the text, alone or inside an
-/// `ndi_metadata_group`; comments, CDATA sections and processing instructions
-/// are skipped, and an unterminated one runs to the end of the text, as in XML.
+/// `ndi_metadata_group`. Comments, CDATA sections, processing instructions
+/// and document type declarations are skipped. An unterminated one runs to
+/// the end of the text.
 ///
 /// # Errors
 ///
@@ -210,6 +214,7 @@ const QUOTED_LIMIT: usize = 40;
 /// element is malformed or truncated, gives an attribute twice, gives a value
 /// outside the SDK's list, or differs from an earlier element.
 pub(crate) fn parse(metadata: Option<&str>) -> Result<Option<ColorInfo>> {
+    const DOCTYPE: &[u8] = b"<!DOCTYPE";
     let Some(text) = metadata else {
         return Ok(None);
     };
@@ -234,6 +239,14 @@ pub(crate) fn parse(metadata: Option<&str>) -> Result<Option<ColorInfo>> {
                     Some(end) => 2 + end + 2,
                     None => break,
                 }
+            } else if let Some(body) = tag
+                .strip_prefix(DOCTYPE)
+                .filter(|body| matches!(body.first(), None | Some(b' ' | b'\t' | b'\r' | b'\n')))
+            {
+                match doctype_end(body) {
+                    Some(end) => DOCTYPE.len() + end,
+                    None => break,
+                }
             } else if let Some(attributes) = start_tag(tag) {
                 let (info, len) = element(attributes)?;
                 if let Some(earlier) = found.filter(|&earlier| earlier != info) {
@@ -251,6 +264,31 @@ pub(crate) fn parse(metadata: Option<&str>) -> Result<Option<ColorInfo>> {
             };
     }
     Ok(found)
+}
+
+/// The offset past the declaration's closing `>`, measured from after
+/// `<!DOCTYPE`. End the declaration at a `>` outside the internal subset.
+/// Literals, comments and instructions may contain either delimiter.
+fn doctype_end(text: &[u8]) -> Option<usize> {
+    let mut in_subset = false;
+    let mut at = 0;
+    while let Some(&byte) = text.get(at) {
+        at += 1;
+        match byte {
+            b'\'' | b'"' => at += text[at..].iter().position(|&next| next == byte)? + 1,
+            b'<' if text[at..].starts_with(b"!--") => {
+                at += 3 + find(&text[at + 3..], b"-->")? + 3;
+            }
+            b'<' if text[at..].starts_with(b"?") => {
+                at += 1 + find(&text[at + 1..], b"?>")? + 2;
+            }
+            b'[' => in_subset = true,
+            b']' => in_subset = false,
+            b'>' if !in_subset => return Some(at),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The text after `<ndi_color_info` when `tag` starts that element's start
@@ -489,6 +527,42 @@ mod tests {
     }
 
     #[test]
+    fn document_type_declarations_are_opaque_to_color_scanning() {
+        let element = "<ndi_color_info transfer='bt_709'/>";
+        for declaration in [
+            r#"<!DOCTYPE ndi_metadata_group [<!ENTITY label "<ndi_color_info transfer='bt_2100_pq'/>">]>"#,
+            r#"<!DOCTYPE ndi_metadata_group [
+                <!-- ] > <ndi_color_info matrix='unknown'/> -->
+                <?camera ] > ' <ndi_color_info/> ?>
+                <!ELEMENT ndi_metadata_group ANY>
+                <!ENTITY label '<ndi_color_info transfer="bt_2100_pq"/>'>
+                <!ENTITY other "text with ] >">
+            ]>"#,
+            r#"<!DOCTYPE ndi_metadata_group SYSTEM "camera]>v1.dtd">"#,
+            "<!DOCTYPE ndi_metadata_group>",
+        ] {
+            let empty = format!("{declaration}<ndi_metadata_group/>");
+            assert_eq!(read(&empty).unwrap(), None, "{declaration}");
+            let content =
+                format!("{declaration}<ndi_metadata_group>{element}</ndi_metadata_group>");
+            assert_eq!(
+                read(&content).unwrap(),
+                read(element).unwrap(),
+                "{declaration}"
+            );
+        }
+
+        for incomplete in [
+            r#"<!DOCTYPE ndi_metadata_group SYSTEM "<ndi_color_info/>"#,
+            r#"<!DOCTYPE ndi_metadata_group [<!ENTITY label "<ndi_color_info/>">"#,
+            "<!DOCTYPE ndi_metadata_group [<!-- ] > <ndi_color_info/>",
+            "<!DOCTYPE ndi_metadata_group [<?camera ] > <ndi_color_info/>",
+        ] {
+            assert_eq!(read(incomplete).unwrap(), None, "{incomplete}");
+        }
+    }
+
+    #[test]
     fn the_sdk_example_reads_in_any_attribute_order_and_quote_style() {
         // As the 6.4 SDK's HDR sender example writes it.
         let sdk = "<ndi_color_info \t transfer=\"bt_2100_hlg\" \t matrix=\"bt_2100\" \t primaries=\"bt_2100\" /> ";
@@ -656,7 +730,12 @@ mod tests {
                 "{filler:?}"
             );
         }
-        for prefix in ["<!--", "<![CDATA[", "<?camera "] {
+        for prefix in [
+            "<!--",
+            "<![CDATA[",
+            "<?camera ",
+            "<!DOCTYPE ndi_metadata_group [",
+        ] {
             let unterminated = format!("{prefix}{}", "<ndi_color_info/>".repeat(limit / 20));
             assert_eq!(read(&unterminated).unwrap(), None);
         }
@@ -669,6 +748,7 @@ mod tests {
             "<ndi_metadata_group><!-- c --><ndi_color_info primaries='bt_709'></ndi_color_info><![CDATA[x]]></ndi_metadata_group>",
             "<ndi_color_info matrix=\"bt_601\" />é<ndi_color_info matrix=\"bt_601\"/>",
             "<?camera <ndi_color_info matrix='unknown'/> ?>é<ndi_color_info matrix='bt_601'/>",
+            r#"<!DOCTYPE ndi_metadata_group [<!ENTITY label "<ndi_color_info transfer='bt_2100_pq'/>">]><ndi_metadata_group/>"#,
         ];
         let alphabet = "<>?/=\"' \t!-[]CDATAndi_color_infobt_2100_pqé";
         let alphabet: Vec<char> = alphabet.chars().collect();

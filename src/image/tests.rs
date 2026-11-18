@@ -1847,6 +1847,41 @@ fn cicp_tags_bt2020_and_hdr_pngs_before_their_image_data() {
 }
 
 #[test]
+fn entity_declarations_do_not_change_image_color_or_hdr_policy() {
+    let mut frame = VideoFrame::builder()
+        .resolution(2, 2)
+        .metadata("<ndi_metadata_group/>")
+        .build()
+        .unwrap();
+    let jpeg = options(ImageFormat::Jpeg(85));
+    let png = options(ImageFormat::Png);
+    let expected_jpeg = frame.encode_image(&jpeg).unwrap();
+    let expected_png = frame.encode_image(&png).unwrap();
+
+    let declaration = r#"<!DOCTYPE ndi_metadata_group [<!ENTITY label "<ndi_color_info transfer='bt_2100_pq'/>">]>"#;
+    frame
+        .set_metadata(format!("{declaration}<ndi_metadata_group/>"))
+        .unwrap();
+    assert_eq!(frame.color_info().unwrap(), None);
+    assert_eq!(frame.encode_image(&jpeg).unwrap(), expected_jpeg);
+    assert_eq!(frame.encode_image(&png).unwrap(), expected_png);
+
+    frame
+        .set_metadata(format!(
+            "{declaration}<ndi_metadata_group><ndi_color_info primaries='bt_2020' transfer='bt_2100_hlg'/></ndi_metadata_group>"
+        ))
+        .unwrap();
+    assert_eq!(
+        frame.color_info().unwrap().unwrap().transfer(),
+        Some(crate::TransferFunction::Hlg)
+    );
+    let tagged_png = frame.encode_image(&png.hdr(HdrPolicy::CodeValues)).unwrap();
+    let chunks = png_chunks(&tagged_png);
+    let (_, cicp) = chunks.iter().find(|(kind, _)| kind == b"cICP").unwrap();
+    assert_eq!(cicp, &[9, 18, 0, 1]);
+}
+
+#[test]
 fn processing_instructions_do_not_change_image_color_or_hdr_policy() {
     for format in [PixelFormat::Uyvy, PixelFormat::Rgba] {
         let mut frame = VideoFrame::builder()
