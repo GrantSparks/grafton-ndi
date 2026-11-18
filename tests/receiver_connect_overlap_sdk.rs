@@ -44,7 +44,7 @@ use grafton_ndi::{
 };
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Mutex, MutexGuard,
     },
     thread,
@@ -53,6 +53,7 @@ use std::{
 
 const SLICE: Duration = Duration::from_millis(100);
 const PATIENCE: Duration = Duration::from_secs(15);
+static DIAGNOSTIC_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 fn diagnostics_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -73,7 +74,10 @@ fn sockets() -> MutexGuard<'static, ()> {
     let turn = SOCKETS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    trace(format_args!("acquired the socket test lock"));
+    if diagnostics_enabled() {
+        DIAGNOSTIC_CALLS.store(0, Ordering::Relaxed);
+        trace(format_args!("acquired the socket test lock"));
+    }
     turn
 }
 
@@ -94,20 +98,11 @@ fn margin() -> Duration {
 }
 
 fn timed<T>(operation: &str, budget: Duration, call: impl FnOnce() -> T) -> T {
-    thread_local! {
-        static TRACED_CALLS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-    }
-    // Record a few phases per worker. A long overlap run still captures every
-    // thread's current call in the watchdog dump.
+    // Socket cases run one at a time and each starts with a fresh trace
+    // budget. The watchdog still captures the current call in every thread.
     let traced = diagnostics_enabled()
         && operation.contains("connect")
-        && TRACED_CALLS.with(|count| {
-            let seen = count.get();
-            if seen < 8 {
-                count.set(seen + 1);
-            }
-            seen < 8
-        });
+        && DIAGNOSTIC_CALLS.fetch_add(1, Ordering::Relaxed) < 16;
     if traced {
         trace(format_args!("entering {operation}"));
     }

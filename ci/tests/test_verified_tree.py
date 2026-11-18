@@ -50,7 +50,7 @@ class Fixture:
         self.artifact = {"id": ARTIFACT, "name": "ci-tested-tree-2", "size_in_bytes": 200, "expired": False}
         self.jobs = [
             {"name": name, "status": "completed", "conclusion": "success"}
-            for name in ("required-ci", "sdk (linux)")
+            for name in ("required-ci", "test (macos-15)", "sdk (linux)")
         ]
         self.archive_member = verified_tree.PROOF
 
@@ -107,7 +107,7 @@ class VerifiedTree(unittest.TestCase):
                 self.assertIsNone(api.match())
 
     def test_requires_the_gate_and_native_jobs_to_have_succeeded(self):
-        for index in range(2):
+        for index in range(3):
             api = Fixture()
             api.jobs[index]["conclusion"] = "skipped"
             self.assertIsNone(api.match())

@@ -107,11 +107,12 @@ def matching_run(api, sha, tree, repository_id):
                     "&status=success&per_page=5")["workflow_runs"]
     for run in runs:
         run_id, attempt = run.get("id"), run.get("run_attempt")
+        actor = (run.get("actor") or {}).get("login")
         if not (positive_id(run_id) and positive_id(attempt)
                 and run.get("status") == "completed" and run.get("conclusion") == "success"
                 and run.get("event") == "pull_request" and run.get("path") == WORKFLOW
                 and run.get("head_sha") == head and run.get("head_branch") == head_branch
-                and run.get("actor", {}).get("login") != "dependabot[bot]"
+                and isinstance(actor, str) and actor and actor != "dependabot[bot]"
                 and (run.get("repository") or {}).get("id") == repository_id
                 and (run.get("head_repository") or {}).get("id") == repository_id):
             continue
@@ -140,10 +141,11 @@ def github_merge_tree(api, commit, tree, base, head):
 def required_check_passed(api, run_id, attempt):
     jobs = api.json(f"actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100")["jobs"]
     gate = [job for job in jobs if job.get("name") == "required-ci"]
-    native = [job for job in jobs if job.get("name", "").startswith("sdk (")]
-    return (len(gate) == 1 and native
+    checks = [job for job in jobs if job.get("name") not in
+              ("Find full CI for the merged tree", "publish documentation")]
+    return (len(gate) == 1 and any(job.get("name", "").startswith("sdk (") for job in checks)
             and all(job.get("status") == "completed" and job.get("conclusion") == "success"
-                    for job in gate + native))
+                    for job in checks))
 
 
 def reuse(env):
