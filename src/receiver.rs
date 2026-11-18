@@ -523,7 +523,7 @@ fn validate_ptz_preset(preset: u8) -> Result<i32> {
 /// the source `$ptz` controls.
 macro_rules! ptz_command {
     ($ptz:expr, $func:ident $(, $arg:expr)*) => {{
-        let connection = $ptz.core.lock_control();
+        let connection = $ptz.core.lock_mutating_control()?;
         // SAFETY: the live core and control permit cover this call; the
         // RecvInstance inventory records control/capture and remote overlap.
         // Every argument is a plain value.
@@ -1158,8 +1158,12 @@ impl VideoMode for AvSyncAttached {}
 ///
 /// Captures, events, source-name waits, getters, [`Self::is_connected`] and
 /// [`Self::connection_target`] never wait for a local connection change.
-/// Shared controls serialize briefly with one another; the SDK's receiver
-/// lock supplies their synchronization with connection changes. Local
+/// Shared controls serialize briefly with one another. On Standard Windows,
+/// PTZ commands, upstream metadata and connection-metadata additions return
+/// [`Error::NotConnected`] during a local connection change; tally is retained
+/// and applied when that native request returns. These controls do not wait
+/// for the change. Other runtimes synchronize controls through their native
+/// receiver lock. Local
 /// [`Self::connect_to`], [`Self::disconnect`] and [`Self::reconnect`] requests
 /// serialize with one another and may wait for running allocator policies.
 /// Dropping the last owner destroys the native receiver on the dropping
@@ -1186,13 +1190,22 @@ struct ChangePermit;
 
 /// Exclusive permission for one local connection request.
 struct ConnectionChange<'a> {
-    instance: RecvInstance,
+    core: &'a ReceiverCore,
     _exclusive: MutexGuard<'a, ChangePermit>,
 }
 
 impl ConnectionChange<'_> {
     fn instance(&self) -> NDIlib_recv_instance_t {
-        self.instance.0
+        self.core.instance.0
+    }
+}
+
+impl Drop for ConnectionChange<'_> {
+    fn drop(&mut self) {
+        if self.core.legacy_controls {
+            let mut control = self.core.lock_control();
+            control.finish_change(self.core.sdk());
+        }
     }
 }
 
@@ -1200,11 +1213,34 @@ impl ConnectionChange<'_> {
 #[derive(Default)]
 struct ControlPermit {
     registrations: ConnectionMetadata,
+    // Standard Windows controls do not synchronize their connection reads
+    // with native connect. Publish this phase while holding the control lock,
+    // then release the lock before the native connection request begins.
+    changing: bool,
+    pending_tally: Option<Tally>,
+}
+
+impl ControlPermit {
+    fn set_tally(&mut self, tally: Tally, send: impl FnOnce(Tally)) {
+        if self.changing {
+            self.pending_tally = Some(tally);
+        } else {
+            send(tally);
+        }
+    }
+
+    fn finish_change(&mut self, send: impl FnOnce(Tally)) {
+        if let Some(tally) = self.pending_tally.take() {
+            send(tally);
+        }
+        self.changing = false;
+    }
 }
 
 /// Serialized shared controls, independent of local connection changes.
-/// The native receiver lock supplies exclusion against connection changes;
-/// this permit only serializes controls with one another.
+/// Native receiver locks supply connection exclusion where available. On
+/// Standard Windows this permit also publishes the local changing phase;
+/// connection-reading controls refuse that phase without waiting.
 pub(crate) struct Control<'a> {
     instance: RecvInstance,
     _exclusive: MutexGuard<'a, ControlPermit>,
@@ -1216,12 +1252,24 @@ enum ConnectionRequest {
     Disconnect,
 }
 
-impl Control<'_> {
-    /// The native identity authorized by this control permit.
-    pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
-        self.instance.0
-    }
+/// A control admitted while the receiver's native connection is stable.
+/// Holding its control permit prevents a legacy change from starting.
+struct MutatingControl<'a>(Control<'a>);
 
+impl<'a> std::ops::Deref for MutatingControl<'a> {
+    type Target = Control<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for MutatingControl<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl MutatingControl<'_> {
     fn add_metadata<S: MetadataSource + ?Sized>(
         &mut self,
         table: &sys::ReceiverConnectionMetadata,
@@ -1233,6 +1281,31 @@ impl Control<'_> {
             // clear returns or after native destruction, and serializes shared
             // controls. The native receiver lock synchronizes local changes.
             unsafe { table.NDIlib_recv_add_connection_metadata(instance, raw) };
+        });
+    }
+}
+
+impl Control<'_> {
+    /// The native identity authorized by this control permit.
+    pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
+        self.instance.0
+    }
+
+    fn set_tally(&mut self, sdk: &sys::Core, tally: Tally) {
+        let instance = self.instance();
+        self._exclusive.set_tally(tally, |tally| {
+            // SAFETY: the control permit excludes native changes on legacy
+            // Standard Windows; other runtimes supply native exclusion.
+            unsafe { sdk.NDIlib_recv_set_tally(instance, &tally.to_sdk()) };
+        });
+    }
+
+    fn finish_change(&mut self, sdk: &sys::Core) {
+        let instance = self.instance();
+        self._exclusive.finish_change(|tally| {
+            // SAFETY: native connect has returned and the change permit still
+            // excludes another request. The control permit excludes writers.
+            unsafe { sdk.NDIlib_recv_set_tally(instance, &tally.to_sdk()) };
         });
     }
 
@@ -1460,10 +1533,23 @@ pub(crate) struct RecvInstance(NDIlib_recv_instance_t);
 // original &mut/by-value basis; advertiser-held Arcs are covered by the native
 // registry synchronization and field independence above.
 //
+// Windows native editions differ. Standard 6.3.2 and 6.4 pin only receiver
+// lifetime in their exported helper; connect replaces connection pointers at
+// +0x198/+0x1a0 under a lock at +0x1a8, while tally, metadata sends and PTZ
+// commands dereference those pointers without that lock. Their Rust control
+// permit therefore publishes a changing phase before local connect, then is
+// released. Connection-reading controls refuse that phase; tally is retained
+// and replayed after native connect. Receiver-owned getters, source queries,
+// delay state, and metadata clearing stay independent. Advanced Windows
+// 6.3.2/6.4 instead use the +0x108 shared/exclusive connection lock; connect
+// releases it before destroying retired connections. Allocators require that
+// Advanced edition, so their callbacks retain the independent-control basis.
+//
 // A Rust control permit serializes the listed controls with one another.
-// Against local and remote connection changes they use the native receiver
-// lock above, as captures already do. Local requests take only the independent
-// change permit, so allocator callbacks can capture and use shared controls.
+// The native connection-lock basis above applies to measured Linux and
+// Advanced Windows runtimes. Standard Windows local changes use the explicit
+// changing phase instead. No Rust control permit is held during native connect,
+// so Advanced allocator callbacks can capture and use shared controls.
 // tests/receiver_connect_overlap_sdk.rs exercises every available
 // shared control against captures, local changes and 6.4 remote changes.
 // Sixteen capture threads, three control threads and 1080p feeds completed
@@ -1482,11 +1568,17 @@ unsafe impl Sync for RecvInstance {}
 pub(crate) struct ReceiverCore {
     instance: RecvInstance,
     pub(crate) sdk: crate::runtime::Bound<sys::Core>,
+    #[cfg(test)]
+    test_sdk: Option<&'static sys::Core>,
     /// Serializes local connection changes; callbacks may take the independent
     /// control permit while a native connection change waits for them.
     change_guard: Mutex<ChangePermit>,
     /// Serializes shared controls only; never held across a connection change.
     control_guard: Mutex<ControlPermit>,
+    /// Standard Windows uses a native implementation without the Advanced
+    /// receiver's connection read lock. Its unsafe controls refuse the brief
+    /// transition instead of waiting for native connect.
+    legacy_controls: bool,
     /// The latest requested target. The change permit serializes its writers;
     /// snapshots never take it and therefore never wait for a capture or a queued
     /// connection change. Writers hold this lock only to replace the value.
@@ -1614,8 +1706,12 @@ impl<M: CreatableMode> Receiver<M> {
             core: Arc::new(ReceiverCore {
                 instance: RecvInstance(instance),
                 sdk,
+                #[cfg(test)]
+                test_sdk: None,
                 change_guard: Mutex::new(ChangePermit),
                 control_guard: Mutex::new(ControlPermit::default()),
+                legacy_controls: cfg!(windows)
+                    && ndi.info().edition() == crate::capabilities::SdkEdition::Standard,
                 target: RwLock::new(target),
                 pending: PendingEvents::default(),
                 source_query_guard: Mutex::new(SourceQueryPermit),
@@ -1855,10 +1951,14 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// [`Error::UnsupportedCapability`] without
     /// [`RuntimeFeature::ReceiverConnectionMetadata`](crate::RuntimeFeature::ReceiverConnectionMetadata).
+    /// [`Error::NotConnected`] during a local connection change on Standard
+    /// Windows; no metadata is registered in that case.
     #[doc(alias = "NDIlib_recv_add_connection_metadata")]
     pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let table = self.core.connection_metadata()?;
-        self.core.lock_control().add_metadata(table, metadata);
+        self.core
+            .lock_mutating_control()?
+            .add_metadata(table, metadata);
         Ok(())
     }
 
@@ -1963,21 +2063,11 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// The SDK keeps the state and sends it to every source the receiver
     /// connects to, so it can be set before a connection and survives a
-    /// reconnect.
+    /// reconnect. On Standard Windows a tally changed during a local
+    /// connection request is retained and sent as that request finishes.
     #[doc(alias = "NDIlib_recv_set_tally")]
     pub fn set_tally(&self, tally: Tally) {
-        let connection = self.core.lock_control();
-        // `Processing.NDI.Recv.h`: the flag is false when nothing is
-        // connected, and the state is sent the moment something connects, so
-        // it reports no failure.
-        // SAFETY: the receiver instance is live for this borrow, and the
-        // tally outlives the synchronous call. The control permit supplies
-        // the control exclusion in the RecvInstance inventory.
-        unsafe {
-            self.core
-                .sdk()
-                .NDIlib_recv_set_tally(connection.instance(), &tally.to_sdk())
-        };
+        self.core.lock_control().set_tally(self.core.sdk(), tally);
     }
 
     /// Send metadata upstream, to the source this receiver is connected to.
@@ -1988,11 +2078,12 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Errors
     ///
     /// [`Error::NotConnected`] when the receiver is connected to no source,
-    /// so nothing was sent.
+    /// so nothing was sent, or during a local connection change on Standard
+    /// Windows. See the [waiting contract](Receiver#waiting).
     #[doc(alias = "NDIlib_recv_send_metadata")]
     pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let raw = metadata.metadata_raw();
-        let connection = self.core.lock_control();
+        let connection = self.core.lock_mutating_control()?;
         // SAFETY: the receiver instance is live for this borrow, and the
         // borrowed C string outlives the synchronous call. The control permit
         // supplies the control exclusion in the RecvInstance inventory.
@@ -2247,6 +2338,10 @@ impl ReceiverCore {
 
     /// The entry points of the runtime this receiver was created through.
     pub(crate) fn sdk(&self) -> &sys::Core {
+        #[cfg(test)]
+        if let Some(table) = self.test_sdk {
+            return table;
+        }
         &self.sdk
     }
 
@@ -2259,9 +2354,13 @@ impl ReceiverCore {
     }
 
     fn lock_change(&self) -> ConnectionChange<'_> {
+        let exclusive = self.change_guard.lock();
+        if self.legacy_controls {
+            self.control_guard.lock().changing = true;
+        }
         ConnectionChange {
-            instance: self.instance,
-            _exclusive: self.change_guard.lock(),
+            core: self,
+            _exclusive: exclusive,
         }
     }
 
@@ -2270,6 +2369,18 @@ impl ReceiverCore {
         Control {
             instance: self.instance,
             _exclusive: self.control_guard.lock(),
+        }
+    }
+
+    /// Connection-reading controls must not enter a legacy Windows native
+    /// receiver while its connection is being replaced. Refusal is immediate:
+    /// no Rust control lock is held while native connect waits.
+    fn lock_mutating_control(&self) -> Result<MutatingControl<'_>> {
+        let control = self.lock_control();
+        if control._exclusive.changing {
+            Err(Error::NotConnected)
+        } else {
+            Ok(MutatingControl(control))
         }
     }
 
@@ -2302,7 +2413,7 @@ impl ReceiverCore {
     /// snapshots proceed while another connection change is queued.
     #[cfg(all(test, any(feature = "advanced", feature = "tokio", feature = "smol")))]
     pub(crate) fn reconnect_lock(&self) -> impl Drop + '_ {
-        self.lock_change()._exclusive
+        self.lock_change()
     }
 
     /// One SDK capture of kind `K` within `attempt`.
@@ -2662,7 +2773,9 @@ pub(crate) mod native_capture_calls {
 ///
 /// A value outside its range, or not finite, is refused with
 /// [`Error::InvalidInput`] before anything is sent. A command the SDK does
-/// not send is reported as [`Error::NativeOperationFailed`].
+/// not send is reported as [`Error::NativeOperationFailed`]. Commands return
+/// [`Error::NotConnected`] during a local connection change on Standard Windows;
+/// see the [waiting contract](Receiver#waiting).
 #[derive(Clone, Copy)]
 pub struct Ptz<'rx> {
     core: &'rx ReceiverCore,
@@ -4430,6 +4543,60 @@ mod tests {
     }
 
     #[test]
+    fn legacy_controls_refuse_changes_without_blocking_getters_or_losing_tally() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let mut receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        Arc::get_mut(&mut receiver.core).unwrap().legacy_controls = true;
+        let change = receiver.core.lock_change();
+        assert!(matches!(
+            receiver.core.lock_mutating_control(),
+            Err(Error::NotConnected)
+        ));
+        receiver.set_tally(Tally::new(true, false));
+        receiver.set_tally(Tally::new(false, true));
+        assert_eq!(
+            receiver.core.lock_control()._exclusive.pending_tally,
+            Some(Tally::new(false, true))
+        );
+        let metadata = MetadataFrame::new("<during-change/>").unwrap();
+        assert!(matches!(
+            receiver.send_metadata(&metadata),
+            Err(Error::NotConnected)
+        ));
+        assert!(matches!(receiver.ptz().zoom(0.5), Err(Error::NotConnected)));
+        // These receiver-owned observations never consult a replaced connection.
+        receiver.connection_stats().unwrap();
+        let _ = receiver.ptz().is_supported();
+        drop(change);
+        let control = receiver.core.lock_control();
+        assert!(!control._exclusive.changing);
+        assert_eq!(control._exclusive.pending_tally, None);
+        drop(control);
+        assert!(receiver.core.lock_mutating_control().is_ok());
+    }
+
+    #[test]
+    fn changing_control_state_replays_only_the_latest_tally() {
+        let mut permit = ControlPermit {
+            changing: true,
+            ..ControlPermit::default()
+        };
+        permit.set_tally(Tally::new(true, false), |_| {
+            panic!("native tally entered during change")
+        });
+        permit.set_tally(Tally::new(false, true), |_| {
+            panic!("native tally entered during change")
+        });
+        let mut sent = Vec::new();
+        permit.finish_change(|tally| sent.push(tally));
+        assert_eq!(sent, [Tally::new(false, true)]);
+        assert!(!permit.changing);
+        assert_eq!(permit.pending_tally, None);
+    }
+
+    #[test]
     fn shared_controls_proceed_during_local_connection_changes() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
@@ -5249,3 +5416,7 @@ mod tests {
 #[cfg(ndi_test_capture_permissions)]
 #[path = "../tests/ui/internal/capture_permissions.rs"]
 mod capture_permission_fixture;
+
+#[cfg(test)]
+#[path = "receiver/legacy_control_tests.rs"]
+mod legacy_control_tests;

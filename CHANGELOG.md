@@ -26,6 +26,11 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Fixed
 
+- Standard Windows receiver controls no longer read a connection being replaced
+  by a local connect, disconnect or reconnect. Connection-reading commands
+  report `NotConnected` during that transition; tally changes are retained and
+  replayed afterward, and getters remain independent of the native connect.
+
 - Queued senders publish unknown-completion failures in the admission lock,
   so a racing submission cannot enter after failure is detected.
 - Receiver shared controls use a separate permit from local connection changes,
