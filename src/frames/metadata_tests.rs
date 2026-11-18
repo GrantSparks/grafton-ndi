@@ -809,9 +809,9 @@ fn metadata_constructors_select_the_capture_family_text_extent() {
 #[test]
 fn bounded_text_classification_drives_optional_and_strict_metadata() {
     let unterminated = vec![b'x'; MAX_METADATA_BYTES];
-    let cases: [(Option<&[u8]>, FrameMetadataStatus, Option<&str>); 5] = [
+    let cases = [
         (None, FrameMetadataStatus::Absent, None),
-        (Some(b"\0"), FrameMetadataStatus::Text, Some("")),
+        (Some(b"\0".as_slice()), FrameMetadataStatus::Text, Some("")),
         (
             Some("métadata\0".as_bytes()),
             FrameMetadataStatus::Text,
