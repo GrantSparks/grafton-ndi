@@ -76,6 +76,14 @@ impl Snapshot {
                     p_url_address: c"192.0.2.10:5962".as_ptr(),
                 },
             }];
+            if gate_path("second-feed").is_some_and(|path| path.exists()) {
+                self.plain.push(NDIlib_source_t {
+                    p_ndi_name: c"STUDIO (Program)".as_ptr(),
+                    __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                        p_url_address: c"192.0.2.10:5963".as_ptr(),
+                    },
+                });
+            }
             return;
         }
         let (count, len, byte) = match scenario.as_str() {
@@ -120,11 +128,16 @@ impl Snapshot {
     }
 }
 
+fn gate_path(file: &str) -> Option<std::path::PathBuf> {
+    let directory = std::env::var_os("GRAFTON_FAKE_FINDER_GATE")?;
+    Some(std::path::PathBuf::from(directory).join(file))
+}
+
 /// A deterministic gate used only by the deadline regression. Removing the
 /// trigger claims it once; tests release it even when an assertion panics.
-fn deadline_gate(trigger: &str, entered: &str, release: &str) {
+fn deadline_gate(trigger: &str, entered: &str, release: &str) -> bool {
     let Some(directory) = std::env::var_os("GRAFTON_FAKE_FINDER_GATE") else {
-        return;
+        return false;
     };
     let directory = std::path::PathBuf::from(directory);
     if std::fs::remove_file(directory.join(trigger)).is_ok() {
@@ -132,7 +145,9 @@ fn deadline_gate(trigger: &str, entered: &str, release: &str) {
         while !directory.join(release).exists() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        return true;
     }
+    false
 }
 
 export! {
@@ -172,7 +187,10 @@ export! {
             return super::changes::sources().wait(timeout_in_ms, "finder");
         }
         if std::env::var("GRAFTON_FAKE_FINDER_CASE").unwrap() == "deadline" {
-            deadline_gate("hold-wait", "waiting", "wait-release");
+            if deadline_gate("hold-wait", "waiting", "wait-release") {
+                return gate_path("second-feed").is_some_and(|path| path.exists());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(u64::from(timeout_in_ms)));
             return false;
         }
         if std::env::var("GRAFTON_FAKE_FINDER_CASE").unwrap().starts_with("selection") {

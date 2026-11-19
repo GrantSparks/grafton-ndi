@@ -9,7 +9,7 @@ use common::TestChild;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use grafton_ndi::{Finder, FinderOptions, Ndi, RuntimeOptions, SourceCache};
+use grafton_ndi::{Finder, FinderOptions, Ndi, RuntimeOptions, Source, SourceCache};
 use runtime_fixture::FakeRuntime;
 use std::{
     fs,
@@ -21,6 +21,10 @@ use std::{
 
 struct Gate(PathBuf);
 
+const WINDOW: Duration = Duration::from_millis(200);
+const CAMERA: &str = "STUDIO (Camera)";
+const PROGRAM: &str = "STUDIO (Program)";
+
 impl Gate {
     fn reset(&self) {
         for file in [
@@ -30,6 +34,7 @@ impl Gate {
             "hold-wait",
             "waiting",
             "wait-release",
+            "second-feed",
         ] {
             let _ = fs::remove_file(self.0.join(file));
         }
@@ -89,17 +94,15 @@ fn contended<T: Send>(
         scope.spawn(move || tx.send(operation(finder)).unwrap());
         // The native snapshot stays gated until the operation returns. Thus this
         // checks lock-budget completion without depending on exact scheduling.
-        let result = rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("lookup waited for the gated snapshot beyond its own budget");
-        assert_eq!(
-            gate.snapshots(),
-            calls,
-            "busy lookup entered another native snapshot"
-        );
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        let busy_calls = gate.snapshots();
         drop(release);
         assert_eq!(owner.join().unwrap().len(), 1);
-        result
+        assert_eq!(
+            busy_calls, calls,
+            "busy lookup entered another native snapshot"
+        );
+        result.expect("lookup waited for the gated snapshot beyond its own budget")
     })
 }
 
@@ -115,51 +118,84 @@ fn expired_during_wait<T: Send>(
         let (tx, rx) = mpsc::channel();
         scope.spawn(move || tx.send(operation(finder)).unwrap());
         gate.wait("waiting"); // The lookup already took its initial snapshot.
+        gate.write("second-feed");
         gate.write("block");
         let owner = scope.spawn(|| finder.current_sources().unwrap());
         gate.wait("entered");
         let calls = gate.snapshots();
-        // Spend the lookup's 20 ms budget while its native wait is gated.
-        thread::sleep(Duration::from_millis(30));
+        // Spend the budget while the wait reporting the second feed is gated.
+        thread::sleep(WINDOW);
         gate.write("wait-release");
-        let result = rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("expired lookup waited for the gated snapshot");
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        let busy_calls = gate.snapshots();
+        drop(release);
+        assert_feeds(&owner.join().unwrap(), &[CAMERA, PROGRAM]);
         assert_eq!(
-            gate.snapshots(),
-            calls,
+            busy_calls, calls,
             "expired busy attempt entered native code"
         );
-        drop(release);
-        owner.join().unwrap();
-        result
+        result.expect("expired lookup waited for the gated snapshot")
     })
 }
 
-fn exercise(cache: &SourceCache, gate: &Gate) {
+fn assert_feeds(sources: &[Source], expected: &[&str]) {
+    assert!(
+        sources
+            .iter()
+            .map(Source::name)
+            .eq(expected.iter().copied()),
+        "expected {expected:?}, got {sources:?}"
+    );
+}
+
+fn exercise_cache_window(
+    cache: &SourceCache,
+    gate: &Gate,
+    lookup: impl Fn(Duration) -> Vec<Source> + Sync,
+) {
     let finder = cache.finder();
+    let busy = contended(finder, gate, |_| lookup(Duration::ZERO));
+    assert!(busy.is_empty());
+    assert!(cache.is_empty());
+
+    let calls = gate.snapshots();
+    assert_feeds(&lookup(Duration::ZERO), &[CAMERA]);
+    assert_eq!(gate.snapshots(), calls + 1);
+    assert_eq!(cache.len(), 1);
+    cache.clear();
+
+    let partial = expired_during_wait(finder, gate, |_| lookup(WINDOW));
+    assert_feeds(&partial, &[CAMERA]);
+    assert!(cache.is_empty());
+    assert_feeds(&finder.current_sources().unwrap(), &[CAMERA, PROGRAM]);
+
+    let calls = gate.snapshots();
+    assert_feeds(&lookup(WINDOW), &[CAMERA, PROGRAM]);
+    assert_eq!(
+        gate.snapshots(),
+        calls + 2,
+        "the retry must acquire both its initial and final snapshots"
+    );
+    assert_eq!(cache.len(), 1);
+
+    let calls = gate.snapshots();
+    assert_feeds(&lookup(WINDOW), &[CAMERA, PROGRAM]);
+    assert_eq!(gate.snapshots(), calls, "a cache hit must not call the SDK");
+}
+
+fn exercise(finder: &Finder, gate: &Gate) {
     assert!(contended(finder, gate, |finder| finder
         .find_source(Duration::ZERO, |_| true)
         .unwrap())
     .is_none());
     assert!(contended(finder, gate, |finder| finder
-        .find_source_by_name("STUDIO (Camera)", Duration::ZERO)
+        .find_source_by_name(CAMERA, Duration::ZERO)
         .unwrap())
     .is_none());
     assert!(contended(finder, gate, |finder| finder
         .find_sources(Duration::ZERO)
         .unwrap())
     .is_empty());
-    let (sources, cached) = contended(finder, gate, |_| {
-        (
-            cache
-                .find_sources_by_host("studio", Duration::ZERO)
-                .unwrap(),
-            cache.len(),
-        )
-    });
-    assert!(sources.is_empty());
-    assert_eq!(cached, 0);
     let (result, waited) = contended(finder, gate, |finder| {
         let start = Instant::now();
         (
@@ -175,19 +211,12 @@ fn exercise(cache: &SourceCache, gate: &Gate) {
         "bounded contention returned prematurely: {waited:?}"
     );
     assert!(expired_during_wait(finder, gate, |finder| finder
-        .find_source(Duration::from_millis(20), |_| false)
+        .find_source(WINDOW, |_| false)
         .unwrap())
     .is_none());
-    let accumulated = expired_during_wait(finder, gate, |finder| {
-        finder.find_sources(Duration::from_millis(20)).unwrap()
-    });
-    assert_eq!(accumulated.len(), 1);
-    let sources = expired_during_wait(finder, gate, |_| {
-        cache
-            .find_sources_by_host("studio", Duration::from_millis(20))
-            .unwrap()
-    });
-    assert_eq!(sources.len(), 1);
+    let accumulated =
+        expired_during_wait(finder, gate, |finder| finder.find_sources(WINDOW).unwrap());
+    assert_feeds(&accumulated, &[CAMERA]);
 
     // Ordinary current_sources keeps its blocking serialization; a lookup can
     // acquire the released lock and select a source within its remaining budget.
@@ -216,7 +245,7 @@ fn exercise(cache: &SourceCache, gate: &Gate) {
                 .unwrap()
                 .unwrap()
                 .name(),
-            "STUDIO (Camera)"
+            CAMERA
         );
     });
 
@@ -256,11 +285,34 @@ fn finder_lookup_snapshot_contention_spends_one_wait_budget() {
     if let Some(library) = std::env::var_os("GRAFTON_FAKE_FINDER_RUNTIME") {
         let ndi =
             Ndi::with_options(&RuntimeOptions::new().library_path(PathBuf::from(library))).unwrap();
-        let finder = Finder::new(&ndi, &FinderOptions::new()).unwrap();
         let gate = Gate(PathBuf::from(
             std::env::var_os("GRAFTON_FAKE_FINDER_GATE").unwrap(),
         ));
-        exercise(&SourceCache::new(finder), &gate);
+        let new_cache = || SourceCache::new(Finder::new(&ndi, &FinderOptions::new()).unwrap());
+        let cache = new_cache();
+        exercise(cache.finder(), &gate);
+        exercise_cache_window(&cache, &gate, |timeout| {
+            cache.find_sources_by_host("studio", timeout).unwrap()
+        });
+        #[cfg(feature = "tokio")]
+        {
+            let adapter = grafton_ndi::asynchronous::tokio::AsyncSourceCache::new(new_cache());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            exercise_cache_window(adapter.cache(), &gate, |timeout| {
+                runtime
+                    .block_on(adapter.find_sources_by_host("studio", timeout))
+                    .unwrap()
+            });
+        }
+        #[cfg(feature = "smol")]
+        {
+            let adapter = grafton_ndi::asynchronous::smol::AsyncSourceCache::new(new_cache());
+            exercise_cache_window(adapter.cache(), &gate, |timeout| {
+                smol::block_on(adapter.find_sources_by_host("studio", timeout)).unwrap()
+            });
+        }
         return;
     }
     let directory = common::FixtureDir::create("finder-deadlines");

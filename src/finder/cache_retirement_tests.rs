@@ -109,7 +109,7 @@ fn retirement_reclaims_keys_snapshots_strings_and_map_after_unlocking() {
                     HostQuery::checked("camera.local").unwrap(),
                     Deadline::after(Duration::ZERO).unwrap(),
                     None,
-                    |_, _| Ok(Ok(sources)),
+                    |_, _| Ok(Ok(DiscoveryOutcome::Complete(sources))),
                 )
             });
             assert_eq!(result.unwrap().unwrap().len(), 1);
@@ -243,7 +243,7 @@ fn measure_cache_retirement_contention() {
                                     None,
                                     |_, _| {
                                         misses += 1;
-                                        Ok(Ok(vec![source.clone()]))
+                                        Ok(Ok(DiscoveryOutcome::Complete(vec![source.clone()])))
                                     },
                                 )
                                 .unwrap()
@@ -312,7 +312,7 @@ fn measure_cache_retirement_contention() {
                             HostQuery::checked("refill.local").unwrap(),
                             Deadline::after(Duration::ZERO).unwrap(),
                             None,
-                            |_, _| Ok(Ok(sources)),
+                            |_, _| Ok(Ok(DiscoveryOutcome::Complete(sources))),
                         )
                     });
                     refill_ns += before.elapsed().as_nanos();

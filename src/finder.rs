@@ -15,6 +15,7 @@ use std::{
     borrow::{Borrow, Cow},
     cell::Cell,
     collections::{HashMap, HashSet},
+    convert::Infallible,
     ffi::{c_char, CStr, CString},
     fmt::{self, Display, Formatter},
     hash::{Hash, Hasher},
@@ -1037,14 +1038,15 @@ impl Finder {
     /// several notifications); polling to the deadline makes resolution robust
     /// against that while still returning the instant `accept` is satisfied.
     ///
-    /// Returns `Ok(Ok(None))` if the deadline passes without a selection.
+    /// Distinguishes a completed final snapshot from a busy snapshot lock
+    /// so callers can decide whether the result is eligible for caching.
     fn poll_until_deadline<T, S: Stop, R>(
         &self,
         deadline: Deadline,
         stop: S,
         mut copy: impl FnMut(SnapshotGuard<'_>) -> Result<R>,
         mut accept: impl FnMut(R) -> StopResult<Option<T>, S>,
-    ) -> StopResult<Option<T>, S> {
+    ) -> StopResult<DiscoveryPoll<T>, S> {
         let mut watch = self.watch();
         loop {
             if let Err(stopped) = stop.check() {
@@ -1052,16 +1054,16 @@ impl Finder {
             }
             let sources = match watch.snapshot_until(deadline, stop, &mut copy)? {
                 Ok(Some(sources)) => sources,
-                Ok(None) => return Ok(Ok(None)),
+                Ok(None) => return Ok(Ok(DiscoveryPoll::SnapshotBusy)),
                 Err(stopped) => return Ok(Err(stopped)),
             };
             match accept(sources)? {
-                Ok(Some(selected)) => return Ok(Ok(Some(selected))),
+                Ok(Some(selected)) => return Ok(Ok(DiscoveryPoll::Selected(selected))),
                 Ok(None) => {}
                 Err(stopped) => return Ok(Err(stopped)),
             }
             if deadline.is_expired() {
-                return Ok(Ok(None));
+                return Ok(Ok(DiscoveryPoll::Complete));
             }
             // Block until the source list changes or the window ends; either
             // way the next iteration re-snapshots. The wait is rounded up, so
@@ -1117,6 +1119,7 @@ impl Finder {
             |guard| guard.snapshot(&SourceSnapshot(&self.sdk)),
             |sources| Ok(select_owned_source(sources, stop, &mut select)),
         )
+        .map(|outcome| outcome.map(DiscoveryPoll::into_selection))
     }
 
     /// Wait for an exact, case-sensitive complete NDI source name.
@@ -1152,6 +1155,7 @@ impl Finder {
             |guard| guard.first_named(&SourceSnapshot(&self.sdk), name),
             |source| Ok(Ok(source)),
         )
+        .map(|outcome| outcome.map(DiscoveryPoll::into_selection))
     }
 
     /// Discovers sources for up to `timeout`, returning the complete set.
@@ -1224,6 +1228,7 @@ impl Finder {
         stop: S,
     ) -> StopResult<Vec<Source>, S> {
         self.find_selected_sources_until(deadline, stop, None)
+            .map(|outcome| outcome.map(DiscoveryOutcome::into_sources))
     }
 
     fn find_selected_sources_until<S: Stop>(
@@ -1231,7 +1236,7 @@ impl Finder {
         deadline: Deadline,
         stop: S,
         query: Option<HostQuery<'_>>,
-    ) -> StopResult<Vec<Source>, S> {
+    ) -> StopResult<DiscoveryOutcome, S> {
         let mut window = DiscoveryWindow::default();
         let outcome = self.poll_until_deadline(
             deadline,
@@ -1246,9 +1251,41 @@ impl Finder {
                 window = staged;
                 Ok(())
             },
-            |()| Ok(Ok(None::<()>)),
+            |()| Ok(Ok(None::<Infallible>)),
         )?;
-        Ok(outcome.map(|_| window.sources))
+        Ok(outcome.map(|end| match end {
+            DiscoveryPoll::Complete => DiscoveryOutcome::Complete(window.sources),
+            DiscoveryPoll::SnapshotBusy => DiscoveryOutcome::SnapshotBusy(window.sources),
+            DiscoveryPoll::Selected(never) => match never {},
+        }))
+    }
+}
+
+enum DiscoveryPoll<T> {
+    Selected(T),
+    Complete,
+    SnapshotBusy,
+}
+
+impl<T> DiscoveryPoll<T> {
+    fn into_selection(self) -> Option<T> {
+        match self {
+            Self::Selected(selected) => Some(selected),
+            Self::Complete | Self::SnapshotBusy => None,
+        }
+    }
+}
+
+enum DiscoveryOutcome {
+    Complete(Vec<Source>),
+    SnapshotBusy(Vec<Source>),
+}
+
+impl DiscoveryOutcome {
+    fn into_sources(self) -> Vec<Source> {
+        match self {
+            Self::Complete(sources) | Self::SnapshotBusy(sources) => sources,
+        }
     }
 }
 
@@ -2140,7 +2177,9 @@ impl Display for Source {
 ///
 /// Entries remain until [`Self::invalidate`] or [`Self::clear`]; they can contain
 /// offline endpoints and omit feeds announced after the original window. Empty
-/// results are not cached. Results that cannot be stored are returned uncached.
+/// results are not cached. A miss with a busy final snapshot returns the feeds
+/// observed so far without filling the cache, so the next miss tries discovery
+/// again. Results that cannot be stored are returned uncached.
 /// The accepted grammar is [`Source::matches_host`]'s.
 /// Equivalent hostname or machine-name ASCII case/final-dot and numeric IP
 /// spellings share an entry. Other spellings, including DNS aliases, remain
@@ -2272,7 +2311,9 @@ impl SourceCache {
     /// one non-waiting snapshot attempt. Results keep first-observed order, and
     /// sources that differ in name or full address text are distinct. Select the
     /// desired feed explicitly.
-    /// Empty results return an empty vector and are not retained.
+    /// Empty results return an empty vector and are not retained. If the final
+    /// snapshot lock stays busy until the budget expires, the feeds observed
+    /// so far are returned uncached and a later miss retries discovery.
     ///
     /// Discovery runs outside the cache lock; its window includes snapshot-lock
     /// contention. Access to cached descriptor copies can briefly serialize on the
@@ -2318,7 +2359,7 @@ impl SourceCache {
         query: HostQuery<'_>,
         deadline: Deadline,
         stop: S,
-    ) -> StopResult<Vec<Source>, S> {
+    ) -> StopResult<DiscoveryOutcome, S> {
         self.finder()
             .find_selected_sources_until(deadline, stop, Some(query))
     }
@@ -2387,7 +2428,7 @@ impl CachedSources {
         query: HostQuery<'_>,
         deadline: Deadline,
         previous_miss: Option<CacheMiss>,
-        discover: impl FnOnce(HostQuery<'_>, Deadline) -> StopResult<Vec<Source>, S>,
+        discover: impl FnOnce(HostQuery<'_>, Deadline) -> StopResult<DiscoveryOutcome, S>,
     ) -> StopResult<Vec<Source>, S> {
         self.find_sources_by_host_with_copy::<S>(
             query,
@@ -2403,7 +2444,7 @@ impl CachedSources {
         query: HostQuery<'_>,
         deadline: Deadline,
         previous_miss: Option<CacheMiss>,
-        discover: impl FnOnce(HostQuery<'_>, Deadline) -> StopResult<Vec<Source>, S>,
+        discover: impl FnOnce(HostQuery<'_>, Deadline) -> StopResult<DiscoveryOutcome, S>,
         mut copy: impl FnMut(&[Source]) -> Result<Vec<Source>>,
     ) -> StopResult<Vec<Source>, S> {
         // A queued lookup can use a hit published before its worker starts.
@@ -2415,7 +2456,8 @@ impl CachedSources {
         // SDK waits and user discovery run outside the cache mutex. Invalidation
         // changes the generation, so an old result cannot repopulate the cache.
         let sources = match discover(query, deadline)? {
-            Ok(sources) => sources,
+            Ok(DiscoveryOutcome::Complete(sources)) => sources,
+            Ok(DiscoveryOutcome::SnapshotBusy(sources)) => return Ok(Ok(sources)),
             Err(stopped) => return Ok(Err(stopped)),
         };
         if !sources.is_empty() {
@@ -2529,7 +2571,7 @@ mod tests {
                 query,
                 deadline,
                 None,
-                |query, _| discover(query).map(Ok),
+                |query, _| discover(query).map(|sources| Ok(DiscoveryOutcome::Complete(sources))),
                 copy,
             )?;
             Ok(sources)
@@ -2785,7 +2827,7 @@ mod tests {
                     assert!(matches!(query, HostQuery::Host("camera")));
                     assert_eq!(remaining.end(), deadline.end());
                     assert!(remaining.is_expired());
-                    Ok(Ok(Vec::new()))
+                    Ok(Ok(DiscoveryOutcome::Complete(Vec::new())))
                 },
             )
             .unwrap()

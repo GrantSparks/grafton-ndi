@@ -54,11 +54,13 @@ finder and retains its runtime, so no lifetime parameter or separately stored
 finder is needed. `cache.finder()` lends that same finder for uncached work.
 
 `find_sources_by_host(host, timeout)` returns every matching feed, leaving feed
-selection to the caller. A miss observes the full discovery window; a hit
-returns owned descriptor copies. Empty results are not cached. Entries remain
-stale until `invalidate(host)` or `clear()` removes them: choose an invalidation
-policy for your service. IP hints belong on the finder; a lookup never changes
-its scope. See the compilable server-state example in
+selection to the caller. A miss observes the discovery window, and a hit
+returns owned descriptor copies. When snapshot-lock contention prevents the
+final snapshot, the miss returns the feeds observed so far and the next miss
+retries discovery. Empty results are not cached. Entries remain stale until
+`invalidate(host)` or `clear()` removes them, so choose an invalidation policy
+for your service. IP hints belong on the finder, and a lookup keeps that
+finder's scope. See the compilable server-state example in
 [`SourceCache::new`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.SourceCache.html#method.new).
 
 For async service state, move that cache into
