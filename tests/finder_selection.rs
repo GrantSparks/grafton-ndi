@@ -291,7 +291,7 @@ fn discovery_selects_only_lossless_source_targets() {
         for (query, expected) in [("studio", named), ("192.0.2.7", addressed)] {
             assert_eq!(
                 cache.find_sources_by_host(query, Duration::ZERO).unwrap(),
-                [expected.clone()]
+                std::slice::from_ref(&expected)
             );
             let snapshots = read_fake_log().matches("finder-snapshot\n").count();
             assert_eq!(
