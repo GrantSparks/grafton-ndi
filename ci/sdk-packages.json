@@ -66,63 +66,63 @@
     "version": "6.4.0.2",
     "edition": "advanced",
     "platform": "android",
-    "size": 111136785,
-    "sha256": "47a88d29495ade40e5afdd3eb931ecbbe808f7a92efafc286ac55d4ec6be9cb6"
+    "size": 111248038,
+    "sha256": "a1241d51755de2cf4a40e36e79726961a9c31368278354226b2c63c5466ae0b0"
   },
   "current-advanced-apple": {
     "version": "6.4.0.2",
     "edition": "advanced",
     "platform": "apple",
-    "size": 548170331,
-    "sha256": "9d84269501b101b734794c7584130e9db744da3b0927dd87948134d842cf5a21"
+    "size": 548263726,
+    "sha256": "9062f032fea482e2c3002922cb48421694ec7657e7e0b55fd4deedb5b8843adb"
   },
   "current-advanced-linux": {
     "version": "6.4.0.2",
     "edition": "advanced",
     "platform": "linux",
-    "size": 421322095,
-    "sha256": "5f2ee43a5a4d91b0367c25a26c1b85c547d2635e0ac2243faa312b06b1f6278d"
+    "size": 421387779,
+    "sha256": "ce4fe63939ad6c7c6d5bb3427dd6079a43821ca0c8fc15d0b706850f29f2d3c9"
   },
   "current-advanced-windows": {
     "version": "6.4.0.2",
     "edition": "advanced",
     "platform": "windows",
-    "size": 149624072,
-    "sha256": "3630a0e28e4cb77933a151e5087dd4b6567e0f502bebcf6202ea9e8c6f7ae256"
+    "size": 151010696,
+    "sha256": "5e79bcaa9fcbc28e7098eb6c1a1f6a65de3bb295877a5e118a0565f7b68a0c9d"
   },
   "current-hx-driver-linux": {
     "version": "6.4.0.2",
     "driver": "hx",
     "platform": "linux",
-    "size": 22540162,
-    "sha256": "8db03931abf85e2486d7d42f89db8176d15ec2559947ae990e088a02ffee08da"
+    "size": 22538658,
+    "sha256": "15a2e1f7587b159d7b32416fe11369d6798ee68d5f100e05ee6c5ade567c050e"
   },
   "current-standard-android": {
     "version": "6.4.0.2",
     "edition": "standard",
     "platform": "android",
-    "size": 26499422,
-    "sha256": "795705638ef7730f09759dd53c61f57dbf8da57b6446994bd205626a227401cd"
+    "size": 26584597,
+    "sha256": "89d66856582e0ab5bbbaced551b9c0efaa71856e29484ed89462c343762d7a3c"
   },
   "current-standard-apple": {
     "version": "6.4.0.2",
     "edition": "standard",
     "platform": "apple",
-    "size": 468856607,
-    "sha256": "ce161a7cbe0b80b1a936ea93d6139df6ea4fbd4ea28d6bf8309da1efd31d0367"
+    "size": 468942482,
+    "sha256": "4e0781be36a46d50224e2af6c483db8e26c1606870d18e80b906ab3b0f6fbb30"
   },
   "current-standard-linux": {
     "version": "6.4.0.2",
     "edition": "standard",
     "platform": "linux",
-    "size": 67364407,
-    "sha256": "d464f4ebb201366fd3bc283e374335fb5ae296d4336f4ce6006aba14e6b6df84"
+    "size": 67470104,
+    "sha256": "1b066cca076d3e8b49a5f1dc7fbf77065967256807e3cb5ea387c574176eace6"
   },
   "current-standard-windows": {
     "version": "6.4.0.2",
     "edition": "standard",
     "platform": "windows",
-    "size": 43395912,
-    "sha256": "b281644a0666bd0ddf066935574ce7904ed370a367eb03dab80a1f1b82391c0b"
+    "size": 44930208,
+    "sha256": "f37604ee01cb788ccb954b5b4e5888328ea391d9610e9a8eab65ac68191784ba"
   }
 }

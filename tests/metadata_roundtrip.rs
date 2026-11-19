@@ -240,5 +240,6 @@ fn has_known_registration_loss(info: &RuntimeInfo) -> bool {
             info.raw_version(),
             "NDI SDK WIN64 16:38:09 Apr 14 2026 6.3.2.0"
                 | "NDI SDK WIN64 13:07:15 Nov  6 2026 6.4.0.2"
+                | "NDI SDK WIN64 16:09:44 Nov 17 2026 6.4.0.2"
         )
 }
