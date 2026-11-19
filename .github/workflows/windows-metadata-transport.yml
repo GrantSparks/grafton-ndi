@@ -1,8 +1,8 @@
-name: Windows metadata transport comparison
+name: Windows metadata workaround comparison
 
 on:
   push:
-    branches: [receiver-diagnostic-windows-metadata-transport]
+    branches: [receiver-diagnostic-windows-metadata-workarounds]
 
 permissions:
   contents: read
@@ -15,20 +15,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - package: 6.3.2-standard-windows
-            mode: named-observed
-            transport: default
-          - package: 6.3.2-standard-windows
-            mode: named-observed
-            transport: tcp-only
-          - package: current-standard-windows
-            mode: named-observed
-            transport: tcp-only
+        package: [6.3.2-standard-windows, current-standard-windows]
+        mode: [named-observed, name-only, register-live, send-live]
     env:
       PACKAGE: ${{ matrix.package }}
       MODE: ${{ matrix.mode }}
-      TRANSPORT: ${{ matrix.transport }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
@@ -43,12 +34,6 @@ jobs:
       - name: Exercise native registration delivery
         shell: pwsh
         run: |
-          if ($env:TRANSPORT -eq 'tcp-only') {
-            $env:NDI_CONFIG_DIR = Join-Path $env:RUNNER_TEMP 'probe-ndi-config'
-            New-Item -ItemType Directory -Path $env:NDI_CONFIG_DIR | Out-Null
-            '{"ndi":{"rudp":{"send":{"enable":false},"recv":{"enable":false}},"tcp":{"send":{"enable":false},"recv":{"enable":false}},"unicast":{"send":{"enable":false},"recv":{"enable":false}},"multicast":{"send":{"enable":false},"recv":{"enable":false}}}}' |
-              Set-Content -LiteralPath (Join-Path $env:NDI_CONFIG_DIR 'ndi-config.v1.json') -Encoding ascii
-          }
           $include = Get-ChildItem -LiteralPath $env:NDI_SDK_DIR -Recurse -Filter Processing.NDI.Lib.h | Select-Object -First 1
           $library = Get-ChildItem -LiteralPath $env:NDI_SDK_DIR -Recurse -Filter Processing.NDI.Lib.x64.lib | Select-Object -First 1
           if (!$include -or !$library) { throw 'Native C SDK files are unavailable' }
@@ -65,7 +50,7 @@ jobs:
           cl /nologo /std:c11 /W4 /I"%NDI_PROBE_INCLUDE%" ci\metadata_native_probe.c "%NDI_PROBE_LIB%" /Fe:"%RUNNER_TEMP%\metadata-probe.exe"
           if errorlevel 1 exit /b 1
           set "PATH=%NDI_RUNTIME_DIR_V6%;%PATH%"
-          "%RUNNER_TEMP%\metadata-probe.exe" %MODE% 24 3
+          "%RUNNER_TEMP%\metadata-probe.exe" %MODE% 16 3
           '@ | Set-Content -LiteralPath $script -Encoding ascii
           & cmd.exe /d /c $script
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

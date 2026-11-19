@@ -89,11 +89,31 @@ static bool expect_registration(NDIlib_send_instance_t sender, NDIlib_recv_insta
     return false;
 }
 
-enum trial_result { setup_error = -1, success, initial_miss, reconnect_miss, disconnect_miss };
+static bool wait_for_fresh_video(NDIlib_send_instance_t sender, NDIlib_recv_instance_t receiver,
+                                 NDIlib_video_frame_v2_t *video, int64_t timecode) {
+    const uint64_t end = now_ms() + 10000;
+    video->timecode = timecode;
+    while (now_ms() < end) {
+        NDIlib_send_send_video_v2(sender, video);
+        NDIlib_video_frame_v2_t captured = {0};
+        if (NDIlib_recv_capture_v3(receiver, &captured, NULL, NULL, 100)
+            == NDIlib_frame_type_video) {
+            bool fresh = captured.timecode == timecode;
+            NDIlib_recv_free_video_v2(receiver, &captured);
+            if (fresh && NDIlib_recv_get_no_connections(receiver) > 0) return true;
+        }
+    }
+    return false;
+}
+
+enum trial_result {
+    setup_error = -1, success, initial_miss, reconnect_miss, disconnect_miss, media_miss
+};
 
 static enum trial_result trial(const char *mode, unsigned round, unsigned reconnects) {
-    const bool by_address = !strncmp(mode, "address", 7);
-    const bool observe_disconnect = strstr(mode, "observed") != NULL;
+    const bool name_only = !strcmp(mode, "name-only");
+    const bool register_live = !strcmp(mode, "register-live");
+    const bool send_live = !strcmp(mode, "send-live");
     char name[100];
     char endpoint[100];
     snprintf(name, sizeof name, "Raw NDI metadata %lu %u", process_id(), round);
@@ -118,12 +138,14 @@ static enum trial_result trial(const char *mode, unsigned round, unsigned reconn
     registered.p_data = original;
     registered.length = (int)sizeof original;
     registered.timecode = 21;
-    NDIlib_recv_add_connection_metadata(receiver, &registered);
+    if (!register_live && !send_live) {
+        NDIlib_recv_add_connection_metadata(receiver, &registered);
+    }
     NDIlib_source_t target = {0};
     enum trial_result outcome = setup_error;
     if (loopback_endpoint(sender, endpoint, sizeof endpoint)) {
-        target.p_ndi_name = by_address ? "" : NDIlib_send_get_source_name(sender)->p_ndi_name;
-        target.p_url_address = endpoint;
+        target.p_ndi_name = NDIlib_send_get_source_name(sender)->p_ndi_name;
+        target.p_url_address = name_only ? NULL : endpoint;
         uint8_t pixels[16 * 16 * 4 + 64] = {0};
         NDIlib_video_frame_v2_t video = {0};
         video.xres = 16;
@@ -148,7 +170,7 @@ static enum trial_result trial(const char *mode, unsigned round, unsigned reconn
                 }
                 NDIlib_recv_connect(receiver, NULL);
                 const uint64_t disconnected = now_ms();
-                if (observe_disconnect) {
+                {
                     for (;;) {
                         disconnected_sender = NDIlib_send_get_no_connections(sender, 0);
                         disconnected_receiver = NDIlib_recv_get_no_connections(receiver);
@@ -173,6 +195,21 @@ static enum trial_result trial(const char *mode, unsigned round, unsigned reconn
             }
             const uint64_t started = now_ms();
             NDIlib_recv_connect(receiver, &target);
+            if (send_live || (register_live && stage == 0)) {
+                const bool fresh = wait_for_fresh_video(sender, receiver, &video, 6020 + (int64_t)stage);
+                if (!fresh) {
+                    printf("raw fresh video missing mode=%s round=%u stage=%u\n", mode, round, stage);
+                    outcome = media_miss;
+                    break;
+                }
+                if (send_live) {
+                    const bool accepted = NDIlib_recv_send_metadata(receiver, &registered);
+                    printf("raw explicit mode=%s round=%u stage=%u accepted=%d\n",
+                           mode, round, stage, accepted);
+                } else {
+                    NDIlib_recv_add_connection_metadata(receiver, &registered);
+                }
+            }
             unsigned pictures = 0;
             bool seen = expect_registration(sender, receiver, &video, original, 10000, &pictures);
             printf("raw mode=%s round=%u stage=%u port=%s received=%d video=%u elapsed=%" PRIu64
@@ -234,9 +271,9 @@ int main(int argc, char **argv) {
     unsigned count = (unsigned)strtoul(argv[2], NULL, 10);
     unsigned reconnects = (unsigned)strtoul(argv[3], NULL, 10);
     printf("Raw SDK runtime: %s\n", NDIlib_version());
-    unsigned initial = 0, later = 0, disconnect = 0, completed = 0, reconnects_checked = 0;
+    unsigned initial = 0, later = 0, disconnect = 0, media = 0, completed = 0, reconnects_checked = 0;
     fflush(stdout);
-    for (unsigned index = 0; index < count && initial + later + disconnect < 4; ++index) {
+    for (unsigned index = 0; index < count && initial + later + disconnect + media < 4; ++index) {
         enum trial_result result = trial(mode, index, reconnects);
         if (result == setup_error) {
             fputs("Could not establish the diagnostic sender/receiver pair\n", stderr);
@@ -247,9 +284,10 @@ int main(int argc, char **argv) {
         initial += result == initial_miss;
         later += result == reconnect_miss;
         disconnect += result == disconnect_miss;
+        media += result == media_miss;
         if (result == success) reconnects_checked += reconnects;
     }
-    printf("raw summary mode=%s trials=%u initial_misses=%u reconnect_misses=%u disconnect_misses=%u reconnects_in_passing_trials=%u\n",
-           mode, completed, initial, later, disconnect, reconnects_checked);
+    printf("raw summary mode=%s trials=%u initial_misses=%u reconnect_misses=%u disconnect_misses=%u media_misses=%u reconnects_in_passing_trials=%u\n",
+           mode, completed, initial, later, disconnect, media, reconnects_checked);
     NDIlib_destroy();
 }
