@@ -78,6 +78,11 @@ class VerifiedTree(unittest.TestCase):
     def test_reuses_the_exact_tree_of_a_successful_run(self):
         self.assertEqual(Fixture().match(), RUN)
 
+    def test_reuses_a_pull_request_run_that_skipped_publication(self):
+        api = Fixture()
+        api.jobs.append({"name": "publish release", "status": "completed", "conclusion": "skipped"})
+        self.assertEqual(api.match(), RUN)
+
     def test_rejects_other_pull_requests_trees_and_attempts(self):
         for field, wrong in {"tree": "0" * 40, "pull": 56, "attempt": 1, "repository_id": 7,
                              "run_id": 42, "head": MERGE}.items():

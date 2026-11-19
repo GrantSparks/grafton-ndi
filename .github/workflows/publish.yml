@@ -1,30 +1,20 @@
-name: Publish
+name: Publish release
 
-# Pushing `v<version>` starts publishing that commit of main to crates.io.
-# A dispatch from main can retry an existing tag using the current workflow.
-# CI publishes the authoritative API reference to GitHub Pages from main.
-# docs.rs may also build the published crate as a supplementary reference.
-#
-# GitHub controls deployment access through the crates-io environment.
-# crates.io grants a publishing token to that trusted workflow and environment.
+# rust.yml authorizes the tagged commit and provides the trusted workflow identity.
 on:
-  push:
-    tags: ['v*']
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      tag:
-        description: Existing release tag
+      commit:
+        description: Validated, tested release commit
+        required: true
+        type: string
+      version:
+        description: Crate version from the tagged commit
         required: true
         type: string
 
-run-name: Publish ${{ inputs.tag || github.ref_name }}
-
 permissions:
   contents: read
-
-concurrency:
-  group: publish-${{ inputs.tag || github.ref_name }}
-  cancel-in-progress: false
 
 defaults:
   run:
@@ -34,70 +24,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: release tag
-    if: >-
-      github.repository == 'GrantSparks/grafton-ndi' &&
-      (github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      actions: read
-      pull-requests: read
-    outputs:
-      commit: ${{ steps.release.outputs.commit }}
-      version: ${{ steps.release.outputs.version }}
-      run_id: ${{ steps.release.outputs.run_id }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: Validate the tag and look up full CI for its tree
-        id: release
-        env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-          GH_TOKEN: ${{ github.token }}
-        run: python3 ci/release.py --prepare
-
-  ci:
-    name: ci
-    needs: release
-    if: needs.release.outputs.run_id == ''
-    permissions:
-      contents: read
-      actions: read
-      pull-requests: read
-      pages: write
-      id-token: write
-    uses: ./.github/workflows/rust.yml
-    with:
-      release_commit: ${{ needs.release.outputs.commit }}
-    secrets:
-      NDI_SDK_SOURCES_JSON: ${{ secrets.NDI_SDK_SOURCES_JSON }}
-      NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}
-
   # Builds the packaged crate, including every dependency build script, in a
   # job that cannot obtain a registry token.
   verify:
     name: verify package
-    needs: [release, ci]
-    if: >-
-      ${{ !cancelled() && needs.release.result == 'success' &&
-      (needs.ci.result == 'success' ||
-      (needs.ci.result == 'skipped' && needs.release.outputs.run_id != '')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      RELEASE_VERSION: ${{ needs.release.outputs.version }}
+      RELEASE_VERSION: ${{ inputs.version }}
     outputs:
       sha256: ${{ steps.package.outputs.sha256 }}
       toolchain: ${{ steps.package.outputs.toolchain }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.release.outputs.commit }}
+          ref: ${{ inputs.commit }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.100.0
@@ -129,8 +70,7 @@ jobs:
   # have, and the toolchain version that produced it.
   publish:
     name: publish to crates.io
-    needs: [release, verify]
-    if: ${{ !cancelled() && needs.release.result == 'success' && needs.verify.result == 'success' }}
+    needs: verify
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: crates-io
@@ -138,13 +78,13 @@ jobs:
       contents: read
       id-token: write
     env:
-      RELEASE_VERSION: ${{ needs.release.outputs.version }}
+      RELEASE_VERSION: ${{ inputs.version }}
       VERIFIED_SHA256: ${{ needs.verify.outputs.sha256 }}
       VERIFIED_TOOLCHAIN: ${{ needs.verify.outputs.toolchain }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.release.outputs.commit }}
+          ref: ${{ inputs.commit }}
       - name: Re-create the verified package
         working-directory: ${{ runner.temp }}
         run: |
