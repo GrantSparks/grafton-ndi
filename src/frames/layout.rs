@@ -2,6 +2,16 @@
 
 use super::*;
 
+#[cfg(all(test, feature = "advanced"))]
+pub(crate) mod layout_validation_counts {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(crate) static VIDEO: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static AUDIO: Cell<usize> = const { Cell::new(0) };
+    }
+}
+
 /// Validated video frame layout information.
 ///
 /// This struct holds pre-validated layout information for a video frame,
@@ -153,6 +163,9 @@ impl ValidatedVideoLayout {
         height: u32,
         line_stride: Option<usize>,
     ) -> LayoutResult<Self> {
+        #[cfg(all(test, feature = "advanced"))]
+        layout_validation_counts::VIDEO.set(layout_validation_counts::VIDEO.get() + 1);
+
         validate_video_dimensions(width.into(), height.into())?;
 
         let minimum = min_video_line_stride(pixel_format, width);
@@ -836,6 +849,9 @@ impl ValidatedAudioLayout {
         no_samples: SdkQuantity,
         channel_stride: Option<usize>,
     ) -> LayoutResult<Self> {
+        #[cfg(all(test, feature = "advanced"))]
+        layout_validation_counts::AUDIO.set(layout_validation_counts::AUDIO.get() + 1);
+
         let minimum = u64::from(no_samples.get()) * size_of::<f32>() as u64;
         let stride = channel_stride.map_or(minimum, |stride| stride as u64);
         let sample_count =
