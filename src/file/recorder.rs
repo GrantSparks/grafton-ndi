@@ -286,6 +286,10 @@ impl FileRecorder {
     /// are consumed and discarded before the native start. Poll them before
     /// starting if their contents are needed. The asynchronous recorder instead
     /// forwards these events through its `next_event` operation.
+    /// A restart checks for SDK event loss after draining the queue. A loss
+    /// visible at this check can require a reset without changing the previous
+    /// session's final report. If the restart succeeds, the new session
+    /// accounts for loss after this check.
     ///
     /// The target is only read, so it stays with the caller whatever the
     /// outcome, for example to start again once a missing directory exists.
@@ -332,10 +336,10 @@ impl FileRecorder {
         self.naming.check(target)?;
         // Events left over from an earlier session must not be counted in this one.
         self.discard_stale_events(sink)?;
-        // Draining may reveal lost or inconsistent lifecycle evidence for a
-        // previously final session. Its immutable report does not release
-        // the resulting unknown native-file obligation.
-        self.ledger.dropped(self.dropped_event_count());
+        // Both sessions share this boundary so a counter increase cannot
+        // fall between the prior ledger's check and the new ledger's baseline.
+        let dropped_at_boundary = self.dropped_event_count();
+        self.ledger.dropped(dropped_at_boundary);
         self.ledger.admit_start()?;
         let session = self
             .ledger
@@ -344,11 +348,10 @@ impl FileRecorder {
             .ok_or(Error::InvalidInput(
                 crate::InputDefect::SessionCounterExhausted,
             ))?;
-        let dropped = self.dropped_event_count();
         self.native.start(target, timecode)?;
         self.ledger = Ledger::session(
             session,
-            dropped,
+            dropped_at_boundary,
             self.tracks.contains(MediaTypes::VIDEO) || self.tracks.contains(MediaTypes::AUDIO),
         );
         Ok(session)

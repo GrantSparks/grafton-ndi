@@ -185,6 +185,13 @@ pub(super) struct InjectedFrame {
     pub(super) bytes: Vec<u8>,
 }
 
+/// When to increase the counter during the next mock SDK read.
+#[repr(u8)]
+pub(super) enum DroppedAtSample {
+    Before = 1,
+    After = 2,
+}
+
 /// A stand-in for the SDK's recorder: an event queue the test can feed, and a
 /// record of how it was stopped and destroyed.
 pub(super) struct Recorder {
@@ -226,6 +233,7 @@ pub(super) struct Recorder {
     /// Every capture reports an oversized event, even when its queue is empty.
     pub(super) oversize_every_event: std::sync::atomic::AtomicBool,
     pub(super) dropped_events: std::sync::atomic::AtomicU64,
+    dropped_at_sample: std::sync::atomic::AtomicU8,
     pub(super) stops: std::sync::atomic::AtomicUsize,
     /// Calls that wait for an event, rather than the owner's nonblocking pump.
     pub(super) waits: std::sync::atomic::AtomicUsize,
@@ -273,6 +281,7 @@ impl Recorder {
             oversize_next_event: Default::default(),
             oversize_every_event: Default::default(),
             dropped_events: Default::default(),
+            dropped_at_sample: Default::default(),
             stops: Default::default(),
             waits: Default::default(),
             captures: Default::default(),
@@ -288,6 +297,11 @@ impl Recorder {
     /// Make this the recorder the next creation on the current thread returns.
     pub(super) fn install(self: &std::sync::Arc<Self>) {
         NEXT_RECORDER.with(|next| *next.borrow_mut() = Some(std::sync::Arc::clone(self)));
+    }
+
+    pub(super) fn drop_at_next_sample(&self, when: DroppedAtSample) {
+        self.dropped_at_sample
+            .store(when as u8, std::sync::atomic::Ordering::Release);
     }
 
     /// Initialize the fake SDK's capture mutex before measuring wrapper work.
@@ -515,14 +529,19 @@ unsafe extern "C" fn recorder_is_recording(handle: NDIlib_file_recorder_instance
 }
 
 unsafe extern "C" fn recorder_dropped(handle: NDIlib_file_recorder_instance_t) -> u64 {
+    use std::sync::atomic::Ordering;
     // SAFETY: the wrapper passes a live handle.
     let recorder = unsafe { Recorder::from_handle(handle) };
-    recorder
-        .dropped_queries
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    recorder
-        .dropped_events
-        .load(std::sync::atomic::Ordering::Acquire)
+    recorder.dropped_queries.fetch_add(1, Ordering::AcqRel);
+    let when = recorder.dropped_at_sample.swap(0, Ordering::AcqRel);
+    if when == DroppedAtSample::Before as u8 {
+        recorder.dropped_events.fetch_add(1, Ordering::AcqRel);
+    }
+    let sample = recorder.dropped_events.load(Ordering::Acquire);
+    if when == DroppedAtSample::After as u8 {
+        recorder.dropped_events.fetch_add(1, Ordering::AcqRel);
+    }
+    sample
 }
 
 unsafe extern "C" fn recorder_rollover(

@@ -563,7 +563,7 @@ fn evidence_lost_during_the_stale_event_drain_refuses_the_next_native_start() {
         let report = recorder.report();
         match evidence {
             0 => device.push(ROLLOVER, "late-open.mkv"),
-            1 => device.dropped_events.store(1, Ordering::Release),
+            1 => device.drop_at_next_sample(mock::DroppedAtSample::Before),
             2 => {
                 device.push(ROLLOVER, "unreadable-open.mkv");
                 device.oversize_next_event.store(true, Ordering::Release);
@@ -615,6 +615,77 @@ fn evidence_lost_during_the_stale_event_drain_refuses_the_next_native_start() {
         drop(recorder);
         assert_eq!(replacement.stops.load(Ordering::Acquire), 1);
         assert_eq!(replacement.destroys.load(Ordering::Acquire), 1);
+    }
+}
+
+#[test]
+fn restart_uses_one_dropped_event_sample_and_observes_subsequent_loss() {
+    for lost_after_sample in [false, true] {
+        let device = mock::Recorder::new(Closing::AtStop);
+        let mut recorder = recording_with(
+            &device,
+            FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
+                .drop_wait(Duration::ZERO),
+        );
+        let FinishStatus::Ended(SessionEnd::Closed(first)) =
+            recorder.finish(Duration::ZERO).unwrap()
+        else {
+            panic!("the first session closed");
+        };
+        let queries = device.dropped_queries.load(Ordering::Acquire);
+        if lost_after_sample {
+            device.drop_at_next_sample(mock::DroppedAtSample::After);
+        }
+        let target = target("restart-at-counter-boundary");
+        assert_eq!(
+            recorder
+                .start(&target, RecordingTimecode::Preserve)
+                .unwrap(),
+            2
+        );
+        assert_eq!(device.dropped_queries.load(Ordering::Acquire), queries + 1);
+        assert_eq!(device.starts.load(Ordering::Acquire), 2);
+        assert_eq!(recorder.report().dropped_events(), 0);
+        recorder.next_event(Duration::ZERO).unwrap().unwrap();
+        let second = recorder.report();
+        assert_eq!(second.dropped_events(), u64::from(lost_after_sample));
+        let outcome = recorder.finish(Duration::ZERO).unwrap();
+        assert_eq!(first.session(), 1);
+        assert_eq!(first.dropped_events(), 0);
+        assert!(first.closure_confirmed());
+        if lost_after_sample {
+            let FinishStatus::Ended(SessionEnd::Indeterminate(second)) = outcome else {
+                panic!("lost events prevent closure confirmation");
+            };
+            assert_eq!(second.dropped_events(), 1);
+            assert!(matches!(
+                recorder.start(&target, RecordingTimecode::Preserve),
+                Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
+            ));
+            assert_eq!(device.starts.load(Ordering::Acquire), 2);
+            let replacement = mock::Recorder::new(Closing::AtStop);
+            replacement.install();
+            assert_eq!(
+                recorder
+                    .reset(&FileRecorderOptions::new(
+                        SourceSpec::new("replacement").unwrap()
+                    ))
+                    .unwrap(),
+                second
+            );
+            assert_eq!(
+                recorder
+                    .start(&target, RecordingTimecode::Preserve)
+                    .unwrap(),
+                3
+            );
+            assert_eq!(replacement.starts.load(Ordering::Acquire), 1);
+        } else {
+            assert!(matches!(
+                outcome,
+                FinishStatus::Ended(SessionEnd::Closed(_))
+            ));
+        }
     }
 }
 
@@ -1161,16 +1232,29 @@ fn a_refused_start_is_not_counted_in_any_session() {
     recorder
         .start(&target("first"), RecordingTimecode::Preserve)
         .unwrap();
-    assert!(matches!(
-        recorder.finish(Duration::from_secs(1)).unwrap(),
-        FinishStatus::Ended(SessionEnd::Closed(_))
-    ));
+    let FinishStatus::Ended(SessionEnd::Closed(first)) =
+        recorder.finish(Duration::from_secs(1)).unwrap()
+    else {
+        panic!("the first session closed");
+    };
     refuse_start(&mut recorder);
-    let report = recorder.report();
-    assert_eq!(report.session(), 1);
-    assert_eq!(report.error_events(), 0);
-    assert!(report.closure_confirmed());
+    assert_eq!(recorder.report(), first);
     assert_eq!(recorder.state(), RecorderState::Closed);
+    assert_eq!(device.starts.load(Ordering::Acquire), 3);
+    assert_eq!(
+        recorder
+            .start(&target("retry"), RecordingTimecode::Preserve)
+            .unwrap(),
+        2
+    );
+    assert_eq!(device.starts.load(Ordering::Acquire), 4);
+    let FinishStatus::Ended(SessionEnd::Closed(second)) =
+        recorder.finish(Duration::from_secs(1)).unwrap()
+    else {
+        panic!("the retried session closed");
+    };
+    assert_eq!(second.error_events(), 0);
+    assert_eq!(second.dropped_events(), 0);
 }
 
 #[test]

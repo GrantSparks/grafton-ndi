@@ -5217,6 +5217,40 @@ mod tests {
     }
 
     #[test]
+    fn async_restart_observes_events_lost_after_the_start_sample() {
+        let (device, recorder) =
+            mock_recorder_with_drop_wait(Closing::AtStop, AsyncFileOptions::new(), Duration::ZERO);
+        let FinishStatus::Ended(SessionEnd::Closed(first)) =
+            block_on(recorder.finish(Duration::ZERO)).unwrap()
+        else {
+            panic!("the first session closed");
+        };
+        device.drop_at_next_sample(mock::DroppedAtSample::After);
+        let target =
+            RecordingTarget::new(std::env::temp_dir().join("async-counter-sample")).unwrap();
+        assert_eq!(
+            block_on(recorder.start(&target, RecordingTimecode::Preserve)).unwrap(),
+            2
+        );
+        assert_eq!(device.starts.load(Ordering::Acquire), 2);
+        let FinishStatus::Ended(SessionEnd::Indeterminate(second)) =
+            block_on(recorder.finish(Duration::ZERO)).unwrap()
+        else {
+            panic!("lost events prevent closure confirmation");
+        };
+        assert_eq!(first.dropped_events(), 0);
+        assert!(first.closure_confirmed());
+        assert_eq!(second.session(), 2);
+        assert_eq!(second.dropped_events(), 1);
+        assert!(matches!(
+            block_on(recorder.start(&target, RecordingTimecode::Preserve)),
+            Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
+        ));
+        assert_eq!(device.starts.load(Ordering::Acquire), 2);
+        block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
     fn async_reset_retires_unknown_cleanup_only_after_replacement_succeeds() {
         let (device, recorder) = mock_recorder_with_drop_wait(
             Closing::AtStop,
