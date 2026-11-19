@@ -42,6 +42,19 @@ Native behavior needs validation with the runtime, platform and network you
 deploy. Use [runtime checks](../ci/README.md#test-against-an-installed-runtime)
 with your installation.
 
+### Receiver connection metadata on Windows
+
+On Windows x64, Standard NDI 6.3.2.0 and 6.4.0.2 can omit metadata registered
+with `Receiver::add_connection_metadata` on the first connection or after
+reconnect, even when fresh video arrives. This was reproduced with the
+native SDK over loopback. [Known issue #551](https://github.com/GrantSparks/grafton-ndi/issues/551)
+
+Applications that manage reconnects can keep the payload and call
+`Receiver::send_metadata` once fresh media confirms the initial connection
+or reconnect. Use explicit sends as the sole send path for that payload to
+avoid duplicates. SDK send acceptance confirms submission. Use an application
+acknowledgment if you need confirmation from the peer.
+
 ## Discovery Server
 
 Advertisers and listeners require NDI 6.4 or later; the wrapper rejects older

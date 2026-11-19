@@ -44,7 +44,7 @@ use grafton_ndi::{
 };
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Mutex, MutexGuard,
     },
     thread,
@@ -53,12 +53,32 @@ use std::{
 
 const SLICE: Duration = Duration::from_millis(100);
 const PATIENCE: Duration = Duration::from_secs(15);
+static DIAGNOSTIC_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GRAFTON_NDI_RECEIVER_DIAGNOSTICS").as_deref() == Ok("1"))
+}
+
+fn trace(phase: std::fmt::Arguments<'_>) {
+    if diagnostics_enabled() {
+        let thread = thread::current();
+        let name = thread.name().unwrap_or("worker");
+        eprintln!("receiver-watchdog: {name}: {phase}");
+    }
+}
 
 fn sockets() -> MutexGuard<'static, ()> {
     static SOCKETS: Mutex<()> = Mutex::new(());
-    SOCKETS
+    trace(format_args!("waiting for the socket test lock"));
+    let turn = SOCKETS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if diagnostics_enabled() {
+        DIAGNOSTIC_CALLS.store(0, Ordering::Relaxed);
+        trace(format_args!("acquired the socket test lock"));
+    }
+    turn
 }
 
 fn duration() -> Duration {
@@ -78,12 +98,23 @@ fn margin() -> Duration {
 }
 
 fn timed<T>(operation: &str, budget: Duration, call: impl FnOnce() -> T) -> T {
+    // Socket cases run one at a time and each starts with a fresh trace
+    // budget. The watchdog still captures the current call in every thread.
+    let traced = diagnostics_enabled()
+        && operation.contains("connect")
+        && DIAGNOSTIC_CALLS.fetch_add(1, Ordering::Relaxed) < 16;
+    if traced {
+        trace(format_args!("entering {operation}"));
+    }
     let began = Instant::now();
     let result = call();
+    let elapsed = began.elapsed();
+    if traced {
+        trace(format_args!("returned from {operation}"));
+    }
     assert!(
-        began.elapsed() <= budget + margin(),
-        "{operation} exceeded its budget: {:?}",
-        began.elapsed()
+        elapsed <= budget + margin(),
+        "{operation} exceeded its budget: {elapsed:?}"
     );
     result
 }

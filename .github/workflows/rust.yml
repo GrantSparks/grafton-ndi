@@ -35,6 +35,25 @@ env:
   WINDOWS_LLVM_SHA256: 3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b
 
 jobs:
+  verified-tree:
+    name: Find full CI for the merged tree
+    if: github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' && vars.NDI_CI_RELEASED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      run_id: ${{ steps.lookup.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify the completed pull request run
+        id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/verified_tree.py reuse
+
   # The crate builds without an NDI SDK, so everything in lint, test and cross
   # runs for every event, including pull requests from forks.
   lint:
@@ -128,6 +147,8 @@ jobs:
           cargo audit --deny warnings
 
   test:
+    needs: verified-tree
+    if: ${{ !cancelled() && needs.verified-tree.outputs.run_id == '' }}
     name: test (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -198,6 +219,8 @@ jobs:
           cargo test --locked --no-fail-fast --all-features --config "$runner" --lib -- --exact "${tests[@]}" --test-threads=1
 
   miri:
+    needs: verified-tree
+    if: ${{ !cancelled() && needs.verified-tree.outputs.run_id == '' }}
     name: miri (${{ matrix.model }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -227,6 +250,8 @@ jobs:
           done
 
   cross:
+    needs: verified-tree
+    if: ${{ !cancelled() && needs.verified-tree.outputs.run_id == '' }}
     name: cross
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -259,6 +284,8 @@ jobs:
         run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/build-android.sh aarch64-linux-android
 
   hx-pictures:
+    needs: verified-tree
+    if: ${{ !cancelled() && needs.verified-tree.outputs.run_id == '' }}
     name: NDI HX test pictures
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -267,7 +294,7 @@ jobs:
       - name: Generate test pictures
         run: |
           # The runner's mirror list prefers a regional archive that can stall FFmpeg downloads.
-          sudo sed -Ei '/^URIs:/s#(mirror\+file:/etc/apt/apt-mirrors\.txt|https?://[[:alnum:]-]+\.ec2\.archive\.ubuntu\.com/ubuntu/?)([[:space:]]|$)#https://archive.ubuntu.com/ubuntu/\2#' /etc/apt/sources.list.d/ubuntu.sources
+          ci/ubuntu-primary-archive.sh
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends ffmpeg
           python3 tests/support/generate_hx.py --output-dir "$RUNNER_TEMP/ndi-hx-pictures"
@@ -295,8 +322,10 @@ jobs:
   # generated into the target directory must stay on the runner.
   sdk:
     name: sdk (${{ matrix.name }})
-    needs: hx-pictures
+    needs: [verified-tree, hx-pictures]
     if: >-
+      !cancelled() && needs.hx-pictures.result == 'success' &&
+      needs.verified-tree.outputs.run_id == '' &&
       vars.NDI_CI_RELEASED == 'true' && github.actor != 'dependabot[bot]' &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
@@ -492,6 +521,7 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       PACKAGE: ${{ matrix.package }}
+      GRAFTON_NDI_RECEIVER_DIAGNOSTICS: ${{ contains(fromJSON('["linux-x86 standard-6.4","linux-x64 standard-6.4","macos-arm64 standard-6.3.2"]'), matrix.name) && '1' || '0' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
@@ -507,12 +537,15 @@ jobs:
         env:
           SDK_MATRIX_NAME: ${{ matrix.name }}
         run: |
-          if [ "$SDK_MATRIX_NAME" = 'linux-x64 standard-6.3.2' ]; then
-            # Use the primary archive for the Valgrind install in the timed Memcheck step.
-            sudo sed -Ei '/^URIs:/s#(mirror\+file:/etc/apt/apt-mirrors\.txt|https?://[[:alnum:]-]+\.ec2\.archive\.ubuntu\.com/ubuntu/?)([[:space:]]|$)#https://archive.ubuntu.com/ubuntu/\2#' /etc/apt/sources.list.d/ubuntu.sources
+          if [ "$SDK_MATRIX_NAME" = 'linux-x64 standard-6.3.2' ] || [ "$GRAFTON_NDI_RECEIVER_DIAGNOSTICS" = 1 ]; then
+            # The SDK padding and receiver diagnostics need additional packages.
+            ci/ubuntu-primary-archive.sh
           fi
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends bubblewrap libavahi-client3
+          if [ "$GRAFTON_NDI_RECEIVER_DIAGNOSTICS" = 1 ]; then
+            sudo apt-get install --yes --no-install-recommends gdb
+          fi
           # Ubuntu 24.04 denies the unprivileged user namespace that bwrap needs.
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -723,7 +756,7 @@ jobs:
   required-ci:
     name: required-ci
     if: always()
-    needs: [lint, test, cross, hx-pictures, sdk, miri]
+    needs: [verified-tree, lint, test, cross, hx-pictures, sdk, miri]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -731,11 +764,23 @@ jobs:
       - name: Every job this event requires succeeded
         env:
           RESULTS: ${{ toJSON(needs) }}
+          REUSE_ALLOWED: ${{ github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' && vars.NDI_CI_RELEASED == 'true' }}
           # The condition of the sdk job, without the switch that turns it on.
           SDK_EXPECTED: >-
             ${{ github.actor != 'dependabot[bot]' &&
             (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         run: python3 ci/gate.py
+      - name: Record the fully tested pull request tree
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.sdk.result == 'success'
+        run: python3 ci/verified_tree.py record "$RUNNER_TEMP/ci-tested-tree.json"
+      - name: Preserve the verified tree
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.sdk.result == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ci-tested-tree-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-tested-tree.json
+          if-no-files-found: error
+          retention-days: 30
 
   deploy-docs:
     name: publish documentation

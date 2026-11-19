@@ -24,5 +24,13 @@ EOF
 
 # Nested cargo invocations (trybuild) must not wait for a registry they cannot reach.
 export CARGO_NET_OFFLINE=true
+if [ "${GRAFTON_NDI_RECEIVER_DIAGNOSTICS:-}" = 1 ]; then
+    case "${1##*/}" in
+        grafton_ndi-*|receiver_connect_overlap_sdk-*)
+            scripts=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+            set -- python3 "$scripts/receiver_watchdog.py" "$@"
+            ;;
+    esac
+fi
 exec bwrap --unshare-user --unshare-net --dev-bind / / --tmpfs /run \
     --dir /run/tmp --setenv TMPDIR /run/tmp --ro-bind-data 9 /etc/hosts -- "$@"

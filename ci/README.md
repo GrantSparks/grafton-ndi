@@ -15,6 +15,13 @@ repository scripts. A run skips deployment when its commit is no longer the
 tip of `main`. The release caller forwards those permissions for reusable
 workflow validation. Its tag ref keeps the Pages job disabled.
 
+A push to `main` can reuse full validation from a successful same-repository
+pull request. CI checks the tested tree against the new `main` tree and verifies
+the GitHub-signed synthetic merge and the successful SDK checks for that run
+attempt. Lint still checks the merged checkout and builds its Pages artifact.
+If the evidence is missing or differs, the push runs the full matrix. Use the
+manual CI workflow for a fresh full run on an existing commit.
+
 Use the pinned Rust toolchain with Clippy and rustfmt:
 
 ```sh
@@ -175,6 +182,19 @@ GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --locked --config ci/offline.toml --con
 On Debian 12 with Valgrind 3.19 and glibc 2.36, the live SDK recipe may report
 reads from glibc's loader token comparisons. Add
 `"--suppressions=ci/valgrind.supp"` to its runner array on that host.
+
+## Receiver stall diagnostics
+
+The Standard SDK rows for Linux x86 and x64 and macOS ARM64 with SDK 6.3.2
+supervise the receiver reconnect unit case and the native connect/capture
+overlap executable. The watchdog prints the test phases and collects thread
+stacks before stopping a stalled test group. Linux uses GDB and macOS uses
+`sample`. A timeout fails the test step.
+
+Run the **Receiver diagnostics** workflow on the ref with the SDK pins to
+investigate. Select the Linux x86, Linux x64 or macOS configuration. Each job
+repeats only the reconnect and overlap tests under the loopback runner. The
+matching `receiver-diagnostic-*` branch names can also start these jobs on push.
 
 ## Test against an installed runtime
 

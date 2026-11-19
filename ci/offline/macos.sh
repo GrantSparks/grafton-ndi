@@ -28,4 +28,12 @@ printf '{"ndi":{"networks":{"discovery":"127.0.0.1"}}}\n' > "$scratch/config/ndi
 export NDI_CONFIG_DIR="$scratch/config"
 export TMPDIR="$scratch/tmp"
 export CARGO_NET_OFFLINE=true
+if [ "${GRAFTON_NDI_RECEIVER_DIAGNOSTICS:-}" = 1 ]; then
+    case "${1##*/}" in
+        grafton_ndi-*|receiver_connect_overlap_sdk-*)
+            scripts=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+            set -- python3 "$scripts/receiver_watchdog.py" "$@"
+            ;;
+    esac
+fi
 /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny network*)(allow network-bind)(allow network-outbound (remote ip "localhost:*"))(allow network-inbound (local ip "localhost:*"))' "$@"
