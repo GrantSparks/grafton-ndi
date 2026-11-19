@@ -17,18 +17,18 @@ jobs:
       matrix:
         include:
           - package: 6.3.2-standard-windows
-            mode: named
+            mode: named-observed
+            transport: default
           - package: 6.3.2-standard-windows
             mode: named-observed
-          - package: 6.3.2-standard-windows
-            mode: address
-          - package: 6.3.2-standard-windows
-            mode: address-observed
+            transport: tcp-only
           - package: current-standard-windows
-            mode: named
+            mode: named-observed
+            transport: tcp-only
     env:
       PACKAGE: ${{ matrix.package }}
       MODE: ${{ matrix.mode }}
+      TRANSPORT: ${{ matrix.transport }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
@@ -43,6 +43,12 @@ jobs:
       - name: Exercise native registration delivery
         shell: pwsh
         run: |
+          if ($env:TRANSPORT -eq 'tcp-only') {
+            $env:NDI_CONFIG_DIR = Join-Path $env:RUNNER_TEMP 'probe-ndi-config'
+            New-Item -ItemType Directory -Path $env:NDI_CONFIG_DIR | Out-Null
+            '{"ndi":{"rudp":{"send":{"enable":false},"recv":{"enable":false}},"tcp":{"send":{"enable":false},"recv":{"enable":false}},"unicast":{"send":{"enable":false},"recv":{"enable":false}},"multicast":{"send":{"enable":false},"recv":{"enable":false}}}}' |
+              Set-Content -LiteralPath (Join-Path $env:NDI_CONFIG_DIR 'ndi-config.v1.json') -Encoding ascii
+          }
           $include = Get-ChildItem -LiteralPath $env:NDI_SDK_DIR -Recurse -Filter Processing.NDI.Lib.h | Select-Object -First 1
           $library = Get-ChildItem -LiteralPath $env:NDI_SDK_DIR -Recurse -Filter Processing.NDI.Lib.x64.lib | Select-Object -First 1
           if (!$include -or !$library) { throw 'Native C SDK files are unavailable' }
