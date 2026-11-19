@@ -2174,7 +2174,8 @@ impl Display for Source {
 /// offline endpoints and omit feeds announced after the original window. Empty
 /// results are not cached. A miss with a busy final snapshot returns the feeds
 /// observed so far without filling the cache, so the next miss tries discovery
-/// again. Results that cannot be stored are returned uncached.
+/// again. A failed cache reservation returns the discovered result uncached.
+/// See [`Self::find_sources_by_host`] for allocation behavior during publication.
 /// The accepted grammar is [`Source::matches_host`]'s.
 /// Equivalent hostname or machine-name ASCII case/final-dot and numeric IP
 /// spellings share an entry. Other spellings, including DNS aliases, remain
