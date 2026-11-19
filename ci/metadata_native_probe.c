@@ -48,10 +48,10 @@ static bool loopback_endpoint(NDIlib_send_instance_t sender, char *out, size_t s
         const NDIlib_source_t *sources = NDIlib_find_get_current_sources(finder, &count);
         for (uint32_t index = 0; index < count; ++index) {
             const NDIlib_source_t *source = &sources[index];
-            if (!source->p_ndi_name || !source->p_ip_address
+            if (!source->p_ndi_name || !source->p_url_address
                 || strcmp(source->p_ndi_name, sent->p_ndi_name)) continue;
-            if (strstr(source->p_ip_address, "://")) continue;
-            const char *port = strrchr(source->p_ip_address, ':');
+            if (strstr(source->p_url_address, "://")) continue;
+            const char *port = strrchr(source->p_url_address, ':');
             if (!port) continue;
             int length = snprintf(out, size, "127.0.0.1%s", port);
             found = length > 0 && (size_t)length < size;
@@ -89,16 +89,20 @@ static bool expect_registration(NDIlib_send_instance_t sender, NDIlib_recv_insta
     return false;
 }
 
-static int trial(bool reuse_name, unsigned round, unsigned reconnects) {
+enum trial_result { setup_error = -1, success, initial_miss, reconnect_miss, disconnect_miss };
+
+static enum trial_result trial(const char *mode, unsigned round, unsigned reconnects) {
+    const bool by_address = !strncmp(mode, "address", 7);
+    const bool observe_disconnect = strstr(mode, "observed") != NULL;
     char name[100];
     char endpoint[100];
-    snprintf(name, sizeof name, "Raw NDI metadata %lu %u", process_id(), reuse_name ? 0 : round);
+    snprintf(name, sizeof name, "Raw NDI metadata %lu %u", process_id(), round);
     NDIlib_send_create_t send_options = {0};
     send_options.p_ndi_name = name;
     send_options.clock_video = false;
     send_options.clock_audio = true;
     NDIlib_send_instance_t sender = NDIlib_send_create(&send_options);
-    if (!sender) return -1;
+    if (!sender) return setup_error;
     NDIlib_recv_create_v3_t recv_options = {0};
     recv_options.source_to_connect_to.p_ndi_name = "";
     recv_options.color_format = NDIlib_recv_color_format_BGRX_BGRA;
@@ -107,7 +111,7 @@ static int trial(bool reuse_name, unsigned round, unsigned reconnects) {
     NDIlib_recv_instance_t receiver = NDIlib_recv_create_v3(&recv_options);
     if (!receiver) {
         NDIlib_send_destroy(sender);
-        return -1;
+        return setup_error;
     }
     NDIlib_metadata_frame_t registered = {0};
     char original[] = "<receiver-registration/>";
@@ -116,10 +120,10 @@ static int trial(bool reuse_name, unsigned round, unsigned reconnects) {
     registered.timecode = 21;
     NDIlib_recv_add_connection_metadata(receiver, &registered);
     NDIlib_source_t target = {0};
-    int outcome = -1;
+    enum trial_result outcome = setup_error;
     if (loopback_endpoint(sender, endpoint, sizeof endpoint)) {
-        target.p_ndi_name = NDIlib_send_get_source_name(sender)->p_ndi_name;
-        target.p_ip_address = endpoint;
+        target.p_ndi_name = by_address ? "" : NDIlib_send_get_source_name(sender)->p_ndi_name;
+        target.p_url_address = endpoint;
         uint8_t pixels[16 * 16 * 4 + 64] = {0};
         NDIlib_video_frame_v2_t video = {0};
         video.xres = 16;
@@ -132,8 +136,10 @@ static int trial(bool reuse_name, unsigned round, unsigned reconnects) {
         video.timecode = NDIlib_send_timecode_synthesize;
         video.p_data = pixels;
         video.line_stride_in_bytes = 16 * 4;
-        outcome = 0;
+        outcome = success;
         for (unsigned stage = 0; stage <= reconnects; ++stage) {
+            uint64_t to_zero = 0;
+            int disconnected_sender = -1, disconnected_receiver = -1;
             if (stage > 0) {
                 for (;;) {
                     NDIlib_metadata_frame_t metadata = {0};
@@ -141,14 +147,37 @@ static int trial(bool reuse_name, unsigned round, unsigned reconnects) {
                     NDIlib_send_free_metadata(sender, &metadata);
                 }
                 NDIlib_recv_connect(receiver, NULL);
+                const uint64_t disconnected = now_ms();
+                if (observe_disconnect) {
+                    for (;;) {
+                        disconnected_sender = NDIlib_send_get_no_connections(sender, 0);
+                        disconnected_receiver = NDIlib_recv_get_no_connections(receiver);
+                        to_zero = now_ms() - disconnected;
+                        if (!disconnected_sender && !disconnected_receiver) break;
+                        if (to_zero >= 5000) {
+                            outcome = disconnect_miss;
+                            break;
+                        }
+#ifdef _WIN32
+                        Sleep(5);
+#else
+                        struct timespec pause = {0, 5000000};
+                        nanosleep(&pause, NULL);
+#endif
+                    }
+                    printf("raw disconnected mode=%s round=%u stage=%u sender=%d receiver=%d to_zero=%" PRIu64 "ms\n",
+                           mode, round, stage, disconnected_sender, disconnected_receiver, to_zero);
+                    fflush(stdout);
+                    if (outcome == disconnect_miss) break;
+                }
             }
             const uint64_t started = now_ms();
             NDIlib_recv_connect(receiver, &target);
             unsigned pictures = 0;
             bool seen = expect_registration(sender, receiver, &video, original, 10000, &pictures);
-            printf("raw reuse=%d round=%u stage=%u port=%s received=%d video=%u elapsed=%" PRIu64
+            printf("raw mode=%s round=%u stage=%u port=%s received=%d video=%u elapsed=%" PRIu64
                    "ms sender=%d receiver=%d\n",
-                   reuse_name, round, stage, endpoint, seen, pictures, now_ms() - started,
+                   mode, round, stage, endpoint, seen, pictures, now_ms() - started,
                    NDIlib_send_get_no_connections(sender, 0),
                    NDIlib_recv_get_no_connections(receiver));
             fflush(stdout);
@@ -167,7 +196,7 @@ static int trial(bool reuse_name, unsigned round, unsigned reconnects) {
             bool delivered_add = expect_registration(sender, receiver, &video, add_xml, 2200, &pictures);
             printf("raw lost stage=%u direct_accepted=%d direct_delivered=%d add_while_connected_delivered=%d\n",
                    stage, accepted, delivered, delivered_add);
-            outcome = 1 + (int)stage;
+            outcome = stage ? reconnect_miss : initial_miss;
             break;
         }
     }
@@ -201,24 +230,26 @@ int main(int argc, char **argv) {
         return 4;
     }
 #endif
-    bool reuse_name = !strcmp(argv[1], "reuse");
+    const char *mode = argv[1];
     unsigned count = (unsigned)strtoul(argv[2], NULL, 10);
     unsigned reconnects = (unsigned)strtoul(argv[3], NULL, 10);
     printf("Raw SDK runtime: %s\n", NDIlib_version());
-    unsigned initial = 0, later = 0, completed = 0;
+    unsigned initial = 0, later = 0, disconnect = 0, completed = 0, reconnects_checked = 0;
     fflush(stdout);
-    for (unsigned index = 0; index < count && initial + later < 4; ++index) {
-        int result = trial(reuse_name, index, reconnects);
-        if (result < 0) {
+    for (unsigned index = 0; index < count && initial + later + disconnect < 4; ++index) {
+        enum trial_result result = trial(mode, index, reconnects);
+        if (result == setup_error) {
             fputs("Could not establish the diagnostic sender/receiver pair\n", stderr);
             NDIlib_destroy();
             return 3;
         }
         ++completed;
-        initial += result == 1;
-        later += result > 1;
+        initial += result == initial_miss;
+        later += result == reconnect_miss;
+        disconnect += result == disconnect_miss;
+        if (result == success) reconnects_checked += reconnects;
     }
-    printf("raw summary reuse=%d trials=%u initial_misses=%u reconnect_misses=%u\n",
-           reuse_name, completed, initial, later);
+    printf("raw summary mode=%s trials=%u initial_misses=%u reconnect_misses=%u disconnect_misses=%u reconnects_in_passing_trials=%u\n",
+           mode, completed, initial, later, disconnect, reconnects_checked);
     NDIlib_destroy();
 }
