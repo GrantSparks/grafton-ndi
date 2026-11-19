@@ -179,7 +179,10 @@ fn receiver_connection_metadata_survives_its_input_and_reconnect() -> Result<(),
             let sending = sender.connection_count()?;
             let receiving = receiver.connection_stats()?.connections();
             assert!(
-                has_known_registration_loss(info) && received_video && sending > 0 && receiving > 0,
+                has_known_registration_loss(info, connection == 0)
+                    && received_video
+                    && sending > 0
+                    && receiving > 0,
                 "receiver registration missing on connection {connection}; fresh video={received_video}, \
                  connections sender={sending} receiver={receiving}; runtime={info:?}"
             );
@@ -231,14 +234,15 @@ fn receiver_connection_metadata_survives_its_input_and_reconnect() -> Result<(),
     Ok(())
 }
 
-fn has_known_registration_loss(info: &RuntimeInfo) -> bool {
+fn has_known_registration_loss(info: &RuntimeInfo, initial_connection: bool) -> bool {
     // Scope #551 to the native Windows builds that reproduced the failure.
+    let version = info.raw_version();
     cfg!(all(target_os = "windows", target_arch = "x86_64"))
         && info.edition() == SdkEdition::Standard
         && info.linkage() == SdkLinkage::Shared
-        && matches!(
-            info.raw_version(),
+        && (matches!(
+            version,
             "NDI SDK WIN64 16:38:09 Apr 14 2026 6.3.2.0"
                 | "NDI SDK WIN64 13:07:15 Nov  6 2026 6.4.0.2"
-        )
+        ) || (initial_connection && version == "NDI SDK WIN64 16:09:44 Nov 17 2026 6.4.0.2"))
 }

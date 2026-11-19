@@ -47,7 +47,8 @@ with your installation.
 On Windows x64, Standard NDI 6.3.2.0 and 6.4.0.2 can omit metadata registered
 with `Receiver::add_connection_metadata` on the first connection or after
 reconnect, even when fresh video arrives. This was reproduced with the
-native SDK over loopback. [Known issue #551](https://github.com/GrantSparks/grafton-ndi/issues/551)
+native SDK over loopback. The November 17 build of 6.4.0.2 still reproduced
+the first-connection failure. [Known issue #551](https://github.com/GrantSparks/grafton-ndi/issues/551)
 
 Applications that manage reconnects can keep the payload and call
 `Receiver::send_metadata` once fresh media confirms the initial connection
