@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Entries and examples describe the API of their named release. For the current
 API, see the [README](https://github.com/GrantSparks/grafton-ndi/blob/main/README.md) and the [migration index](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/migration/README.md).
 
-## [3.0.0] - Unreleased
+## [3.0.0] - 2026-11-19
 
 Version 3.0 loads the NDI runtime explicitly and expands the library with
 mixed-media capture, Advanced SDK operations, recording, playback and image
