@@ -1071,11 +1071,11 @@ fn file_6_4_0_2_seek_frame_timestamp_matches_file_pts() {
         || info.version() != crate::SdkVersion::parse("6.4.0.2")
         || api.library_path().and_then(Path::parent) != info.library_path().and_then(Path::parent)
     {
-        eprintln!(
-            "skipped File PTS correlation with {} and {:?}",
+        test_support::unsupported(&format!(
+            "File PTS correlation with {} and {:?}",
             info.raw_version(),
             api.library_path()
-        );
+        ));
         return;
     }
 
