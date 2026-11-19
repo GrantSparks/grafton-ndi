@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/received_timestamp_cannot_compare_with_sdk_clock.rs:4:34
+  |
+4 |     frame.timestamp().unwrap() < ndi.timestamp().unwrap()
+  |     --------------------------   ^^^^^^^^^^^^^^^^^^^^^^^^ expected `ReceivedTimestamp`, found `SdkTimestamp`
+  |     |
+  |     expected because this is `ReceivedTimestamp`

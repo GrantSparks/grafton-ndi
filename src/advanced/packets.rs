@@ -11,7 +11,7 @@ use crate::media::SdkQuantity;
 use crate::{
     frames::{FrameMetadataRef, OwnedFrameMetadata, VideoHeader},
     sys::bindings::*,
-    Error, FourCc, FrameRate, PictureAspectRatio, Rejected, Result, ScanType, SdkTimestamp,
+    Error, FourCc, FrameRate, PictureAspectRatio, ReceivedTimestamp, Rejected, Result, ScanType,
     StreamTier, Timecode,
 };
 pub(crate) use payload::{PacketBytes, PacketSlice};
@@ -771,7 +771,7 @@ impl VideoPacketFormat {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FrameExtras {
     timecode: Timecode,
-    timestamp: Option<SdkTimestamp>,
+    timestamp: Option<ReceivedTimestamp>,
     metadata: OwnedFrameMetadata,
 }
 
@@ -794,7 +794,7 @@ impl FrameExtras {
         let mut extras = Self::default();
         extras.copy_received(
             Timecode::from_ticks(timecode),
-            SdkTimestamp::from_sdk(timestamp),
+            ReceivedTimestamp::from_sdk(timestamp),
             frame.frame_metadata(),
         );
         Ok(extras)
@@ -804,7 +804,7 @@ impl FrameExtras {
     fn copy_received(
         &mut self,
         timecode: Timecode,
-        timestamp: Option<SdkTimestamp>,
+        timestamp: Option<ReceivedTimestamp>,
         metadata: FrameMetadataRef<'_>,
     ) {
         self.metadata.copy_from(metadata);
@@ -818,7 +818,7 @@ impl FrameExtras {
     }
 
     /// The timestamp of a received frame.
-    pub(crate) fn timestamp(&self) -> Option<SdkTimestamp> {
+    pub(crate) fn timestamp(&self) -> Option<ReceivedTimestamp> {
         self.timestamp
     }
 
@@ -862,7 +862,7 @@ impl FrameExtras {
     fn to_sdk(&self) -> (i64, i64, *const c_char) {
         (
             self.timecode.ticks(),
-            SdkTimestamp::to_sdk(self.timestamp),
+            ReceivedTimestamp::to_sdk(self.timestamp),
             self.metadata.view().as_ptr(),
         )
     }
@@ -2754,7 +2754,7 @@ mod tests {
         };
         let received = unsafe { copy_video_packet(&delivered) }.unwrap();
         assert_eq!(received.timecode(), Timecode::from_ticks(17));
-        assert_eq!(received.timestamp(), Some(SdkTimestamp::from_ticks(4242)));
+        assert_eq!(received.timestamp(), ReceivedTimestamp::from_sdk(4242));
         // Relaying a received frame hands the SDK what it delivered.
         assert_eq!(
             CompressedFrame::<VideoPacketFormat>::try_from(received.clone())
@@ -2779,7 +2779,7 @@ mod tests {
         };
         let received = unsafe { copy_audio_packet(&delivered) }.unwrap();
         assert_eq!(received.timecode(), Timecode::from_ticks(-5));
-        assert_eq!(received.timestamp(), Some(SdkTimestamp::from_ticks(99)));
+        assert_eq!(received.timestamp(), ReceivedTimestamp::from_sdk(99));
     }
 
     /// A clone owns its own copy of the bytes, so the SDK's writes to one

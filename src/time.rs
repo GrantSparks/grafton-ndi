@@ -1,6 +1,6 @@
 //! Time values carried by frames and read from the selected runtime's clock.
 //!
-//! Both count 100-nanosecond ticks, the SDK's unit for time.
+//! These values count 100-nanosecond ticks, the SDK's unit for time.
 
 use crate::{
     sys::bindings::{NDIlib_recv_timestamp_undefined, NDIlib_send_timecode_synthesize},
@@ -53,9 +53,8 @@ impl Default for Timecode {
 
 /// A reading of the SDK's clock, in 100-nanosecond ticks since the Unix epoch.
 ///
-/// A received frame's timestamp is the moment its sender submitted it, as
-/// the SDK recorded it; [`Ndi::timestamp`] reads the clock now. Sendable
-/// frames have no timestamp: the SDK generates one when it sends a frame.
+/// [`Ndi::timestamp`] reads the clock. Media accessors return
+/// [`ReceivedTimestamp`], whose tick origin depends on the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SdkTimestamp(i64);
 
@@ -67,6 +66,31 @@ impl SdkTimestamp {
     }
 
     /// The timestamp in 100-nanosecond ticks since the Unix epoch.
+    #[must_use]
+    pub const fn ticks(self) -> i64 {
+        self.0
+    }
+}
+
+/// A received media timestamp in signed 100-nanosecond ticks.
+///
+/// The source and capture path determine the tick origin. For example, on
+/// Linux x86-64 with NDI Advanced and the File library 6.4.0.2, seeking a
+/// single-track file produced a video frame whose timestamp matched the
+/// file-relative PTS in the player's `FirstFrame` event.
+///
+/// An undefined timestamp is represented as `None` by media accessors.
+/// FrameSync and AV-sync audio also treat zero as undefined.
+///
+/// Order these values only when they share a tick origin. Use [`Self::ticks`]
+/// and interpret the ticks for the specific source before comparing them
+/// with an [`SdkTimestamp`].
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReceivedTimestamp(i64);
+
+impl ReceivedTimestamp {
+    /// The raw signed timestamp in 100-nanosecond ticks from the source.
     #[must_use]
     pub const fn ticks(self) -> i64 {
         self.0
@@ -109,15 +133,26 @@ mod tests {
     #[test]
     fn received_timestamps_map_the_undefined_sentinel_to_none() {
         assert_eq!(
-            SdkTimestamp::from_sdk(NDIlib_recv_timestamp_undefined),
+            ReceivedTimestamp::from_sdk(NDIlib_recv_timestamp_undefined),
             None
         );
         for ticks in [i64::MIN, -1, 0, 1, i64::MAX - 1] {
-            let timestamp = SdkTimestamp::from_sdk(ticks);
-            assert_eq!(timestamp, Some(SdkTimestamp::from_ticks(ticks)));
-            assert_eq!(SdkTimestamp::to_sdk(timestamp), ticks);
+            let timestamp = ReceivedTimestamp::from_sdk(ticks);
+            assert_eq!(timestamp.map(ReceivedTimestamp::ticks), Some(ticks));
+            assert_eq!(ReceivedTimestamp::to_sdk(timestamp), ticks);
         }
-        assert_eq!(SdkTimestamp::to_sdk(None), NDIlib_recv_timestamp_undefined);
+        assert_eq!(
+            ReceivedTimestamp::to_sdk(None),
+            NDIlib_recv_timestamp_undefined
+        );
+        assert_eq!(
+            std::mem::size_of::<ReceivedTimestamp>(),
+            std::mem::size_of::<SdkTimestamp>()
+        );
+    }
+
+    #[test]
+    fn editorial_timecode_defaults_to_synthesize() {
         assert_eq!(Timecode::SYNTHESIZE.ticks(), i64::MAX);
         assert_eq!(Timecode::default(), Timecode::SYNTHESIZE);
     }

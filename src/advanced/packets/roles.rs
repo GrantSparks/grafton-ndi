@@ -328,8 +328,8 @@ impl<F: PacketFormat> CompressedFrame<F> {
         self.format
     }
 
-    /// When the original sender submitted the frame, if supplied at capture.
-    pub fn timestamp(&self) -> Option<SdkTimestamp> {
+    /// Source-dependent timestamp preserved when relaying a received frame.
+    pub fn timestamp(&self) -> Option<ReceivedTimestamp> {
         self.extras.timestamp()
     }
 
@@ -422,8 +422,8 @@ impl<F: PacketFormat> ReceivedPacket<F> {
         self.format
     }
 
-    /// The sender's submission time, when supplied by the SDK.
-    pub fn timestamp(&self) -> Option<SdkTimestamp> {
+    /// Source-dependent timestamp supplied by the SDK at capture.
+    pub fn timestamp(&self) -> Option<ReceivedTimestamp> {
         self.extras.timestamp()
     }
 
@@ -555,8 +555,8 @@ impl<'rx, F: PacketFormat> CompressedRef<'rx, F> {
         F::timecode(self.frame.descriptor())
     }
 
-    /// The sender's submission time, when supplied by the SDK.
-    pub fn timestamp(&self) -> Option<SdkTimestamp> {
+    /// Source-dependent timestamp supplied by the SDK at capture.
+    pub fn timestamp(&self) -> Option<ReceivedTimestamp> {
         self.frame.timestamp()
     }
 
@@ -814,7 +814,7 @@ fn debug_packet(
     format: impl Debug,
     bytes: usize,
     timecode: Timecode,
-    timestamp: Option<SdkTimestamp>,
+    timestamp: Option<ReceivedTimestamp>,
     metadata_status: FrameMetadataStatus,
 ) -> fmt::Result {
     f.debug_struct(name)

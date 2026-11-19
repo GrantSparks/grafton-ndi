@@ -28,7 +28,7 @@ unsafe impl AudioParts for BorrowedAudioFrame<'_> {
     fn audio_timecode(&self) -> Timecode {
         self.timecode
     }
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+    fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> {
         None
     }
     fn samples(&self) -> *const f32 {
@@ -186,7 +186,7 @@ audio_accessors! {
     debug("BorrowedAudioFrame", "data (samples)" = sample_count);
     timecode {}
     timestamp {
-        /// Application input has no SDK submission timestamp.
+        /// Application input has no received timestamp.
     }
     channel_stride_bytes {
         /// Includes any configured inter-channel padding.
@@ -268,7 +268,7 @@ unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
     /// A frame built for sending carries no timestamp; [`Self::to_raw`]
     /// sends none.
     #[inline]
-    fn sdk_timestamp(&self) -> Option<crate::SdkTimestamp> {
+    fn sdk_timestamp(&self) -> Option<crate::ReceivedTimestamp> {
         None
     }
 
@@ -293,7 +293,7 @@ crate::frames::video_accessors! {
         /// can be read in place.
     }
     timestamp {
-        /// Application input has no SDK submission timestamp.
+        /// Application input has no received timestamp.
     }
     data(self -> Option<&[u8]>) {
         /// Contiguous active pixels, or `None` when row or plane padding separates

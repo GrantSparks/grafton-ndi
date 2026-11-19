@@ -42,9 +42,9 @@ Every options type implements `Debug + Clone + PartialEq`, and implements
 Value constructors validate their input once. Later use does not repeat the
 same validation or introduce the same failure path. Signatures use the
 validated type for each concept: `FrameRate`, `PictureAspectRatio`, `FourCc`,
-`Timecode`, `SdkTimestamp` and `Source`. Code mappings implement `From` and
-`TryFrom`. SDK-domain counts and dimensions use `u32`; indices and storage
-sizes use `usize`.
+`Timecode`, `SdkTimestamp`, `ReceivedTimestamp` and `Source`. Code mappings
+implement `From` and `TryFrom`. SDK-domain counts and dimensions use `u32`;
+indices and storage sizes use `usize`.
 
 ## Capture
 

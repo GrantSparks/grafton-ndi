@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     advanced::{EnvelopeCodec, PacketEnvelope, VideoPacketFormat},
-    FrameMetadataStatus, SdkTimestamp,
+    FrameMetadataStatus, ReceivedTimestamp,
 };
 use std::{
     ptr,
@@ -260,6 +260,7 @@ fn borrowed_packets_normalize_timestamps_through_their_held_capture() {
     for (ticks, expected) in [
         (NDIlib_recv_timestamp_undefined, None),
         (0, Some(0)),
+        (-123, Some(-123)),
         (123, Some(123)),
     ] {
         let raw_video = NDIlib_video_frame_v2_t {
@@ -280,15 +281,27 @@ fn borrowed_packets_normalize_timestamps_through_their_held_capture() {
             Guard::with_test_free(ptr::null_mut(), raw_audio, |_, _| {})
         })
         .unwrap();
-        assert_eq!(video_ref.timestamp().map(SdkTimestamp::ticks), expected);
-        assert_eq!(audio_ref.timestamp().map(SdkTimestamp::ticks), expected);
         assert_eq!(
-            video_ref.to_owned().timestamp().map(SdkTimestamp::ticks),
+            video_ref.timestamp().map(ReceivedTimestamp::ticks),
             expected
         );
         assert_eq!(
-            audio_ref.to_owned().timestamp().map(SdkTimestamp::ticks),
+            audio_ref.timestamp().map(ReceivedTimestamp::ticks),
             expected
         );
+        let owned_video = video_ref.to_owned();
+        let owned_audio = audio_ref.to_owned();
+        assert_eq!(
+            owned_video.timestamp().map(ReceivedTimestamp::ticks),
+            expected
+        );
+        assert_eq!(
+            owned_audio.timestamp().map(ReceivedTimestamp::ticks),
+            expected
+        );
+        let mut relay_video = CompressedFrame::<VideoPacketFormat>::try_from(owned_video).unwrap();
+        let mut relay_audio = CompressedFrame::<AudioPacketFormat>::try_from(owned_audio).unwrap();
+        assert_eq!(relay_video.raw().timestamp, ticks);
+        assert_eq!(relay_audio.raw().timestamp, ticks);
     }
 }

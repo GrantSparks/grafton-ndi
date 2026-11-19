@@ -1,6 +1,6 @@
 use grafton_ndi::{
     AudioChannels, AudioFormat, AudioFrame, AudioSource, ColorInfo, FrameMetadataStatus, FrameRate,
-    PictureAspectRatio, PixelFormat, Result, ScanType, SdkTimestamp, Timecode, VideoFrame,
+    PictureAspectRatio, PixelFormat, Result, ScanType, ReceivedTimestamp, Timecode, VideoFrame,
     VideoPlane, VideoPlanes, VideoSource,
 };
 
@@ -30,7 +30,7 @@ impl VideoSource for Unchecked {
     fn timecode(&self) -> Timecode {
         unreachable!()
     }
-    fn timestamp(&self) -> Option<SdkTimestamp> {
+    fn timestamp(&self) -> Option<ReceivedTimestamp> {
         unreachable!()
     }
     fn line_stride_bytes(&self) -> usize {
@@ -109,7 +109,7 @@ impl AudioSource for Unchecked {
     fn timecode(&self) -> Timecode {
         unreachable!()
     }
-    fn timestamp(&self) -> Option<SdkTimestamp> {
+    fn timestamp(&self) -> Option<ReceivedTimestamp> {
         unreachable!()
     }
     fn metadata(&self) -> Option<&str> {

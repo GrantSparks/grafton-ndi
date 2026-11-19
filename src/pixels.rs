@@ -7,7 +7,7 @@ use crate::{
         AudioChannels, AudioParts, FrameMetadataRef, Initialized, PackedAudioLayout,
         PackedVideoLayout, ValidatedVideoLayout, VideoHeader, VideoParts, VideoPlanes, VideoTiming,
     },
-    Rejected, Result, ScanType, SdkTimestamp,
+    ReceivedTimestamp, Rejected, Result, ScanType,
 };
 
 mod sealed {
@@ -416,7 +416,7 @@ pub(crate) struct PackedVideo<'a> {
     storage: &'a VideoStorage,
     timing: VideoTiming,
     metadata: FrameMetadataRef<'a>,
-    timestamp: Option<SdkTimestamp>,
+    timestamp: Option<ReceivedTimestamp>,
 }
 // SAFETY: private fields bind the pixels to their storage's own layout and
 // initialized zero tail. Its timing is copied and its metadata remains borrowed.
@@ -433,7 +433,7 @@ unsafe impl VideoParts for PackedVideo<'_> {
     fn frame_metadata(&self) -> FrameMetadataRef<'_> {
         self.metadata
     }
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+    fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> {
         self.timestamp
     }
     fn initialized(&self) -> Initialized {

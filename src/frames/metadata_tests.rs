@@ -546,8 +546,54 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
 }
 
 #[test]
+fn received_video_timestamps_round_trip_through_native_descriptors() {
+    fn check<S>(ticks: i64)
+    where
+        S: VideoTest,
+        S::Instance: Default,
+    {
+        let mut pixels = [37; 32];
+        let raw = NDIlib_video_frame_v2_t {
+            xres: 4,
+            yres: 2,
+            FourCC: FourCc::from(PixelFormat::Bgra).raw(),
+            frame_rate_N: 30,
+            frame_rate_D: 1,
+            p_data: pixels.as_mut_ptr(),
+            timestamp: ticks,
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: 16,
+            },
+            ..Default::default()
+        };
+        // SAFETY: the guard borrows these live initialized pixels; release
+        // only updates the counter and does not free their borrowed storage.
+        let frame = unsafe {
+            S::wrap(Guard::with_test_free(
+                S::Instance::default(),
+                raw,
+                count_free,
+            ))
+            .unwrap()
+        };
+        let expected = (ticks != NDIlib_recv_timestamp_undefined).then_some(ticks);
+        assert_eq!(frame.timestamp().map(ReceivedTimestamp::ticks), expected);
+        assert_eq!(frame.video_descriptor().timestamp, ticks);
+        let mut owned = frame.owned_copy();
+        assert_eq!(owned.timestamp().map(ReceivedTimestamp::ticks), expected);
+        assert_eq!(owned.video_descriptor().timestamp, ticks);
+        frame.copy_into_owned(&mut owned);
+        assert_eq!(owned.video_descriptor().timestamp, ticks);
+    }
+    for ticks in [0, -123, 123_456, NDIlib_recv_timestamp_undefined] {
+        check::<VideoKind>(ticks);
+        check::<FrameSyncVideoFree>(ticks);
+    }
+}
+
+#[test]
 fn timestamp_normalization_uses_audio_capture_family_marker() {
-    fn check<S>(ticks: i64, expected: Option<SdkTimestamp>)
+    fn check<S>(ticks: i64, expected: Option<i64>)
     where
         S: AudioTest,
         S::Instance: Default,
@@ -576,23 +622,20 @@ fn timestamp_normalization_uses_audio_capture_family_marker() {
             ))
             .unwrap()
         };
-        assert_eq!(frame.sdk_timestamp(), expected);
+        let descriptor_ticks = expected.unwrap_or(NDIlib_recv_timestamp_undefined);
+        assert_eq!(frame.timestamp().map(ReceivedTimestamp::ticks), expected);
+        assert_eq!(frame.audio_descriptor().timestamp, descriptor_ticks);
         let mut owned = frame.owned_copy();
-        assert_eq!(owned.timestamp(), expected);
+        assert_eq!(owned.timestamp().map(ReceivedTimestamp::ticks), expected);
+        assert_eq!(owned.audio_descriptor().timestamp, descriptor_ticks);
         assert_eq!(owned.timecode(), Timecode::SYNTHESIZE);
         frame.copy_into_owned(&mut owned);
-        assert_eq!(owned.timestamp(), expected);
+        assert_eq!(owned.audio_descriptor().timestamp, descriptor_ticks);
     }
-    for ticks in [0, NDIlib_recv_timestamp_undefined, 123_456] {
-        check::<AudioKind>(ticks, SdkTimestamp::from_sdk(ticks));
-        check::<FrameSyncAudioFree>(
-            ticks,
-            if ticks == 0 {
-                None
-            } else {
-                SdkTimestamp::from_sdk(ticks)
-            },
-        );
+    for ticks in [0, -123, 123_456, NDIlib_recv_timestamp_undefined] {
+        let expected = (ticks != NDIlib_recv_timestamp_undefined).then_some(ticks);
+        check::<AudioKind>(ticks, expected);
+        check::<FrameSyncAudioFree>(ticks, expected.filter(|&ticks| ticks != 0));
     }
 }
 

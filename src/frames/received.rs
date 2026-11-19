@@ -162,7 +162,7 @@ pub(crate) trait SdkDescriptor {
     /// The descriptor's metadata text pointer, null for none.
     fn metadata_pointer(&self) -> *const c_char;
 
-    /// Standalone metadata has no SDK submission timestamp.
+    /// Standalone metadata has no received timestamp field.
     fn timestamp(&self) -> Option<i64> {
         None
     }
@@ -240,8 +240,8 @@ pub(crate) trait HoldsDescriptor {
     }
 
     /// Normalize a descriptor's timestamp using its capture family's markers.
-    fn normalize_timestamp(&self, ticks: i64) -> Option<SdkTimestamp> {
-        SdkTimestamp::from_sdk(ticks)
+    fn normalize_timestamp(&self, ticks: i64) -> Option<ReceivedTimestamp> {
+        ReceivedTimestamp::from_sdk(ticks)
     }
 }
 
@@ -260,11 +260,11 @@ where
         unsafe { S::scan_metadata(self.frame()) }
     }
 
-    fn normalize_timestamp(&self, ticks: i64) -> Option<SdkTimestamp> {
+    fn normalize_timestamp(&self, ticks: i64) -> Option<ReceivedTimestamp> {
         if ticks == S::TIMESTAMP_UNDEFINED {
             None
         } else {
-            SdkTimestamp::from_sdk(ticks)
+            ReceivedTimestamp::from_sdk(ticks)
         }
     }
 }
@@ -391,7 +391,7 @@ impl<F: HoldsDescriptor, V> ValidatedFrame<F, V> {
     }
 
     /// Normalize the held descriptor's timestamp for its capture family.
-    pub(crate) fn timestamp(&self) -> Option<SdkTimestamp> {
+    pub(crate) fn timestamp(&self) -> Option<ReceivedTimestamp> {
         self.frame
             .normalize_timestamp(self.descriptor().timestamp()?)
     }
@@ -617,7 +617,7 @@ unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_video_frame_v2_t>> VideoParts
     }
 
     #[inline]
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+    fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> {
         self.timestamp()
     }
 }
@@ -638,7 +638,7 @@ unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> AudioParts
         Timecode::from_ticks(self.descriptor().timecode)
     }
     #[inline]
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+    fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> {
         self.timestamp()
     }
     #[inline]

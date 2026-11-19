@@ -314,8 +314,8 @@ retains the historical measurements and their limits.
 `AvSync` matches audio to a captured video's timestamp. It owns the receiver
 and reserves audio capture; capture video through `sync.receiver()`, then pass
 it to `synchronize` as an `AvSyncVideo`. `AvSyncVideo::new` accepts a borrowed
-capture or an owned copy of one, and returns `None` for a frame without its
-sender's timestamp, such as one the application built. Matching reads the
+capture or an owned copy of one, and returns `None` for a frame without a
+received timestamp, such as one the application built. Matching reads the
 video's timing independently of send-format capabilities: owned and borrowed
 planar 4:4:4 video can both synchronize on older Advanced runtimes.
 `queued_audio` takes
@@ -332,8 +332,8 @@ Send or convert them in place, call `to_owned()` to retain a copy, or `copy_into
 to reuse an existing `AudioFrame` without allocating when its capacity suffices.
 The owned methods delegate to this same capture path. Borrowed audio stays on
 its capture thread, may coexist with later results, and keeps the synchronizer
-borrowed until released. AV-sync's zero unknown timestamp reads as `None`;
-matched sender timestamps read as `Some`.
+borrowed until released. The AV-sync audio accessor returns `None` for the
+zero unknown marker and `Some(ReceivedTimestamp)` for a defined timestamp.
 
 `AvSync` is `Send` but not `Sync`; synchronization runs on one thread at a
 time. Its shared receiver permits concurrent compatible capture/control work;

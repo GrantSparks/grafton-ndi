@@ -119,6 +119,7 @@ fn crate_root_types_keep_their_auto_traits() {
         RawCapture: Send, Sync, UnwindSafe, RefUnwindSafe;
         RawSend: Send, Sync, UnwindSafe, RefUnwindSafe;
         RawVideo<'static>: Send, UnwindSafe, RefUnwindSafe;
+        ReceivedTimestamp: Send, Sync, UnwindSafe, RefUnwindSafe;
         Receiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         Receiver<FrameSyncAttached>: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceiverBandwidth: Send, Sync, UnwindSafe, RefUnwindSafe;
