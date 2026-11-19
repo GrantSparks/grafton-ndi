@@ -387,6 +387,11 @@ def obligations(msrv, features, miri_groups):
 
     table['rust.yml', 'verified-tree', 'Verify the completed pull request run'] = Obligation(
         'python3 ci/verified_tree.py reuse',
+        condition="github.event_name == 'push' && github.ref == 'refs/heads/main'",
+    )
+    table['rust.yml', 'verified-tree', 'Validate the tag and look up full CI for its tree'] = Obligation(
+        'python3 ci/release.py --prepare',
+        condition="github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'",
     )
 
     # rust.yml, lint
@@ -588,11 +593,24 @@ def obligations(msrv, features, miri_groups):
         if [ "$SDK_MATRIX_NAME" = 'linux-x64 standard-6.3.2' ] || [ "$GRAFTON_NDI_RECEIVER_DIAGNOSTICS" = 1 ]; then
           ci/ubuntu-primary-archive.sh
         fi
-        sudo apt-get update
-        sudo apt-get install --yes --no-install-recommends bubblewrap libavahi-client3
-        if [ "$GRAFTON_NDI_RECEIVER_DIAGNOSTICS" = 1 ]; then
-          sudo apt-get install --yes --no-install-recommends gdb
+        packages=(bubblewrap libavahi-client3)
+        if [ "$TARGET" = 'i686-unknown-linux-gnu' ]; then
+          sudo dpkg --add-architecture i386
+          packages+=(gcc-multilib libc6-dev:i386 libavahi-client3:i386)
         fi
+        if [ "$GRAFTON_NDI_RECEIVER_DIAGNOSTICS" = 1 ]; then
+          packages+=(gdb)
+        fi
+        for attempt in 1 2 3; do
+          if sudo apt-get -o Acquire::By-Hash=true -o APT::Update::Error-Mode=any update; then
+            break
+          fi
+          if [ "$attempt" = 3 ]; then
+            exit 1
+          fi
+          sleep "$((attempt * 4))"
+        done
+        sudo apt-get install --yes --no-install-recommends "${packages[@]}"
         if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         fi
@@ -605,14 +623,6 @@ def obligations(msrv, features, miri_groups):
         echo 'LIBCLANG_PATH=/usr/lib/llvm-19/lib' >> "$GITHUB_ENV"
         ''',
         condition="runner.os == 'Linux' && (contains(matrix.package, 'advanced') || matrix.bindings)",
-    )
-    table['rust.yml', 'sdk', '32-bit Linux linker and runtime dependencies'] = Obligation(
-        r'''
-        sudo dpkg --add-architecture i386
-        sudo apt-get update
-        sudo apt-get install --yes --no-install-recommends gcc-multilib libc6-dev:i386 libavahi-client3:i386
-        ''',
-        condition="matrix.target == 'i686-unknown-linux-gnu'",
     )
     table['rust.yml', 'sdk', 'Windows libclang'] = Obligation(
         r'''
@@ -810,11 +820,6 @@ def obligations(msrv, features, miri_groups):
         fi
         echo 'deploy=true' >> "$GITHUB_OUTPUT"
         ''',
-    )
-
-    # publish.yml, release
-    table['publish.yml', 'release', 'Validate the tag and look up full CI for its tree'] = Obligation(
-        'python3 ci/release.py --prepare',
     )
 
     # publish.yml, verify

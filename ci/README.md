@@ -25,9 +25,7 @@ the deployment job publishes it only after `required-ci` succeeds. Pull
 requests, manual CI runs and release-tag runs validate docs without publishing.
 Pages write permissions are confined to the deployment job, which runs no
 repository scripts. A run skips deployment when its commit is no longer the
-tip of `main`. The release caller forwards those permissions for reusable
-workflow validation when full CI is needed. Its event keeps the Pages job
-disabled.
+tip of `main`. Release events keep the Pages job disabled.
 
 A push to `main` can reuse full validation from a successful same-repository
 pull request. CI checks the tested tree against the new `main` tree and verifies
@@ -299,19 +297,24 @@ requires a byte-for-byte match before it requests the crates.io token.
 
 For a transient failure, rerun the failed jobs. Reruns use the workflow from
 the original run. To retry an existing tag with the current workflow, dispatch
-`publish.yml` from `main` and enter the tag. Both triggers use the same
-validation and package steps.
+`rust.yml` from `main` and enter the tag. Both triggers use the same
+validation and package steps. Leave the tag blank for a normal manual CI run.
 
 ```sh
-gh workflow run publish.yml --ref main -f tag=v3.0.0
+gh workflow run rust.yml --ref main -f tag=v3.0.0
 ```
 
 ### Release controls
 
-The crates.io trusted publisher binds this repository, `publish.yml` and the
-`crates-io` environment. Give that environment custom deployment policies
-for `v*` tags and the `main` branch, which is used for manual retries.
-GitHub applies these policies before the publishing job can get its identity.
+The crates.io trusted publisher registers this repository and `rust.yml`.
+GitHub supplies that filename as the caller of the package and publishing
+jobs in `publish.yml`. Keep `rust.yml` as the entry point when changing
+those jobs.
+
+The publishing job uses the `crates-io` GitHub environment. Repository
+owners can give it custom deployment policies for `v*` tags and the `main`
+branch used for manual retries. GitHub applies configured policies before
+the publishing job can get its identity.
 
 Write access to the release refs carries publishing authority. Review
 repository access when adding maintainers or automation. Tag rulesets can

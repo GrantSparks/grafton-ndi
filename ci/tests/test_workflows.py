@@ -27,10 +27,9 @@ WORKFLOWS = ROOT / '.github' / 'workflows'
 READ_ONLY = {'contents': 'read'}
 # Only deployment jobs and the reusable-workflow caller may request write permissions.
 JOB_PERMISSIONS = {
-    ('publish.yml', 'release'): {'contents': 'read', 'actions': 'read', 'pull-requests': 'read'},
-    ('publish.yml', 'ci'): {'contents': 'read', 'actions': 'read', 'pull-requests': 'read', 'pages': 'write', 'id-token': 'write'},
     ('publish.yml', 'publish'): {'contents': 'read', 'id-token': 'write'},
     ('rust.yml', 'verified-tree'): {'contents': 'read', 'actions': 'read', 'pull-requests': 'read'},
+    ('rust.yml', 'publish-release'): {'contents': 'read', 'id-token': 'write'},
     ('rust.yml', 'deploy-docs'): {'contents': 'read', 'pages': 'write', 'id-token': 'write'},
 }
 RECEIVER_CONFIGURATIONS = [
@@ -49,9 +48,8 @@ PASSED_SECRETS = {name: f'${{{{ secrets.{name} }}}}' for name in ('NDI_SDK_SOURC
 # Every place where the word `secrets` may occur, as a key or inside any scalar.
 SECRET_USES = {
     'receiver-diagnostics.yml': {f'jobs.probe.steps[Provision the diagnostic SDK].env.{name}' for name in PASSED_SECRETS},
-    'rust.yml': {'on.workflow_call.secrets (key)', *(f'jobs.sdk.steps[Provision the SDK].env.{name}'
-                                                    for name in PASSED_SECRETS)},
-    'publish.yml': {'jobs.ci.secrets (key)', *(f'jobs.ci.secrets.{name}' for name in PASSED_SECRETS)},
+    'rust.yml': {f'jobs.sdk.steps[Provision the SDK].env.{name}' for name in PASSED_SECRETS},
+    'publish.yml': set(),
 }
 # Where the secrets exist: not in pull requests from forks, and not in runs that Dependabot starts.
 SECRETS_AVAILABLE = ("github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || "
@@ -60,30 +58,37 @@ REUSE_ALLOWED = ("github.event_name == 'push' && github.repository == 'GrantSpar
                  "github.ref == 'refs/heads/main' && vars.NDI_CI_RELEASED == 'true'")
 FULL_REQUIRED = "needs.verified-tree.outputs.run_id == ''"
 FULL_EVENT = "(github.event_name != 'pull_request' || !github.event.pull_request.draft)"
-FULL_CONDITION = f"${{{{ !cancelled() && {FULL_EVENT} && {FULL_REQUIRED} }}}}"
-FULL_GATE = f"${{{{ always() && {FULL_EVENT} }}}}"
+VERIFIED_TREE_AVAILABLE = "needs.verified-tree.result != 'failure'"
+RELEASE_REQUIRES_CI = f"(needs.verified-tree.outputs.release_commit == '' || {FULL_REQUIRED})"
+FULL_CONDITION = f"${{{{ !cancelled() && {VERIFIED_TREE_AVAILABLE} && {FULL_EVENT} && {FULL_REQUIRED} }}}}"
+FULL_GATE = f"${{{{ always() && {FULL_EVENT} && {RELEASE_REQUIRES_CI} }}}}"
 DRAFT_CHECK_NAME = "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-ci' || 'lint' }}"
 PR_EVENTS = ['opened', 'synchronize', 'reopened', 'ready_for_review', 'converted_to_draft']
 PUBLISH_PROOF = ("github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == "
                  "github.repository && needs.sdk.result == 'success'")
-RELEASE_COMMIT = '${{ needs.release.outputs.commit }}'
-RELEASE_VERSION = '${{ needs.release.outputs.version }}'
+RELEASE_COMMIT = '${{ needs.verified-tree.outputs.release_commit }}'
+RELEASE_VERSION = '${{ needs.verified-tree.outputs.release_version }}'
 RELEASE_TAG = '${{ inputs.tag || github.ref_name }}'
-RELEASE_CI_CHECKOUT = "${{ inputs.release_commit || '' }}"
+RELEASE_CI_CHECKOUT = "${{ needs.verified-tree.outputs.release_commit || '' }}"
 JOB_CONDITIONS = {
     'receiver-diagnostics.yml': {'probe': RECEIVER_TRUST},
-    'rust.yml': {'verified-tree': REUSE_ALLOWED,
-                 **dict.fromkeys(('test', 'cross', 'hx-pictures', 'miri'), FULL_CONDITION),
-                 'sdk': (f"!cancelled() && needs.hx-pictures.result == 'success' && {FULL_REQUIRED} && "
-                         f"vars.NDI_CI_RELEASED == 'true' && {SECRETS_AVAILABLE}"), 'required-ci': FULL_GATE, 'deploy-docs': "${{ !cancelled() && needs.required-ci.result == 'success' && github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' }}"},
-    'publish.yml': {
-        'release': ("github.repository == 'GrantSparks/grafton-ndi' && (github.event_name == 'push' || "
-                    "(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))"),
-        'ci': "needs.release.outputs.run_id == ''",
-        'verify': ("${{ !cancelled() && needs.release.result == 'success' && (needs.ci.result == 'success' || "
-                   "(needs.ci.result == 'skipped' && needs.release.outputs.run_id != '')) }}"),
-        'publish': "${{ !cancelled() && needs.release.result == 'success' && needs.verify.result == 'success' }}",
+    'rust.yml': {
+        'verified-tree': (
+            "github.repository == 'GrantSparks/grafton-ndi' && ((github.event_name == 'push' && "
+            "(github.ref_type == 'tag' || (github.ref == 'refs/heads/main' && vars.NDI_CI_RELEASED == 'true'))) || "
+            "(github.event_name == 'workflow_dispatch' && inputs.tag != ''))"),
+        'lint': f"${{{{ !cancelled() && {VERIFIED_TREE_AVAILABLE} && {RELEASE_REQUIRES_CI} }}}}",
+        **dict.fromkeys(('test', 'cross', 'hx-pictures', 'miri'), FULL_CONDITION),
+        'sdk': (f"!cancelled() && needs.hx-pictures.result == 'success' && {FULL_REQUIRED} && "
+                f"vars.NDI_CI_RELEASED == 'true' && {SECRETS_AVAILABLE}"),
+        'required-ci': FULL_GATE,
+        'deploy-docs': "${{ !cancelled() && needs.required-ci.result == 'success' && github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' }}",
+        'publish-release': (
+            "${{ !cancelled() && needs.verified-tree.result == 'success' && "
+            "needs.verified-tree.outputs.release_commit != '' && (needs.required-ci.result == 'success' || "
+            "(needs.required-ci.result == 'skipped' && needs.verified-tree.outputs.run_id != '')) }}"),
     },
+    'publish.yml': {},
 }
 TRIGGERS = {
     'receiver-diagnostics.yml': {
@@ -93,14 +98,18 @@ TRIGGERS = {
             'required': 'true', 'type': 'choice', 'options': RECEIVER_CONFIGURATIONS,
         }}},
     },
-    'rust.yml': {'push': {'branches': ['main']}, 'pull_request': {'branches': ['main'], 'types': PR_EVENTS}, 'workflow_dispatch': None,
-                 'workflow_call': {
-                     'inputs': {'release_commit': {'description': 'The validated release commit to test', 'type': 'string'}},
-                     'secrets': {name: {'required': 'false'} for name in PASSED_SECRETS},
-                 }},
-    'publish.yml': {'push': {'tags': ['v*']}, 'workflow_dispatch': {'inputs': {'tag': {
-        'description': 'Existing release tag', 'required': 'true', 'type': 'string',
-    }}}},
+    'rust.yml': {
+        'push': {'branches': ['main'], 'tags': ['v*']},
+        'pull_request': {'branches': ['main'], 'types': PR_EVENTS},
+        'workflow_dispatch': {'inputs': {'tag': {
+            'description': 'Existing release tag, or leave blank to run CI',
+            'required': 'false', 'type': 'string',
+        }}},
+    },
+    'publish.yml': {'workflow_call': {'inputs': {
+        'commit': {'description': 'Validated, tested release commit', 'required': 'true', 'type': 'string'},
+        'version': {'description': 'Crate version from the tagged commit', 'required': 'true', 'type': 'string'},
+    }}},
 }
 # The actions each job uses, in order. The sdk job has SDK files on disk, so it has no
 # cache and only downloads the test pictures; the publish job holds the registry identity.
@@ -115,16 +124,15 @@ ACTIONS = {
         'sdk': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'actions/download-artifact'],
         'verified-tree': ['actions/checkout'],
         'required-ci': ['actions/checkout', 'actions/upload-artifact'],
+        'publish-release': './.github/workflows/publish.yml',
         'deploy-docs': ['actions/deploy-pages'],
     },
     'publish.yml': {
-        'release': ['actions/checkout'],
-        'ci': './.github/workflows/rust.yml',
         'verify': ['actions/checkout', 'dtolnay/rust-toolchain', 'actions/upload-artifact'],
         'publish': ['actions/checkout', 'rust-lang/crates-io-auth-action'],
     },
 }
-PUBLISH_NEEDS = {'release': None, 'ci': 'release', 'verify': ['release', 'ci'], 'publish': ['release', 'verify']}
+PUBLISH_NEEDS = {'verify': None, 'publish': 'verify'}
 OUTSIDE_THE_CHECKOUT = '${{ runner.temp }}'
 
 
@@ -199,7 +207,7 @@ def violations(texts):
             + differs('receiver-diagnostics.yml: probe runner',
                       parsed['receiver-diagnostics.yml']['jobs']['probe'].get('runs-on'), RECEIVER_PROBE_RUNNER)
             + differs('rust.yml: draft check name', parsed['rust.yml']['jobs']['lint'].get('name'), DRAFT_CHECK_NAME)
-            + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
+            + gate_violations(parsed['rust.yml']) + publish_violations(parsed['rust.yml'], parsed['publish.yml'])
             + docs_violations(parsed['rust.yml']) + memory_checker_violations(parsed['rust.yml'])
             + repeated_feature_violations(parsed['rust.yml'])
             + sdk_input_violations(parsed['rust.yml'])
@@ -559,9 +567,11 @@ def gate_violations(rust):
     record = steps.get('Record the fully tested pull request tree', {})
     upload = steps.get('Preserve the verified tree', {})
     lookup = jobs['verified-tree']
-    verify = lookup['steps'][-1]
+    lookup_steps = {step.get('id'): step for step in lookup['steps']}
+    lookup_checkout = next((step for step in lookup['steps']
+                            if step.get('uses', '').startswith('actions/checkout@')), {})
     found = []
-    for job in ('test', 'cross', 'hx-pictures', 'miri'):
+    for job in ('lint', 'test', 'cross', 'hx-pictures', 'miri'):
         found += differs(f'rust.yml: {job} waits for the verified tree decision', jobs[job].get('needs'), 'verified-tree')
     for job in ('lint', 'test', 'cross', 'hx-pictures', 'miri', 'sdk', 'required-ci'):
         checkout = next((step for step in jobs[job]['steps']
@@ -569,12 +579,19 @@ def gate_violations(rust):
         found += differs(f'rust.yml: {job} checks out the selected release commit when provided',
                          checkout.get('with', {}).get('ref'), RELEASE_CI_CHECKOUT)
     return (found + differs('rust.yml: jobs required-ci waits for', sorted(gate.get('needs') or []),
-                    sorted(set(jobs) - {'required-ci', 'deploy-docs'}))
+            sorted(set(jobs) - {'required-ci', 'deploy-docs', 'publish-release'}))
             + differs('rust.yml: the gate step', step.get('env'), {
                 'RESULTS': '${{ toJSON(needs) }}', 'SDK_EXPECTED': f'${{{{ {SECRETS_AVAILABLE} }}}}',
                 'REUSE_ALLOWED': f'${{{{ {REUSE_ALLOWED} }}}}'})
-            + differs('rust.yml: verifier output', lookup.get('outputs'), {'run_id': '${{ steps.lookup.outputs.run_id }}'})
-            + differs('rust.yml: verifier token', verify.get('env'), {'GH_TOKEN': '${{ github.token }}'})
+            + differs('rust.yml: tag selection uses checkout history', lookup_checkout.get('with'), {'fetch-depth': '0'})
+            + differs('rust.yml: verifier output', lookup.get('outputs'), {
+                'run_id': '${{ steps.release.outputs.run_id || steps.lookup.outputs.run_id }}',
+                'release_commit': '${{ steps.release.outputs.commit }}',
+                'release_version': '${{ steps.release.outputs.version }}',
+            })
+            + differs('rust.yml: verifier token', lookup_steps['lookup'].get('env'), {'GH_TOKEN': '${{ github.token }}'})
+            + differs('rust.yml: selected tag and verifier token', lookup_steps['release'].get('env'),
+                      {'RELEASE_TAG': RELEASE_TAG, 'GH_TOKEN': '${{ github.token }}'})
             + differs('rust.yml: record only a full PR result', record.get('if'), PUBLISH_PROOF)
             + differs('rust.yml: upload only a full PR result', upload.get('if'), PUBLISH_PROOF)
             + differs('rust.yml: verified tree upload', upload.get('with'), {
@@ -586,32 +603,24 @@ def gate_violations(rust):
                       [('Provision the SDK', PASSED_SECRETS)]))
 
 
-def publish_violations(publish):
+def publish_violations(rust, publish):
     """The job that holds the publishing identity runs nothing from the repository."""
     jobs = publish['jobs']
     job = jobs['publish']
-    release_checkout = next((step for step in jobs['release']['steps']
-                             if step.get('uses', '').startswith('actions/checkout@')), {})
-    selector = next((step for step in jobs['release']['steps']
-                     if step.get('name') == 'Validate the tag and look up full CI for its tree'), {})
+    caller = rust['jobs']['publish-release']
     scripts = [step for step in job['steps'] if 'run' in step]
     found = (differs('publish.yml: job order', {name: body.get('needs') for name, body in jobs.items()}, PUBLISH_NEEDS)
-             + differs('publish.yml: runs for the same tag share a concurrency group', publish.get('concurrency'),
-                       {'group': 'publish-' + RELEASE_TAG, 'cancel-in-progress': 'false'})
-             + differs('publish.yml: tag selection uses checkout history',
-                       release_checkout.get('with'), {'fetch-depth': '0'})
-             + differs('publish.yml: selected tag and verifier token', selector.get('env'),
-                       {'RELEASE_TAG': RELEASE_TAG, 'GH_TOKEN': '${{ github.token }}'})
-             + differs('publish.yml: release job outputs', jobs['release'].get('outputs'), {
-                 field: f'${{{{ steps.release.outputs.{field} }}}}' for field in ('commit', 'version', 'run_id')})
-             + differs('publish.yml: full CI uses the selected release commit', jobs['ci'].get('with'),
-                       {'release_commit': RELEASE_COMMIT})
-             + differs('publish.yml: secrets passed to CI', jobs['ci'].get('secrets'), PASSED_SECRETS)
+             + differs('rust.yml: release waits for tag and CI verification',
+                       caller.get('needs'), ['verified-tree', 'required-ci'])
+             + differs('rust.yml: publish uses the selected release commit', caller.get('with'),
+                       {'commit': RELEASE_COMMIT, 'version': RELEASE_VERSION})
+             + differs('rust.yml: runs for the same version share a concurrency group', caller.get('concurrency'),
+                       {'group': 'publish-' + RELEASE_VERSION, 'cancel-in-progress': 'false'})
              + differs('publish.yml: environment of publish', job.get('environment'), 'crates-io')
              + differs('publish.yml: package version to verify', jobs['verify'].get('env'),
-                       {'RELEASE_VERSION': RELEASE_VERSION})
+                       {'RELEASE_VERSION': '${{ inputs.version }}'})
              + differs('publish.yml: values publish takes from release and verify', job.get('env'), {
-                 'RELEASE_VERSION': RELEASE_VERSION,
+                 'RELEASE_VERSION': '${{ inputs.version }}',
                  'VERIFIED_SHA256': '${{ needs.verify.outputs.sha256 }}',
                  'VERIFIED_TOOLCHAIN': '${{ needs.verify.outputs.toolchain }}'})
              + differs('publish.yml: where the registry token goes',
@@ -621,7 +630,7 @@ def publish_violations(publish):
         checkout = next((step for step in jobs[name]['steps']
                          if step.get('uses', '').startswith('actions/checkout@')), {})
         found += differs(f'publish.yml: {name} checks out the selected release commit',
-                         checkout.get('with', {}).get('ref'), RELEASE_COMMIT)
+                         checkout.get('with', {}).get('ref'), '${{ inputs.commit }}')
     # Cargo reads configuration from the working directory upwards, so it must not start in the checkout.
     found += [f'publish.yml: step {step["name"]!r} of publish runs in the checkout'
               for step in scripts if step.get('working-directory') != OUTSIDE_THE_CHECKOUT]
@@ -660,8 +669,8 @@ WRONG_EDITS = (
     ('a secret to a second sdk step', 'rust.yml', '      - name: Vendored bindings are current\n',
      '      - name: Vendored bindings are current\n        env:\n'
      '          NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}\n', 'mention secrets'),
-    ('all secrets inherited by CI', 'publish.yml', '    secrets:\n      NDI_SDK_SOURCES_JSON: ${{ secrets.NDI_SDK_SOURCES_JSON }}\n'
-     '      NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}\n', '    secrets: inherit\n', 'mention secrets'),
+    ('all secrets inherited by publish', 'rust.yml', '    uses: ./.github/workflows/publish.yml\n',
+     '    uses: ./.github/workflows/publish.yml\n    secrets: inherit\n', 'mention secrets'),
     ('a job the gate does not wait for', 'rust.yml', '  required-ci:\n',
      '  docs:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n    steps:\n      - run: exit 1\n\n  required-ci:\n',
      'required-ci waits for'),
@@ -685,8 +694,10 @@ WRONG_EDITS = (
      '    runs-on: ${{ matrix.runner }}\n    continue-on-error: true\n', 'lets a failure pass'),
     ('continue-on-error on a test step', 'rust.yml', '      - name: Tests, all features\n',
      '      - name: Tests, all features\n        continue-on-error: true\n', 'lets a failure pass'),
-    ('a condition on lint', 'rust.yml', f'    name: {DRAFT_CHECK_NAME}\n',
-     f"    name: {DRAFT_CHECK_NAME}\n    if: github.event_name == 'push'\n",
+    ('lint skips pull requests', 'rust.yml',
+     "    if: >-\n      ${{ !cancelled() && needs.verified-tree.result != 'failure' &&\n"
+     "      (needs.verified-tree.outputs.release_commit == '' || needs.verified-tree.outputs.run_id == '') }}\n",
+     "    if: github.event_name == 'push'\n",
      'job conditions'),
     ('Dependabot expected to have secrets', 'rust.yml', "${{ github.actor != 'dependabot[bot]' &&\n            (", '${{ (',
      'the gate step'),
@@ -705,17 +716,18 @@ WRONG_EDITS = (
      '    name: cross\n    runs-on: ubuntu-24.04\n', 'no timeout'),
     ('pull_request_target', 'rust.yml', '  pull_request:\n    branches: [main]\n',
      '  pull_request_target:\n    branches: [main]\n', 'triggers'),
-    ('publishing from a branch push', 'publish.yml', "  push:\n    tags: ['v*']\n",
-     "  push:\n    tags: ['v*']\n    branches: [main]\n", 'triggers'),
+    ('publish.yml can be run as an entry point', 'publish.yml', 'on:\n  workflow_call:\n',
+     "on:\n  push:\n    tags: ['v*']\n  workflow_call:\n", 'triggers'),
     ('publish without the environment', 'publish.yml', '    environment: crates-io\n', '', 'environment of publish'),
-    ('publish without waiting for verify', 'publish.yml', '    name: publish to crates.io\n    needs: [release, verify]\n',
-     '    name: publish to crates.io\n    needs: release\n', 'job order'),
+    ('publish without waiting for verify', 'publish.yml', '    name: publish to crates.io\n    needs: verify\n',
+     '    name: publish to crates.io\n', 'job order'),
     ('publish rechecks out the tag', 'publish.yml',
-     '          ref: ${{ needs.release.outputs.commit }}\n      - name: Re-create the verified package\n',
-     '          ref: ${{ inputs.tag }}\n      - name: Re-create the verified package\n',
+     '          ref: ${{ inputs.commit }}\n      - name: Re-create the verified package\n',
+     '          ref: ${{ github.ref }}\n      - name: Re-create the verified package\n',
      'checks out the selected release commit'),
-    ('verification allows skipped CI without proof', 'publish.yml', "(needs.ci.result == 'skipped' && needs.release.outputs.run_id != '')) }}",
-     "needs.ci.result == 'skipped') }}", 'job conditions'),
+    ('publishing allows skipped CI without proof', 'rust.yml',
+     "(needs.required-ci.result == 'skipped' && needs.verified-tree.outputs.run_id != '')) }}",
+     "needs.required-ci.result == 'skipped') }}", 'job conditions'),
     ('cargo package started in the checkout', 'publish.yml',
      '      - name: Re-create the verified package\n        working-directory: ${{ runner.temp }}\n',
      '      - name: Re-create the verified package\n', 'runs in the checkout'),

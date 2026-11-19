@@ -142,7 +142,7 @@ def required_check_passed(api, run_id, attempt):
     jobs = api.json(f"actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100")["jobs"]
     gate = [job for job in jobs if job.get("name") == "required-ci"]
     checks = [job for job in jobs if job.get("name") not in
-              ("Find full CI for the merged tree", "publish documentation")]
+              ("Find full CI for the merged tree", "publish documentation", "publish release")]
     return (len(gate) == 1 and any(job.get("name", "").startswith("sdk (") for job in checks)
             and all(job.get("status") == "completed" and job.get("conclusion") == "success"
                     for job in checks))
