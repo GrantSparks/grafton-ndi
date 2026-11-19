@@ -18,7 +18,7 @@ pub use loading::{
 
 use thiserror::Error;
 
-use std::ffi::NulError;
+use std::ffi::{CString, NulError};
 
 #[cfg(test)]
 use crate::capabilities::RuntimeFeature;
@@ -439,6 +439,16 @@ impl From<NulError> for Error {
     fn from(error: NulError) -> Self {
         Self::InvalidCString(error)
     }
+}
+
+/// Report the first NUL's byte offset and retain only the prefix through it.
+pub(crate) fn nul_error_with_prefix(text: &str) -> Option<NulError> {
+    let position = text.find('\0')?;
+    #[expect(
+        clippy::expect_used,
+        reason = "the slice ends with the first NUL, and NulError has no public constructor"
+    )]
+    Some(CString::new(&text.as_bytes()[..=position]).expect_err("the prefix ends with a NUL"))
 }
 
 // The existing largest payload is NulError. Selection diagnostics must not

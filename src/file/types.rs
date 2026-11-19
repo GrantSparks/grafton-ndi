@@ -155,7 +155,9 @@ impl SourceSpec {
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when the name is empty, and
-    /// [`Error::InvalidCString`] when it contains a NUL.
+    /// [`Error::InvalidCString`] when it contains a NUL. For this error,
+    /// [`NulError::into_vec`](std::ffi::NulError::into_vec) returns the bytes
+    /// through the first NUL.
     pub fn new(name: impl AsRef<str>) -> Result<Self> {
         let name = SourceName::checked(name.as_ref())?;
         Ok(Self {

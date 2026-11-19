@@ -425,7 +425,7 @@ mod tests {
                 .poll(&mut context),
             Poll::Ready(Err(Error::InvalidInput(InputDefect::TimeoutTooLong { .. })))
         ));
-        for name in ["", "bad\0name", "trailing\0"] {
+        for name in ["", "\0leading", "bad\0name", "trailing\0", "é映\0tail\0"] {
             for timeout in [Duration::ZERO, excessive] {
                 let expected = adapter
                     .finder()

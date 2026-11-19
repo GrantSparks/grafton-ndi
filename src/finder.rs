@@ -1132,8 +1132,10 @@ impl Finder {
     ///
     /// # Errors
     ///
-    /// An empty name returns [`Error::InvalidInput`]; a name containing a NUL
-    /// returns [`Error::InvalidCString`]. The name is checked before the timeout,
+    /// An empty name returns [`Error::InvalidInput`]. A name containing a NUL
+    /// returns [`Error::InvalidCString`], whose
+    /// [`NulError::into_vec`](std::ffi::NulError::into_vec) returns the bytes
+    /// through the first NUL. The name is checked before the timeout,
     /// including in async lookups. Other errors match [`Self::find_source`].
     #[doc(alias = "NDIlib_find_get_current_sources")]
     #[doc(alias = "NDIlib_find_wait_for_sources")]
@@ -1329,12 +1331,8 @@ impl<'a> SourceName<'a> {
                 what: "source name",
             }));
         }
-        if name.contains('\0') {
-            #[expect(
-                clippy::unwrap_used,
-                reason = "contains proved an interior NUL; NulError has no public constructor"
-            )]
-            return Err(CString::new(name).unwrap_err().into());
+        if let Some(error) = crate::error::nul_error_with_prefix(name) {
+            return Err(error.into());
         }
         Ok(Self(name))
     }
@@ -2588,6 +2586,14 @@ mod tests {
 
     use super::*;
 
+    const MALFORMED_SOURCE_NAMES: [(&str, &str); 5] = [
+        ("\0leading", "\0"),
+        ("bad\0name", "bad\0"),
+        ("trailing\0", "trailing\0"),
+        ("multiple\0names\0", "multiple\0"),
+        ("é映\0later", "é映\0"),
+    ];
+
     fn assert_same_name_error(actual: Error, expected: &Error) {
         match (actual, expected) {
             (Error::InvalidInput(actual), Error::InvalidInput(expected)) => {
@@ -2608,11 +2614,17 @@ mod tests {
                 what: "source name",
             }),
         );
-        for name in ["bad\0name", "trailing\0"] {
-            let expected = Error::from(CString::new(name).unwrap_err());
-            assert_same_name_error(SourceName::checked(name).unwrap_err(), &expected);
+        for (name, prefix) in MALFORMED_SOURCE_NAMES {
+            let Error::InvalidCString(error) = SourceName::checked(name).unwrap_err() else {
+                panic!("expected a NUL error for {name:?}");
+            };
+            assert_eq!(error.nul_position(), prefix.len() - 1);
             #[cfg(feature = "file-io")]
-            assert_same_name_error(crate::file::SourceSpec::new(name).unwrap_err(), &expected);
+            assert_same_name_error(
+                crate::file::SourceSpec::new(name).unwrap_err(),
+                &Error::InvalidCString(error.clone()),
+            );
+            assert_eq!(error.into_vec(), prefix.as_bytes());
         }
         let longest = "x".repeat(if cfg!(miri) {
             64
@@ -2638,6 +2650,27 @@ mod tests {
         }
         // Address-only Source values intentionally do not use this name rule.
         assert_eq!(Source::new("").unwrap().name(), "");
+    }
+
+    #[test]
+    fn invalid_source_name_allocation_depends_only_on_the_prefix() {
+        for prefix in ["\0", "é映\0"] {
+            let (_, prefix_peak) =
+                crate::test_alloc::peak_bytes(|| SourceName::checked(prefix).unwrap_err());
+            assert!(prefix_peak <= 64);
+            let max_suffix = if cfg!(miri) { 64 } else { 1 << 20 };
+            for suffix_len in [1, 32, max_suffix] {
+                let name = format!("{prefix}{}", "x".repeat(suffix_len));
+                let (error, peak) =
+                    crate::test_alloc::peak_bytes(|| SourceName::checked(&name).unwrap_err());
+                let Error::InvalidCString(error) = error else {
+                    panic!("expected a NUL error");
+                };
+                assert_eq!(error.nul_position(), prefix.len() - 1);
+                assert_eq!(error.into_vec(), prefix.as_bytes());
+                assert_eq!(peak, prefix_peak, "suffix length {suffix_len}");
+            }
+        }
     }
 
     #[test]
@@ -2687,7 +2720,7 @@ mod tests {
             .unwrap()
         });
         let id = crate::discovery_server::ReceiverId::new("not-advertised").unwrap();
-        for name in ["", "bad\0name", "trailing\0"] {
+        for name in std::iter::once("").chain(MALFORMED_SOURCE_NAMES.map(|(name, _)| name)) {
             let expected = SourceName::checked(name).unwrap_err();
             assert_same_name_error(
                 finder

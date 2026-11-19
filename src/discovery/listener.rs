@@ -984,8 +984,10 @@ impl RecvListener {
     ///
     /// Returns [`Error::InvalidInput`] when `source_name` is empty, and
     /// [`Error::InvalidCString`] when it contains a NUL byte, before reading
-    /// listener membership;
-    /// [`Error::ReceiverRequestNotAccepted`] when no receiver the listener
+    /// listener membership. For this error, [`NulError::into_vec`](std::ffi::NulError::into_vec)
+    /// returns the bytes through the first NUL.
+    ///
+    /// Returns [`Error::ReceiverRequestNotAccepted`] when no receiver the listener
     /// lists has this identifier (`advertised` is false: the listener may not
     /// have connected yet, the receiver may not be registered, or its entry
     /// may have an unreadable identifier; a later request can succeed) or the
