@@ -34,6 +34,7 @@
 
 use std::{
     env,
+    num::NonZeroU32,
     time::{Duration, Instant},
 };
 
@@ -54,10 +55,8 @@ fn main() -> Result<()> {
         eprintln!("usage: file_thumbnails <recording.mkv> [count]");
         std::process::exit(2);
     };
-    let count: u32 = arguments.next().map_or(Ok(8), |count| count.parse())?;
-    if count == 0 {
-        return Err("the count must be at least 1".into());
-    }
+    let count = arguments.next().map_or(Ok(8), |count| count.parse())?;
+    let count = NonZeroU32::new(count).ok_or("the count must be at least 1")?;
 
     let ndi = Ndi::new()?;
     let file = FileApi::new(&ndi, &FileApiOptions::default())?;
@@ -68,7 +67,7 @@ fn main() -> Result<()> {
                 .into(),
         );
     }
-    let length = info.duration().value().duration();
+    let length = info.duration().value();
 
     // A group of its own keeps the player's source off every other
     // receiver's list.
@@ -102,11 +101,11 @@ fn main() -> Result<()> {
         receiver.next_event(Duration::from_millis(50))?;
     }
     player.start(&recording)?;
-    for i in 0..count {
-        let position = length * i / count;
+    for i in 0..count.get() {
+        let position = thumbnail_position(length, i, count);
         // Start already positioned the player at zero; reuse that first frame.
         if i != 0 {
-            player.seek(FilePosition::from_duration(position)?)?;
+            player.seek(position)?;
             player.set_paused(false);
         }
         let frame = first_frame(&mut player, &receiver)
@@ -119,12 +118,67 @@ fn main() -> Result<()> {
         std::fs::write(&path, &encoded)?;
         println!(
             "{path}: {:.2} s, {}x{} reduced to a quarter",
-            position.as_secs_f64(),
+            position.duration().as_secs_f64(),
             frame.width(),
             frame.height()
         );
     }
     Ok(())
+}
+
+fn thumbnail_position(length: FilePosition, index: u32, count: NonZeroU32) -> FilePosition {
+    let ticks = u128::from(length.ticks()) * u128::from(index) / u128::from(count.get());
+    // The loop always passes index < count, so the quotient fits in u64.
+    FilePosition::from_ticks(ticks as u64)
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+
+    #[test]
+    fn positions_floor_to_ticks_and_stay_within_the_recording() {
+        for (length, expected) in [
+            (7, &[0][..]),
+            (0, &[0, 0, 0]),
+            (2, &[0, 0, 0, 1, 1]),
+            (8, &[0, 2, 4, 6]),
+            (9, &[0, 2, 4, 6]),
+        ] {
+            let length = FilePosition::from_ticks(length);
+            let count = NonZeroU32::new(expected.len() as u32).unwrap();
+            let positions: Vec<_> = (0..count.get())
+                .map(|index| thumbnail_position(length, index, count).ticks())
+                .collect();
+            assert_eq!(positions, expected);
+            assert!(positions.windows(2).all(|pair| pair[0] <= pair[1]));
+            if length.ticks() > 0 {
+                assert!(positions.iter().all(|&position| position < length.ticks()));
+            }
+            for (index, &position) in (0..count.get()).zip(&positions) {
+                let previous = length.duration() * index / count.get();
+                assert_eq!(
+                    FilePosition::from_duration(previous).unwrap().ticks(),
+                    position
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn positions_handle_maximum_duration_and_large_counts() {
+        let length = FilePosition::from_ticks(u64::MAX);
+        let count = NonZeroU32::new(10_000_002).unwrap();
+        let last = thumbnail_position(length, count.get() - 1, count);
+        assert_eq!(last.ticks(), 18_446_742_229_035_513_178);
+
+        let count = NonZeroU32::new(u32::MAX).unwrap();
+        assert_eq!(thumbnail_position(length, 0, count).ticks(), 0);
+        let penultimate = thumbnail_position(length, count.get() - 2, count);
+        let last = thumbnail_position(length, count.get() - 1, count);
+        assert_eq!(last.ticks(), u64::MAX - (u64::from(u32::MAX) + 2));
+        assert!(penultimate < last && last < length);
+    }
 }
 
 /// Drain video while awaiting the player's event, then match its timecode.
