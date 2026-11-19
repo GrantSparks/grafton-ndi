@@ -170,7 +170,7 @@ pub use {
 pub use color_info::{ColorInfo, ColorPrimaries, TransferFunction, YuvMatrix};
 pub use media::{FourCc, FrameRate, MediaTypes, PictureAspectRatio, StreamTier};
 pub use rejected::Rejected;
-pub use time::{SdkTimestamp, Timecode};
+pub use time::{ReceivedTimestamp, SdkTimestamp, Timecode};
 
 /// Alias for Result with our Error type
 pub type Result<T> = std::result::Result<T, crate::error::Error>;

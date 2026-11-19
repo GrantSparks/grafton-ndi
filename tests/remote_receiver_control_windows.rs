@@ -12,14 +12,13 @@ mod runtime_fixture;
 use grafton_ndi::{
     discovery_server::{AdvertiserOptions, RecvAdvertisement, RecvAdvertiser},
     Capability, CapabilityRefusal, Error, Ndi, Receiver, ReceiverOptions, RuntimeFeature,
-    RuntimeOptions, SdkEdition, Source,
+    RuntimeOptions, SdkEdition,
 };
 
 fn exercise(ndi: &Ndi) {
     let receiver = Receiver::new(
         ndi,
-        &ReceiverOptions::new(Source::new("").unwrap())
-            .name(common::unique_name("standard windows receiver")),
+        &ReceiverOptions::disconnected().name(common::unique_name("standard windows receiver")),
     )
     .unwrap();
     // Registration does not need a reachable server.

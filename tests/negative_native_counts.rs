@@ -13,7 +13,7 @@ use runtime_fixture::read_fake_log;
 
 use grafton_ndi::{
     Error, FrameSync, Ndi, Receiver, ReceiverEvent, ReceiverItem, ReceiverOptions, RuntimeOptions,
-    SdkResultDefect, Source,
+    SdkResultDefect,
 };
 use std::time::Duration;
 
@@ -29,8 +29,7 @@ fn refused<T: std::fmt::Debug>(result: Result<T, Error>, function: &str, expecte
 fn negative_counts_are_errors_and_status_survives() {
     if let Some(path) = std::env::var_os("GRAFTON_NEGATIVE_COUNTS_CHILD") {
         let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(path)).unwrap();
-        let receiver =
-            Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap();
         for selected in [
             "connections",
             "received-video",

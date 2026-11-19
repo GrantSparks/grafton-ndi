@@ -111,7 +111,9 @@
 //! a [`SenderId`], [`ReceiverId`] or [`InputGroupId`] keeps the server's exact
 //! bytes, so handing one back in a subscription or a connection request always
 //! names the same peer. Each kind is its own type, so a sender's identifier
-//! cannot be used where a receiver's is meant.
+//! cannot be used where a receiver's is meant. [`AdvertisedSender::to_source`]
+//! requires an exact UTF-8 name and address when converting an advertisement
+//! into a connection target.
 //!
 //! Each snapshot or event batch has one 16 MiB budget covering native arrays
 //! and strings scanned plus owned Rust storage reserved, including UTF-8

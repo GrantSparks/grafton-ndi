@@ -3,7 +3,7 @@ use grafton_ndi::{
     discovery_server::{AdvertiserOptions, ListenerOptions, RecvAdvertisement, SendAdvertisement},
     routing::RouterOptions,
     FinderOptions, FrameSyncAudioRequest, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions,
-    RuntimeOptions, SdkEdition, SenderOptions, Source,
+    RuntimeOptions, SdkEdition, SenderOptions, Source, SourceAddress,
 };
 
 #[test]
@@ -12,7 +12,10 @@ fn receiver_options_report_presets_and_last_setter_wins() {
         .bandwidth(ReceiverBandwidth::AudioOnly)
         .name("first")
         .name("venue-audio");
-    assert_eq!(options.configured_source().name(), "Venue (Audio)");
+    assert_eq!(
+        options.configured_source().map(Source::name),
+        Some("Venue (Audio)")
+    );
     assert_eq!(options.configured_bandwidth(), ReceiverBandwidth::AudioOnly);
     assert_eq!(
         options.configured_color_format(),
@@ -24,6 +27,28 @@ fn receiver_options_report_presets_and_last_setter_wins() {
         ReceiverOptions::new(Source::new("default").unwrap()).configured_name(),
         None
     );
+}
+
+#[test]
+fn receiver_options_keep_address_only_targets_and_clear_empty_targets() {
+    let disconnected = ReceiverOptions::disconnected().name("pending");
+    let unnamed = Source::new("").unwrap();
+    let empty = unnamed
+        .clone()
+        .with_address(SourceAddress::new("").unwrap());
+    let address_only = unnamed
+        .clone()
+        .with_address(SourceAddress::new("192.0.2.10:5961").unwrap());
+
+    assert!(disconnected.configured_source().is_none());
+    assert!(ReceiverOptions::new(unnamed).configured_source().is_none());
+    assert!(ReceiverOptions::new(empty.clone())
+        .configured_source()
+        .is_none());
+    let configured = disconnected.clone().source(address_only.clone());
+    assert_eq!(configured.configured_source(), Some(&address_only));
+    assert_eq!(configured.clone().source(empty), disconnected);
+    assert_eq!(configured.clear_source(), disconnected);
 }
 
 #[test]

@@ -9,7 +9,7 @@ common_helpers!(child, fixture);
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use grafton_ndi::{FrameSync, Ndi, Receiver, ReceiverOptions, RuntimeOptions, Source};
+use grafton_ndi::{FrameSync, Ndi, Receiver, ReceiverOptions, RuntimeOptions};
 
 #[test]
 fn wrappers_print_the_named_receiver_without_native_calls() {
@@ -37,7 +37,7 @@ fn wrappers_print_the_named_receiver_without_native_calls() {
 const NAME: &str = "debug studio";
 
 fn exercise(ndi: &Ndi) {
-    let options = ReceiverOptions::new(Source::new("").unwrap()).name(NAME);
+    let options = ReceiverOptions::disconnected().name(NAME);
     let receiver = || Receiver::new(ndi, &options).unwrap();
 
     check(&receiver(), "Receiver", "RawCapture");

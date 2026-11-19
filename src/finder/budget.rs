@@ -1,10 +1,13 @@
 //! Finder-specific count bounds and the shared discovery snapshot copier.
 
-use std::{ffi::c_char, mem::size_of};
+use std::{
+    ffi::{c_char, CStr},
+    mem::size_of,
+};
 
 use crate::{
     finder::SourceText,
-    sdk_copy::{CopyBudget, LossyText, TextError},
+    sdk_copy::{CopyBudget, TextError},
     Error, ResourceKind, Result,
 };
 
@@ -48,7 +51,7 @@ impl SnapshotBudget {
     /// Copy advertised metadata without building native source storage.
     ///
     /// # Safety
-    /// As for [`Self::source_text_view`].
+    /// As for [`Self::source_c_str`].
     #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_source_metadata)))]
     pub(crate) unsafe fn metadata_text(
         &mut self,
@@ -62,18 +65,25 @@ impl SnapshotBudget {
         }
     }
 
-    /// Borrow classified text after charging exactly the ordinary source copy.
+    /// Borrow bounded source text and charge its scan and storage.
+    /// The charge uses the original bytes even when a descriptor is omitted.
     ///
     /// # Safety
     /// A non-null pointer stays readable through its first NUL or the SDK
     /// string bound, with storage kept live for the returned lifetime.
-    pub(super) unsafe fn source_text_view<'a>(
+    pub(super) unsafe fn source_c_str<'a>(
         &mut self,
         pointer: *const c_char,
-    ) -> Result<Option<LossyText<'a>>> {
+    ) -> Result<Option<&'a CStr>> {
         // SAFETY: forwarded to the caller's obligations.
-        match unsafe { self.0.source_text_view(pointer) } {
-            Ok(text) => Ok(text),
+        match unsafe { self.0.c_str(pointer) } {
+            Ok(text) => {
+                if let Some(text) = text {
+                    self.0
+                        .take(text.to_bytes().len() + SourceText::STORAGE_OVERHEAD)?;
+                }
+                Ok(text)
+            }
             Err(TextError::Unterminated) => Ok(None),
             Err(TextError::Failed(error)) => Err(error),
         }
@@ -133,7 +143,7 @@ pub(super) fn copy_string(text: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::{
-        finder::{decode_source, source_pointers, HostQuery, SeenSource},
+        finder::{decode_source, source_pointers, HostQuery, SeenSource, SourceTextView},
         sdk_copy::MAX_SDK_STRING_BYTES,
         sys::bindings::NDIlib_source_t,
         Source,
@@ -145,8 +155,11 @@ mod tests {
         pointer: *const c_char,
     ) -> Result<Option<SourceText>> {
         // SAFETY: tests keep the bounded string readable.
-        unsafe { budget.source_text_view(pointer) }?
-            .map(|text| SourceText::from_sdk(text, crate::AllocationKind::DiscoveryResults))
+        unsafe { budget.source_c_str(pointer) }?
+            .map(|text| {
+                let text = SourceTextView::new(text).map_err(Error::InvalidUtf8)?;
+                SourceText::from_sdk(text, crate::AllocationKind::DiscoveryResults)
+            })
             .transpose()
     }
 
@@ -177,15 +190,16 @@ mod tests {
         unsafe {
             copy_snapshot(entries.as_ptr(), entries.len() as u32, |entry, budget| {
                 let (name, address) = source_pointers(entry);
-                decode_source(name, address, budget, |_| Ok(true))
+                decode_source(name, address, budget, |_| true)
             })
         }
     }
 
     #[test]
     fn small_source_text_budgets_check_exact_copy_and_scan_bounds() {
-        let bytes = c"a\xff";
-        let charged = bytes.to_bytes_with_nul().len() + 4 + SourceText::STORAGE_OVERHEAD;
+        let bytes = c"a�";
+        let charged =
+            bytes.to_bytes_with_nul().len() + bytes.to_bytes().len() + SourceText::STORAGE_OVERHEAD;
         let budget = |remaining| {
             SnapshotBudget(CopyBudget::new(
                 remaining,
@@ -233,7 +247,7 @@ mod tests {
 
     fn selected_snapshot(
         entries: &[NDIlib_source_t],
-        select: impl Fn(&super::super::BorrowedSource<'_>) -> Result<bool>,
+        select: impl Fn(&super::super::BorrowedSource<'_>) -> bool,
     ) -> Result<Vec<Source>> {
         // SAFETY: tests keep the descriptors and all pointed-to strings live.
         unsafe {
@@ -254,7 +268,7 @@ mod tests {
         entries[72] = matching;
         for (name, expected) in [("missing", 0), ("HOST (Camera)", 1)] {
             let (sources, allocations) = crate::test_alloc::allocation_count(|| {
-                selected_snapshot(&entries, |source| Ok(source.name.equals(name)))
+                selected_snapshot(&entries, |source| source.name.as_str() == name)
             });
             assert_eq!(sources.unwrap().len(), expected);
             assert_eq!(allocations, 4 * expected + usize::from(expected > 0));
@@ -285,33 +299,11 @@ mod tests {
     }
 
     #[test]
-    fn selecting_host_and_seen_identity_decodes_lossy_text_once() {
-        for (address, expected) in [
-            (c"192.0.2.7:5961", 1),
-            (c"ndi://192.0.2.7:5961/feed\xff", 2),
-        ] {
-            let mut entry = named(c"STUDIO \xff (Camera)".as_ptr());
-            entry.__bindgen_anon_1.p_url_address = address.as_ptr();
-            let seen = snapshot(&[entry])
-                .unwrap()
-                .into_iter()
-                .map(SeenSource)
-                .collect();
-            for host in ["192.0.2.7", "STUDIO \u{fffd}"] {
-                let query = HostQuery::checked(host).unwrap();
-                let (sources, allocations) = crate::test_alloc::allocation_count(|| {
-                    selected_snapshot(&[entry], |source| source.selected_by(Some(query), &seen))
-                });
-                assert!(sources.unwrap().is_empty(), "{host}");
-                assert_eq!(allocations, expected, "{host} and {address:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn selecting_snapshots_preserves_lossy_identity_host_rules_and_order() {
-        let mut lossy = named(c"STUDIO \xff (Camera)".as_ptr());
-        lossy.__bindgen_anon_1.p_url_address = c"http://camera.local:8080/path".as_ptr();
+    fn selecting_snapshots_preserves_host_rules_and_order() {
+        let mut invalid = named(c"STUDIO \xff (Camera)".as_ptr());
+        invalid.__bindgen_anon_1.p_url_address = c"http://camera.local:8080/path".as_ptr();
+        let mut replacement = invalid;
+        replacement.p_ndi_name = c"STUDIO � (Camera)".as_ptr();
         let mut addressed = named(ptr::null());
         addressed.__bindgen_anon_1.p_url_address = c"192.0.2.7:5961".as_ptr();
         let mut missing_address = named(c"STUDIO (Camera)".as_ptr());
@@ -319,10 +311,10 @@ mod tests {
         let mut ipv6 = named(c"OTHER (IPv6)".as_ptr());
         ipv6.__bindgen_anon_1.p_url_address = c"http://[2001:db8::1]:8080/path".as_ptr();
         let entries = [
-            lossy,
+            invalid,
             addressed,
             missing_address,
-            lossy,
+            replacement,
             ipv6,
             NDIlib_source_t::default(),
         ];
@@ -334,7 +326,7 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>();
             let actual =
-                selected_snapshot(&entries, |source| Ok(source.name.equals(name))).unwrap();
+                selected_snapshot(&entries, |source| source.name.as_str() == name).unwrap();
             assert_eq!(actual, expected);
         }
         let empty_seen = HashSet::new();
@@ -387,7 +379,7 @@ mod tests {
             let mut selected = SnapshotBudget::new();
             // SAFETY: each test descriptor points to live terminated literals.
             unsafe {
-                super::super::decode_source(name, address, &mut old, |_| Ok(true)).unwrap();
+                super::super::decode_source(name, address, &mut old, |_| true).unwrap();
                 assert!(
                     super::super::decode_source(name, address, &mut selected, reject)
                         .unwrap()
@@ -410,7 +402,7 @@ mod tests {
             // SAFETY: the descriptor points to live terminated literals.
             let (expected, actual) = unsafe {
                 (
-                    super::super::decode_source(name, address, &mut old, |_| Ok(true)).map(|_| ()),
+                    super::super::decode_source(name, address, &mut old, |_| true).map(|_| ()),
                     super::super::decode_source(name, address, &mut selected, reject).map(|_| ()),
                 )
             };
@@ -490,28 +482,38 @@ mod tests {
             vec![named(largest.as_ptr()); 3],
         ] {
             let expected = snapshot(&entries).map(|_| ());
-            let actual = selected_snapshot(&entries, |_| Ok(false)).map(|_| ());
+            let actual = selected_snapshot(&entries, |_| false).map(|_| ());
             assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
         }
     }
 
     #[test]
-    fn lossy_expansion_is_charged_before_allocating_the_output() {
+    fn invalid_utf8_spends_the_copy_budget_without_allocating() {
         let text = CString::new(vec![0xff; MAX_SDK_STRING_BYTES - 1]).unwrap();
-        let (result, allocations) =
-            crate::test_alloc::allocation_count(|| snapshot(&[named(text.as_ptr())]));
+        let invalid = named(text.as_ptr());
+        let (result, allocations) = crate::test_alloc::allocation_count(|| snapshot(&[invalid]));
+        assert!(result.unwrap().is_empty());
+        assert_eq!(allocations, 0);
+        let (result, allocations) = crate::test_alloc::allocation_count(|| snapshot(&[invalid; 4]));
         assert!(matches!(result, Err(Error::ResourceLimit { .. })));
-        assert_eq!(
-            allocations, 0,
-            "a copy limit error occurs before any output allocation"
-        );
+        assert_eq!(allocations, 0);
+
         let mut budget = SnapshotBudget::new();
-        let bytes = c"a\xff\xe2\x82\xac\xe2\x82";
-        // SAFETY: live literal, including a NUL terminator.
-        let copied = unsafe { copy_text(&mut budget, bytes.as_ptr()) }
-            .unwrap()
-            .unwrap();
-        assert_eq!(copied.as_str(), bytes.to_string_lossy());
+        let name = c"a\xff";
+        let address = c"192.0.2.1";
+        // SAFETY: both literals remain live. Validation must precede selection.
+        let result = unsafe {
+            decode_source(name.as_ptr(), address.as_ptr(), &mut budget, |_| {
+                panic!("malformed descriptor reached the selector")
+            })
+        };
+        assert!(result.unwrap().is_none());
+        assert_eq!(
+            budget.spent(),
+            name.to_bytes().len() * 2
+                + address.to_bytes().len() * 2
+                + 2 * (1 + SourceText::STORAGE_OVERHEAD)
+        );
     }
 
     #[test]

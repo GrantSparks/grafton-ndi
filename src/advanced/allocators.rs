@@ -286,6 +286,9 @@ impl AllocationRequest {
     /// the [`capacity_limit`](Self::capacity_limit).
     pub fn with_stride_bytes(self, stride: usize) -> Result<Self> {
         let (bytes, layout) = match self.layout {
+            // The stored extent and layout already describe this stride.
+            // Check their size against the current grant below.
+            _ if stride == self.stride => (self.bytes, self.layout),
             RequestLayout::Video(pixel) => {
                 let layout = ValidatedVideoLayout::new_uncompressed_checked(
                     pixel,
@@ -307,7 +310,6 @@ impl AllocationRequest {
                     RequestLayout::Audio(layout),
                 )
             }
-            RequestLayout::Compressed(_) if stride == self.stride => (self.bytes, self.layout),
             RequestLayout::Compressed(_) => {
                 return Err(invalid_input(
                     crate::InputDefect::CompressedAllocationStride,
@@ -1340,13 +1342,12 @@ enum Stream {
 /// use std::time::Duration;
 /// use grafton_ndi::{
 ///     advanced::{AllocationBuffer, AllocationRequest, AllocatorLimits, AllocatorService},
-///     Receiver, ReceiverOptions, Source, Ndi,
+///     Receiver, ReceiverOptions, Ndi,
 /// };
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// let ndi = Ndi::new()?;
-/// # let source = Source::new("").unwrap();
-/// let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
+/// let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected())?;
 /// let service = AllocatorService::new(ndi.process_lifetime(), &AllocatorLimits::default())?;
 /// let mut receiver = service.attach(receiver)?;
 ///
@@ -1764,6 +1765,9 @@ mod tests {
     use super::*;
     use crate::Error;
     use crate::StreamTier;
+
+    static CALLBACK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     include!("allocators/cycle_cost_tests.rs");
     #[test]
     fn compressed_allocator_sizes_keep_the_packet_bound() {
@@ -2599,7 +2603,7 @@ mod tests {
 
     #[test]
     fn invalid_buffer_layout_and_stride_overflow_are_counted_once() {
-        for malformed in 0..3 {
+        for malformed in 0..4 {
             let registry = Registry::new(limits()).unwrap();
             let token = registry
                 .register(move |request| {
@@ -2610,6 +2614,10 @@ mod tests {
                         0 => buffer.request.width += 1,
                         1 => buffer.request.stride = i32::MAX as usize + 1,
                         2 => buffer.request.bytes -= 1,
+                        3 => {
+                            buffer.storage =
+                                AllocationStorage::Owned(OwnedStorage::zeroed(request_of(32))?)
+                        }
                         _ => unreachable!(),
                     }
                     Ok(buffer)
@@ -2622,6 +2630,7 @@ mod tests {
             assert_eq!(usage.retained_allocations(), 0);
             assert_eq!(usage.retained_bytes(), 0);
             assert_eq!(usage.in_progress_allocations(), 0);
+            assert_eq!(lock(&registry.state).reserved_bytes, 0);
         }
     }
 
@@ -2672,6 +2681,74 @@ mod tests {
     }
 
     #[test]
+    fn same_stride_cached_video_buffers_must_match_format_and_dimensions() {
+        let descriptor = |format, height| NDIlib_video_frame_v2_t {
+            FourCC: FourCc::from(format).raw(),
+            xres: 4,
+            yres: height,
+            ..Default::default()
+        };
+        let first = descriptor(PixelFormat::Bgra, 2).request().unwrap();
+        let registry = Registry::new(limits()).unwrap();
+        let token = registry.register(cached_request_policy()).unwrap();
+        let (pointer, stride) = registry.allocate(token, first).unwrap();
+        assert_eq!(stride, 16);
+        assert!(registry.free(token, pointer.as_ptr()));
+
+        for later in [
+            descriptor(PixelFormat::Rgba, 2),
+            descriptor(PixelFormat::Bgra, 1),
+        ] {
+            let later = later.request().unwrap();
+            assert_eq!(later.stride_bytes(), first.stride_bytes());
+            assert!(registry.allocate(token, later).is_none());
+        }
+        let usage = registry.usage();
+        assert_eq!(usage.declined(AllocationDecline::BufferRefused), 2);
+        assert_eq!(usage.declined_allocations(), 2);
+        assert_eq!(usage.retained_allocations(), 0);
+        assert_eq!(usage.retained_bytes(), 0);
+        assert_eq!(usage.in_progress_allocations(), 0);
+        assert_eq!(lock(&registry.state).reserved_bytes, 0);
+    }
+
+    #[test]
+    fn a_cached_buffer_at_the_same_stride_still_has_to_fit_its_new_grant() {
+        let registry = Registry::new(AllocatorLimits {
+            max_concurrent_calls: 1,
+            max_bytes: 96,
+            ..limits()
+        })
+        .unwrap();
+        let pool = TestPool::new(2, 64);
+        let token = registry
+            .register({
+                let pool = pool.clone();
+                let cached = Mutex::new(None);
+                move |request| pool.buffer(*lock(&cached).get_or_insert(request))
+            })
+            .unwrap();
+        let request = request_of(32);
+        let (pointer, stride) = registry.allocate(token, request).unwrap();
+        assert_eq!(stride, 16);
+        // The second call needs 32 bytes and gets 32, but the cached policy's
+        // unchanged layout still comes with a 64-byte pool block.
+        assert!(registry.allocate(token, request).is_none());
+        let usage = registry.usage();
+        assert_eq!(usage.declined(AllocationDecline::BufferRefused), 1);
+        assert_eq!(usage.declined_allocations(), 1);
+        assert_eq!(usage.retained_bytes(), 64);
+        assert_eq!(usage.retained_allocations(), 1);
+        assert_eq!(usage.in_progress_allocations(), 0);
+        assert_eq!(lock(&registry.state).reserved_bytes, 0);
+        assert_eq!(pool.releases.load(Ordering::Relaxed), 1);
+        assert!(registry.free(token, pointer.as_ptr()));
+        assert_eq!(pool.releases.load(Ordering::Relaxed), 2);
+        assert_eq!(registry.usage().retained_bytes(), 0);
+        assert_eq!(registry.usage().retained_allocations(), 0);
+    }
+
+    #[test]
     fn exact_compressed_sizes_and_valid_uncompressed_padding_are_published() {
         let video = (NDIlib_video_frame_v2_t {
             FourCC: FourCc::from(PixelFormat::Bgra).raw(),
@@ -2699,9 +2776,65 @@ mod tests {
     }
 
     #[test]
+    fn uncompressed_callbacks_reuse_the_checked_layout_only_at_the_same_stride() {
+        use crate::frames::layout_validation_counts::{AUDIO, VIDEO};
+
+        let _serial = lock(&CALLBACK_TEST_LOCK);
+        let registry = REGISTRY.get_or_init(|| Registry::new(limits()).unwrap());
+        for (stride, expected_stride, expected_validations) in [(None, 16, 1), (Some(32), 32, 3)] {
+            let token = registry
+                .register(move |request: AllocationRequest| {
+                    let request = match stride {
+                        Some(stride) => request.with_stride_bytes(stride)?,
+                        None => request,
+                    };
+                    AllocationBuffer::zeroed(request)
+                })
+                .unwrap();
+            let opaque = token as *mut c_void;
+            let mut video = NDIlib_video_frame_v2_t {
+                FourCC: FourCc::from(PixelFormat::Bgra).raw(),
+                xres: 4,
+                yres: 2,
+                ..Default::default()
+            };
+            let mut audio = NDIlib_audio_frame_v3_t {
+                FourCC: AudioFormat::Fltp.to_sdk(),
+                sample_rate: 48_000,
+                no_channels: 2,
+                no_samples: 4,
+                ..Default::default()
+            };
+            VIDEO.set(0);
+            AUDIO.set(0);
+            // SAFETY: both descriptors are live for the calls, and this
+            // fixture only passes their allocated pointers back for release.
+            unsafe {
+                assert!(allocate(opaque, &mut video));
+                assert!(free(opaque, &video));
+                assert!(allocate(opaque, &mut audio));
+                assert!(free(opaque, &audio));
+                assert!(!video.p_data.is_null());
+                assert!(!audio.p_data.is_null());
+                assert_eq!(video.__bindgen_anon_1.line_stride_in_bytes, expected_stride);
+                assert_eq!(
+                    audio.__bindgen_anon_1.channel_stride_in_bytes,
+                    expected_stride
+                );
+            }
+            registry.closing(token);
+            // Each packed request is decoded once. Padding validates again
+            // in the policy and when the registry checks the returned request.
+            assert_eq!(VIDEO.get(), expected_validations);
+            assert_eq!(AUDIO.get(), expected_validations);
+        }
+    }
+
+    #[test]
     fn compressed_callback_declines_clear_the_data_and_size() {
         // Drive the process callback registry directly. Native setter fixtures
         // may share it, but never allocate frames or alter these decline counts.
+        let _serial = lock(&CALLBACK_TEST_LOCK);
         let registry = REGISTRY.get_or_init(|| Registry::new(limits()).unwrap());
         let token = registry.register(cached_request_policy()).unwrap();
         let opaque = token as *mut c_void;
@@ -3318,6 +3451,20 @@ mod tests {
         .request()
         .unwrap();
         assert_eq!(compressed.with_stride_bytes(32).unwrap(), compressed);
+        for request in [planar, audio, compressed] {
+            let bytes = request.minimum_bytes();
+            let limited = AllocationRequest {
+                capacity_limit: bytes - 1,
+                ..request
+            };
+            assert_eq!(
+                input(limited.with_stride_bytes(limited.stride_bytes())),
+                crate::InputDefect::AllocationTooLarge {
+                    bytes,
+                    limit: bytes - 1,
+                }
+            );
+        }
         for stride in [0, 31, 36] {
             assert!(matches!(
                 input(compressed.with_stride_bytes(stride)),

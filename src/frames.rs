@@ -14,7 +14,7 @@ use crate::{
     media::SdkQuantity,
     pixels::{AudioCopy, PackedStorage, PackedVideo, VideoCopy, VideoStorage},
     sys::{self, bindings::*},
-    Error, FourCc, FrameRate, PictureAspectRatio, Rejected, Result, SdkTimestamp, Timecode,
+    Error, FourCc, FrameRate, PictureAspectRatio, ReceivedTimestamp, Rejected, Result, Timecode,
 };
 
 #[cfg(feature = "advanced")]
@@ -764,8 +764,8 @@ pub(crate) unsafe trait VideoParts {
     /// The frame's one validated metadata observation.
     fn frame_metadata(&self) -> FrameMetadataRef<'_>;
 
-    /// The time the sender submitted the frame, when it is known.
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp>;
+    /// The timestamp carried by the received frame, when present.
+    fn sdk_timestamp(&self) -> Option<ReceivedTimestamp>;
 
     /// Which bytes the storage's owner guarantees are initialized.
     /// Capture guarantees only active pixels, never padding or trailing room.
@@ -803,7 +803,7 @@ unsafe impl<T: VideoParts + ?Sized> VideoParts for &T {
     fn frame_metadata(&self) -> FrameMetadataRef<'_> {
         (**self).frame_metadata()
     }
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+    fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> {
         (**self).sdk_timestamp()
     }
     fn initialized(&self) -> Initialized {
@@ -834,7 +834,7 @@ pub(crate) trait VideoPartsExt: VideoParts {
                 line_stride_in_bytes: layout.sdk_line_stride(),
             },
             p_metadata: frame.frame_metadata().as_ptr(),
-            timestamp: SdkTimestamp::to_sdk(frame.sdk_timestamp()),
+            timestamp: ReceivedTimestamp::to_sdk(frame.sdk_timestamp()),
         }
     }
 
@@ -949,8 +949,8 @@ pub trait VideoSource: VideoParts {
     /// Frame timecode, or the sender's synthesis sentinel.
     fn timecode(&self) -> Timecode;
 
-    /// SDK submission time, when supplied by a captured frame.
-    fn timestamp(&self) -> Option<SdkTimestamp>;
+    /// Source-dependent timestamp supplied by the SDK for a captured frame.
+    fn timestamp(&self) -> Option<ReceivedTimestamp>;
 
     /// Distance in bytes between first-plane row starts.
     fn line_stride_bytes(&self) -> usize;
@@ -1252,11 +1252,11 @@ macro_rules! video_accessors {
                     $crate::frames::VideoPartsExt::plane_views(self)
                 }
 
-                /// Get the time the sender submitted this frame.
+                /// The source-dependent timestamp of the received frame.
                 ///
                 $(#[$timestamp])*
                 #[inline]
-                fn timestamp(&self) -> Option<$crate::SdkTimestamp> {
+                fn timestamp(&self) -> Option<$crate::ReceivedTimestamp> {
                     $crate::frames::VideoParts::sdk_timestamp(self)
                 }
 
@@ -1437,7 +1437,7 @@ pub struct VideoFrame {
     /// The layout, scan type, pixels and scan-dependent SDK room.
     data: VideoStorage,
     metadata: OwnedFrameMetadata,
-    timestamp: Option<SdkTimestamp>,
+    timestamp: Option<ReceivedTimestamp>,
 }
 
 // SAFETY: VideoStorage owns the packed layout, initialized pixels and
@@ -1462,7 +1462,7 @@ unsafe impl VideoParts for VideoFrame {
         self.metadata.view()
     }
     #[inline]
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+    fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> {
         self.timestamp
     }
 
@@ -1902,8 +1902,8 @@ pub(crate) unsafe trait AudioParts {
     /// The frame's timecode.
     fn audio_timecode(&self) -> Timecode;
 
-    /// The time the sender submitted the frame, when it is known.
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp>;
+    /// The timestamp carried by the received frame, when present.
+    fn sdk_timestamp(&self) -> Option<ReceivedTimestamp>;
 
     /// The start of the frame's sample storage.
     fn samples(&self) -> *const f32;
@@ -1928,7 +1928,7 @@ pub(crate) trait AudioPartsExt: AudioParts {
                 channel_stride_in_bytes: layout.sdk_channel_stride(),
             },
             p_metadata: self.frame_metadata().as_ptr(),
-            timestamp: SdkTimestamp::to_sdk(self.sdk_timestamp()),
+            timestamp: ReceivedTimestamp::to_sdk(self.sdk_timestamp()),
         }
     }
 
@@ -2016,8 +2016,8 @@ pub trait AudioSource: AudioParts {
     /// Frame timecode, or the sender's synthesis sentinel.
     fn timecode(&self) -> Timecode;
 
-    /// SDK submission time, when supplied by a captured frame.
-    fn timestamp(&self) -> Option<SdkTimestamp>;
+    /// Source-dependent timestamp supplied by the SDK for a captured frame.
+    fn timestamp(&self) -> Option<ReceivedTimestamp>;
 
     /// UTF-8 metadata; an explicit empty string differs from no metadata.
     /// Unreadable received text is withheld; inspect [`Self::metadata_status`].
@@ -2098,11 +2098,11 @@ macro_rules! audio_accessors {
                     AudioParts::audio_timecode(self)
                 }
 
-                /// Get the time the sender submitted this frame.
+                /// The source-dependent timestamp of the received frame.
                 ///
                 $(#[$timestamp])*
                 #[inline]
-                fn timestamp(&self) -> Option<SdkTimestamp> {
+                fn timestamp(&self) -> Option<ReceivedTimestamp> {
                     AudioParts::sdk_timestamp(self)
                 }
 
@@ -2207,7 +2207,7 @@ pub struct AudioFrame {
     timecode: Timecode,
     data: PackedStorage<PackedAudioLayout>,
     metadata: OwnedFrameMetadata,
-    timestamp: Option<SdkTimestamp>,
+    timestamp: Option<ReceivedTimestamp>,
 }
 
 // SAFETY: PackedStorage privately pairs its layout with initialized samples;
@@ -2223,7 +2223,7 @@ unsafe impl AudioParts for AudioFrame {
         self.timecode
     }
     #[inline]
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+    fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> {
         self.timestamp
     }
     #[inline]
@@ -2278,7 +2278,7 @@ impl AudioFrame {
     ///
     /// This conversion needs no NDI runtime and allocates only the output
     /// samples. It preserves the input's timecode; metadata is absent and the
-    /// SDK timestamp is `None`. Use [`Self::set_metadata`] to attach metadata.
+    /// received timestamp is `None`. Use [`Self::set_metadata`] to attach metadata.
     pub fn from_interleaved(source: &crate::audio_conversion::InterleavedAudioF32<'_>) -> Self {
         let mut frame = Self::from_validated_silence(source.layout(), source.timecode());
         let channels = frame.layout().no_channels();
@@ -3060,7 +3060,7 @@ macro_rules! borrowed_video_accessors {
             fn header(&self) -> VideoHeader { VideoParts::header(&self.inner) }
             fn pixels(&self) -> *const u8 { VideoParts::pixels(&self.inner) }
             fn frame_metadata(&self) -> FrameMetadataRef<'_> { VideoParts::frame_metadata(&self.inner) }
-            fn sdk_timestamp(&self) -> Option<SdkTimestamp> { VideoParts::sdk_timestamp(&self.inner) }
+            fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> { VideoParts::sdk_timestamp(&self.inner) }
         }
         video_accessors! {
             impl['a] $name<'a>;
@@ -3177,7 +3177,7 @@ macro_rules! borrowed_audio_accessors {
             fn audio_timecode(&self) -> Timecode {
                 AudioParts::audio_timecode(&self.inner)
             }
-            fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+            fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> {
                 AudioParts::sdk_timestamp(&self.inner)
             }
             fn samples(&self) -> *const f32 {
@@ -4172,7 +4172,7 @@ mod tests {
                     (owned.timecode(), owned.timestamp()),
                     (
                         Timecode::from_ticks(12345),
-                        Some(SdkTimestamp::from_ticks(67890))
+                        ReceivedTimestamp::from_sdk(67890)
                     )
                 );
                 drop(frame);
@@ -6483,7 +6483,7 @@ mod tests {
         assert_eq!(owned.metadata(), Some("cached"));
         assert_eq!(owned.data().len(), expected_len);
         assert_eq!(owned.timecode(), Timecode::from_ticks(123));
-        assert_eq!(owned.timestamp(), Some(SdkTimestamp::from_ticks(456)));
+        assert_eq!(owned.timestamp(), ReceivedTimestamp::from_sdk(456));
     }
 
     #[test]
@@ -6513,12 +6513,12 @@ mod tests {
 
         assert_eq!(frame_ref.metadata(), Some("audio meta"));
         assert_eq!(frame_ref.timecode(), Timecode::from_ticks(123));
-        assert_eq!(frame_ref.timestamp(), Some(SdkTimestamp::from_ticks(456)));
+        assert_eq!(frame_ref.timestamp(), ReceivedTimestamp::from_sdk(456));
         let owned = frame_ref.to_owned();
         assert_eq!(owned.metadata(), Some("audio meta"));
         assert_eq!(owned.data().len(), sample_count);
         assert_eq!(owned.timecode(), Timecode::from_ticks(123));
-        assert_eq!(owned.timestamp(), Some(SdkTimestamp::from_ticks(456)));
+        assert_eq!(owned.timestamp(), ReceivedTimestamp::from_sdk(456));
     }
 
     #[test]
@@ -6763,7 +6763,7 @@ mod tests {
         assert_eq!(frame.data().len(), sample_count);
         assert_eq!((frame.num_samples(), frame.num_channels()), (1024, 2));
         assert_eq!(frame.sample_rate(), 48_000);
-        assert_eq!(frame.timestamp(), Some(SdkTimestamp::from_ticks(67890)));
+        assert_eq!(frame.timestamp(), ReceivedTimestamp::from_sdk(67890));
     }
 
     #[test]
@@ -7571,7 +7571,7 @@ mod tests {
             owned.data()
         );
         assert_eq!(owned.timecode(), Timecode::from_ticks(123));
-        assert_eq!(owned.timestamp(), Some(SdkTimestamp::from_ticks(456)));
+        assert_eq!(owned.timestamp(), ReceivedTimestamp::from_sdk(456));
         assert_eq!(owned.channel_data(1).unwrap().as_ptr(), unsafe {
             owned.data().as_ptr().add(3)
         });
@@ -8417,7 +8417,7 @@ mod tests {
             builder.build().unwrap()
         };
         let mut planar = built(16, 8, PixelFormat::I420, Some("m".repeat(metadata_len)));
-        planar.timestamp = Some(SdkTimestamp::from_ticks(1));
+        planar.timestamp = ReceivedTimestamp::from_sdk(1);
         vec![
             built(
                 64,
@@ -8448,7 +8448,7 @@ mod tests {
             builder.build().unwrap()
         };
         let mut reshaped = built(5, 3, Some("m".repeat(metadata_len)));
-        reshaped.timestamp = Some(SdkTimestamp::from_ticks(1));
+        reshaped.timestamp = ReceivedTimestamp::from_sdk(1);
         vec![
             built(8, 1024, Some("<longer metadata/>".repeat(8))),
             built(1, 1, None),
@@ -8523,7 +8523,7 @@ mod tests {
                 (
                     48_000,
                     Timecode::from_ticks(123),
-                    Some(SdkTimestamp::from_ticks(456))
+                    ReceivedTimestamp::from_sdk(456)
                 )
             );
             assert_copies_reuse(source, audio_destinations("<audio-copy/>".len()));

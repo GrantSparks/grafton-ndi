@@ -5,7 +5,7 @@ unsafe impl VideoParts for Frame {
     fn header(&self) -> VideoHeader { unimplemented!() }
     fn pixels(&self) -> *const u8 { unimplemented!() }
     fn frame_metadata(&self) -> FrameMetadataRef<'_> { unimplemented!() }
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp> { unimplemented!() }
+    fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> { unimplemented!() }
     fn FORBIDDEN_HELPER(&self) {}
 }
 fn main() {}

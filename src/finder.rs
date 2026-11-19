@@ -12,9 +12,10 @@ mod snapshot_guard_contract;
 pub(crate) use budget::SnapshotBudget;
 
 use std::{
-    borrow::{Borrow, Cow},
+    borrow::Borrow,
     cell::Cell,
     collections::{HashMap, HashSet},
+    convert::Infallible,
     ffi::{c_char, CStr, CString},
     fmt::{self, Display, Formatter},
     hash::{Hash, Hasher},
@@ -28,7 +29,6 @@ use std::{
 use crate::{
     change_feed::ChangeFeed,
     list_setting::list_cstring,
-    sdk_copy::LossyText,
     sys::{self, bindings::*},
     timeout::{Deadline, NeverStop, Stop, StopResult, POLL_INTERVAL},
     Error, Ndi, ResourceKind, Result,
@@ -294,7 +294,7 @@ unsafe impl FinderSnapshot for SourceSnapshot<'_> {
         budget: &mut SnapshotBudget,
     ) -> Result<Option<Source>> {
         // SAFETY: the snapshot guard keeps both native strings readable.
-        unsafe { copy_source(source, budget, |_| Ok(true)) }
+        unsafe { copy_source(source, budget, |_| true) }
     }
 }
 
@@ -379,7 +379,7 @@ impl SnapshotGuard<'_> {
             // SAFETY: scan keeps the source descriptor and its strings live.
             if let Some(source) = unsafe {
                 copy_source(entry, budget, |source| {
-                    Ok(first.is_none() && source.name.equals(name))
+                    first.is_none() && source.name.as_str() == name
                 })
             }? {
                 first = Some(source);
@@ -400,13 +400,9 @@ impl SnapshotGuard<'_> {
             // SAFETY: scan keeps the source descriptor and its strings live.
             if let Some(source) = unsafe {
                 copy_source(entry, budget, |source| {
-                    if retained.is_ok() {
-                        source.selected_by(query, &staged.seen)
-                    } else {
-                        // Preserve the snapshot's error precedence even when
-                        // the discovery window has run out of space.
-                        Ok(false)
-                    }
+                    // Keep scanning after a retention error so snapshot
+                    // errors still take precedence.
+                    retained.is_ok() && source.selected_by(query, &staged.seen)
                 })
             }? {
                 retained = staged.push(source);
@@ -551,7 +547,7 @@ impl SourceWatch<'_> {
     ///
     /// Returns the snapshot errors of [`Finder::current_sources`]:
     /// [`Error::UnexpectedSdkResult`] for a malformed top-level descriptor array,
-    /// [`Error::AllocationFailed`] when result or text storage cannot be reserved,
+    /// [`Error::AllocationFailed`] for failed result or text reservations,
     /// or [`Error::ResourceLimit`] when a snapshot exceeds its copy budgets.
     #[doc(alias = "NDIlib_find_get_current_sources")]
     pub fn current_sources(&mut self) -> Result<Vec<Source>> {
@@ -608,63 +604,19 @@ impl SourceWatch<'_> {
 }
 
 pub(crate) struct BorrowedSource<'a> {
-    name: LossyText<'a>,
-    address: Option<LossyText<'a>>,
+    name: SourceTextView<'a>,
+    address: Option<SourceTextView<'a>>,
 }
 
 impl BorrowedSource<'_> {
-    fn selected_by(
-        &self,
-        query: Option<HostQuery<'_>>,
-        seen: &HashSet<SeenSource>,
-    ) -> Result<bool> {
-        fn text<'a>(value: &LossyText<'a>) -> Result<Cow<'a, str>> {
-            value.as_str().map_or_else(
-                || {
-                    value
-                        .copy()
-                        .map(Cow::Owned)
-                        .map_err(|_| budget::allocation_failed())
-                },
-                |text| Ok(Cow::Borrowed(text)),
-            )
+    fn selected_by(&self, query: Option<HostQuery<'_>>, seen: &HashSet<SeenSource>) -> bool {
+        let name = self.name.as_str();
+        let address = self.address.map(SourceTextView::as_str);
+        if query.is_some_and(|query| !source_matches_query(name, address, query)) {
+            return false;
         }
-
-        // The decoder already charged both fields. For single-field queries,
-        // match that field before decoding the other for the deduplication key.
-        let name = || text(&self.name);
-        let address = || self.address.as_ref().map(text).transpose();
-        let (name, address) = match query {
-            Some(query @ HostQuery::Machine(_)) => {
-                let name = name()?;
-                if !source_name_matches_query(&name, query) {
-                    return Ok(false);
-                }
-                (name, address()?)
-            }
-            Some(query @ HostQuery::Ip(_)) => {
-                let address = address()?;
-                if !address
-                    .as_deref()
-                    .is_some_and(|address| address_matches_query(address, query))
-                {
-                    return Ok(false);
-                }
-                (name()?, address)
-            }
-            query => {
-                let name = name()?;
-                let address = address()?;
-                if query
-                    .is_some_and(|query| !source_matches_query(&name, address.as_deref(), query))
-                {
-                    return Ok(false);
-                }
-                (name, address)
-            }
-        };
-        let key = (name.as_ref(), address.as_deref());
-        Ok(!seen.contains(&key as &dyn SourceIdentity))
+        let key = (name, address);
+        !seen.contains(&key as &dyn SourceIdentity)
     }
 }
 
@@ -676,26 +628,28 @@ mod descriptor_sealed {
 /// selection order and source construction.
 pub(crate) trait DescriptorText: descriptor_sealed::Sealed {
     const ALLOCATION_KIND: crate::AllocationKind;
+    const SKIP_INVALID_UTF8: bool;
 
     fn empty_source_name(&mut self) -> Result<()>;
 
     /// # Safety
     /// The non-null pointer remains readable through its first NUL or the SDK
     /// string bound, for the returned lifetime.
-    unsafe fn view<'a>(&mut self, pointer: *const c_char) -> Result<Option<LossyText<'a>>>;
+    unsafe fn view<'a>(&mut self, pointer: *const c_char) -> Result<Option<&'a CStr>>;
 }
 
 impl descriptor_sealed::Sealed for SnapshotBudget {}
 impl DescriptorText for SnapshotBudget {
     const ALLOCATION_KIND: crate::AllocationKind = crate::AllocationKind::DiscoveryResults;
+    const SKIP_INVALID_UTF8: bool = true;
 
     fn empty_source_name(&mut self) -> Result<()> {
         self.charge_empty_source_name()
     }
 
-    unsafe fn view<'a>(&mut self, pointer: *const c_char) -> Result<Option<LossyText<'a>>> {
+    unsafe fn view<'a>(&mut self, pointer: *const c_char) -> Result<Option<&'a CStr>> {
         // SAFETY: forwarded to the decoder's bounded string obligation.
-        unsafe { self.source_text_view(pointer) }
+        unsafe { self.source_c_str(pointer) }
     }
 }
 
@@ -703,15 +657,15 @@ struct SingleSourceText(sys::table::Called<()>);
 impl descriptor_sealed::Sealed for SingleSourceText {}
 impl DescriptorText for SingleSourceText {
     const ALLOCATION_KIND: crate::AllocationKind = crate::AllocationKind::SourceDescriptor;
+    const SKIP_INVALID_UTF8: bool = false;
 
     fn empty_source_name(&mut self) -> Result<()> {
         Ok(())
     }
 
-    unsafe fn view<'a>(&mut self, pointer: *const c_char) -> Result<Option<LossyText<'a>>> {
+    unsafe fn view<'a>(&mut self, pointer: *const c_char) -> Result<Option<&'a CStr>> {
         // SAFETY: the descriptor caller keeps each non-null string readable.
-        let text = unsafe { crate::sdk_copy::sdk_text(self.0.map(|()| pointer)) }?;
-        Ok(Some(LossyText::new(text)))
+        unsafe { crate::sdk_copy::sdk_text(self.0.map(|()| pointer)) }.map(Some)
     }
 }
 
@@ -727,14 +681,14 @@ pub(crate) unsafe fn decode_source<T: DescriptorText>(
     name: *const c_char,
     address: *const c_char,
     text: &mut T,
-    select: impl FnOnce(&BorrowedSource<'_>) -> Result<bool>,
+    select: impl FnOnce(&BorrowedSource<'_>) -> bool,
 ) -> Result<Option<Source>> {
     if name.is_null() && address.is_null() {
         return Ok(None);
     }
     let name = if name.is_null() {
         text.empty_source_name()?;
-        LossyText::new(c"")
+        c""
     } else {
         // SAFETY: forwarded to the caller's bounded string obligation.
         let Some(name) = (unsafe { text.view(name) })? else {
@@ -751,8 +705,20 @@ pub(crate) unsafe fn decode_source<T: DescriptorText>(
         };
         Some(address)
     };
-    let source = BorrowedSource { name, address };
-    if !select(&source)? {
+    // Both bounded reads have already been charged, even when one field is
+    // malformed and the descriptor won't be available for selection.
+    let validated = SourceTextView::new(name).and_then(|name| {
+        Ok(BorrowedSource {
+            name,
+            address: address.map(SourceTextView::new).transpose()?,
+        })
+    });
+    let source = match validated {
+        Ok(source) => source,
+        Err(_) if T::SKIP_INVALID_UTF8 => return Ok(None),
+        Err(error) => return Err(Error::InvalidUtf8(error)),
+    };
+    if !select(&source) {
         return Ok(None);
     }
     Ok(Some(Source::from_text(
@@ -780,7 +746,7 @@ fn source_pointers(source: &NDIlib_source_t) -> (*const c_char, *const c_char) {
 unsafe fn copy_source(
     source: &NDIlib_source_t,
     budget: &mut SnapshotBudget,
-    select: impl FnOnce(&BorrowedSource<'_>) -> Result<bool>,
+    select: impl FnOnce(&BorrowedSource<'_>) -> bool,
 ) -> Result<Option<Source>> {
     let (name, address) = source_pointers(source);
     // SAFETY: forwarded to the caller's bounded string obligation.
@@ -988,9 +954,21 @@ impl Finder {
     ///
     /// Each snapshot permits at most 16,384 descriptors and 16 MiB total
     /// native descriptors, result storage, scanned string bytes (including
-    /// rejected entries) and produced UTF-8. Exceeding either budget returns
-    /// [`Error::ResourceLimit`]; reservations are fallible. An isolated
-    /// malformed descriptor within the budget is skipped.
+    /// rejected entries) and owned source text with its shared storage overhead.
+    /// Exceeding either budget returns [`Error::ResourceLimit`]. Each SDK string
+    /// is also limited to 4 MiB including its terminator. An isolated malformed
+    /// descriptor within the snapshot budgets is skipped, including one
+    /// whose name or address fails UTF-8 validation.
+    ///
+    /// # Allocation behavior
+    ///
+    /// Failed reservations for the result vector or copied text return
+    /// [`Error::AllocationFailed`]. The same applies to the result and
+    /// deduplication containers in [`Self::find_sources`]. Creating a shared
+    /// owner for copied source text uses the global allocator's allocation
+    /// failure handler, which can terminate the process. This also applies to
+    /// single-source getters that copy an SDK descriptor, such as
+    /// [`crate::Sender::source`].
     ///
     /// # Returns
     ///
@@ -1000,8 +978,8 @@ impl Finder {
     ///
     /// Returns [`Error::UnexpectedSdkResult`] with
     /// [`crate::SdkResultDefect::MalformedDiscoveryData`] for a malformed top-level
-    /// descriptor array, [`Error::AllocationFailed`] when result or text storage
-    /// cannot be reserved, or [`Error::ResourceLimit`] when a snapshot exceeds
+    /// descriptor array, [`Error::AllocationFailed`] for failed result or text
+    /// reservations, or [`Error::ResourceLimit`] when a snapshot exceeds
     /// its copy budgets. An isolated malformed descriptor is skipped.
     ///
     /// # Examples
@@ -1037,14 +1015,15 @@ impl Finder {
     /// several notifications); polling to the deadline makes resolution robust
     /// against that while still returning the instant `accept` is satisfied.
     ///
-    /// Returns `Ok(Ok(None))` if the deadline passes without a selection.
+    /// Distinguishes a completed final snapshot from a busy snapshot lock
+    /// so callers can decide whether the result is eligible for caching.
     fn poll_until_deadline<T, S: Stop, R>(
         &self,
         deadline: Deadline,
         stop: S,
         mut copy: impl FnMut(SnapshotGuard<'_>) -> Result<R>,
         mut accept: impl FnMut(R) -> StopResult<Option<T>, S>,
-    ) -> StopResult<Option<T>, S> {
+    ) -> StopResult<DiscoveryPoll<T>, S> {
         let mut watch = self.watch();
         loop {
             if let Err(stopped) = stop.check() {
@@ -1052,16 +1031,16 @@ impl Finder {
             }
             let sources = match watch.snapshot_until(deadline, stop, &mut copy)? {
                 Ok(Some(sources)) => sources,
-                Ok(None) => return Ok(Ok(None)),
+                Ok(None) => return Ok(Ok(DiscoveryPoll::SnapshotBusy)),
                 Err(stopped) => return Ok(Err(stopped)),
             };
             match accept(sources)? {
-                Ok(Some(selected)) => return Ok(Ok(Some(selected))),
+                Ok(Some(selected)) => return Ok(Ok(DiscoveryPoll::Selected(selected))),
                 Ok(None) => {}
                 Err(stopped) => return Ok(Err(stopped)),
             }
             if deadline.is_expired() {
-                return Ok(Ok(None));
+                return Ok(Ok(DiscoveryPoll::Complete));
             }
             // Block until the source list changes or the window ends; either
             // way the next iteration re-snapshots. The wait is rounded up, so
@@ -1117,6 +1096,7 @@ impl Finder {
             |guard| guard.snapshot(&SourceSnapshot(&self.sdk)),
             |sources| Ok(select_owned_source(sources, stop, &mut select)),
         )
+        .map(|outcome| outcome.map(DiscoveryPoll::into_selection))
     }
 
     /// Wait for an exact, case-sensitive complete NDI source name.
@@ -1129,8 +1109,10 @@ impl Finder {
     ///
     /// # Errors
     ///
-    /// An empty name returns [`Error::InvalidInput`]; a name containing a NUL
-    /// returns [`Error::InvalidCString`]. The name is checked before the timeout,
+    /// An empty name returns [`Error::InvalidInput`]. A name containing a NUL
+    /// returns [`Error::InvalidCString`], whose
+    /// [`NulError::into_vec`](std::ffi::NulError::into_vec) returns the bytes
+    /// through the first NUL. The name is checked before the timeout,
     /// including in async lookups. Other errors match [`Self::find_source`].
     #[doc(alias = "NDIlib_find_get_current_sources")]
     #[doc(alias = "NDIlib_find_wait_for_sources")]
@@ -1152,6 +1134,7 @@ impl Finder {
             |guard| guard.first_named(&SourceSnapshot(&self.sdk), name),
             |source| Ok(Ok(source)),
         )
+        .map(|outcome| outcome.map(DiscoveryPoll::into_selection))
     }
 
     /// Discovers sources for up to `timeout`, returning the complete set.
@@ -1191,8 +1174,9 @@ impl Finder {
     /// counts shared source strings once, plus the storage of both the result
     /// vector and the deduplication set, including container capacity.
     /// Returns [`Error::UnexpectedSdkResult`] for a malformed top-level snapshot
-    /// array, or [`Error::AllocationFailed`] when result or text storage cannot
-    /// be reserved. An isolated malformed descriptor is skipped.
+    /// array, or [`Error::AllocationFailed`] for failed result, deduplication or
+    /// text reservations. See [`Self::current_sources`] for allocation behavior
+    /// of shared source owners. An isolated malformed descriptor is skipped.
     ///
     /// # Examples
     ///
@@ -1224,6 +1208,7 @@ impl Finder {
         stop: S,
     ) -> StopResult<Vec<Source>, S> {
         self.find_selected_sources_until(deadline, stop, None)
+            .map(|outcome| outcome.map(DiscoveryOutcome::into_sources))
     }
 
     fn find_selected_sources_until<S: Stop>(
@@ -1231,7 +1216,7 @@ impl Finder {
         deadline: Deadline,
         stop: S,
         query: Option<HostQuery<'_>>,
-    ) -> StopResult<Vec<Source>, S> {
+    ) -> StopResult<DiscoveryOutcome, S> {
         let mut window = DiscoveryWindow::default();
         let outcome = self.poll_until_deadline(
             deadline,
@@ -1246,9 +1231,41 @@ impl Finder {
                 window = staged;
                 Ok(())
             },
-            |()| Ok(Ok(None::<()>)),
+            |()| Ok(Ok(None::<Infallible>)),
         )?;
-        Ok(outcome.map(|_| window.sources))
+        Ok(outcome.map(|end| match end {
+            DiscoveryPoll::Complete => DiscoveryOutcome::Complete(window.sources),
+            DiscoveryPoll::SnapshotBusy => DiscoveryOutcome::SnapshotBusy(window.sources),
+            DiscoveryPoll::Selected(never) => match never {},
+        }))
+    }
+}
+
+enum DiscoveryPoll<T> {
+    Selected(T),
+    Complete,
+    SnapshotBusy,
+}
+
+impl<T> DiscoveryPoll<T> {
+    fn into_selection(self) -> Option<T> {
+        match self {
+            Self::Selected(selected) => Some(selected),
+            Self::Complete | Self::SnapshotBusy => None,
+        }
+    }
+}
+
+enum DiscoveryOutcome {
+    Complete(Vec<Source>),
+    SnapshotBusy(Vec<Source>),
+}
+
+impl DiscoveryOutcome {
+    fn into_sources(self) -> Vec<Source> {
+        match self {
+            Self::Complete(sources) | Self::SnapshotBusy(sources) => sources,
+        }
     }
 }
 
@@ -1292,12 +1309,8 @@ impl<'a> SourceName<'a> {
                 what: "source name",
             }));
         }
-        if name.contains('\0') {
-            #[expect(
-                clippy::unwrap_used,
-                reason = "contains proved an interior NUL; NulError has no public constructor"
-            )]
-            return Err(CString::new(name).unwrap_err().into());
+        if let Some(error) = crate::error::nul_error_with_prefix(name) {
+            return Err(error.into());
         }
         Ok(Self(name))
     }
@@ -1683,6 +1696,20 @@ impl TryFrom<HostQuery<'_>> for HostKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceAddress(SourceText);
 
+/// A borrowed SDK string checked for UTF-8 and free of interior NULs.
+#[derive(Clone, Copy)]
+pub(crate) struct SourceTextView<'a>(&'a str);
+
+impl<'a> SourceTextView<'a> {
+    pub(crate) fn new(source: &'a CStr) -> std::result::Result<Self, std::str::Utf8Error> {
+        source.to_str().map(Self)
+    }
+
+    pub(crate) fn as_str(self) -> &'a str {
+        self.0
+    }
+}
+
 /// Validated UTF-8 with exactly one trailing NUL, shared by descriptors and
 /// their native borrowers. All SDK pointers lead into this immutable storage.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1694,13 +1721,17 @@ impl SourceText {
         2 * std::mem::size_of::<usize>() + std::mem::size_of::<CString>() + 1;
 
     /// Copy classified SDK text directly into its final shared native storage.
-    pub(crate) fn from_sdk(source: LossyText<'_>, kind: crate::AllocationKind) -> Result<Self> {
+    pub(crate) fn from_sdk(
+        source: SourceTextView<'_>,
+        kind: crate::AllocationKind,
+    ) -> Result<Self> {
+        let source = source.as_str();
         let mut text = String::new();
         let bytes = source.len() + 1;
         text.try_reserve_exact(bytes)
             .map_err(|_| crate::error::allocation_failed(kind, Some(bytes)))?;
-        source.push_to(&mut text);
-        // SAFETY: LossyText carries the NUL-free representation invariant.
+        text.push_str(source);
+        // SAFETY: SourceTextView borrows text from a CStr.
         Ok(unsafe { Self::from_nul_free_string(text) })
     }
 
@@ -2065,8 +2096,7 @@ impl Source {
     }
 
     /// Copy a source descriptor that the SDK call `source` returned
-    /// into owned strings after null checks, replacing bytes that are not
-    /// UTF-8.
+    /// into owned strings after null and UTF-8 checks.
     ///
     /// Null checks cannot validate dangling or otherwise invalid pointers. The
     /// SDK must provide a live descriptor and readable NUL-terminated strings.
@@ -2076,8 +2106,10 @@ impl Source {
     /// Returns [`Error::NativeOperationFailed`] naming the call's function when the
     /// descriptor is null, or names neither a source nor an address, and
     /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
-    /// the 4 MiB one SDK string may be. [`Error::AllocationFailed`] when the
-    /// source text storage cannot be reserved.
+    /// the 4 MiB available for one SDK string, including its terminator.
+    /// [`Error::InvalidUtf8`] reports an invalid name or address.
+    /// [`Error::AllocationFailed`] reports a failed text buffer reservation.
+    /// See [`Finder::current_sources`] for allocation behavior of shared source owners.
     ///
     /// # Safety
     ///
@@ -2104,7 +2136,7 @@ impl Source {
                 name,
                 address,
                 &mut SingleSourceText(source.map(|_| ())),
-                |_| Ok(true),
+                |_| true,
             )
         }?
         .ok_or_else(failed)
@@ -2140,7 +2172,10 @@ impl Display for Source {
 ///
 /// Entries remain until [`Self::invalidate`] or [`Self::clear`]; they can contain
 /// offline endpoints and omit feeds announced after the original window. Empty
-/// results are not cached. Results that cannot be stored are returned uncached.
+/// results are not cached. A miss with a busy final snapshot returns the feeds
+/// observed so far without filling the cache, so the next miss tries discovery
+/// again. A failed cache reservation returns the discovered result uncached.
+/// See [`Self::find_sources_by_host`] for allocation behavior during publication.
 /// The accepted grammar is [`Source::matches_host`]'s.
 /// Equivalent hostname or machine-name ASCII case/final-dot and numeric IP
 /// spellings share an entry. Other spellings, including DNS aliases, remain
@@ -2272,14 +2307,20 @@ impl SourceCache {
     /// one non-waiting snapshot attempt. Results keep first-observed order, and
     /// sources that differ in name or full address text are distinct. Select the
     /// desired feed explicitly.
-    /// Empty results return an empty vector and are not retained.
+    /// Empty results return an empty vector and are not retained. If the final
+    /// snapshot lock stays busy until the budget expires, the feeds observed
+    /// so far are returned uncached and a later miss retries discovery.
     ///
     /// Discovery runs outside the cache lock; its window includes snapshot-lock
     /// contention. Access to cached descriptor copies can briefly serialize on the
     /// cache mutex. Copying and native snapshot execution can finish after the
-    /// discovery wait budget. Discovery uses the same bounded, fallible snapshot
-    /// and accumulated-result allocations as
-    /// [`Finder::find_sources`]. Returned cached descriptors are fallibly copied.
+    /// discovery wait budget. [`Finder::find_sources`] describes the bounded
+    /// discovery work and its allocation errors. Copying a cache hit can return
+    /// [`Error::AllocationFailed`] if the result vector cannot be reserved.
+    /// On a miss, reservations to copy the result, prepare a host key or grow
+    /// the cache map are best-effort. Creating the shared snapshot owner uses
+    /// the global allocator's allocation failure handler, as does creating
+    /// shared source owners during [`Finder::current_sources`].
     /// Entries have the explicit stale-data policy described on [`SourceCache`].
     ///
     /// # Errors
@@ -2287,9 +2328,9 @@ impl SourceCache {
     /// [`Error::InvalidInput`] for a query outside [`Source::matches_host`]'s
     /// grammar or a timeout above [`crate::MAX_TIMEOUT`], even on a cache hit.
     /// The host is checked before the timeout, including in async lookups;
-    /// discovery/resource errors propagate without filling an entry. A completed
-    /// result the cache cannot store is returned uncached. IP hints must already
-    /// be configured on the finder; this method does not change its scope.
+    /// discovery/resource errors propagate without filling an entry. A failed
+    /// publication reservation returns the discovered result uncached. IP hints
+    /// must already be configured on the finder.
     #[doc(alias = "NDIlib_find_get_current_sources")]
     #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
@@ -2318,7 +2359,7 @@ impl SourceCache {
         query: HostQuery<'_>,
         deadline: Deadline,
         stop: S,
-    ) -> StopResult<Vec<Source>, S> {
+    ) -> StopResult<DiscoveryOutcome, S> {
         self.finder()
             .find_selected_sources_until(deadline, stop, Some(query))
     }
@@ -2387,7 +2428,7 @@ impl CachedSources {
         query: HostQuery<'_>,
         deadline: Deadline,
         previous_miss: Option<CacheMiss>,
-        discover: impl FnOnce(HostQuery<'_>, Deadline) -> StopResult<Vec<Source>, S>,
+        discover: impl FnOnce(HostQuery<'_>, Deadline) -> StopResult<DiscoveryOutcome, S>,
     ) -> StopResult<Vec<Source>, S> {
         self.find_sources_by_host_with_copy::<S>(
             query,
@@ -2403,7 +2444,7 @@ impl CachedSources {
         query: HostQuery<'_>,
         deadline: Deadline,
         previous_miss: Option<CacheMiss>,
-        discover: impl FnOnce(HostQuery<'_>, Deadline) -> StopResult<Vec<Source>, S>,
+        discover: impl FnOnce(HostQuery<'_>, Deadline) -> StopResult<DiscoveryOutcome, S>,
         mut copy: impl FnMut(&[Source]) -> Result<Vec<Source>>,
     ) -> StopResult<Vec<Source>, S> {
         // A queued lookup can use a hit published before its worker starts.
@@ -2415,7 +2456,8 @@ impl CachedSources {
         // SDK waits and user discovery run outside the cache mutex. Invalidation
         // changes the generation, so an old result cannot repopulate the cache.
         let sources = match discover(query, deadline)? {
-            Ok(sources) => sources,
+            Ok(DiscoveryOutcome::Complete(sources)) => sources,
+            Ok(DiscoveryOutcome::SnapshotBusy(sources)) => return Ok(Ok(sources)),
             Err(stopped) => return Ok(Err(stopped)),
         };
         if !sources.is_empty() {
@@ -2529,7 +2571,7 @@ mod tests {
                 query,
                 deadline,
                 None,
-                |query, _| discover(query).map(Ok),
+                |query, _| discover(query).map(|sources| Ok(DiscoveryOutcome::Complete(sources))),
                 copy,
             )?;
             Ok(sources)
@@ -2545,6 +2587,14 @@ mod tests {
     }
 
     use super::*;
+
+    const MALFORMED_SOURCE_NAMES: [(&str, &str); 5] = [
+        ("\0leading", "\0"),
+        ("bad\0name", "bad\0"),
+        ("trailing\0", "trailing\0"),
+        ("multiple\0names\0", "multiple\0"),
+        ("é映\0later", "é映\0"),
+    ];
 
     fn assert_same_name_error(actual: Error, expected: &Error) {
         match (actual, expected) {
@@ -2566,11 +2616,17 @@ mod tests {
                 what: "source name",
             }),
         );
-        for name in ["bad\0name", "trailing\0"] {
-            let expected = Error::from(CString::new(name).unwrap_err());
-            assert_same_name_error(SourceName::checked(name).unwrap_err(), &expected);
+        for (name, prefix) in MALFORMED_SOURCE_NAMES {
+            let Error::InvalidCString(error) = SourceName::checked(name).unwrap_err() else {
+                panic!("expected a NUL error for {name:?}");
+            };
+            assert_eq!(error.nul_position(), prefix.len() - 1);
             #[cfg(feature = "file-io")]
-            assert_same_name_error(crate::file::SourceSpec::new(name).unwrap_err(), &expected);
+            assert_same_name_error(
+                crate::file::SourceSpec::new(name).unwrap_err(),
+                &Error::InvalidCString(error.clone()),
+            );
+            assert_eq!(error.into_vec(), prefix.as_bytes());
         }
         let longest = "x".repeat(if cfg!(miri) {
             64
@@ -2596,6 +2652,27 @@ mod tests {
         }
         // Address-only Source values intentionally do not use this name rule.
         assert_eq!(Source::new("").unwrap().name(), "");
+    }
+
+    #[test]
+    fn invalid_source_name_allocation_depends_only_on_the_prefix() {
+        for prefix in ["\0", "é映\0"] {
+            let (_, prefix_peak) =
+                crate::test_alloc::peak_bytes(|| SourceName::checked(prefix).unwrap_err());
+            assert!(prefix_peak <= 64);
+            let max_suffix = if cfg!(miri) { 64 } else { 1 << 20 };
+            for suffix_len in [1, 32, max_suffix] {
+                let name = format!("{prefix}{}", "x".repeat(suffix_len));
+                let (error, peak) =
+                    crate::test_alloc::peak_bytes(|| SourceName::checked(&name).unwrap_err());
+                let Error::InvalidCString(error) = error else {
+                    panic!("expected a NUL error");
+                };
+                assert_eq!(error.nul_position(), prefix.len() - 1);
+                assert_eq!(error.into_vec(), prefix.as_bytes());
+                assert_eq!(peak, prefix_peak, "suffix length {suffix_len}");
+            }
+        }
     }
 
     #[test]
@@ -2645,7 +2722,7 @@ mod tests {
             .unwrap()
         });
         let id = crate::discovery_server::ReceiverId::new("not-advertised").unwrap();
-        for name in ["", "bad\0name", "trailing\0"] {
+        for name in std::iter::once("").chain(MALFORMED_SOURCE_NAMES.map(|(name, _)| name)) {
             let expected = SourceName::checked(name).unwrap_err();
             assert_same_name_error(
                 finder
@@ -2785,7 +2862,7 @@ mod tests {
                     assert!(matches!(query, HostQuery::Host("camera")));
                     assert_eq!(remaining.end(), deadline.end());
                     assert!(remaining.is_expired());
-                    Ok(Ok(Vec::new()))
+                    Ok(Ok(DiscoveryOutcome::Complete(Vec::new())))
                 },
             )
             .unwrap()
@@ -3854,7 +3931,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_rejects_before_decoding_unused_lossy_text() {
+    fn discovery_skips_malformed_and_unmatched_text_without_allocating() {
         let mutex = parking_lot::Mutex::new(FindInstance(ptr::null_mut()));
         let guard = SnapshotGuard {
             instance: mutex.lock(),
@@ -3894,7 +3971,7 @@ mod tests {
 
     #[test]
     fn discovery_accumulates_distinct_name_and_address_text_in_order() {
-        let lossy = source_entry(c"STUDIO (Camera \xff)".as_ptr(), c"192.0.2.1".as_ptr());
+        let invalid = source_entry(c"STUDIO (Camera \xff)".as_ptr(), c"192.0.2.1".as_ptr());
         let same = source_entry(c"STUDIO (Camera �)".as_ptr(), c"192.0.2.1".as_ptr());
         let changed = source_entry(c"STUDIO (Camera �)".as_ptr(), c"192.0.2.2".as_ptr());
         let last = source_entry(c"STUDIO (Last)".as_ptr(), ptr::null());
@@ -3907,8 +3984,8 @@ mod tests {
         };
         let mut window = DiscoveryWindow::default();
         let query = Some(HostQuery::checked("STUDIO").unwrap());
-        let initial = [malformed, lossy, same, unrelated, changed, changed];
-        let subsequent = [same, changed, last, lossy, last];
+        let initial = [malformed, invalid, same, unrelated, changed, changed];
+        let subsequent = [same, changed, last, invalid, last];
         guard
             .discover(&SliceSnapshot(&initial), &mut window, query)
             .unwrap();
@@ -3936,7 +4013,7 @@ mod tests {
         let mut matched_ip = DiscoveryWindow::default();
         guard
             .discover(
-                &SliceSnapshot(&[lossy, same, unrelated]),
+                &SliceSnapshot(&[invalid, same, unrelated]),
                 &mut matched_ip,
                 Some(HostQuery::checked("192.0.2.1").unwrap()),
             )
@@ -4111,7 +4188,7 @@ mod tests {
                 let owned = unsafe {
                     {
                         let (name, address) = source_pointers(source);
-                        decode_source(name, address, budget, |_| Ok(true))
+                        decode_source(name, address, budget, |_| true)
                     }
                 };
                 assert_eq!(self.active.fetch_sub(1, Ordering::SeqCst), 1);
@@ -4186,6 +4263,7 @@ mod tests {
             Source(Source),
             Missing,
             Malformed,
+            InvalidUtf8(std::str::Utf8Error),
         }
 
         let name = c"Camera".as_ptr();
@@ -4232,10 +4310,26 @@ mod tests {
                 Expected::Missing,
             ),
             (
-                "lossy name",
+                "invalid name",
                 c"Cam\xff".as_ptr(),
-                ptr::null(),
-                Expected::Source(Source::new("Cam\u{fffd}").unwrap()),
+                ip,
+                Expected::InvalidUtf8(c"Cam\xff".to_str().unwrap_err()),
+            ),
+            (
+                "invalid address",
+                name,
+                c"ndi://camera.local/\xff".as_ptr(),
+                Expected::InvalidUtf8(c"ndi://camera.local/\xff".to_str().unwrap_err()),
+            ),
+            (
+                "literal replacement characters",
+                c"Cam�".as_ptr(),
+                c"ndi://camera.local/�".as_ptr(),
+                Expected::Source(
+                    Source::new("Cam�")
+                        .unwrap()
+                        .with_address(SourceAddress::new("ndi://camera.local/�").unwrap()),
+                ),
             ),
             ("unterminated name", malformed, ip, Expected::Malformed),
             (
@@ -4288,10 +4382,10 @@ mod tests {
             let ((snapshot, accepted_allocations), (rejected, rejected_allocations), single) = unsafe {
                 (
                     crate::test_alloc::allocation_count(|| {
-                        decode_source(name, address, &mut accepted_budget, |_| Ok(true))
+                        decode_source(name, address, &mut accepted_budget, |_| true)
                     }),
                     crate::test_alloc::allocation_count(|| {
-                        decode_source(name, address, &mut rejected_budget, |_| Ok(false))
+                        decode_source(name, address, &mut rejected_budget, |_| false)
                     }),
                     source_from_raw(&raw, c"test source query"),
                 )
@@ -4311,8 +4405,47 @@ mod tests {
             );
             match expected {
                 Expected::Source(expected) => {
-                    assert_eq!(snapshot.unwrap().as_ref(), Some(&expected), "{label}");
+                    let source = snapshot.unwrap().unwrap();
+                    assert_eq!(source, expected, "{label}");
                     assert_eq!(single.unwrap(), expected, "{label}");
+                    let retained = crate::source_retention::RetainedSource::new(&source);
+                    let (retained_name, retained_address) = source_pointers(retained.descriptor());
+                    // SAFETY: the raw and retained C strings above remain live
+                    // through the comparisons. A retained name is always present.
+                    unsafe {
+                        let original_name = if name.is_null() {
+                            c""
+                        } else {
+                            CStr::from_ptr(name)
+                        };
+                        assert_eq!(CStr::from_ptr(retained_name), original_name, "{label}");
+                        if address.is_null() {
+                            assert!(retained_address.is_null(), "{label}");
+                        } else {
+                            assert_eq!(
+                                CStr::from_ptr(retained_address),
+                                CStr::from_ptr(address),
+                                "{label}"
+                            );
+                        }
+                    }
+                    #[cfg(feature = "file-io")]
+                    {
+                        let spec = crate::file::SourceSpec::try_from(&source);
+                        match source.address() {
+                            Some(address) if !address.as_str().is_empty() => {
+                                let spec = spec.unwrap();
+                                assert_eq!(spec.url(), Some(address.as_str()), "{label}");
+                                assert_eq!(spec.name(), None, "{label}");
+                            }
+                            None if !source.name().is_empty() => {
+                                let spec = spec.unwrap();
+                                assert_eq!(spec.url(), None, "{label}");
+                                assert_eq!(spec.name(), Some(source.name()), "{label}");
+                            }
+                            _ => assert!(spec.is_err(), "{label}"),
+                        }
+                    }
                 }
                 Expected::Missing => {
                     assert_eq!(snapshot.unwrap(), None, "{label}");
@@ -4325,6 +4458,13 @@ mod tests {
                         "{label}: {single:?}"
                     );
                 }
+                Expected::InvalidUtf8(expected) => {
+                    assert!(snapshot.unwrap().is_none(), "{label}");
+                    assert!(
+                        matches!(single, Err(Error::InvalidUtf8(error)) if error == expected),
+                        "{label}: {single:?}"
+                    );
+                }
                 Expected::Malformed => {
                     assert_eq!(snapshot.unwrap(), None, "{label}");
                     assert!(
@@ -4333,38 +4473,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    #[test]
-    fn descriptor_selector_errors_preserve_text_charges_without_building_storage() {
-        for (name, address) in [
-            (c"Camera".as_ptr(), c"192.0.2.1:5960".as_ptr()),
-            (c"Cam\xff".as_ptr(), c"ndi://host\xfe:5960".as_ptr()),
-            (ptr::null(), c"[2001:db8::1]:5960".as_ptr()),
-            (c"".as_ptr(), ptr::null()),
-        ] {
-            let mut rejected_budget = SnapshotBudget::new();
-            let mut failed_budget = SnapshotBudget::new();
-            // SAFETY: the null pointers and complete C literals stay live for
-            // both decodes; neither selector retains its borrowed source.
-            let rejected =
-                unsafe { decode_source(name, address, &mut rejected_budget, |_| Ok(false)) };
-            assert!(rejected.unwrap().is_none());
-            let (failed, allocations) = crate::test_alloc::allocation_count(|| {
-                // SAFETY: the same descriptor and lifetime obligations as above.
-                unsafe {
-                    decode_source(name, address, &mut failed_budget, |_| {
-                        Err(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))
-                    })
-                }
-            });
-            assert!(matches!(
-                failed,
-                Err(Error::InvalidInput(crate::InputDefect::InvalidHostQuery))
-            ));
-            assert_eq!(allocations, 0);
-            assert_eq!(failed_budget.spent(), rejected_budget.spent());
         }
     }
 
@@ -4393,7 +4501,7 @@ mod tests {
                     name.as_ptr(),
                     ptr::null(),
                     &mut SnapshotBudget::new(),
-                    |_| Ok(true),
+                    |_| true,
                 )
             }
         });
@@ -4404,6 +4512,35 @@ mod tests {
                 bytes: Some(1_048_577),
             }))
         ));
+    }
+
+    #[cfg(not(miri))] // Requires re-executing this test binary.
+    #[test]
+    fn source_descriptor_shared_owner_uses_the_global_allocation_failure_handler() {
+        const CHILD: &str = "GRAFTON_NDI_TEST_SOURCE_OWNER_ALLOCATION_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let raw = NDIlib_source_t {
+                p_ndi_name: c"x".as_ptr(),
+                ..Default::default()
+            };
+            // The name and its terminator need two bytes. The Arc owner
+            // requires a larger allocation on every supported target.
+            let result = crate::test_alloc::fail_allocations_at_least(3, || {
+                // SAFETY: the raw descriptor and its terminated C literal stay live.
+                unsafe { source_from_raw(&raw, c"test source query") }
+            });
+            panic!("shared-owner allocation unexpectedly returned {result:?}");
+        }
+        let output = crate::test_support::TestChild::new(
+            "finder::tests::source_descriptor_shared_owner_uses_the_global_allocation_failure_handler",
+        )
+        .env(CHILD, "1")
+        .run_expecting(false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("memory allocation of") && stderr.contains("bytes failed"),
+            "{stderr}"
+        );
     }
 
     #[test]
@@ -4470,7 +4607,7 @@ mod tests {
             budget: &mut SnapshotBudget,
         ) -> Result<Option<Source>> {
             // SAFETY: all fixture strings remain live through this call.
-            unsafe { copy_source(source, budget, |_| Ok(true)) }
+            unsafe { copy_source(source, budget, |_| true) }
         }
     }
 

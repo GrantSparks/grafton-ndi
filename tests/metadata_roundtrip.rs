@@ -143,10 +143,7 @@ fn receiver_connection_metadata_survives_its_input_and_reconnect() -> Result<(),
         &ndi,
         &SenderOptions::new(common::unique_name("receiver connection metadata")).clock_video(false),
     )?;
-    let receiver = Receiver::new(
-        &ndi,
-        &ReceiverOptions::new(grafton_ndi::Source::new("").unwrap()),
-    )?;
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected())?;
     let text = "<receiver-registration/>";
     receiver.add_connection_metadata(
         &MetadataFrame::new(text)?.with_timecode(Timecode::from_ticks(21)),

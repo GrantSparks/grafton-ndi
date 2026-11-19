@@ -89,7 +89,10 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
                 receiver.connection_stats().unwrap(),
                 ordinary.connection_stats().unwrap(),
                 sender.connection_count(),
-                common::port_of(&receiver.connection_target())
+                receiver
+                    .connection_target()
+                    .as_ref()
+                    .and_then(common::port_of)
                     .and_then(common::socket_table)
                     .map_or_else(String::new, |table| format!("\n{table}"))
             );

@@ -13,11 +13,11 @@ use runtime_fixture::read_fake_log;
 
 #[cfg(feature = "advanced")]
 use grafton_ndi::{
-    advanced::MouseButton, MediaTypes, RuntimeFeature, ScanType, SettingChange, StreamTier,
+    advanced::MouseButton, MediaTypes, RuntimeFeature, ScanType, SettingChange, Source, StreamTier,
 };
 use grafton_ndi::{
     Error, FrameDefect, FrameSync, FrameSyncAudioRequest, LayoutDefect, Ndi, Receiver,
-    ReceiverOptions, RuntimeOptions, Source,
+    ReceiverOptions, RuntimeOptions,
 };
 use std::time::Duration;
 
@@ -64,7 +64,7 @@ fn exercise_kvm(library: std::path::PathBuf) {
     let view = session.receiver();
     let _ = view.ptz();
     assert_eq!(read_fake_log(), before);
-    assert_eq!(view.connection_target(), first);
+    assert_eq!(view.connection_target().as_ref(), Some(&first));
     view.set_tally(grafton_ndi::Tally::new(true, false));
     session.key_down(0xffe1).unwrap();
     session.mouse_down(MouseButton::Right).unwrap();
@@ -96,7 +96,7 @@ fn exercise_kvm(library: std::path::PathBuf) {
     drop(session);
     receiver.connect_to(&next);
     let mut session = receiver.kvm().unwrap();
-    assert_eq!(session.receiver().connection_target(), next);
+    assert_eq!(session.receiver().connection_target().as_ref(), Some(&next));
     session.key_down(0xff0d).unwrap();
     // Drop releases only the second session's key, before the disconnect.
     drop(session);
@@ -253,7 +253,7 @@ fn exercise(library: std::path::PathBuf) {
     let source = Source::new("STUDIO (Clocked)").unwrap();
     let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source.clone())).unwrap();
     let mut sync = FrameSync::new(receiver).unwrap();
-    assert_eq!(sync.receiver().connection_target(), source);
+    assert_eq!(sync.receiver().connection_target().as_ref(), Some(&source));
     let before = sync
         .capture_video_ref(ScanType::Progressive)
         .unwrap()
@@ -347,7 +347,7 @@ fn exercise(library: std::path::PathBuf) {
     let after = sync.capture_video(ScanType::Progressive).unwrap().unwrap();
     assert_eq!(after.timecode().ticks(), 1234);
     let receiver = sync.into_receiver();
-    assert_eq!(receiver.connection_target(), source);
+    assert_eq!(receiver.connection_target().as_ref(), Some(&source));
     drop(receiver);
 
     let log = read_fake_log();
@@ -432,7 +432,7 @@ fn exercise(library: std::path::PathBuf) {
 mod test_alloc;
 
 fn unconnected(ndi: &Ndi) -> Receiver {
-    Receiver::new(ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap()
+    Receiver::new(ndi, &ReceiverOptions::disconnected()).unwrap()
 }
 
 fn count(calls: &str, prefix: &str) -> usize {

@@ -1193,8 +1193,8 @@ fn discovery_server_connects_overlap_capture_and_report_the_remote_target() {
                 progress_after_in(&receiver, before, "remote request_connect");
                 loans.wait_for_media(&ndi);
                 assert_eq!(
-                    receiver.connection_target(),
-                    peers.sources[0],
+                    receiver.connection_target().as_ref(),
+                    Some(&peers.sources[0]),
                     "remote control changed the locally requested target"
                 );
                 listener.request_disconnect(&id).unwrap();

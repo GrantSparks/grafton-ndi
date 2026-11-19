@@ -158,6 +158,7 @@ required-features = ["file-io"]
 [[example]]
 name = "file_thumbnails"
 required-features = ["file-io", "image-encoding"]
+test = true
 
 [[example]]
 name = "framesync_reception_monitor"

@@ -13,6 +13,7 @@ use runtime_fixture::{read_fake_log, NativeGate};
 
 use grafton_ndi::{
     Error, Ndi, Receiver, ReceiverEvent, ReceiverItemRef, ReceiverOptions, RuntimeOptions, Source,
+    SourceAddress,
 };
 use std::{
     path::PathBuf,
@@ -39,6 +40,75 @@ fn connection_target_tracks_native_requests() {
             "GRAFTON_FAKE_NDI_LOG",
             directory.path().join("requests.log"),
         )
+        .run();
+}
+
+#[test]
+fn disconnected_receiver_has_no_target_and_keeps_the_first_real_selection() {
+    if let Some(path) = std::env::var_os("GRAFTON_TARGET_IDLE_CHILD") {
+        let ndi =
+            Ndi::with_options(&RuntimeOptions::new().library_path(PathBuf::from(path))).unwrap();
+        let options = ReceiverOptions::disconnected();
+        let receiver = Receiver::new(&ndi, &options).unwrap();
+        let unnamed = Source::new("").unwrap();
+        let empty = unnamed
+            .clone()
+            .with_address(SourceAddress::new("").unwrap());
+        let address_only =
+            unnamed.with_address(SourceAddress::new("ndi://192.0.2.10:5960").unwrap());
+        let named = Source::new("Named").unwrap();
+
+        assert!(options.configured_source().is_none());
+        assert!(receiver.connection_target().is_none());
+        assert!(read_fake_log().contains("receiver-create-target:None:None\n"));
+        let before = read_fake_log();
+        receiver.reconnect();
+        assert_eq!(read_fake_log(), before);
+        receiver.connect_to(&empty);
+        assert!(receiver.connection_target().is_none());
+        for source in [&named, &address_only] {
+            receiver.connect_to(source);
+            assert_eq!(receiver.connection_target().as_ref(), Some(source));
+            receiver.disconnect();
+            assert_eq!(receiver.connection_target().as_ref(), Some(source));
+            receiver.reconnect();
+        }
+        receiver.connect_to(&empty);
+        assert_eq!(receiver.connection_target().as_ref(), Some(&address_only));
+        receiver.reconnect();
+        let log = read_fake_log();
+        let targets: Vec<_> = log
+            .lines()
+            .filter_map(|line| line.strip_prefix("receiver-connect-target:"))
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                "Some(\"Named\"):None",
+                "Some(\"Named\"):None",
+                "Some(\"\"):Some(\"ndi://192.0.2.10:5960\")",
+                "Some(\"\"):Some(\"ndi://192.0.2.10:5960\")",
+                "Some(\"\"):Some(\"ndi://192.0.2.10:5960\")",
+            ]
+        );
+        assert_eq!(log.matches("receiver-connect:<disconnected>\n").count(), 4);
+
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::new(address_only.clone())).unwrap();
+        assert_eq!(receiver.connection_target().as_ref(), Some(&address_only));
+        assert!(read_fake_log()
+            .contains("receiver-create-target:Some(\"\"):Some(\"ndi://192.0.2.10:5960\")\n"));
+        return;
+    }
+    let directory = common::FixtureDir::create("connection-target-idle");
+    let library = directory.path().join("libndi_idle_target.so");
+    runtime_fixture::FakeRuntime {
+        cfgs: vec!["fake_objects", "fake_receiver_targets"],
+        ..Default::default()
+    }
+    .build(&library);
+    TestChild::new("disconnected_receiver_has_no_target_and_keeps_the_first_real_selection")
+        .env("GRAFTON_TARGET_IDLE_CHILD", &library)
+        .env("GRAFTON_FAKE_NDI_LOG", directory.join("requests.log"))
         .run();
 }
 
@@ -76,11 +146,11 @@ fn connection_target_snapshot_does_not_wait_for_a_native_connection_request() {
             drop(release);
             assert_eq!(
                 snapshot.expect("snapshot waited for native connect"),
-                initial
+                Some(initial)
             );
             captured.expect("capture did not finish while native connect was gated");
         });
-        assert_eq!(receiver.connection_target(), blocked);
+        assert_eq!(receiver.connection_target().as_ref(), Some(&blocked));
 
         let capture_gate = PathBuf::from(std::env::var_os("GRAFTON_FAKE_CAPTURE_GATE").unwrap());
         std::env::set_var("GRAFTON_FAKE_CAPTURE_SCRIPT", "wait-gate:hold,status");
@@ -171,21 +241,25 @@ fn exercise_target() {
     let b = Source::new("B").unwrap();
     let receiver = Receiver::new(&ndi, &ReceiverOptions::new(a.clone())).unwrap();
     let initial = receiver.connection_target();
-    assert_eq!(initial, a);
+    assert_eq!(initial.as_ref(), Some(&a));
     let _: () = receiver.reconnect();
-    assert_eq!(receiver.connection_target(), a);
+    assert_eq!(receiver.connection_target().as_ref(), Some(&a));
     let _: () = receiver.connect_to(&b);
-    assert_eq!(receiver.connection_target(), b);
-    assert_eq!(initial, a, "a snapshot does not change with the receiver");
+    assert_eq!(receiver.connection_target().as_ref(), Some(&b));
+    assert_eq!(
+        initial.as_ref(),
+        Some(&a),
+        "a snapshot does not change with the receiver"
+    );
     receiver.disconnect();
-    assert_eq!(receiver.connection_target(), b);
+    assert_eq!(receiver.connection_target().as_ref(), Some(&b));
     receiver.reconnect();
-    assert_eq!(receiver.connection_target(), b);
+    assert_eq!(receiver.connection_target().as_ref(), Some(&b));
     assert!(matches!(
         Source::new("bad\0name"),
         Err(Error::InvalidCString(_))
     ));
-    assert_eq!(receiver.connection_target(), b);
+    assert_eq!(receiver.connection_target().as_ref(), Some(&b));
     let requests = || {
         read_fake_log()
             .lines()
@@ -223,14 +297,12 @@ fn exercise_target() {
     );
     assert_eq!(
         requests().last().unwrap(),
-        receiver.connection_target().name()
+        receiver.connection_target().unwrap().name()
     );
     #[cfg(feature = "tokio")]
     {
         let before = requests();
-        rejected_async_requests(
-            Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
-        );
+        rejected_async_requests(Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap());
         assert_eq!(
             requests(),
             before,
@@ -238,7 +310,7 @@ fn exercise_target() {
         );
     }
     // Retrying after the contention must send exactly the retained target.
-    let target = receiver.connection_target();
+    let target = receiver.connection_target().unwrap();
     receiver.disconnect();
     receiver.reconnect();
     assert_eq!(requests().last().unwrap(), target.name());

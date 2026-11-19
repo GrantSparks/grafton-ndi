@@ -137,6 +137,19 @@ pub(super) fn recorder_event(
     event
 }
 
+pub(super) fn recorder_event_with_diagnostics(
+    kind: NDIlib_file_recorder_event_type_e,
+    path: &str,
+) -> NDIlib_file_recorder_event_t {
+    let mut event = recorder_event(kind, path);
+    for (slot, byte) in event.p_message.iter_mut().zip(b"mock diagnostic") {
+        *slot = *byte as std::ffi::c_char;
+    }
+    // A full format field must keep its original bytes and truncation evidence.
+    event.source_format.fill(b'f' as std::ffi::c_char);
+    event
+}
+
 pub(super) const STARTED: NDIlib_file_recorder_event_type_e =
     NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_started;
 pub(super) const ROLLOVER: NDIlib_file_recorder_event_type_e =
@@ -185,6 +198,13 @@ pub(super) struct InjectedFrame {
     pub(super) bytes: Vec<u8>,
 }
 
+/// When to increase the counter during the next mock SDK read.
+#[repr(u8)]
+pub(super) enum DroppedAtSample {
+    Before = 1,
+    After = 2,
+}
+
 /// A stand-in for the SDK's recorder: an event queue the test can feed, and a
 /// record of how it was stopped and destroyed.
 pub(super) struct Recorder {
@@ -226,6 +246,7 @@ pub(super) struct Recorder {
     /// Every capture reports an oversized event, even when its queue is empty.
     pub(super) oversize_every_event: std::sync::atomic::AtomicBool,
     pub(super) dropped_events: std::sync::atomic::AtomicU64,
+    dropped_at_sample: std::sync::atomic::AtomicU8,
     pub(super) stops: std::sync::atomic::AtomicUsize,
     /// Calls that wait for an event, rather than the owner's nonblocking pump.
     pub(super) waits: std::sync::atomic::AtomicUsize,
@@ -273,6 +294,7 @@ impl Recorder {
             oversize_next_event: Default::default(),
             oversize_every_event: Default::default(),
             dropped_events: Default::default(),
+            dropped_at_sample: Default::default(),
             stops: Default::default(),
             waits: Default::default(),
             captures: Default::default(),
@@ -290,6 +312,11 @@ impl Recorder {
         NEXT_RECORDER.with(|next| *next.borrow_mut() = Some(std::sync::Arc::clone(self)));
     }
 
+    pub(super) fn drop_at_next_sample(&self, when: DroppedAtSample) {
+        self.dropped_at_sample
+            .store(when as u8, std::sync::atomic::Ordering::Release);
+    }
+
     /// Initialize the fake SDK's capture mutex before measuring wrapper work.
     /// The standard library's pthread mutex allocates on its first lock.
     pub(super) fn prepare_capture(&self) {
@@ -305,6 +332,17 @@ impl Recorder {
     pub(super) fn push_event(&self, event: NDIlib_file_recorder_event_t) {
         self.events.lock().unwrap().push_back(event);
         self.changed.notify_one();
+    }
+
+    pub(super) fn queue_open_failures(&self, populated: bool) {
+        let event = if populated {
+            recorder_event_with_diagnostics(OPEN_FAILED, "attempt.mkv")
+        } else {
+            recorder_event(OPEN_FAILED, "")
+        };
+        for _ in 0..8 {
+            self.push_event(event);
+        }
     }
 
     /// End the session the way the library does on its own, for example after
@@ -515,14 +553,19 @@ unsafe extern "C" fn recorder_is_recording(handle: NDIlib_file_recorder_instance
 }
 
 unsafe extern "C" fn recorder_dropped(handle: NDIlib_file_recorder_instance_t) -> u64 {
+    use std::sync::atomic::Ordering;
     // SAFETY: the wrapper passes a live handle.
     let recorder = unsafe { Recorder::from_handle(handle) };
-    recorder
-        .dropped_queries
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    recorder
-        .dropped_events
-        .load(std::sync::atomic::Ordering::Acquire)
+    recorder.dropped_queries.fetch_add(1, Ordering::AcqRel);
+    let when = recorder.dropped_at_sample.swap(0, Ordering::AcqRel);
+    if when == DroppedAtSample::Before as u8 {
+        recorder.dropped_events.fetch_add(1, Ordering::AcqRel);
+    }
+    let sample = recorder.dropped_events.load(Ordering::Acquire);
+    if when == DroppedAtSample::After as u8 {
+        recorder.dropped_events.fetch_add(1, Ordering::AcqRel);
+    }
+    sample
 }
 
 unsafe extern "C" fn recorder_rollover(

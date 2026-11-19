@@ -155,7 +155,9 @@ impl SourceSpec {
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when the name is empty, and
-    /// [`Error::InvalidCString`] when it contains a NUL.
+    /// [`Error::InvalidCString`] when it contains a NUL. For this error,
+    /// [`NulError::into_vec`](std::ffi::NulError::into_vec) returns the bytes
+    /// through the first NUL.
     pub fn new(name: impl AsRef<str>) -> Result<Self> {
         let name = SourceName::checked(name.as_ref())?;
         Ok(Self {
@@ -1134,12 +1136,15 @@ impl EventText {
     }
 
     pub(super) fn from_buffer(buffer: &[c_char]) -> Self {
-        let end = buffer.iter().position(|&b| b == 0);
-        let used = end.unwrap_or(buffer.len());
-        Self {
-            bytes: buffer[..used].iter().map(|&b| b.to_ne_bytes()[0]).collect(),
-            terminated: end.is_some(),
-            possibly_truncated: !buffer.is_empty() && used >= buffer.len() - 1,
+        EventTextRef::from_buffer(buffer).into_owned()
+    }
+
+    #[cfg(test)]
+    pub(super) fn as_ref(&self) -> EventTextRef<'_> {
+        EventTextRef {
+            bytes: &self.bytes,
+            terminated: self.terminated,
+            possibly_truncated: self.possibly_truncated,
         }
     }
 
@@ -1166,6 +1171,45 @@ impl EventText {
     /// Whether the string filled the available payload and might be truncated.
     pub fn is_possibly_truncated(&self) -> bool {
         self.possibly_truncated
+    }
+}
+
+/// The bounded text of one event while its native buffer is still available.
+#[derive(Clone, Copy)]
+pub(super) struct EventTextRef<'a> {
+    bytes: &'a [u8],
+    terminated: bool,
+    possibly_truncated: bool,
+}
+
+impl<'a> EventTextRef<'a> {
+    pub(super) fn from_buffer(buffer: &'a [c_char]) -> Self {
+        let end = buffer.iter().position(|&b| b == 0);
+        let used = end.unwrap_or(buffer.len());
+        // SAFETY: c_char and u8 are both one byte with alignment one. Every
+        // initialized c_char bit pattern is a u8, and used is within buffer.
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), used) };
+        Self {
+            bytes,
+            terminated: end.is_some(),
+            possibly_truncated: !buffer.is_empty() && used >= buffer.len() - 1,
+        }
+    }
+
+    pub(super) fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub(super) fn is_exact_nonempty(self) -> bool {
+        !self.bytes.is_empty() && self.terminated && !self.possibly_truncated
+    }
+
+    pub(super) fn into_owned(self) -> EventText {
+        EventText {
+            bytes: self.bytes.to_vec(),
+            terminated: self.terminated,
+            possibly_truncated: self.possibly_truncated,
+        }
     }
 }
 
@@ -1926,10 +1970,14 @@ impl PlayerEvent {
 
 impl RecorderEvent {
     /// The event the SDK's `raw` reports.
-    pub(super) fn from_sdk(raw: &NDIlib_file_recorder_event_t) -> Self {
+    pub(super) fn from_sdk(
+        raw: &NDIlib_file_recorder_event_t,
+        kind: RecorderEventKind,
+        path: EventTextRef<'_>,
+    ) -> Self {
         Self {
-            kind: RecorderEventKind::from_raw(raw.type_),
-            path: EventText::from_buffer(&raw.p_path),
+            kind,
+            path: path.into_owned(),
             message: EventText::from_buffer(&raw.p_message),
             tracks: tracks(raw.track_flags),
             dropped_packet_count: raw.dropped_packet_count,
@@ -1981,6 +2029,14 @@ impl RecorderStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decode_recorder_event(raw: &NDIlib_file_recorder_event_t) -> RecorderEvent {
+        RecorderEvent::from_sdk(
+            raw,
+            RecorderEventKind::from_raw(raw.type_),
+            EventTextRef::from_buffer(&raw.p_path),
+        )
+    }
 
     #[test]
     fn event_text_debug_prints_text_and_only_nondefault_evidence() {
@@ -3248,12 +3304,12 @@ mod tests {
             track_flags: NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_audio,
             ..Default::default()
         };
-        assert_eq!(RecorderEvent::from_sdk(&raw).tracks(), MediaTypes::AUDIO);
+        assert_eq!(decode_recorder_event(&raw).tracks(), MediaTypes::AUDIO);
         let other = NDIlib_file_recorder_event_t {
             type_: NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_started,
             ..Default::default()
         };
-        assert!(RecorderEvent::from_sdk(&other).tracks().is_empty());
+        assert!(decode_recorder_event(&other).tracks().is_empty());
     }
 
     #[test]
@@ -3482,7 +3538,7 @@ mod tests {
         recorder.source_format[0] = b'f' as c_char;
         let expected_info = FileInfo::from_sdk(&info);
         let expected_player = PlayerEvent::from_sdk(&player);
-        let expected_recorder = RecorderEvent::from_sdk(&recorder);
+        let expected_recorder = decode_recorder_event(&recorder);
         assert_eq!(
             expected_info.source_format().unwrap().audio_num_channels(),
             2
@@ -3534,7 +3590,7 @@ mod tests {
                 source_format: format,
                 ..player
             });
-            let mut decoded_recorder = RecorderEvent::from_sdk(&NDIlib_file_recorder_event_t {
+            let mut decoded_recorder = decode_recorder_event(&NDIlib_file_recorder_event_t {
                 source_format_payload: format,
                 ..recorder
             });
@@ -3574,7 +3630,7 @@ mod tests {
             ..Default::default()
         };
         raw.p_path.fill(0xff_u8 as c_char);
-        let event = RecorderEvent::from_sdk(&raw);
+        let event = decode_recorder_event(&raw);
         assert_eq!(event.kind(), RecorderEventKind::FileClosed);
         assert!(!event.path().is_terminated());
         assert!(event.path().to_str().is_err());

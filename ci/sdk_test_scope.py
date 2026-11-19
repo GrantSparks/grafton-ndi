@@ -259,7 +259,7 @@ MIRI_SKIPS = (
     'sdk_copy::tests::rejected_scans_stay_charged_and_short_budgets_are_fatal',
     'finder::budget::tests::aggregate_bytes_are_checked_before_string_allocation',
     'finder::budget::tests::count_and_span_are_checked_before_dereferencing_or_reserving',
-    'finder::budget::tests::lossy_expansion_is_charged_before_allocating_the_output',
+    'finder::budget::tests::invalid_utf8_spends_the_copy_budget_without_allocating',
     'finder::budget::tests::rejected_entries_still_consume_the_scan_budget',
 )
 MIRI_GROUPS = tuple(group for group in FILTER_SELECTIONS if group.startswith('miri-'))

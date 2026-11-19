@@ -418,8 +418,11 @@ impl FilePlayer {
     /// [`Error::NativeOperationFailed`] when the SDK returns no source, or one
     /// that names neither a source nor an address, and
     /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
-    /// the 4 MiB one SDK string may be.
-    /// [`Error::AllocationFailed`] when source descriptor storage cannot be reserved.
+    /// the 4 MiB available for one SDK string, including its terminator.
+    /// [`Error::InvalidUtf8`] reports an invalid name or address.
+    /// [`Error::AllocationFailed`] reports a failed text buffer reservation.
+    /// See [`crate::Finder::current_sources`] for allocation behavior of
+    /// shared source owners.
     #[doc(alias = "NDIlib_file_player_get_advertised_source")]
     pub fn advertised_source(&self) -> Result<Source> {
         // SAFETY: the player is live. The descriptor the SDK returns, and its

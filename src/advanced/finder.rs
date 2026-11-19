@@ -58,7 +58,7 @@ unsafe fn extended_source(
 ) -> Result<Option<ExtendedSource>> {
     // SAFETY: the caller keeps the strings readable while the snapshot policy
     // copies them, omitting malformed entries without losing their scan charges.
-    let Some(source) = (unsafe { decode_source(name, address, budget, |_| Ok(true))? }) else {
+    let Some(source) = (unsafe { decode_source(name, address, budget, |_| true)? }) else {
         return Ok(None);
     };
     let metadata = if metadata.is_null() {
@@ -125,8 +125,9 @@ impl Finder {
     /// is included in that same byte budget, including lossy UTF-8 expansion.
     /// [`crate::Error::UnexpectedSdkResult`] with
     /// [`crate::SdkResultDefect::MalformedDiscoveryData`] for a malformed top-level
-    /// descriptor array, or [`crate::Error::AllocationFailed`] when result or text
-    /// storage cannot be reserved. An isolated malformed descriptor is skipped.
+    /// descriptor array, or [`crate::Error::AllocationFailed`] for failed result
+    /// or text reservations. See [`Self::current_sources`] for allocation behavior
+    /// of shared source owners. An isolated malformed descriptor is skipped.
     #[doc(alias = "NDIlib_find_get_current_sources_v2")]
     pub fn current_sources_with_metadata(&self) -> Result<Vec<ExtendedSource>> {
         let table = self.runtime().table::<SourceMetadata>()?;
@@ -156,10 +157,9 @@ mod tests {
             let mut plain_budget = SnapshotBudget::new();
             let mut metadata_budget = SnapshotBudget::new();
             // SAFETY: both pointer pairs are null or live terminated literals.
-            let plain = unsafe {
-                crate::finder::decode_source(name, address, &mut plain_budget, |_| Ok(true))
-            }
-            .unwrap();
+            let plain =
+                unsafe { crate::finder::decode_source(name, address, &mut plain_budget, |_| true) }
+                    .unwrap();
             let metadata =
                 unsafe { extended_source(name, address, std::ptr::null(), &mut metadata_budget) }
                     .unwrap();
@@ -201,6 +201,9 @@ mod tests {
         let lossy = copy(Some(name), Some(address), Some(invalid_utf8)).unwrap();
         assert_eq!(lossy.metadata(), Some("<ndi \u{fffd}/>"));
         assert_eq!(lossy.into_source().name(), "HOST (Camera)");
+
+        assert!(copy(Some(invalid_utf8), Some(address), None).is_none());
+        assert!(copy(Some(name), Some(invalid_utf8), None).is_none());
 
         // Neither a name nor an address: there is nothing to connect to.
         assert!(copy(None, None, Some(invalid_utf8)).is_none());

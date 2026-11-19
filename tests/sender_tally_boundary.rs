@@ -10,9 +10,7 @@ use common::TestChild;
 #[path = "support/runtime_fixture.rs"]
 mod runtime_fixture;
 
-use grafton_ndi::{
-    Ndi, Receiver, ReceiverOptions, RuntimeOptions, Sender, SenderOptions, Source, Tally,
-};
+use grafton_ndi::{Ndi, Receiver, ReceiverOptions, RuntimeOptions, Sender, SenderOptions, Tally};
 use runtime_fixture::{read_fake_log, FakeRuntime};
 use std::{
     path::PathBuf,
@@ -44,8 +42,7 @@ fn polls_preserve_changes_and_never_enter_a_waiters_native_query() {
         let ndi =
             Ndi::with_options(&RuntimeOptions::new().library_path(PathBuf::from(library))).unwrap();
         let sender = Sender::new(&ndi, &SenderOptions::new("fake tally")).unwrap();
-        let receiver =
-            Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap();
         // Poll first, then wait: the report must be returned exactly once.
         receiver.set_tally(Tally::new(true, false));
         for _ in 0..3 {

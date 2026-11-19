@@ -2,12 +2,7 @@
 use super::{FrameMetadataStatus, MAX_METADATA_BYTES};
 use crate::sdk_copy::bounded_sdk_text;
 use crate::{sys::bindings::NDIlib_metadata_frame_t, Error, Rejected, Result};
-use std::{
-    ffi::{CStr, CString},
-    fmt,
-    os::raw::c_char,
-    ptr, slice, str,
-};
+use std::{ffi::CStr, fmt, os::raw::c_char, ptr, slice, str};
 
 /// Validated metadata text, borrowed together with its terminator: the
 /// pointer and length of a C string that is known to be valid.
@@ -370,15 +365,8 @@ impl TerminatedText {
         // cannot overflow usize on any supported target.
         let len_with_nul = text.len() + 1;
         validate_metadata_len_with_nul(len_with_nul)?;
-        if let Some(position) = text.as_bytes().iter().position(|&byte| byte == 0) {
-            #[expect(
-                clippy::expect_used,
-                reason = "the searched prefix includes its first NUL; NulError has no public constructor"
-            )]
-            return Err(Error::InvalidCString(
-                CString::new(&text.as_bytes()[..=position])
-                    .expect_err("the prefix includes its first NUL"),
-            ));
+        if let Some(error) = crate::error::nul_error_with_prefix(text) {
+            return Err(error.into());
         }
         Ok(())
     }

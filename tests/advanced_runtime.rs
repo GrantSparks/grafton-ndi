@@ -75,7 +75,7 @@ fn video() -> VideoFrame {
 }
 
 fn unconnected_receiver(ndi: &Ndi) -> Receiver {
-    Receiver::new(ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap()
+    Receiver::new(ndi, &ReceiverOptions::disconnected()).unwrap()
 }
 
 /// What `receiver` says about its connection, for the message of a test that
@@ -88,7 +88,10 @@ fn link<M: ReceiverMode>(receiver: &Receiver<M>) -> String {
         "the receiver of {:?} reports {:?}{}",
         receiver.connection_target(),
         receiver.connection_stats().unwrap(),
-        tcp_table(&receiver.connection_target())
+        receiver
+            .connection_target()
+            .as_ref()
+            .map_or_else(String::new, tcp_table)
     )
 }
 
@@ -284,7 +287,7 @@ fn advanced_native_constructors_controls_and_queue() {
     drop(genlock);
     let packets = PacketReceiver::new(
         &ndi,
-        &ReceiverOptions::new(Source::new("").unwrap()).config(config.clone()),
+        &ReceiverOptions::disconnected().config(config.clone()),
         PassthroughPreset::HevcWithAudio,
     )
     .unwrap();
@@ -295,8 +298,7 @@ fn advanced_native_constructors_controls_and_queue() {
     drop(
         PacketReceiver::new(
             &ndi,
-            &ReceiverOptions::new(Source::new("").unwrap())
-                .color_format(ReceiverColorFormat::Best444),
+            &ReceiverOptions::disconnected().color_format(ReceiverColorFormat::Best444),
             PassthroughPreset::HevcWithAudio,
         )
         .unwrap(),
@@ -621,7 +623,7 @@ fn operations_report_why_the_advanced_sdk_is_unavailable() {
         RuntimeFeature::AdvancedReceiverConfiguration,
         Receiver::new(
             &ndi,
-            &ReceiverOptions::new(Source::new("").unwrap()).config(config.clone()),
+            &ReceiverOptions::disconnected().config(config.clone()),
         )
         .err()
         .unwrap(),
@@ -640,7 +642,7 @@ fn operations_report_why_the_advanced_sdk_is_unavailable() {
         RuntimeFeature::Passthrough(PassthroughPreset::Hevc),
         PacketReceiver::new(
             &ndi,
-            &ReceiverOptions::new(Source::new("").unwrap()),
+            &ReceiverOptions::disconnected(),
             PassthroughPreset::Hevc,
         )
         .err()

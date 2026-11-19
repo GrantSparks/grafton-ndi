@@ -232,7 +232,7 @@ unsafe impl VideoParts for P216Output<'_> {
     fn frame_metadata(&self) -> FrameMetadataRef<'_> {
         FrameMetadataRef::Absent
     }
-    fn sdk_timestamp(&self) -> Option<crate::SdkTimestamp> {
+    fn sdk_timestamp(&self) -> Option<crate::ReceivedTimestamp> {
         None
     }
     fn initialized(&self) -> crate::frames::Initialized {

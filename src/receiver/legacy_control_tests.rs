@@ -128,17 +128,13 @@ fn native_change_refuses_unsafe_controls_and_replays_tally_without_blocking_gett
     // SAFETY: the closure creates a fresh receiver handle for this runtime,
     // whose core includes the callbacks above and owns destruction.
     let mut receiver: Receiver = unsafe {
-        Receiver::create(
-            &ndi,
-            &ReceiverOptions::new(Source::new("").unwrap()),
-            |_, _| {
-                let instance = Box::into_raw(Box::new(Arc::clone(&native))).cast();
-                crate::runtime::NativeCreation::plain(sys::table::for_test(
-                    instance,
-                    c"NDIlib_recv_create_v3",
-                ))
-            },
-        )
+        Receiver::create(&ndi, &ReceiverOptions::disconnected(), |_, _| {
+            let instance = Box::into_raw(Box::new(Arc::clone(&native))).cast();
+            crate::runtime::NativeCreation::plain(sys::table::for_test(
+                instance,
+                c"NDIlib_recv_create_v3",
+            ))
+        })
     }
     .unwrap();
     Arc::get_mut(&mut receiver.core)

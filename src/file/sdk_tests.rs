@@ -1059,6 +1059,133 @@ fn a_player_plays_a_recording_and_keeps_its_source_between_files() {
 }
 
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn file_6_4_0_2_seek_frame_timestamp_matches_file_pts() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let info = ndi.runtime().info();
+    // The relationship was observed on this provider/runtime pair. Other
+    // versions and editions may carry a different timestamp origin.
+    if info.edition() != crate::SdkEdition::Advanced
+        || info.version() != crate::SdkVersion::parse("6.4.0.2")
+        || api.library_path().and_then(Path::parent) != info.library_path().and_then(Path::parent)
+    {
+        test_support::unsupported(&format!(
+            "File PTS correlation with {} and {:?}",
+            info.raw_version(),
+            api.library_path()
+        ));
+        return;
+    }
+
+    let scratch = FixtureDir::create("seek-frame-timestamp");
+    let clip = scratch.join("clip.mkv");
+    record_clip(
+        &api,
+        &LiveSource::start(&ndi, "seek-frame-timestamp"),
+        &clip,
+    );
+    let position = FilePosition::from_ticks(
+        FilePlayer::probe(&api, &clip)
+            .unwrap()
+            .duration()
+            .value()
+            .ticks()
+            / 2,
+    );
+    assert_ne!(position.ticks(), 0);
+
+    let name = format!("grafton-file-seek-timestamp-{}", std::process::id());
+    let mut player =
+        FilePlayer::new(&api, &FilePlayerOptions::new(&name).groups([name.as_str()])).unwrap();
+    let advertised = player.advertised_source().unwrap();
+    let finder = crate::Finder::new(
+        &ndi,
+        &crate::FinderOptions::new()
+            .groups([name])
+            .extra_ips(["127.0.0.1"]),
+    )
+    .unwrap();
+    let source = finder
+        .find_source(PATIENCE, |source| {
+            source.name() == advertised.name() && source.address().is_some()
+        })
+        .unwrap()
+        .expect("the player with an address");
+    let receiver = crate::Receiver::new(&ndi, &crate::ReceiverOptions::new(source)).unwrap();
+    let connected_by = Instant::now() + PATIENCE;
+    while !receiver.is_connected() {
+        assert!(
+            Instant::now() < connected_by,
+            "the receiver did not connect"
+        );
+        receiver.next_event(Duration::from_millis(10)).unwrap();
+    }
+
+    player.start(&clip).unwrap();
+    let started_by = Instant::now() + PATIENCE;
+    loop {
+        assert!(
+            Instant::now() < started_by,
+            "no startup first frame arrived"
+        );
+        if let Some(event) = player.next_event(Duration::from_millis(10)).unwrap() {
+            assert_ne!(event.kind(), PlayerEventKind::Error, "{event:?}");
+            if event.kind() == PlayerEventKind::FirstFrame {
+                break;
+            }
+        }
+    }
+    player.set_paused(true);
+    while receiver
+        .capture_video_ref(Duration::ZERO)
+        .unwrap()
+        .is_some()
+    {
+        assert!(Instant::now() < started_by, "startup frames kept arriving");
+    }
+    let clock = ndi.timestamp().unwrap();
+    player.seek(position).unwrap();
+    player.set_paused(false);
+
+    let seeked_by = Instant::now() + PATIENCE;
+    let mut frame_ticks = Vec::new();
+    let mut first_pts = None;
+    loop {
+        assert!(
+            Instant::now() < seeked_by,
+            "seek {position:?}, first PTS {first_pts:?}, received frame ticks {frame_ticks:?}, SDK clock {clock:?}"
+        );
+        let timestamp = receiver
+            .capture_video_ref(Duration::from_millis(10))
+            .unwrap()
+            .and_then(|frame| frame.timestamp());
+        if let Some(timestamp) = timestamp {
+            frame_ticks.push(timestamp.ticks());
+        }
+        while let Some(event) = player.next_event(Duration::ZERO).unwrap() {
+            assert_ne!(event.kind(), PlayerEventKind::Error, "{event:?}");
+            if event.kind() == PlayerEventKind::FirstFrame {
+                let pts = i64::try_from(event.first_pts().ticks()).unwrap();
+                assert!(pts > 0, "the nonzero seek returned {event:?}");
+                first_pts = Some(pts);
+            }
+        }
+        let Some(pts) = first_pts else { continue };
+        let Some(timestamp) = frame_ticks.iter().copied().find(|&ticks| ticks == pts) else {
+            continue;
+        };
+        eprintln!(
+            "first PTS {pts}, frame timestamp {timestamp}, SDK clock {}",
+            clock.ticks()
+        );
+        assert_ne!(timestamp, clock.ticks());
+        break;
+    }
+}
+
+#[test]
 fn an_async_player_runs_on_its_own_thread_and_closes_every_clone() {
     let Some((ndi, api)) = file_api() else {
         return;

@@ -262,6 +262,67 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
 }
 
 #[test]
+fn discovery_selects_only_lossless_source_targets() {
+    if let Some(library) = std::env::var_os("GRAFTON_UTF8_FINDER_RUNTIME") {
+        let ndi =
+            Ndi::with_options(&RuntimeOptions::new().library_path(PathBuf::from(library))).unwrap();
+        let cache = SourceCache::new(finder(&ndi, "Studio"));
+        let named = Source::new("STUDIO (Camera �)").unwrap();
+        let addressed = Source::new("")
+            .unwrap()
+            .with_address(SourceAddress::new("ndi://192.0.2.7/�").unwrap());
+        let mut expected = vec![named.clone(), addressed.clone()];
+        if std::env::var("GRAFTON_FAKE_FINDER_CASE").unwrap() == "utf8-reverse" {
+            expected.reverse();
+        }
+        assert_eq!(cache.finder().current_sources().unwrap(), expected);
+        assert_eq!(
+            cache
+                .finder()
+                .find_source_by_name(named.name(), Duration::ZERO)
+                .unwrap(),
+            Some(named.clone())
+        );
+        assert!(cache
+            .finder()
+            .find_source_by_name("STUDIO (Bad address)", Duration::ZERO)
+            .unwrap()
+            .is_none());
+        for (query, expected) in [("studio", named), ("192.0.2.7", addressed)] {
+            assert_eq!(
+                cache.find_sources_by_host(query, Duration::ZERO).unwrap(),
+                std::slice::from_ref(&expected)
+            );
+            let snapshots = read_fake_log().matches("finder-snapshot\n").count();
+            assert_eq!(
+                cache.find_sources_by_host(query, Duration::ZERO).unwrap(),
+                [expected]
+            );
+            assert_eq!(
+                read_fake_log().matches("finder-snapshot\n").count(),
+                snapshots
+            );
+        }
+        return;
+    }
+    let directory = common::FixtureDir::create("finder-utf8");
+    let library = directory.path().join("finder.so");
+    FakeRuntime {
+        cfgs: vec!["fake_finder"],
+        version: Some("6.4.0.2"),
+        ..Default::default()
+    }
+    .build(&library);
+    for scenario in ["utf8-forward", "utf8-reverse"] {
+        TestChild::new("discovery_selects_only_lossless_source_targets")
+            .env("GRAFTON_UTF8_FINDER_RUNTIME", &library)
+            .env("GRAFTON_FAKE_FINDER_CASE", scenario)
+            .env("GRAFTON_FAKE_NDI_LOG", directory.path().join("calls.log"))
+            .run();
+    }
+}
+
+#[test]
 fn cache_matches_only_the_outer_endpoint_host() {
     if let Some(library) = std::env::var_os("GRAFTON_OUTER_ENDPOINT_RUNTIME") {
         let ndi =

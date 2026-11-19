@@ -7,7 +7,7 @@ unsafe impl AudioParts for Frame {
     fn audio_timecode(&self) -> Timecode {
         unimplemented!()
     }
-    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+    fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> {
         unimplemented!()
     }
     fn samples(&self) -> *const f32 {

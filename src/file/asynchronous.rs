@@ -2240,7 +2240,8 @@ impl AsyncFilePlayer {
     pub fn source_format(&self) -> FileOperation<Option<SourceFormat>> {
         self.worker.source_format()
     }
-    /// The NDI source this player advertises.
+    /// The NDI source this player advertises. See
+    /// [`FilePlayer::advertised_source`] for descriptor read errors.
     #[doc(alias = "NDIlib_file_player_get_advertised_source")]
     pub fn advertised_source(&self) -> FileOperation<Source> {
         self.worker.call(|p| p.advertised_source())
@@ -5217,6 +5218,40 @@ mod tests {
     }
 
     #[test]
+    fn async_restart_observes_events_lost_after_the_start_sample() {
+        let (device, recorder) =
+            mock_recorder_with_drop_wait(Closing::AtStop, AsyncFileOptions::new(), Duration::ZERO);
+        let FinishStatus::Ended(SessionEnd::Closed(first)) =
+            block_on(recorder.finish(Duration::ZERO)).unwrap()
+        else {
+            panic!("the first session closed");
+        };
+        device.drop_at_next_sample(mock::DroppedAtSample::After);
+        let target =
+            RecordingTarget::new(std::env::temp_dir().join("async-counter-sample")).unwrap();
+        assert_eq!(
+            block_on(recorder.start(&target, RecordingTimecode::Preserve)).unwrap(),
+            2
+        );
+        assert_eq!(device.starts.load(Ordering::Acquire), 2);
+        let FinishStatus::Ended(SessionEnd::Indeterminate(second)) =
+            block_on(recorder.finish(Duration::ZERO)).unwrap()
+        else {
+            panic!("lost events prevent closure confirmation");
+        };
+        assert_eq!(first.dropped_events(), 0);
+        assert!(first.closure_confirmed());
+        assert_eq!(second.session(), 2);
+        assert_eq!(second.dropped_events(), 1);
+        assert!(matches!(
+            block_on(recorder.start(&target, RecordingTimecode::Preserve)),
+            Err(Error::InvalidState(StateConflict::IncompleteFileTracking))
+        ));
+        assert_eq!(device.starts.load(Ordering::Acquire), 2);
+        block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
     fn async_reset_retires_unknown_cleanup_only_after_replacement_succeeds() {
         let (device, recorder) = mock_recorder_with_drop_wait(
             Closing::AtStop,
@@ -6496,7 +6531,7 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         // The event pump takes this while the finish is registered.
-        let mut close = mock::recorder_event(mock::FILE_CLOSED, mock::TAKE);
+        let mut close = mock::recorder_event_with_diagnostics(mock::FILE_CLOSED, mock::TAKE);
         close.source_format_payload.video_track_count = 3;
         device.push_event(close);
         let outcome = block_on(finishing).unwrap();
@@ -6514,6 +6549,11 @@ mod tests {
             .unwrap();
         assert_eq!(malformed.kind(), RecorderEventKind::FileClosed);
         assert_eq!(malformed.path().to_str().unwrap(), mock::TAKE);
+        assert_eq!(malformed.message().to_str().unwrap(), "mock diagnostic");
+        assert!(malformed.message().is_terminated());
+        assert_eq!(malformed.format_text().as_bytes(), &[b'f'; 1024]);
+        assert!(!malformed.format_text().is_terminated());
+        assert!(malformed.format_text().is_possibly_truncated());
         assert_eq!(
             malformed.source_format(),
             Err(crate::SdkResultDefect::FileTrackCount {

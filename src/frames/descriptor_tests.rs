@@ -87,7 +87,7 @@ fn video_parts_implementations_cannot_override_shared_helpers() {
 struct ValidatedVideoLayout { payload_len_bytes: usize, data_len_bytes: usize }
 struct VideoHeader { scan_type: () }
 struct FrameMetadataRef<'a>(std::marker::PhantomData<&'a ()>);
-struct SdkTimestamp;
+struct ReceivedTimestamp;
 enum Initialized { ActiveRows, Storage { room_after: usize } }
 mod pixels { pub fn send_room(_: &super::ValidatedVideoLayout, _: ()) -> usize { 0 } }
 "#;
@@ -226,7 +226,7 @@ fn audio_and_metadata_parts_implementations_cannot_override_shared_helpers() {
 struct ValidatedAudioLayout;
 struct FrameMetadataRef<'a>(std::marker::PhantomData<&'a ()>);
 struct MetadataText<'a>(std::marker::PhantomData<&'a ()>);
-struct SdkTimestamp;
+struct ReceivedTimestamp;
 enum Initialized { ActiveRows, Storage { room_after: usize } }
 struct Timecode;
 "#;
@@ -289,7 +289,7 @@ fn a_growing_video_layout_is_read_once_and_keeps_the_destination_paired() {
         fn frame_metadata(&self) -> FrameMetadataRef<'_> {
             self.frame.metadata.view()
         }
-        fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+        fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> {
             None
         }
     }
@@ -344,7 +344,7 @@ fn a_growing_audio_layout_is_read_once_and_keeps_the_destination_paired() {
         fn audio_timecode(&self) -> Timecode {
             self.frame.timecode
         }
-        fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+        fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> {
             None
         }
         fn samples(&self) -> *const f32 {
@@ -406,7 +406,7 @@ fn a_video_accessor_panic_leaves_the_reused_destination_whole() {
             assert_ne!(count, 0, "test accessor panic");
             self.frame.metadata.view()
         }
-        fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+        fn sdk_timestamp(&self) -> Option<ReceivedTimestamp> {
             None
         }
     }

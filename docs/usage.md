@@ -37,14 +37,16 @@ authority before the path, query or fragment. Finder list settings accept
 iterables, such as `groups(["Public", "Studio"])` and
 `extra_ips(["192.0.2.10"])`; their readback accessors return slices.
 
-Snapshots and accumulated results have bounded, fallible allocations.
+Discovery bounds snapshot copy work and the results retained across a window.
 `Error::ResourceLimit` identifies the resource and units through `ResourceKind`.
-Invalid snapshot arrays return `UnexpectedSdkResult`, and storage allocation
-failures return `AllocationFailed` with their `AllocationFailure`;
-individual malformed descriptors can be skipped. See
-[`Finder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.Finder.html)
-for exact limits. Run [`find_sources`](../examples/find_sources.rs) to inspect the
-names your network advertises.
+Invalid snapshot arrays return `UnexpectedSdkResult`. Failed reservations for
+copied text and result containers return `AllocationFailed`. Allocating the
+shared owners for source text or cached results can terminate the process
+through the global allocator. Individual malformed descriptors can be skipped.
+See [`Finder::current_sources`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.Finder.html#method.current_sources)
+and [`Finder::find_sources`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.Finder.html#method.find_sources)
+for exact limits and error behavior. Run [`find_sources`](../examples/find_sources.rs)
+to inspect the names your network advertises.
 
 ### Keep discovery in server state
 
@@ -54,11 +56,13 @@ finder and retains its runtime, so no lifetime parameter or separately stored
 finder is needed. `cache.finder()` lends that same finder for uncached work.
 
 `find_sources_by_host(host, timeout)` returns every matching feed, leaving feed
-selection to the caller. A miss observes the full discovery window; a hit
-returns owned descriptor copies. Empty results are not cached. Entries remain
-stale until `invalidate(host)` or `clear()` removes them: choose an invalidation
-policy for your service. IP hints belong on the finder; a lookup never changes
-its scope. See the compilable server-state example in
+selection to the caller. A miss observes the discovery window, and a hit
+returns owned descriptor copies. When snapshot-lock contention prevents the
+final snapshot, the miss returns the feeds observed so far and the next miss
+retries discovery. Empty results are not cached. Entries remain stale until
+`invalidate(host)` or `clear()` removes them, so choose an invalidation policy
+for your service. IP hints belong on the finder, and a lookup keeps that
+finder's scope. See the compilable server-state example in
 [`SourceCache::new`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.SourceCache.html#method.new).
 
 For async service state, move that cache into
@@ -276,15 +280,17 @@ there is no source). [`status_monitor`](../examples/status_monitor.rs) shows
 status events; [`receive_ptz`](../examples/receive_ptz.rs) checks PTZ
 support before sending controls.
 
-`connect_to(&source)` remembers a new requested target; `connection_target()`
+Use `ReceiverOptions::disconnected()` if you will select a source after creating
+the receiver. `connection_target()` returns `None` until a local target is set.
+`connect_to(&source)` requests and remembers a target, and `connection_target()`
 returns its owned snapshot. `disconnect()` retains it and `reconnect()` retries
-it. Success means the request was issued; observe connection state and media
-progress separately.
+it when present. Use connection state and media progress to confirm a request
+took effect.
 
 The connection target is the last local request. A Discovery Server client's
 remote source change is observed through `wait_for_source_name_change()` and does
-not update `connection_target()`. Calling `reconnect()` requests the local
-target again, replacing any remote routing.
+not update `connection_target()`. Calling `reconnect()` with a remembered local
+target requests it again, replacing any remote routing.
 
 ## Integrate with async runtimes
 

@@ -1,13 +1,13 @@
 use grafton_ndi::{
     advanced::{PacketItemRef, PacketReceiver, PassthroughPreset},
-    Ndi, ReceiverOptions, Source,
+    Ndi, ReceiverOptions,
 };
 use std::time::Duration;
 fn escape() -> PacketItemRef<'static> {
     let ndi = Ndi::new().unwrap();
     let receiver = PacketReceiver::new(
         &ndi,
-        &ReceiverOptions::new(Source::new("").unwrap()),
+        &ReceiverOptions::disconnected(),
         PassthroughPreset::Hevc,
     )
     .unwrap();

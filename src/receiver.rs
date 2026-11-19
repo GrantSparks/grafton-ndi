@@ -658,11 +658,12 @@ impl ReceiverBandwidth {
     }
 }
 
-/// Configuration for creating a [`Receiver`]: the source it connects to and
-/// how it delivers that source's media.
+/// Configuration for creating a [`Receiver`], including an optional initial
+/// source and how the receiver delivers media.
 ///
-/// [`new`](Self::new) starts from the defaults; the presets start from
-/// settings suited to one use. Every setter replaces one setting.
+/// [`new`](Self::new) and [`disconnected`](Self::disconnected) start from the
+/// defaults. The presets start from settings suited to one use. Every setter
+/// replaces one setting.
 ///
 /// # Examples
 ///
@@ -682,7 +683,7 @@ impl ReceiverBandwidth {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReceiverOptions {
-    source: Source,
+    source: Option<Source>,
     color_format: ReceiverColorFormat,
     bandwidth: ReceiverBandwidth,
     allow_video_fields: bool,
@@ -710,9 +711,17 @@ impl ReceiveSettings<'_> {
 
 impl ReceiverOptions {
     /// Replace the source, preserving every other receiver setting.
+    /// An empty name and an absent or empty address clear the source.
     #[must_use]
     pub fn source(mut self, source: Source) -> Self {
-        self.source = source;
+        self.source = has_receiver_target(&source).then_some(source);
+        self
+    }
+
+    /// Clear the initial source, preserving every other receiver setting.
+    #[must_use]
+    pub fn clear_source(mut self) -> Self {
+        self.source = None;
         self
     }
 
@@ -731,10 +740,10 @@ impl ReceiverOptions {
         self
     }
 
-    /// The requested source, independent of later live source changes.
+    /// The optional initial source, independent of later live source changes.
     #[must_use]
-    pub fn configured_source(&self) -> &Source {
-        &self.source
+    pub fn configured_source(&self) -> Option<&Source> {
+        self.source.as_ref()
     }
 
     /// The stored color choice. Packet passthrough presets may override this
@@ -770,12 +779,20 @@ impl ReceiverOptions {
         self.config.as_ref()
     }
 
-    /// Receive from `source` with the default settings:
-    /// [`ReceiverColorFormat::BgrxBgra`], [`ReceiverBandwidth::Highest`],
-    /// video fields allowed, and a receiver name the SDK chooses.
+    /// Receive from `source` with the settings of [`Self::disconnected`].
+    /// An empty name and an absent or empty address leave the receiver
+    /// disconnected. An address alone can identify a source.
     pub fn new(source: Source) -> Self {
+        Self::disconnected().source(source)
+    }
+
+    /// Start without a source, using [`ReceiverColorFormat::BgrxBgra`],
+    /// [`ReceiverBandwidth::Highest`], video fields allowed, and a receiver
+    /// name the SDK chooses. Use
+    /// [`Receiver::connect_to`] after selecting a source.
+    pub fn disconnected() -> Self {
         Self {
-            source,
+            source: None,
             color_format: ReceiverColorFormat::BgrxBgra,
             bandwidth: ReceiverBandwidth::Highest,
             allow_video_fields: true,
@@ -999,6 +1016,18 @@ impl ReceiverOptions {
     }
 }
 
+/// Only receivers interpret a completely empty descriptor as no target.
+fn has_receiver_target(source: &Source) -> bool {
+    !source.name().is_empty()
+        || source
+            .address()
+            .is_some_and(|address| !address.as_str().is_empty())
+}
+
+pub(crate) fn prepare_receiver_target(source: &Source) -> Option<RetainedSource> {
+    has_receiver_target(source).then(|| RetainedSource::new(source))
+}
+
 pub(crate) struct ValidatedReceiveOptions<'a> {
     options: &'a ReceiverOptions,
     _best444: Option<&'a sys::ReceiveBest444>,
@@ -1008,12 +1037,14 @@ pub(crate) struct ValidatedReceiveOptions<'a> {
 impl ValidatedReceiveOptions<'_> {
     pub(crate) fn settings<'a>(
         &self,
-        target: &'a RetainedSource,
+        target: Option<&'a RetainedSource>,
         name: Option<&'a CStr>,
     ) -> ReceiveSettings<'a> {
         ReceiveSettings {
             raw: NDIlib_recv_create_v3_t {
-                source_to_connect_to: *target.descriptor(),
+                source_to_connect_to: target
+                    .map(|target| *target.descriptor())
+                    .unwrap_or_default(),
                 color_format: self.options.sdk_color_format(),
                 bandwidth: self.options.bandwidth.to_sdk(),
                 allow_video_fields: self.options.allow_video_fields,
@@ -1265,9 +1296,21 @@ enum ConnectionRequest {
 
 impl ReceiverCore {
     fn request(&self, request: ConnectionRequest) {
-        let connection = self.lock_change();
-        // Clone only the retained allocation under the read lock; snapshots
-        // continue during native work and writers replace only the final value.
+        let exclusive = self.change_guard.lock();
+        let remember_target = matches!(request, ConnectionRequest::Connect(_));
+        let target = match request {
+            ConnectionRequest::Connect(next) => Some(next),
+            ConnectionRequest::Reconnect => {
+                // Keep the target alive without holding the read lock across
+                // the native call. An idle retry needs no control transition.
+                let Some(last) = self.target.read().clone() else {
+                    return;
+                };
+                Some(last)
+            }
+            ConnectionRequest::Disconnect => None,
+        };
+        let connection = self.begin_change(exclusive);
         let call = |source| {
             // SAFETY: the proof authorizes this live receiver's connection
             // request. RetainedSource keeps the native descriptor and strings.
@@ -1276,14 +1319,14 @@ impl ReceiverCore {
                     .NDIlib_recv_connect(connection.instance(), source)
             };
         };
-        match request {
-            ConnectionRequest::Connect(next) => {
-                let mut target = self.target.read().clone();
-                target.replace(next, call);
-                *self.target.write() = target;
-            }
-            ConnectionRequest::Reconnect => self.target.read().reissue(call),
-            ConnectionRequest::Disconnect => call(ptr::null()),
+        match &target {
+            Some(target) => target.reissue(call),
+            None => call(ptr::null()),
+        }
+        if remember_target {
+            // The change permit keeps the previous target in place until the
+            // native call returns. Readers can snapshot it during the call.
+            *self.target.write() = target;
         }
     }
 }
@@ -1514,7 +1557,7 @@ pub(crate) struct ReceiverCore {
     /// The latest requested target. The change permit serializes its writers;
     /// snapshots never take it and therefore never wait for a capture or a queued
     /// connection change. Writers hold this lock only to replace the value.
-    target: RwLock<RetainedSource>,
+    target: RwLock<Option<RetainedSource>>,
     pending: PendingEvents,
     // Only native source-name queries take this permit. Replaying an abandoned
     // result takes the separate short lock, never waiting for the SDK.
@@ -1577,7 +1620,7 @@ impl Receiver {
         self.capture_any_until(Deadline::after(timeout)?)
     }
 
-    /// Create a receiver and connect it to the configured source.
+    /// Create a receiver, requesting the configured source if one is set.
     ///
     /// # Errors
     ///
@@ -1628,9 +1671,9 @@ impl<M: CreatableMode> Receiver<M> {
         ) -> crate::runtime::NativeCreation<NDIlib_recv_instance_t>,
     ) -> Result<Self> {
         let validated = options.validate_runtime(ndi.evidence())?;
-        let target = RetainedSource::new(&options.source);
+        let target = options.configured_source().map(RetainedSource::new);
         let name = options.name.as_deref().map(CString::new).transpose()?;
-        let settings = validated.settings(&target, name.as_deref());
+        let settings = validated.settings(target.as_ref(), name.as_deref());
         let sdk = ndi.bind_core();
         // The settings borrow the target's own descriptor and name. Both
         // owners move into the core after creation without moving their buffers.
@@ -1924,9 +1967,8 @@ impl<M: ReceiverMode> Receiver<M> {
     /// observed change to no source. Concurrent pollers compete for notifications.
     /// This differs from [`Self::connection_target`], the latest requested target.
     ///
-    /// The SDK reports each change once, so a name that is not valid UTF-8 is
-    /// not an error: invalid sequences are replaced with U+FFFD, as
-    /// [`Finder`](crate::Finder) does for discovered source names.
+    /// The SDK reports each change once. This notification replaces invalid
+    /// UTF-8 sequences with U+FFFD so the change remains visible.
     ///
     /// # Errors
     ///
@@ -1952,14 +1994,17 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Success means the request was issued, not that the source is available.
     /// The source was validated at construction. Existing FrameSync ownership
     /// remains.
+    /// An empty name and an absent or empty address act like [`Self::disconnect`],
+    /// preserving any last target.
     #[doc(alias = "NDIlib_recv_connect")]
     pub fn connect_to(&self, source: &Source) {
-        self.connect_target(RetainedSource::new(source));
+        self.connect_target(prepare_receiver_target(source));
     }
 
     /// Apply an input already validated on the synchronous or async caller.
-    pub(crate) fn connect_target(&self, target: RetainedSource) {
-        self.core.request(ConnectionRequest::Connect(target));
+    pub(crate) fn connect_target(&self, target: Option<RetainedSource>) {
+        self.core
+            .request(target.map_or(ConnectionRequest::Disconnect, ConnectionRequest::Connect));
     }
 
     /// Disconnect while retaining the target for [`Self::reconnect`].
@@ -2068,7 +2113,8 @@ impl<M: ReceiverMode> Receiver<M> {
     /// This requests the last local target again. If a Discovery Server client
     /// remotely changed this receiver's source, reconnecting replaces that
     /// remote routing with the local target. Observe remote changes through
-    /// [`Self::wait_for_source_name_change`].
+    /// [`Self::wait_for_source_name_change`]. Before a local target is selected,
+    /// this call returns without issuing an SDK request.
     ///
     /// Observe native connection state with [`Self::is_connected`] and
     /// progress of the expected media with [`Self::connection_stats`]. A
@@ -2083,8 +2129,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// `AsyncReceiver::reconnect` to run that work on its blocking pool.
     ///
     /// Uses the retained, validated target without allocation or conversion.
-    /// `NDIlib_recv_connect` reports no status: returning means the request was
-    /// issued, not that the feed recovered. Confirm recovery through
+    /// `NDIlib_recv_connect` reports no status. Confirm recovery through
     /// [`Self::connection_stats`].
     #[doc(alias = "NDIlib_recv_connect")]
     pub fn reconnect(&self) {
@@ -2093,12 +2138,13 @@ impl<M: ReceiverMode> Receiver<M> {
 
     /// An owned snapshot of the latest locally requested connection target.
     ///
-    /// Initially the source specified in [`ReceiverOptions`], updated by each
-    /// successful [`Self::connect_to`]. [`Self::disconnect`] retains it, and
+    /// Initially the source specified in [`ReceiverOptions`], or `None` when
+    /// created disconnected. [`Self::connect_to`] remembers each selected
+    /// source. [`Self::disconnect`] retains it, and
     /// [`Self::reconnect`] requests it again. A Discovery Server client's remote
     /// connection change does not update this local target. Observe actual
     /// connection changes with [`Self::wait_for_source_name_change`].
-    /// The snapshot clones the source's name and address. It never waits for
+    /// The snapshot shares the source's name and address. It never waits for
     /// captures or queued connection changes; a concurrent `connect_to` holds
     /// the target lock only while replacing the value after its request returns.
     ///
@@ -2107,12 +2153,18 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # fn main() -> grafton_ndi::Result<()> {
     /// # let ndi = Ndi::new()?;
     /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)").unwrap()))?;
-    /// println!("Requested target: {}", receiver.connection_target());
+    /// if let Some(target) = receiver.connection_target() {
+    ///     println!("Requested target: {target}");
+    /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub fn connection_target(&self) -> Source {
-        self.core.target.read().current().clone()
+    pub fn connection_target(&self) -> Option<Source> {
+        self.core
+            .target
+            .read()
+            .as_ref()
+            .map(|target| target.current().clone())
     }
 
     /// Get connection and performance statistics for this receiver.
@@ -2226,8 +2278,12 @@ impl ReceiverCore {
         self.ndi().table()
     }
 
+    #[cfg(test)]
     fn lock_change(&self) -> ConnectionChange<'_> {
-        let exclusive = self.change_guard.lock();
+        self.begin_change(self.change_guard.lock())
+    }
+
+    fn begin_change<'a>(&'a self, exclusive: MutexGuard<'a, ChangePermit>) -> ConnectionChange<'a> {
         if self.guard_local_connection_changes {
             self.begin_control_change();
         }
@@ -3193,13 +3249,7 @@ mod tests {
                 assert_eq!(validated.is_ok(), supported);
                 if let Ok(validated) = validated {
                     assert!(validated._best444.is_some());
-                    assert_eq!(
-                        validated
-                            .settings(&RetainedSource::new(&best.source), None)
-                            .raw()
-                            .color_format,
-                        102
-                    );
+                    assert_eq!(validated.settings(None, None).raw().color_format, 102);
                 }
                 for (bandwidth, value) in [
                     (ReceiverBandwidth::VideoOnlyLowest, 1),
@@ -3210,13 +3260,7 @@ mod tests {
                     assert_eq!(validated.is_ok(), supported);
                     if let Ok(validated) = validated {
                         assert!(validated._video_only.is_some());
-                        assert_eq!(
-                            validated
-                                .settings(&RetainedSource::new(&options.source), None)
-                                .raw()
-                                .bandwidth,
-                            value
-                        );
+                        assert_eq!(validated.settings(None, None).raw().bandwidth, value);
                     }
                 }
                 assert!(unconnected().validate_runtime(evidence).is_ok());
@@ -3307,12 +3351,35 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_receiver_allocates_only_its_core() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let (receiver, allocations) = crate::test_alloc::allocation_count(|| {
+            Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap()
+        });
+        assert_eq!(
+            allocations, 1,
+            "only the shared receiver core should allocate"
+        );
+        let (target, allocations) = crate::test_alloc::allocation_count(|| {
+            receiver.reconnect();
+            receiver.connection_target()
+        });
+        assert_eq!(target, None);
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
     fn reconnect_reuses_validated_name_url_and_ip_targets_without_allocating() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         for source in [
             Source::new("retained name").unwrap(),
+            Source::new("")
+                .unwrap()
+                .with_address(crate::SourceAddress::new("ndi://127.0.0.1:5961").unwrap()),
             Source::new("retained URL")
                 .unwrap()
                 .with_address(crate::SourceAddress::new("ndi://127.0.0.1:5961").unwrap()),
@@ -3323,11 +3390,11 @@ mod tests {
             let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source.clone())).unwrap();
             let ((), allocations) = crate::test_alloc::allocation_count(|| receiver.reconnect());
             assert_eq!(allocations, 0);
-            assert_eq!(receiver.connection_target(), source);
+            assert_eq!(receiver.connection_target().as_ref(), Some(&source));
             receiver.disconnect();
             let ((), allocations) = crate::test_alloc::allocation_count(|| receiver.reconnect());
             assert_eq!(allocations, 0);
-            assert_eq!(receiver.connection_target(), source);
+            assert_eq!(receiver.connection_target().as_ref(), Some(&source));
         }
     }
 
@@ -3686,14 +3753,14 @@ mod tests {
         }
     }
 
-    /// A source no receiver can connect to: no name and no address.
+    /// A named target with no sender in the fixture.
     fn test_source() -> Source {
-        Source::new("").unwrap()
+        Source::new("receiver test target").unwrap()
     }
 
     /// The options of a receiver that stays unconnected.
     fn unconnected() -> ReceiverOptions {
-        ReceiverOptions::new(test_source())
+        ReceiverOptions::disconnected()
     }
 
     /// A clock that moves only when a test advances it, to drive
@@ -4123,7 +4190,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::new(test_source())).unwrap();
         trace("receiver created");
         std::thread::scope(|scope| {
             let (done, completed) = std::sync::mpsc::channel();
@@ -4470,13 +4537,13 @@ mod tests {
 
     struct TestSettings {
         raw: NDIlib_recv_create_v3_t,
-        _target: RetainedSource,
+        _target: Option<RetainedSource>,
         _name: Option<CString>,
     }
 
     fn raw_settings(options: &ReceiverOptions) -> TestSettings {
         sys::with_test_evidence("6.4.0.2", |evidence| {
-            let target = RetainedSource::new(&options.source);
+            let target = options.configured_source().map(RetainedSource::new);
             let name = options
                 .name
                 .as_deref()
@@ -4486,7 +4553,7 @@ mod tests {
             let raw = *options
                 .validate_runtime(evidence)
                 .unwrap()
-                .settings(&target, name.as_deref())
+                .settings(target.as_ref(), name.as_deref())
                 .raw();
             TestSettings {
                 raw,
@@ -4506,7 +4573,7 @@ mod tests {
         let name = CString::new("retained receiver").unwrap();
         sys::with_test_evidence("6.4.0.2", |evidence| {
             let validated = options.validate_runtime(evidence).unwrap();
-            let settings = validated.settings(&target, Some(&name));
+            let settings = validated.settings(Some(&target), Some(&name));
             let raw = settings.raw();
             assert_eq!(
                 raw.source_to_connect_to.p_ndi_name,
@@ -4531,6 +4598,9 @@ mod tests {
             NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
         );
         assert!(raw.raw.allow_video_fields);
+        assert!(raw.raw.source_to_connect_to.p_ndi_name.is_null());
+        // SAFETY: receive settings initialize the address pointer in the union.
+        assert!(unsafe { raw.raw.source_to_connect_to.__bindgen_anon_1.p_url_address }.is_null());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Bounded knowledge of the files a native recorder may still own.
 
 use super::{EventText, OpenFile, RecorderEventKind};
+use crate::file::types::EventTextRef;
 
 const MAX_FILES: usize = 16_384;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -30,7 +31,7 @@ pub(super) struct Files {
 }
 
 impl Files {
-    fn position(&self, path: &EventText) -> Result<usize, usize> {
+    fn position(&self, path: EventTextRef<'_>) -> Result<usize, usize> {
         self.entries
             .binary_search_by(|open| open.path.as_bytes().cmp(path.as_bytes()))
     }
@@ -90,22 +91,23 @@ impl FileTracker {
         self.data().entries.capacity() * size_of::<OpenFile>() + self.data().path_bytes
     }
 
-    fn exact(path: &EventText) -> bool {
-        !path.as_bytes().is_empty() && path.is_terminated() && !path.is_possibly_truncated()
-    }
-
-    pub(super) fn open(&mut self, kind: RecorderEventKind, path: EventText) {
+    pub(super) fn open_with_path<'a>(
+        &mut self,
+        kind: RecorderEventKind,
+        path: impl FnOnce() -> EventTextRef<'a>,
+    ) {
         // Once evidence was lost, accepting more unmatched paths cannot
         // reconstruct an exhaustive set. It would only retain unbounded work.
         if !self.is_complete() {
             return;
         }
-        if !Self::exact(&path) || (kind == RecorderEventKind::Started && !self.is_empty()) {
+        let path = path();
+        if !path.is_exact_nonempty() || (kind == RecorderEventKind::Started && !self.is_empty()) {
             self.mark_incomplete();
             return;
         }
         let files = self.data_mut();
-        let index = match files.position(&path) {
+        let index = match files.position(path) {
             Ok(_) => {
                 self.mark_incomplete();
                 return;
@@ -123,7 +125,7 @@ impl FileTracker {
         };
         let bytes = capacity * size_of::<OpenFile>() + files.path_bytes;
         if files.entries.len() == MAX_FILES
-            || path.retained_bytes() > MAX_BYTES.saturating_sub(bytes)
+            || path.as_bytes().len() > MAX_BYTES.saturating_sub(bytes)
             || files
                 .entries
                 .try_reserve_exact(capacity - files.entries.len())
@@ -132,6 +134,7 @@ impl FileTracker {
             self.mark_incomplete();
             return;
         }
+        let path = path.into_owned();
         // Reserve-exact requests the checked capacity. Also account for the
         // actual capacity an allocator supplies before retaining this path.
         if self.retained_bytes() + path.retained_bytes() > MAX_BYTES
@@ -158,8 +161,8 @@ impl FileTracker {
         files.next_order = next_order;
     }
 
-    pub(super) fn first_frame(&mut self, path: &EventText) {
-        if Self::exact(path) {
+    pub(super) fn first_frame(&mut self, path: EventTextRef<'_>) {
+        if path.is_exact_nonempty() {
             let files = self.data_mut();
             if let Ok(index) = files.position(path) {
                 files.entries[index].has_media = true;
@@ -171,9 +174,9 @@ impl FileTracker {
 
     /// Release a matching known file, even after the report has become final.
     /// Absence of a first frame proves emptiness only under complete tracking.
-    pub(super) fn close(&mut self, path: &EventText) -> FileClose {
+    pub(super) fn close(&mut self, path: EventTextRef<'_>) -> FileClose {
         let complete = self.is_complete();
-        if Self::exact(path) {
+        if path.is_exact_nonempty() {
             let files = self.data_mut();
             if let Ok(index) = files.position(path) {
                 let closed = files.entries.remove(index);
