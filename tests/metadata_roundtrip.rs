@@ -3,9 +3,10 @@
 mod helpers;
 common_helpers!(runtime, name, loopback);
 use grafton_ndi::{
-    MetadataFrame, MetadataFrameRef, MetadataSource, Receiver, ReceiverOptions, Sender,
-    SenderOptions, Timecode, VideoFrame,
+    MetadataFrame, MetadataFrameRef, MetadataSource, Receiver, ReceiverOptions, RuntimeInfo,
+    SdkEdition, SdkLinkage, Sender, SenderOptions, Timecode, VideoFrame,
 };
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -152,28 +153,92 @@ fn receiver_connection_metadata_survives_its_input_and_reconnect() -> Result<(),
     )?;
     let target = common::loopback_source(&ndi, &sender)?;
     receiver.connect_to(&target);
-    let video = VideoFrame::builder().resolution(16, 16).build()?;
-    for attempt in 0..2 {
+    for connection in 0..2 {
+        let timecode = Timecode::from_ticks(1000 + connection);
+        let video = VideoFrame::builder()
+            .resolution(16, 16)
+            .timecode(timecode)
+            .build()?;
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
+        let mut received_video = false;
+        let mut received_registration = false;
+        while Instant::now() < deadline {
             sender.send_video(&video)?;
-            receiver.capture_video_ref(Duration::from_millis(10))?;
-            if let Some(metadata) = sender.capture_metadata(Duration::from_millis(100))? {
-                if metadata.data() == text {
+            received_video |= receiver
+                .capture_video_ref(Duration::from_millis(10))?
+                .is_some_and(|frame| frame.timecode() == timecode);
+            received_registration = sender
+                .capture_metadata(Duration::from_millis(100))?
+                .is_some_and(|metadata| metadata.data() == text);
+            if received_registration {
+                break;
+            }
+        }
+        if !received_registration {
+            let info = ndi.info();
+            let sending = sender.connection_count()?;
+            let receiving = receiver.connection_stats()?.connections();
+            assert!(
+                has_known_registration_loss(info) && received_video && sending > 0 && receiving > 0,
+                "receiver registration missing on connection {connection}; fresh video={received_video}, \
+                 connections sender={sending} receiver={receiving}; runtime={info:?}"
+            );
+            let explicit =
+                MetadataFrame::new(format!("<receiver-explicit stage='{connection}'/>"))?
+                    .with_timecode(timecode);
+            receiver.send_metadata(&explicit)?;
+            drop(capture_expected_metadata(
+                &sender,
+                &explicit,
+                "explicit upstream delivery after #551",
+            )?);
+
+            // Write directly to stderr so the advisory is visible in passing CI logs.
+            let prefix = if std::env::var_os("GITHUB_ACTIONS").is_some() {
+                "::warning title=NDI SDK known issue #551::"
+            } else {
+                ""
+            };
+            writeln!(
+                std::io::stderr().lock(),
+                "{prefix}Automatic receiver metadata missing on connection {connection} with {}. \
+                 Fresh video and explicit upstream delivery verified. \
+                 https://github.com/GrantSparks/grafton-ndi/issues/551",
+                info.raw_version(),
+            )
+            .expect("write the SDK compatibility advisory");
+        }
+        if connection == 0 {
+            receiver.disconnect();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let sending = sender.connection_count()?;
+                let receiving = receiver.connection_stats()?.connections();
+                if sending == 0 && receiving == 0 {
                     break;
                 }
+                assert!(
+                    Instant::now() < deadline,
+                    "disconnect did not settle; connections sender={sending} receiver={receiving}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
             }
-            assert!(
-                Instant::now() < deadline,
-                "receiver registration missing on connection {attempt}"
-            );
-        }
-        if attempt == 0 {
             while sender.capture_metadata(Duration::ZERO)?.is_some() {}
-            receiver.disconnect();
             receiver.reconnect();
         }
     }
     receiver.clear_connection_metadata()?;
     Ok(())
+}
+
+fn has_known_registration_loss(info: &RuntimeInfo) -> bool {
+    // Scope #551 to the native Windows builds that reproduced the failure.
+    cfg!(all(target_os = "windows", target_arch = "x86_64"))
+        && info.edition() == SdkEdition::Standard
+        && info.linkage() == SdkLinkage::Shared
+        && matches!(
+            info.raw_version(),
+            "NDI SDK WIN64 16:38:09 Apr 14 2026 6.3.2.0"
+                | "NDI SDK WIN64 13:07:15 Nov  6 2026 6.4.0.2"
+        )
 }

@@ -1858,6 +1858,13 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Accepts owned or captured metadata. The receiver keeps its own copy,
     /// so the input need not outlive the registration.
     ///
+    /// On Windows x64, the Standard NDI 6.3.2.0 and 6.4.0.2 builds tested in
+    /// [issue #551](https://github.com/GrantSparks/grafton-ndi/issues/551) can
+    /// omit automatic delivery. Applications that manage reconnects can send
+    /// the payload explicitly with [`Self::send_metadata`] after confirming
+    /// each connection is live. Use a single send path for the payload to
+    /// avoid duplicates.
+    ///
     /// # Errors
     ///
     /// [`Error::UnsupportedCapability`] without
