@@ -480,6 +480,25 @@ fn child(scenario: &str) {
             assert_eq!(plain.port(), None);
             assert!(plain.groups().is_empty());
             assert!(plain.events_subscribed());
+            assert!(malformed.to_source().is_none());
+            assert_eq!(plain.to_source().unwrap().name(), "STUDIO (Camera 2)");
+
+            std::env::set_var("GRAFTON_FAKE_DISCOVERY_MALFORMED", "sender-address-utf8");
+            let mut invalid_address_listener = SendListener::new(&ndi, &listeners).unwrap();
+            let senders = invalid_address_listener.current_senders().unwrap();
+            assert_eq!(senders[1].address(), Some("192.0.2.10�"));
+            assert!(senders[1].to_source().is_none());
+            std::env::set_var(
+                "GRAFTON_FAKE_DISCOVERY_MALFORMED",
+                "sender-replacement-character",
+            );
+            let mut replacement_listener = SendListener::new(&ndi, &listeners).unwrap();
+            let source = replacement_listener.current_senders().unwrap()[0]
+                .to_source()
+                .unwrap();
+            assert_eq!(source.name(), "STUDIO (Caf�)");
+            assert_eq!(source.address().unwrap().as_str(), "192.0.2.10:5961");
+            std::env::remove_var("GRAFTON_FAKE_DISCOVERY_MALFORMED");
 
             let mut listener = RecvListener::new(&ndi, &listeners).unwrap();
             let receivers = listener.current_receivers().unwrap();

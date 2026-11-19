@@ -60,6 +60,25 @@ impl Snapshot {
             }
             return;
         }
+        if scenario.starts_with("utf8-") {
+            let source = |name: Option<&CStr>, address: Option<&CStr>| NDIlib_source_t {
+                p_ndi_name: name.map_or(std::ptr::null(), CStr::as_ptr),
+                __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                    p_url_address: address.map_or(std::ptr::null(), CStr::as_ptr),
+                },
+            };
+            self.plain = vec![
+                source(Some(c"STUDIO (Camera \xff)"), None),
+                source(Some(c"STUDIO (Bad address)"), Some(c"ndi://192.0.2.7/\xff")),
+                source(Some(c"STUDIO (Camera �)"), None),
+                source(None, Some(c"ndi://192.0.2.7/�")),
+                source(None, None),
+            ];
+            if scenario == "utf8-reverse" {
+                self.plain.reverse();
+            }
+            return;
+        }
         if scenario == "outer-endpoint" {
             self.plain = vec![NDIlib_source_t {
                 p_ndi_name: c"OTHER (Feed)".as_ptr(),

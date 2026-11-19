@@ -58,7 +58,7 @@ unsafe fn extended_source(
 ) -> Result<Option<ExtendedSource>> {
     // SAFETY: the caller keeps the strings readable while the snapshot policy
     // copies them, omitting malformed entries without losing their scan charges.
-    let Some(source) = (unsafe { decode_source(name, address, budget, |_| Ok(true))? }) else {
+    let Some(source) = (unsafe { decode_source(name, address, budget, |_| true)? }) else {
         return Ok(None);
     };
     let metadata = if metadata.is_null() {
@@ -157,10 +157,9 @@ mod tests {
             let mut plain_budget = SnapshotBudget::new();
             let mut metadata_budget = SnapshotBudget::new();
             // SAFETY: both pointer pairs are null or live terminated literals.
-            let plain = unsafe {
-                crate::finder::decode_source(name, address, &mut plain_budget, |_| Ok(true))
-            }
-            .unwrap();
+            let plain =
+                unsafe { crate::finder::decode_source(name, address, &mut plain_budget, |_| true) }
+                    .unwrap();
             let metadata =
                 unsafe { extended_source(name, address, std::ptr::null(), &mut metadata_budget) }
                     .unwrap();
@@ -202,6 +201,9 @@ mod tests {
         let lossy = copy(Some(name), Some(address), Some(invalid_utf8)).unwrap();
         assert_eq!(lossy.metadata(), Some("<ndi \u{fffd}/>"));
         assert_eq!(lossy.into_source().name(), "HOST (Camera)");
+
+        assert!(copy(Some(invalid_utf8), Some(address), None).is_none());
+        assert!(copy(Some(name), Some(invalid_utf8), None).is_none());
 
         // Neither a name nor an address: there is nothing to connect to.
         assert!(copy(None, None, Some(invalid_utf8)).is_none());

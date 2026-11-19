@@ -3,9 +3,10 @@
 
 use super::{Retained, ServerApi, ServerObject};
 use crate::{
-    finder::{SourceName, SourceText},
+    finder::{SourceName, SourceText, SourceTextView},
     sdk_copy::{
-        bounded_sdk_text, copy_lossy, CopyBudget, SpanError, COPY_LIMIT, MAX_SDK_STRING_BYTES,
+        bounded_sdk_text, copy_lossy, CopyBudget, CopyResult, LossyText, SpanError, COPY_LIMIT,
+        MAX_SDK_STRING_BYTES,
     },
     sys::{self, bindings::*},
     to_ms_checked, Error, Ndi, ResourceKind, Result,
@@ -355,18 +356,64 @@ impl ReceiverCommand {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum AdvertisedSourceText {
+    Exact(SourceText),
+    DisplayOnly(String),
+}
+
+impl AdvertisedSourceText {
+    /// # Safety
+    /// The pointer is null or readable through its first NUL or the SDK bound.
+    unsafe fn copy(
+        pointer: *const std::ffi::c_char,
+        budget: &mut CopyBudget,
+    ) -> CopyResult<Option<Self>> {
+        // SAFETY: forwarded to the caller's bounded read obligation.
+        let Some(raw) = (unsafe { budget.c_str(pointer)? }) else {
+            return Ok(None);
+        };
+        let field = match SourceTextView::new(raw) {
+            Ok(text) => {
+                budget.take(text.as_str().len() + SourceText::STORAGE_OVERHEAD)?;
+                Self::Exact(SourceText::from_sdk(
+                    text,
+                    crate::AllocationKind::DiscoveryResults,
+                )?)
+            }
+            Err(_) => {
+                let text = LossyText::new(raw);
+                budget.take(text.len())?;
+                Self::DisplayOnly(
+                    text.copy()
+                        .map_err(|_| crate::sdk_copy::allocation_failed())?,
+                )
+            }
+        };
+        Ok(Some(field))
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Exact(text) => text.as_str(),
+            Self::DisplayOnly(text) => text,
+        }
+    }
+}
+
 /// An owned description of one advertised sender, independent of later
 /// listener calls.
 ///
 /// Every string is whatever the sender advertised. Text that is not valid
 /// UTF-8 is decoded with U+FFFD in place of the offending bytes; only the
-/// [identifier](Self::id) keeps its exact bytes.
+/// [identifier](Self::id) keeps its exact bytes. [`Self::to_source`] requires
+/// the original name and any advertised address to be valid UTF-8.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AdvertisedSender {
     id: Option<SenderId>,
-    name: Option<SourceText>,
+    name: Option<AdvertisedSourceText>,
     metadata: Option<String>,
-    address: Option<SourceText>,
+    address: Option<AdvertisedSourceText>,
     port: Option<NonZeroU16>,
     groups: Vec<String>,
     subscribed: bool,
@@ -378,7 +425,7 @@ impl AdvertisedSender {
     }
     /// The sender's source name.
     pub fn name(&self) -> Option<&str> {
-        self.name.as_ref().map(SourceText::as_str)
+        self.name.as_ref().map(AdvertisedSourceText::as_str)
     }
     /// The connection metadata the sender advertises.
     pub fn metadata(&self) -> Option<&str> {
@@ -386,7 +433,7 @@ impl AdvertisedSender {
     }
     /// The sender's network address.
     pub fn address(&self) -> Option<&str> {
-        self.address.as_ref().map(SourceText::as_str)
+        self.address.as_ref().map(AdvertisedSourceText::as_str)
     }
     /// The sender's non-zero network port, or `None` when the advertised value
     /// is outside the range 1–65535.
@@ -399,17 +446,24 @@ impl AdvertisedSender {
     }
     /// Convert this advertised sender into a connection target.
     ///
-    /// Returns `None` when the server supplied no source name. An address is
-    /// included when the advertised host is an IP address or host name and the
-    /// advertised port is non-zero. IPv6 literals are enclosed in brackets.
-    /// Otherwise the receiver can look up the source by name.
+    /// Returns `None` when the server supplied no source name or when the
+    /// original name or address contains invalid UTF-8. An address is included
+    /// when the advertised host is an IP address or host name and the port is
+    /// non-zero. IPv6 literals are enclosed in brackets. Otherwise the receiver
+    /// can look up the source by name.
     pub fn to_source(&self) -> Option<crate::Source> {
-        let name = self.name.as_ref()?.clone();
-        let address = self
-            .address()
+        let AdvertisedSourceText::Exact(name) = self.name.as_ref()? else {
+            return None;
+        };
+        let host = match self.address.as_ref() {
+            Some(AdvertisedSourceText::Exact(address)) => Some(address.as_str()),
+            Some(AdvertisedSourceText::DisplayOnly(_)) => return None,
+            None => None,
+        };
+        let address = host
             .zip(self.port)
             .and_then(|(host, port)| crate::SourceAddress::from_advertised_host(host, port));
-        Some(crate::Source::from_text(name, address))
+        Some(crate::Source::from_text(name.clone(), address))
     }
 
     /// Whether this listener is subscribed to the sender's events.
@@ -884,9 +938,9 @@ impl SendListener {
                 let groups = budget.collect(groups, |group, budget| Ok(budget.text(*group)?))?;
                 Ok(AdvertisedSender {
                     id: budget.id(sender.p_uuid)?.map(SenderId::from_exact),
-                    name: budget.source_text(sender.p_name)?,
+                    name: AdvertisedSourceText::copy(sender.p_name, budget)?,
                     metadata: budget.text(sender.p_metadata)?,
-                    address: budget.source_text(sender.p_address)?,
+                    address: AdvertisedSourceText::copy(sender.p_address, budget)?,
                     port: advertised_port(sender.port),
                     groups,
                     subscribed: sender.events_subscribed,
@@ -1045,9 +1099,13 @@ mod tests {
     fn advertised_sources_use_name_and_only_complete_addresses() {
         let mut sender = AdvertisedSender {
             id: None,
-            name: Some(SourceText::new("Studio (Camera)".into()).unwrap()),
+            name: Some(AdvertisedSourceText::Exact(
+                SourceText::new("Studio (Camera)".into()).unwrap(),
+            )),
             metadata: None,
-            address: Some(SourceText::new("192.0.2.10".into()).unwrap()),
+            address: Some(AdvertisedSourceText::Exact(
+                SourceText::new("192.0.2.10".into()).unwrap(),
+            )),
             port: NonZeroU16::new(5960),
             groups: vec![],
             subscribed: false,
@@ -1061,7 +1119,9 @@ mod tests {
             ("2001:db8::10", "[2001:db8::10]:5960"),
             ("[2001:db8::10]", "[2001:db8::10]:5960"),
         ] {
-            sender.address = Some(SourceText::new(address.into()).unwrap());
+            sender.address = Some(AdvertisedSourceText::Exact(
+                SourceText::new(address.into()).unwrap(),
+            ));
             let source = sender.to_source().unwrap();
             let actual = source.address().unwrap();
             assert_eq!(actual.as_str(), endpoint);
@@ -1081,7 +1141,9 @@ mod tests {
             "192.0.2.10:1234",
             "Camera Desk",
         ] {
-            sender.address = Some(SourceText::new(address.into()).unwrap());
+            sender.address = Some(AdvertisedSourceText::Exact(
+                SourceText::new(address.into()).unwrap(),
+            ));
             let source = sender.to_source().unwrap();
             assert_eq!(source.name(), "Studio (Camera)");
             assert!(source.address().is_none(), "{address}");

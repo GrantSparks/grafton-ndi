@@ -1924,9 +1924,8 @@ impl<M: ReceiverMode> Receiver<M> {
     /// observed change to no source. Concurrent pollers compete for notifications.
     /// This differs from [`Self::connection_target`], the latest requested target.
     ///
-    /// The SDK reports each change once, so a name that is not valid UTF-8 is
-    /// not an error: invalid sequences are replaced with U+FFFD, as
-    /// [`Finder`](crate::Finder) does for discovered source names.
+    /// The SDK reports each change once. This notification replaces invalid
+    /// UTF-8 sequences with U+FFFD so the change remains visible.
     ///
     /// # Errors
     ///

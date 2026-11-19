@@ -1040,6 +1040,13 @@ mod discovery {
                 "sender-name" => senders[1].p_name = oversized_text(),
                 "sender-metadata" => senders[1].p_metadata = oversized_text(),
                 "sender-address" => senders[1].p_address = oversized_text(),
+                "sender-address-utf8" => {
+                    senders[1].p_address = c"192.0.2.10\xff".as_ptr();
+                    senders[1].port = 5961;
+                }
+                "sender-replacement-character" => {
+                    senders[0].p_name = c"STUDIO (Caf�)".as_ptr();
+                }
                 "sender-group" => {
                     groups[2] = oversized_text();
                     senders[1].p_groups = unsafe { groups.as_mut_ptr().add(2) };

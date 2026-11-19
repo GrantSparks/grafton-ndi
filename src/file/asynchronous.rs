@@ -2240,7 +2240,8 @@ impl AsyncFilePlayer {
     pub fn source_format(&self) -> FileOperation<Option<SourceFormat>> {
         self.worker.source_format()
     }
-    /// The NDI source this player advertises.
+    /// The NDI source this player advertises. See
+    /// [`FilePlayer::advertised_source`] for descriptor read errors.
     #[doc(alias = "NDIlib_file_player_get_advertised_source")]
     pub fn advertised_source(&self) -> FileOperation<Source> {
         self.worker.call(|p| p.advertised_source())
