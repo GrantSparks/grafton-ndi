@@ -1,9 +1,12 @@
 //! Recording an NDI source to disk, with explicit finalization.
 
-use std::time::{Duration, Instant};
+use std::{
+    cell::{Cell, LazyCell},
+    time::{Duration, Instant},
+};
 
 use super::{
-    types::{CheckedRecorderOptions, NamePattern},
+    types::{CheckedRecorderOptions, EventTextRef, NamePattern},
     EventText, FileApi, FileBound, FileRecorderOptions, RecorderEvent, RecorderEventKind,
     RecorderStats, RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec, StateConflict,
 };
@@ -132,6 +135,9 @@ pub(super) enum CleanupRequest {
     Close,
     Abandon,
 }
+
+/// An absent sink still observes every event in the ledger.
+pub(super) type RecorderEventSink<'a> = Option<&'a dyn Fn(Result<RecorderEvent>)>;
 
 /// A recorder that writes one NDI source to disk.
 ///
@@ -323,14 +329,14 @@ impl FileRecorder {
     #[doc(alias = "NDIlib_file_recorder_start")]
     #[doc(alias = "NDIlib_file_recorder_start_with_timecode")]
     pub fn start(&mut self, target: &RecordingTarget, timecode: RecordingTimecode) -> Result<u64> {
-        self.start_with_sink(target, timecode, &mut |_| {})
+        self.start_with_sink(target, timecode, None)
     }
 
     pub(super) fn start_with_sink(
         &mut self,
         target: &RecordingTarget,
         timecode: RecordingTimecode,
-        sink: &mut impl FnMut(Result<RecorderEvent>),
+        sink: RecorderEventSink<'_>,
     ) -> Result<u64> {
         self.ledger.admit_start()?;
         self.naming.check(target)?;
@@ -359,7 +365,7 @@ impl FileRecorder {
 
     /// Take events until the queue is empty, so that none from an earlier
     /// session is attributed to the next one.
-    fn discard_stale_events(&mut self, sink: &mut impl FnMut(Result<RecorderEvent>)) -> Result<()> {
+    fn discard_stale_events(&mut self, sink: RecorderEventSink<'_>) -> Result<()> {
         let mut budget = DrainBudget::late();
         loop {
             match self.pump(&mut budget, Duration::ZERO, sink) {
@@ -408,36 +414,50 @@ impl FileRecorder {
     /// rest of the event is delivered.
     #[doc(alias = "NDIlib_file_recorder_capture_event")]
     pub fn next_event(&mut self, timeout: Duration) -> Result<Option<RecorderEvent>> {
-        self.poll_event_ms(crate::to_ms_checked(timeout)?)
+        let captured = Cell::new(None);
+        self.poll_event_ms(
+            crate::to_ms_checked(timeout)?,
+            Some(&|event| captured.set(Some(event))),
+        );
+        captured.into_inner().transpose()
     }
 
-    /// [`next_event`](Self::next_event), waiting up to `wait_ms` milliseconds.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::UnexpectedSdkResult`] for a whole-event layout or type mismatch.
-    fn poll_event_ms(&mut self, wait_ms: u32) -> Result<Option<RecorderEvent>> {
+    /// Observe one native capture. Return true only if the queue was empty.
+    fn poll_event_ms(&mut self, wait_ms: u32, sink: RecorderEventSink<'_>) -> bool {
         let event = self.native.capture(wait_ms);
         if self.ledger.cleanup_pending()
             || (self.ledger.tracker().is_some() && !matches!(&event, Ok(None)))
         {
             self.ledger.dropped(self.dropped_event_count());
         }
-        let Some(event) = event.inspect_err(|_| self.ledger.mark_uncertain())? else {
-            // Query recording only when the closed or incomplete file set
-            // can end the session. This relies on open-before-close rollover
-            // events, pinned by `rollovers_open_the_next_file_before_closing_the_previous_file`.
-            let transition = self.ledger.drained(|| self.native.is_recording());
-            self.native.apply(transition);
-            return Ok(None);
+        let event = match event {
+            Ok(Some(ref event)) => event,
+            Ok(None) => {
+                // Query recording only when the closed or incomplete file set
+                // can end the session. This relies on open-before-close rollover
+                // events, pinned by `rollovers_open_the_next_file_before_closing_the_previous_file`.
+                let transition = self.ledger.drained(|| self.native.is_recording());
+                self.native.apply(transition);
+                return true;
+            }
+            Err(error) => {
+                self.ledger.mark_uncertain();
+                if let Some(sink) = sink {
+                    sink(Err(error));
+                }
+                return false;
+            }
         };
-        self.native.apply(self.ledger.observe(
-            RecorderEventKind::from_raw(event.type_),
-            EventText::from_buffer(&event.p_path),
-        ));
-        // Decoded after the ledger is updated, so that a malformed payload
+        let kind = RecorderEventKind::from_raw(event.type_);
+        let path = LazyCell::new(|| EventTextRef::from_buffer(&event.p_path));
+        self.native
+            .apply(self.ledger.observe_with_path(kind, || *path));
+        // Decode after updating the ledger, so that a malformed format
         // cannot hide the event that closes a file.
-        Ok(Some(RecorderEvent::from_sdk(&event)))
+        if let Some(sink) = sink {
+            sink(Ok(RecorderEvent::from_sdk(event, kind, *path)));
+        }
+        false
     }
 
     /// Stop the session and wait up to `timeout` for its last file to be
@@ -522,7 +542,7 @@ impl FileRecorder {
                     cleanup_expired: false,
                     at: Instant::now(),
                 },
-                &mut |_| {},
+                None,
                 || false,
                 Some(&mut budget),
             );
@@ -534,7 +554,7 @@ impl FileRecorder {
             } else {
                 FINISH_POLL
             };
-            self.pump(&mut budget, step, &mut |_| {});
+            self.pump(&mut budget, step, None);
         }
     }
 
@@ -569,16 +589,9 @@ impl FileRecorder {
         &mut self,
         budget: &mut DrainBudget,
         step: Duration,
-        sink: &mut impl FnMut(Result<RecorderEvent>),
+        sink: RecorderEventSink<'_>,
     ) -> Pumped {
-        budget.poll(step, |wait| {
-            let polled = self.poll_event_ms(wait);
-            let empty = matches!(polled, Ok(None));
-            if let Some(event) = polled.transpose() {
-                sink(event);
-            }
-            empty
-        })
+        budget.poll(step, |wait| self.poll_event_ms(wait, sink))
     }
 
     /// Drop and async close share the same cleanup driver, including the
@@ -589,7 +602,7 @@ impl FileRecorder {
         waiters: &mut FinishWaiters<R>,
         queued: impl IntoIterator<Item = (Deadline, R)>,
         tick: Duration,
-        sink: &mut impl FnMut(Result<RecorderEvent>),
+        sink: RecorderEventSink<'_>,
         closing: impl Fn() -> CleanupRequest,
     ) {
         if matches!(closing(), CleanupRequest::Abandon) {
@@ -870,7 +883,7 @@ impl Drop for FileRecorder {
                 &mut FinishWaiters::<LocalFinish<'_>>::new(),
                 std::iter::empty(),
                 FINISH_POLL,
-                &mut |_| {},
+                None,
                 || CleanupRequest::Drop,
             );
         }

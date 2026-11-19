@@ -18,6 +18,12 @@ fn path(index: usize) -> EventText {
     indexed_path(index, 24)
 }
 
+impl FileTracker {
+    fn open(&mut self, kind: RecorderEventKind, path: EventText) {
+        self.open_with_path(kind, || path.as_ref());
+    }
+}
+
 fn assert_storage_accounting(tracker: &FileTracker) {
     let (FileTracker::Complete(files) | FileTracker::Incomplete(files)) = tracker;
     let paths: usize = files
@@ -43,12 +49,12 @@ fn complete_tracking_matches_out_of_order_paths_and_preserves_opening_order() {
     tracker.open(RecorderEventKind::Rollover, path(2));
     tracker.open(RecorderEventKind::Rollover, path(5));
     assert_eq!(tracker.current(), Some(&path(5)));
-    tracker.first_frame(&path(2));
-    assert_eq!(tracker.close(&path(5)), FileClose::ConfirmedEmpty);
+    tracker.first_frame(path(2).as_ref());
+    assert_eq!(tracker.close(path(5).as_ref()), FileClose::ConfirmedEmpty);
     // The current file follows opening order, not the path's sort order.
     assert_eq!(tracker.current(), Some(&path(2)));
-    assert_eq!(tracker.close(&path(8)), FileClose::ConfirmedEmpty);
-    assert_eq!(tracker.close(&path(2)), FileClose::HadMedia);
+    assert_eq!(tracker.close(path(8).as_ref()), FileClose::ConfirmedEmpty);
+    assert_eq!(tracker.close(path(2).as_ref()), FileClose::HadMedia);
     assert!(tracker.is_complete());
     assert!(tracker.is_empty());
     assert!(!tracker.cleanup_pending());
@@ -84,13 +90,16 @@ fn malformed_or_missing_lifecycle_evidence_keeps_unknown_cleanup_after_known_clo
                 EventText::from_buffer(&[b't' as c_char, 0]),
             ),
             6 => {
-                assert_eq!(tracker.close(&path(99)), FileClose::Unconfirmed);
+                assert_eq!(tracker.close(path(99).as_ref()), FileClose::Unconfirmed);
             }
             7 => {
-                assert_eq!(tracker.close(&EventText::default()), FileClose::Unconfirmed);
+                assert_eq!(
+                    tracker.close(EventText::default().as_ref()),
+                    FileClose::Unconfirmed
+                );
             }
-            8 => tracker.first_frame(&path(99)),
-            9 => tracker.first_frame(&EventText::default()),
+            8 => tracker.first_frame(path(99).as_ref()),
+            9 => tracker.first_frame(EventText::default().as_ref()),
             _ => unreachable!(),
         }
         assert!(!tracker.is_complete(), "defect {defect}");
@@ -102,7 +111,7 @@ fn malformed_or_missing_lifecycle_evidence_keeps_unknown_cleanup_after_known_clo
             assert_eq!(tracker.retained_bytes(), retained_bytes);
         }
         for index in 0..3 {
-            tracker.close(&path(index));
+            tracker.close(path(index).as_ref());
         }
         assert!(tracker.is_empty(), "defect {defect}");
         assert!(!tracker.is_complete(), "defect {defect}");
@@ -139,12 +148,12 @@ fn generated_mixed_traces_preserve_known_media_and_irreversible_incompleteness()
             let index = (random >> 32) as usize % known.len();
             match step % 7 {
                 0 | 1 if known[index] => {
-                    tracker.first_frame(&path(index));
+                    tracker.first_frame(path(index).as_ref());
                     media[index] = true;
                 }
                 2 if known[index] => {
                     assert_eq!(
-                        tracker.close(&path(index)),
+                        tracker.close(path(index).as_ref()),
                         if media[index] {
                             FileClose::HadMedia
                         } else if incomplete {
@@ -165,7 +174,10 @@ fn generated_mixed_traces_preserve_known_media_and_irreversible_incompleteness()
                     tracker.open(RecorderEventKind::Rollover, path(1000 + step));
                 }
                 5 => {
-                    assert_eq!(tracker.close(&path(2000 + step)), FileClose::Unconfirmed);
+                    assert_eq!(
+                        tracker.close(path(2000 + step).as_ref()),
+                        FileClose::Unconfirmed
+                    );
                     incomplete = true;
                 }
                 _ => {}
@@ -180,7 +192,7 @@ fn generated_mixed_traces_preserve_known_media_and_irreversible_incompleteness()
         for (index, present) in known.into_iter().enumerate() {
             if present {
                 assert_eq!(
-                    tracker.close(&path(index)),
+                    tracker.close(path(index).as_ref()),
                     if media[index] {
                         FileClose::HadMedia
                     } else if incomplete {
@@ -250,7 +262,7 @@ fn one_hundred_thousand_unmatched_opens_plateau_at_both_storage_limits() {
         assert_eq!(allocations, 0, "incomplete bookkeeping must stop growing");
         assert_eq!((tracker.files().len(), tracker.retained_bytes()), plateau);
         while let Some(event) = tracker.files().last().map(|open| open.path.clone()) {
-            tracker.close(&event);
+            tracker.close(event.as_ref());
         }
         assert!(tracker.is_empty());
         assert!(tracker.cleanup_pending());
@@ -299,7 +311,7 @@ fn failed_reservation_preserves_known_files_and_permanently_closes_admission() {
         tracker.open(RecorderEventKind::Rollover, path(capacity + 1));
         assert_eq!(tracker.files().len(), before.0);
         for index in 0..capacity {
-            assert_eq!(tracker.close(&path(index)), FileClose::Unconfirmed);
+            assert_eq!(tracker.close(path(index).as_ref()), FileClose::Unconfirmed);
         }
         assert!(tracker.is_empty());
         assert!(tracker.cleanup_pending());

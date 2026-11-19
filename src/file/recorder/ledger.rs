@@ -8,7 +8,7 @@ use super::{
     RecorderState, SessionEnd,
 };
 use crate::{
-    file::{EventText, RecorderEventKind, StateConflict},
+    file::{types::EventTextRef, EventText, RecorderEventKind, StateConflict},
     Error, Result,
 };
 
@@ -496,7 +496,11 @@ impl Ledger {
         }
     }
 
-    pub(super) fn observe(&mut self, kind: RecorderEventKind, path: EventText) -> Transition {
+    pub(super) fn observe_with_path<'a>(
+        &mut self,
+        kind: RecorderEventKind,
+        path: impl FnOnce() -> EventTextRef<'a>,
+    ) -> Transition {
         let Some(data) = self.open_mut() else {
             // Cleanup evidence cannot change a report already returned.
             if let Some(files) = self.tracker_mut() {
@@ -508,9 +512,9 @@ impl Ledger {
                         // an unknown identifier could describe another open.
                         files.mark_incomplete();
                     }
-                    RecorderEventKind::FirstFrame => files.first_frame(&path),
+                    RecorderEventKind::FirstFrame => files.first_frame(path()),
                     RecorderEventKind::FileClosed => {
-                        files.close(&path);
+                        files.close(path());
                     }
                     _ => {}
                 }
@@ -519,17 +523,18 @@ impl Ledger {
         };
         match kind {
             RecorderEventKind::Started | RecorderEventKind::Rollover => {
-                data.files.open(kind, path);
+                data.files.open_with_path(kind, path);
             }
             RecorderEventKind::FirstFrame => {
-                data.files.first_frame(&path);
+                data.files.first_frame(path());
             }
             RecorderEventKind::FileClosed => {
-                if data.files.close(&path) == FileClose::ConfirmedEmpty && data.records_media {
+                let path = path();
+                if data.files.close(path) == FileClose::ConfirmedEmpty && data.records_media {
                     data.report.empty_files = data.report.empty_files.saturating_add(1);
                 }
                 data.report.closed_files = data.report.closed_files.saturating_add(1);
-                data.report.last_closed_path = Some(path);
+                data.report.last_closed_path = Some(path.into_owned());
             }
             RecorderEventKind::Error => {
                 data.report.error_events = data.report.error_events.saturating_add(1);
@@ -586,6 +591,12 @@ mod tests {
             *slot = byte as std::ffi::c_char;
         }
         EventText::from_buffer(&buffer)
+    }
+
+    impl Ledger {
+        fn observe(&mut self, kind: RecorderEventKind, path: EventText) -> Transition {
+            self.observe_with_path(kind, || path.as_ref())
+        }
     }
 
     fn session() -> Ledger {

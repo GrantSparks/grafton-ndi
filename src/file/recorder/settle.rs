@@ -2,9 +2,11 @@
 
 use std::time::{Duration, Instant};
 
-use super::{FileRecorder, FinishStatus, RecordingReport, SessionEnd, STALE_EVENT_LIMIT};
+use super::{
+    FileRecorder, FinishStatus, RecorderEventSink, RecordingReport, SessionEnd, STALE_EVENT_LIMIT,
+};
 use crate::{
-    file::{RecorderEvent, StateConflict},
+    file::StateConflict,
     timeout::{Deadline, Timeout},
     Error, Result,
 };
@@ -238,7 +240,7 @@ impl<R: FinishReply> FinishWaiters<R> {
         &mut self,
         recorder: &mut FileRecorder,
         batch: Settlement,
-        sink: &mut impl FnMut(Result<RecorderEvent>),
+        sink: RecorderEventSink<'_>,
         closing: impl Fn() -> bool,
         mut cleanup: Option<&mut DrainBudget>,
     ) {
@@ -443,9 +445,11 @@ mod tests {
         .unwrap();
         let before = device.captures.load(std::sync::atomic::Ordering::Acquire);
         assert_eq!(
-            recorder.pump(&mut budget, FINISH_POLL, &mut |_| panic!(
-                "spent budget emitted"
-            )),
+            recorder.pump(
+                &mut budget,
+                FINISH_POLL,
+                Some(&|_| panic!("spent budget emitted")),
+            ),
             Pumped::Exhausted
         );
         assert_eq!(

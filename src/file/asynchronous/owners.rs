@@ -2,7 +2,9 @@
 //! and finalization waits remain private to this module's event-pump impls.
 
 use super::*;
-use crate::file::recorder::{FinishReply, FinishWaiters, Settlement, WaitOutcome};
+use crate::file::recorder::{
+    FinishReply, FinishWaiters, RecorderEventSink, Settlement, WaitOutcome,
+};
 
 /// Playback's native owner is private to the event-pump module. Only
 /// commands that cannot consume native events are forwarded to the handles.
@@ -163,7 +165,7 @@ impl RecorderOwner {
         events: &EventQueue<RecorderEvent>,
     ) -> Result<u64> {
         self.recorder
-            .start_with_sink(target, timecode, &mut |event| events.push(event))
+            .start_with_sink(target, timecode, Some(&|event| events.push(event)))
     }
 
     pub(super) fn reset(&mut self, options: CheckedRecorderOptions) -> Result<RecordingReport> {
@@ -185,7 +187,7 @@ impl RecorderOwner {
                 cleanup_expired,
                 at,
             },
-            &mut |event| events.push(event),
+            Some(&|event| events.push(event)),
             || control.shutdown_requested(),
             None,
         )
@@ -272,6 +274,8 @@ impl Owner for RecorderOwner {
         if !notify {
             events.close(OwnerExit::Closed);
         }
+        let deliver = |event| events.push(event);
+        let sink: RecorderEventSink<'_> = if notify { Some(&deliver) } else { None };
         self.recorder.drain_cleanup(
             requested,
             &mut self.waiters,
@@ -283,11 +287,7 @@ impl Owner for RecorderOwner {
                     (finish.deadline, finish.reply)
                 }),
             TICK,
-            &mut |event| {
-                if notify {
-                    events.push(event);
-                }
-            },
+            sink,
             || control.close_request(),
         );
         self.recorder.report()
@@ -350,6 +350,42 @@ mod tests {
             .admit_for(false, QueueLimit::FileFinishWaits)
             .unwrap();
         FinishResponse::Finish(reply, place)
+    }
+
+    #[test]
+    fn non_notifying_async_shutdown_does_not_allocate_for_diagnostics() {
+        let measure = |populated| {
+            let device = mock::Recorder::new(Closing::Never);
+            device.install();
+            let options = FileRecorderOptions::new(SourceSpec::new("mock").unwrap())
+                .drop_wait(Duration::ZERO);
+            let mut recorder = FileRecorder::new(&mock::recorder_api(), &options).unwrap();
+            recorder
+                .start(
+                    &RecordingTarget::new(std::env::temp_dir().join("mock-no-notification"))
+                        .unwrap(),
+                    RecordingTimecode::Preserve,
+                )
+                .unwrap();
+            device.queue_open_failures(populated);
+            device.push(mock::FILE_CLOSED, mock::TAKE);
+            let mut owner = RecorderOwner::new(recorder);
+            let control = Control::<RecordingReport>::with_outcome();
+            let events = EventQueue::new(16);
+            let requested = Instant::now();
+            control.request_shutdown_at(requested);
+            let (report, allocations) = crate::test_alloc::allocation_count(|| {
+                owner.shutdown(requested, &events, &control, &mut [])
+            });
+            assert!(report.closure_confirmed());
+            assert_eq!(report.error_events(), 8);
+            assert!(lock(&events.0).queue.is_empty());
+            drop(owner);
+            assert_eq!(device.stops.load(Ordering::Acquire), 1);
+            assert!(device.closed_before_destroy.load(Ordering::Acquire));
+            allocations
+        };
+        assert_eq!(measure(false), measure(true));
     }
 
     #[test]

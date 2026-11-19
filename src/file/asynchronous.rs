@@ -6530,7 +6530,7 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         // The event pump takes this while the finish is registered.
-        let mut close = mock::recorder_event(mock::FILE_CLOSED, mock::TAKE);
+        let mut close = mock::recorder_event_with_diagnostics(mock::FILE_CLOSED, mock::TAKE);
         close.source_format_payload.video_track_count = 3;
         device.push_event(close);
         let outcome = block_on(finishing).unwrap();
@@ -6548,6 +6548,11 @@ mod tests {
             .unwrap();
         assert_eq!(malformed.kind(), RecorderEventKind::FileClosed);
         assert_eq!(malformed.path().to_str().unwrap(), mock::TAKE);
+        assert_eq!(malformed.message().to_str().unwrap(), "mock diagnostic");
+        assert!(malformed.message().is_terminated());
+        assert_eq!(malformed.format_text().as_bytes(), &[b'f'; 1024]);
+        assert!(!malformed.format_text().is_terminated());
+        assert!(malformed.format_text().is_possibly_truncated());
         assert_eq!(
             malformed.source_format(),
             Err(crate::SdkResultDefect::FileTrackCount {

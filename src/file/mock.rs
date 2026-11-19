@@ -137,6 +137,19 @@ pub(super) fn recorder_event(
     event
 }
 
+pub(super) fn recorder_event_with_diagnostics(
+    kind: NDIlib_file_recorder_event_type_e,
+    path: &str,
+) -> NDIlib_file_recorder_event_t {
+    let mut event = recorder_event(kind, path);
+    for (slot, byte) in event.p_message.iter_mut().zip(b"mock diagnostic") {
+        *slot = *byte as std::ffi::c_char;
+    }
+    // A full format field must keep its original bytes and truncation evidence.
+    event.source_format.fill(b'f' as std::ffi::c_char);
+    event
+}
+
 pub(super) const STARTED: NDIlib_file_recorder_event_type_e =
     NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_started;
 pub(super) const ROLLOVER: NDIlib_file_recorder_event_type_e =
@@ -319,6 +332,17 @@ impl Recorder {
     pub(super) fn push_event(&self, event: NDIlib_file_recorder_event_t) {
         self.events.lock().unwrap().push_back(event);
         self.changed.notify_one();
+    }
+
+    pub(super) fn queue_open_failures(&self, populated: bool) {
+        let event = if populated {
+            recorder_event_with_diagnostics(OPEN_FAILED, "attempt.mkv")
+        } else {
+            recorder_event(OPEN_FAILED, "")
+        };
+        for _ in 0..8 {
+            self.push_event(event);
+        }
     }
 
     /// End the session the way the library does on its own, for example after

@@ -2,7 +2,7 @@
 use super::*;
 use crate::file::mock::{self, Closing};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     sync::{atomic::Ordering, Arc},
 };
 
@@ -26,7 +26,7 @@ impl WaitPath {
                         cleanup_expired: false,
                         at: deadline.end(),
                     },
-                    &mut |_| {},
+                    None,
                     || false,
                     None,
                 );
@@ -151,7 +151,7 @@ fn cleanup_stops_on_its_256th_late_event_and_settles_every_waiter() {
     let later = RefCell::new(None);
     let mut waiters = FinishWaiters::new();
     let before = device.captures.load(Ordering::Acquire);
-    let mut delivered = 0;
+    let delivered = Cell::new(0);
     recorder.drain_cleanup(
         Instant::now(),
         &mut waiters,
@@ -166,17 +166,17 @@ fn cleanup_stops_on_its_256th_late_event_and_settles_every_waiter() {
             ),
         ],
         Duration::ZERO,
-        &mut |event| {
+        Some(&|event| {
             assert_eq!(event.unwrap().kind(), RecorderEventKind::FirstFrame);
-            delivered += 1;
-        },
+            delivered.set(delivered.get() + 1);
+        }),
         || CleanupRequest::Drop,
     );
     assert_eq!(
         device.captures.load(Ordering::Acquire) - before,
         STALE_EVENT_LIMIT
     );
-    assert_eq!(delivered, STALE_EVENT_LIMIT);
+    assert_eq!(delivered.get(), STALE_EVENT_LIMIT);
     assert!(waiters.is_empty());
     for result in [first.into_inner(), later.into_inner()] {
         assert!(matches!(result, Some(Ok(WaitOutcome::Expired(..)))));
@@ -212,7 +212,7 @@ fn cleanup_spent_during_a_due_batch_also_settles_its_later_waiters() {
             cleanup_expired: false,
             at: due.end(),
         },
-        &mut |_| {},
+        None,
         || false,
         Some(&mut cleanup),
     );

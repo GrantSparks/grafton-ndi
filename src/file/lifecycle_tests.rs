@@ -690,32 +690,113 @@ fn restart_uses_one_dropped_event_sample_and_observes_subsequent_loss() {
 }
 
 #[test]
-fn a_malformed_close_event_still_closes_the_session() {
-    let device = mock::Recorder::new(Closing::Never);
-    let mut recorder = recording_on(&device);
-    recorder.request_stop();
-    let mut event = mock::recorder_event(FILE_CLOSED, TAKE);
-    event.source_format_payload.video_track_count = 3;
-    device.push_event(event);
-    let mut closed = None;
-    while let Some(event) = recorder.next_event(Duration::ZERO).unwrap() {
-        if event.kind() == RecorderEventKind::FileClosed {
-            closed = Some(event);
-        }
+fn discarding_notifications_does_not_allocate_for_their_payloads() {
+    for finish in [true, false] {
+        let measure = |populated| {
+            let device = mock::Recorder::new(Closing::Never);
+            let mut recorder = recording_with(
+                &device,
+                FileRecorderOptions::new(SourceSpec::new("mock source").unwrap())
+                    .drop_wait(Duration::ZERO),
+            );
+            device.queue_open_failures(populated);
+            if populated {
+                // These paths only need to be compared with the tracked path.
+                for _ in 0..8 {
+                    device.push(mock::FIRST_FRAME, TAKE);
+                }
+            }
+            device.push(FILE_CLOSED, TAKE);
+            let allocations = if finish {
+                let (status, allocations) = crate::test_alloc::allocation_count(|| {
+                    recorder.finish(Duration::ZERO).unwrap()
+                });
+                let FinishStatus::Ended(SessionEnd::Closed(report)) = status else {
+                    panic!("finish did not confirm closure");
+                };
+                assert_eq!(report.error_events(), 8);
+                assert_eq!(report.empty_files(), u64::from(!populated));
+                drop(recorder);
+                allocations
+            } else {
+                crate::test_alloc::allocation_count(|| drop(recorder)).1
+            };
+            assert_eq!(device.stops.load(Ordering::Acquire), 1);
+            assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+            assert!(device.closed_before_destroy.load(Ordering::Acquire));
+            allocations
+        };
+        assert_eq!(measure(false), measure(true), "finish={finish}");
     }
-    let event = closed.expect("the format must not hide the close event");
-    assert_eq!(event.path().to_str().unwrap(), TAKE);
-    assert_eq!(
-        event.source_format(),
-        Err(crate::SdkResultDefect::FileTrackCount {
-            count: 3,
-            capacity: 2
-        })
-    );
-    assert!(matches!(
-        recorder.wait_for_finish(Duration::from_millis(50)).unwrap(),
-        Some(SessionEnd::Closed(_))
-    ));
+}
+
+#[test]
+fn reporting_and_discarding_recorder_events_produce_the_same_finish_outcomes() {
+    const ROLLED: &str = "rolled.mkv";
+    let run = |notify| {
+        let device = mock::Recorder::new(Closing::Never);
+        let mut recorder = recording_on(&device);
+        device.push(ROLLOVER, ROLLED);
+        device.push(mock::FIRST_FRAME, TAKE);
+        let mut event = mock::recorder_event_with_diagnostics(FILE_CLOSED, TAKE);
+        event.source_format_payload.video_track_count = 3;
+        device.push_event(event);
+        if notify {
+            for kind in [
+                RecorderEventKind::Started,
+                RecorderEventKind::Rollover,
+                RecorderEventKind::FirstFrame,
+            ] {
+                let event = recorder.next_event(Duration::ZERO).unwrap().unwrap();
+                assert_eq!(event.kind(), kind);
+            }
+            let close = recorder.next_event(Duration::ZERO).unwrap().unwrap();
+            assert_eq!(close.kind(), RecorderEventKind::FileClosed);
+            assert_eq!(close.path().to_str().unwrap(), TAKE);
+            assert_eq!(close.message().to_str().unwrap(), "mock diagnostic");
+            assert!(close.message().is_terminated());
+            assert_eq!(close.format_text().as_bytes(), &[b'f'; 1024]);
+            assert!(!close.format_text().is_terminated());
+            assert!(close.format_text().is_possibly_truncated());
+            assert_eq!(
+                close.source_format(),
+                Err(crate::SdkResultDefect::FileTrackCount {
+                    count: 3,
+                    capacity: 2
+                })
+            );
+        }
+        let FinishStatus::TimedOut(timed_out) = recorder.finish(Duration::ZERO).unwrap() else {
+            panic!("the second file is still open");
+        };
+        assert_eq!(timed_out.closed_files(), 1);
+        device.push(mock::FIRST_FRAME, ROLLED);
+        device.push(FILE_CLOSED, ROLLED);
+        if notify {
+            for kind in [RecorderEventKind::FirstFrame, RecorderEventKind::FileClosed] {
+                let event = recorder.next_event(Duration::ZERO).unwrap().unwrap();
+                assert_eq!(event.kind(), kind);
+                assert_eq!(event.path().to_str().unwrap(), ROLLED);
+            }
+        }
+        let Some(SessionEnd::Closed(ended)) = recorder.wait_for_finish(Duration::ZERO).unwrap()
+        else {
+            panic!("both files were finalized");
+        };
+        assert_eq!(ended.closed_files(), 2);
+        assert_eq!(ended.empty_files(), 0);
+        assert_eq!(
+            ended.last_closed_path().unwrap().as_bytes(),
+            ROLLED.as_bytes()
+        );
+        let captures = device.captures.load(Ordering::Acquire);
+        drop(recorder);
+        assert_eq!(device.captures.load(Ordering::Acquire), captures);
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        (timed_out, ended)
+    };
+    assert_eq!(run(false), run(true));
 }
 
 #[test]
