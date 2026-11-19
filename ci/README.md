@@ -4,6 +4,19 @@ For library installation, SDK requirements and supported platforms, start with
 [setup](../docs/setup.md). The [examples](../examples/README.md) exercise sending,
 receiving, image encoding, async adapters and recording.
 
+## Pull request checks
+
+Open a draft pull request while iterating. The `draft-ci` check runs the lint,
+documentation, and build checks on Linux along with the SDK-free library tests
+(`cargo test --locked --lib --all-features`).
+
+Mark the batch ready for review to start the full checks. Wait for
+`required-ci` on the current merge candidate before merging. A push to a
+ready PR starts a fresh full run. Converting it back to draft cancels the
+in-progress full run and starts the draft checks. If another PR changes the
+base while the full run is in progress, update the branch and verify the
+combined tree before merging so `main` can reuse the result.
+
 ## Running the checks locally
 
 CI builds the API reference and checks documentation links and examples once
@@ -185,16 +198,16 @@ reads from glibc's loader token comparisons. Add
 
 ## Receiver stall diagnostics
 
-The Standard SDK rows for Linux x86 and x64 and macOS ARM64 with SDK 6.3.2
-supervise the receiver reconnect unit case and the native connect/capture
-overlap executable. The watchdog prints the test phases and collects thread
-stacks before stopping a stalled test group. Linux uses GDB and macOS uses
-`sample`. A timeout fails the test step.
+The Standard SDK 6.4 rows for Linux x86, x64, and ARM64 and the macOS ARM64 row
+with SDK 6.3.2 supervise the receiver reconnect unit case and the native
+connect/capture overlap executable. The watchdog prints the test phases and
+collects thread stacks before stopping a stalled test group. Linux uses GDB
+and macOS uses `sample`. A timeout fails the test step.
 
 Run the **Receiver diagnostics** workflow on the ref with the SDK pins to
-investigate. Select the Linux x86, Linux x64 or macOS configuration. Each job
-repeats only the reconnect and overlap tests under the loopback runner. The
-matching `receiver-diagnostic-*` branch names can also start these jobs on push.
+investigate. Select the Linux x86, x64, ARM64, or macOS configuration. Each
+job repeats only the reconnect and overlap tests under the loopback runner.
+The matching `receiver-diagnostic-*` branch names also start these jobs on push.
 
 ## Test against an installed runtime
 

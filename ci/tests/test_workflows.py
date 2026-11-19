@@ -32,7 +32,17 @@ JOB_PERMISSIONS = {
     ('rust.yml', 'verified-tree'): {'contents': 'read', 'actions': 'read', 'pull-requests': 'read'},
     ('rust.yml', 'deploy-docs'): {'contents': 'read', 'pages': 'write', 'id-token': 'write'},
 }
-RECEIVER_CONFIGURATIONS = [f'receiver-diagnostic-{target}' for target in ('macos', 'linux-x86', 'linux-x64')]
+RECEIVER_CONFIGURATIONS = [
+    f'receiver-diagnostic-{target}' for target in ('macos', 'linux-x86', 'linux-x64', 'linux-arm64')
+]
+RECEIVER_PROBE_RUNNER = (
+    "${{ (inputs.configuration || github.ref_name) == 'receiver-diagnostic-macos' && 'macos-15' || "
+    "(inputs.configuration || github.ref_name) == 'receiver-diagnostic-linux-arm64' && 'ubuntu-24.04-arm' || "
+    "'ubuntu-24.04' }}"
+)
+RECEIVER_WATCHDOG_ROWS = (
+    'linux-x86 standard-6.4', 'linux-x64 standard-6.4', 'linux-arm64 standard-6.4', 'macos-arm64 standard-6.3.2',
+)
 RECEIVER_TRUST = "github.repository == 'GrantSparks/grafton-ndi' && vars.NDI_CI_RELEASED == 'true' && github.actor != 'dependabot[bot]'"
 PASSED_SECRETS = {name: f'${{{{ secrets.{name} }}}}' for name in ('NDI_SDK_SOURCES_JSON', 'NDI_SDK_ARCHIVE_TOKEN')}
 # Every place where the word `secrets` may occur, as a key or inside any scalar.
@@ -48,7 +58,11 @@ SECRETS_AVAILABLE = ("github.actor != 'dependabot[bot]' && (github.event_name !=
 REUSE_ALLOWED = ("github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && "
                  "github.ref == 'refs/heads/main' && vars.NDI_CI_RELEASED == 'true'")
 FULL_REQUIRED = "needs.verified-tree.outputs.run_id == ''"
-FULL_CONDITION = f"${{{{ !cancelled() && {FULL_REQUIRED} }}}}"
+FULL_EVENT = "(github.event_name != 'pull_request' || !github.event.pull_request.draft)"
+FULL_CONDITION = f"${{{{ !cancelled() && {FULL_EVENT} && {FULL_REQUIRED} }}}}"
+FULL_GATE = f"${{{{ always() && {FULL_EVENT} }}}}"
+DRAFT_CHECK_NAME = "${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-ci' || 'lint' }}"
+PR_EVENTS = ['opened', 'synchronize', 'reopened', 'ready_for_review', 'converted_to_draft']
 PUBLISH_PROOF = ("github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == "
                  "github.repository && needs.sdk.result == 'success'")
 JOB_CONDITIONS = {
@@ -56,7 +70,7 @@ JOB_CONDITIONS = {
     'rust.yml': {'verified-tree': REUSE_ALLOWED,
                  **dict.fromkeys(('test', 'cross', 'hx-pictures', 'miri'), FULL_CONDITION),
                  'sdk': (f"!cancelled() && needs.hx-pictures.result == 'success' && {FULL_REQUIRED} && "
-                         f"vars.NDI_CI_RELEASED == 'true' && {SECRETS_AVAILABLE}"), 'required-ci': 'always()', 'deploy-docs': "${{ !cancelled() && needs.required-ci.result == 'success' && github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' }}"},
+                         f"vars.NDI_CI_RELEASED == 'true' && {SECRETS_AVAILABLE}"), 'required-ci': FULL_GATE, 'deploy-docs': "${{ !cancelled() && needs.required-ci.result == 'success' && github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' }}"},
     'publish.yml': {'release': "github.repository == 'GrantSparks/grafton-ndi'"},
 }
 TRIGGERS = {
@@ -67,7 +81,7 @@ TRIGGERS = {
             'required': 'true', 'type': 'choice', 'options': RECEIVER_CONFIGURATIONS,
         }}},
     },
-    'rust.yml': {'push': {'branches': ['main']}, 'pull_request': {'branches': ['main']}, 'workflow_dispatch': None,
+    'rust.yml': {'push': {'branches': ['main']}, 'pull_request': {'branches': ['main'], 'types': PR_EVENTS}, 'workflow_dispatch': None,
                  'workflow_call': {'secrets': {name: {'required': 'false'} for name in PASSED_SECRETS}}},
     'publish.yml': {'push': {'tags': ['v*']}},
 }
@@ -165,6 +179,9 @@ def violations(texts):
                 found.append(f'{name}: {job} has no timeout')
     manifest = cargo_manifest()
     return (found + workflows.obligation_violations(parsed, workflow_obligations(manifest))
+            + differs('receiver-diagnostics.yml: probe runner',
+                      parsed['receiver-diagnostics.yml']['jobs']['probe'].get('runs-on'), RECEIVER_PROBE_RUNNER)
+            + differs('rust.yml: draft check name', parsed['rust.yml']['jobs']['lint'].get('name'), DRAFT_CHECK_NAME)
             + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
             + docs_violations(parsed['rust.yml']) + memory_checker_violations(parsed['rust.yml'])
             + repeated_feature_violations(parsed['rust.yml'])
@@ -221,7 +238,11 @@ def sdk_input_violations(rust):
     directory = '${{ runner.temp }}/ndi-hx-pictures'
     upload = fixture_steps.get('Upload test pictures', {})
     download = sdk_steps.get('Download test pictures', {})
-    found = (differs('rust.yml: SDK picture dependency', sdk_job.get('needs'), ['verified-tree', 'hx-pictures'])
+    watchdog_rows = '["' + '","'.join(RECEIVER_WATCHDOG_ROWS) + '"]'
+    watchdog = f"${{{{ contains(fromJSON('{watchdog_rows}'), matrix.name) && '1' || '0' }}}}"
+    found = (differs('rust.yml: receiver watchdog configurations',
+                     sdk_job.get('env', {}).get('GRAFTON_NDI_RECEIVER_DIAGNOSTICS'), watchdog)
+             + differs('rust.yml: SDK picture dependency', sdk_job.get('needs'), ['verified-tree', 'hx-pictures'])
              + differs('rust.yml: SDK picture upload', upload.get('with'), {
                  'name': 'ndi-hx-pictures', 'path': '\n'.join(f'{directory}/{name}' for name in names),
                  'if-no-files-found': 'error', 'retention-days': '1'})
@@ -577,10 +598,11 @@ WRONG_EDITS = (
      'permissions:\n  contents: read\n  id-token: write\n\n', 'default permissions'),
     ('write-all on verify', 'publish.yml', '    name: verify package\n',
      '    name: verify package\n    permissions: write-all\n', 'permissions of verify'),
-    ('id-token on lint', 'rust.yml', '    name: lint\n', '    name: lint\n    permissions:\n      id-token: write\n',
+    ('id-token on lint', 'rust.yml', f'    name: {DRAFT_CHECK_NAME}\n',
+     f'    name: {DRAFT_CHECK_NAME}\n    permissions:\n      id-token: write\n',
      'permissions of lint'),
-    ('permissions as a flow mapping', 'rust.yml', '    name: lint\n',
-     '    name: lint\n    permissions: {id-token: write}\n', 'YAML the guards do not read'),
+    ('permissions as a flow mapping', 'rust.yml', f'    name: {DRAFT_CHECK_NAME}\n',
+     f'    name: {DRAFT_CHECK_NAME}\n    permissions: {{id-token: write}}\n', 'YAML the guards do not read'),
     ('every secret to a lint step', 'rust.yml', '      - name: Format\n        run:',
      '      - name: Format\n        env:\n          ALL: ${{ toJSON(secrets) }}\n        run:', 'mention secrets'),
     ('an indexed secret to a lint step', 'rust.yml', '      - name: Format\n        run:',
@@ -601,13 +623,26 @@ WRONG_EDITS = (
      'required-ci waits for'),
     ('the gate no longer waits for sdk', 'rust.yml', '    needs: [verified-tree, lint, test, cross, hx-pictures, sdk, miri]\n',
      '    needs: [lint, test, cross]\n', 'required-ci waits for'),
-    ('the gate skipped when a job fails', 'rust.yml', '    name: required-ci\n    if: always()\n',
+    ('the gate skipped when a job fails', 'rust.yml', f'    name: required-ci\n    if: {FULL_GATE}\n',
      '    name: required-ci\n', 'job conditions'),
+    ('full gate used for drafts', 'rust.yml', f'    if: {FULL_GATE}\n',
+     '    if: always()\n', 'job conditions'),
+    ('full jobs used for drafts', 'rust.yml', f'  hx-pictures:\n    needs: verified-tree\n    if: {FULL_CONDITION}\n',
+     f"  hx-pictures:\n    needs: verified-tree\n    if: ${{{{ !cancelled() && {FULL_REQUIRED} }}}}\n",
+     'job conditions'),
+    ('draft check uses the full check name', 'rust.yml', f'    name: {DRAFT_CHECK_NAME}\n',
+     '    name: required-ci\n', 'draft check name'),
+    ('no CI when marked ready', 'rust.yml', ', ready_for_review', '', 'triggers'),
+    ('no CI when converted to draft', 'rust.yml', ', converted_to_draft', '', 'triggers'),
+    ('no watchdog on Linux ARM64', 'rust.yml', ',"linux-arm64 standard-6.4"', '', 'receiver watchdog configurations'),
+    ('ARM64 diagnostic on an x64 runner', 'receiver-diagnostics.yml', "'ubuntu-24.04-arm'",
+     "'ubuntu-24.04'", 'probe runner'),
     ('continue-on-error on sdk', 'rust.yml', '    runs-on: ${{ matrix.runner }}\n',
      '    runs-on: ${{ matrix.runner }}\n    continue-on-error: true\n', 'lets a failure pass'),
     ('continue-on-error on a test step', 'rust.yml', '      - name: Tests, all features\n',
      '      - name: Tests, all features\n        continue-on-error: true\n', 'lets a failure pass'),
-    ('a condition on lint', 'rust.yml', '    name: lint\n', "    name: lint\n    if: github.event_name == 'push'\n",
+    ('a condition on lint', 'rust.yml', f'    name: {DRAFT_CHECK_NAME}\n',
+     f"    name: {DRAFT_CHECK_NAME}\n    if: github.event_name == 'push'\n",
      'job conditions'),
     ('Dependabot expected to have secrets', 'rust.yml', "${{ github.actor != 'dependabot[bot]' &&\n            (", '${{ (',
      'the gate step'),

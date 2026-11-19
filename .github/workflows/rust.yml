@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
   workflow_call:
     secrets:
@@ -16,7 +17,7 @@ on:
 permissions:
   contents: read
 
-# A new push to a pull request replaces its running check. Runs for main, for
+# A push or draft status change replaces the running PR check. Runs for main, for
 # manual dispatches and for releases are never cancelled or queued behind each other.
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
@@ -54,10 +55,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 ci/verified_tree.py reuse
 
-  # The crate builds without an NDI SDK, so everything in lint, test and cross
-  # runs for every event, including pull requests from forks.
+  # Drafts reuse the SDK-free lint job and run the Linux library tests there.
   lint:
-    name: lint
+    name: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'draft-ci' || 'lint' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -92,6 +92,9 @@ jobs:
           done
       - name: Bindings generator tests
         run: cargo test --locked --package xtask
+      - name: Draft Linux regression tests
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft
+        run: cargo test --locked --lib --all-features
       - name: Rustdoc feature combinations
         env:
           RUSTDOCFLAGS: -D warnings
@@ -148,7 +151,7 @@ jobs:
 
   test:
     needs: verified-tree
-    if: ${{ !cancelled() && needs.verified-tree.outputs.run_id == '' }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.verified-tree.outputs.run_id == '' }}
     name: test (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -220,7 +223,7 @@ jobs:
 
   miri:
     needs: verified-tree
-    if: ${{ !cancelled() && needs.verified-tree.outputs.run_id == '' }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.verified-tree.outputs.run_id == '' }}
     name: miri (${{ matrix.model }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -251,7 +254,7 @@ jobs:
 
   cross:
     needs: verified-tree
-    if: ${{ !cancelled() && needs.verified-tree.outputs.run_id == '' }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.verified-tree.outputs.run_id == '' }}
     name: cross
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -285,7 +288,7 @@ jobs:
 
   hx-pictures:
     needs: verified-tree
-    if: ${{ !cancelled() && needs.verified-tree.outputs.run_id == '' }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.verified-tree.outputs.run_id == '' }}
     name: NDI HX test pictures
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -521,7 +524,7 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       PACKAGE: ${{ matrix.package }}
-      GRAFTON_NDI_RECEIVER_DIAGNOSTICS: ${{ contains(fromJSON('["linux-x86 standard-6.4","linux-x64 standard-6.4","macos-arm64 standard-6.3.2"]'), matrix.name) && '1' || '0' }}
+      GRAFTON_NDI_RECEIVER_DIAGNOSTICS: ${{ contains(fromJSON('["linux-x86 standard-6.4","linux-x64 standard-6.4","linux-arm64 standard-6.4","macos-arm64 standard-6.3.2"]'), matrix.name) && '1' || '0' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
@@ -755,7 +758,7 @@ jobs:
 
   required-ci:
     name: required-ci
-    if: always()
+    if: ${{ always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     needs: [verified-tree, lint, test, cross, hx-pictures, sdk, miri]
     runs-on: ubuntu-24.04
     timeout-minutes: 5

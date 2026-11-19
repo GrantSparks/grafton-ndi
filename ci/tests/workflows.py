@@ -312,6 +312,11 @@ def obligations(msrv, features, miri_groups):
             package=current-standard-linux
             require=1,discovery-server
             ;;
+          receiver-diagnostic-linux-arm64)
+            target=aarch64-unknown-linux-gnu
+            package=current-standard-linux
+            require=1,discovery-server
+            ;;
           *) exit 1 ;;
         esac
         echo "target=$target" >> "$GITHUB_OUTPUT"
@@ -409,6 +414,10 @@ def obligations(msrv, features, miri_groups):
     )
     table['rust.yml', 'lint', 'Bindings generator tests'] = Obligation(
         'cargo test --locked --package xtask',
+    )
+    table['rust.yml', 'lint', 'Draft Linux regression tests'] = Obligation(
+        'cargo test --locked --lib --all-features',
+        condition="github.event_name == 'pull_request' && github.event.pull_request.draft",
     )
     table['rust.yml', 'lint', 'Rustdoc feature combinations'] = Obligation(
         r'''

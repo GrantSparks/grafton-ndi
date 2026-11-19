@@ -6,6 +6,7 @@ on:
       - receiver-diagnostic-macos
       - receiver-diagnostic-linux-x86
       - receiver-diagnostic-linux-x64
+      - receiver-diagnostic-linux-arm64
   workflow_dispatch:
     inputs:
       configuration:
@@ -16,6 +17,7 @@ on:
           - receiver-diagnostic-macos
           - receiver-diagnostic-linux-x86
           - receiver-diagnostic-linux-x64
+          - receiver-diagnostic-linux-arm64
 
 permissions:
   contents: read
@@ -31,7 +33,10 @@ defaults:
 jobs:
   probe:
     if: github.repository == 'GrantSparks/grafton-ndi' && vars.NDI_CI_RELEASED == 'true' && github.actor != 'dependabot[bot]'
-    runs-on: ${{ (inputs.configuration || github.ref_name) == 'receiver-diagnostic-macos' && 'macos-15' || 'ubuntu-24.04' }}
+    runs-on: >-
+      ${{ (inputs.configuration || github.ref_name) == 'receiver-diagnostic-macos' && 'macos-15' ||
+      (inputs.configuration || github.ref_name) == 'receiver-diagnostic-linux-arm64' && 'ubuntu-24.04-arm' ||
+      'ubuntu-24.04' }}
     timeout-minutes: 15
     env:
       CONFIGURATION: ${{ inputs.configuration || github.ref_name }}
@@ -57,6 +62,11 @@ jobs:
               ;;
             receiver-diagnostic-linux-x64)
               target=x86_64-unknown-linux-gnu
+              package=current-standard-linux
+              require=1,discovery-server
+              ;;
+            receiver-diagnostic-linux-arm64)
+              target=aarch64-unknown-linux-gnu
               package=current-standard-linux
               require=1,discovery-server
               ;;
