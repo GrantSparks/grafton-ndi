@@ -53,7 +53,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut session = controls.kvm()?;
     // The restricted receiver view keeps shared controls and metadata capture
     // available while the session holds the connection's exclusive borrow.
-    println!("KVM target: {}", session.receiver().connection_target());
+    if let Some(target) = session.receiver().connection_target() {
+        println!("KVM target: {target}");
+    }
     if !session.is_supported() {
         println!("This source does not offer remote control");
         return Ok(());

@@ -363,13 +363,12 @@ unsafe impl Synchronizer for AvSyncKind {
 /// use std::time::Duration;
 /// use grafton_ndi::{
 ///     advanced::{AvSync, AvSyncOutcome, AvSyncRequest, AvSyncVideo},
-///     Receiver, ReceiverOptions, Source, Ndi,
+///     Receiver, ReceiverOptions, Ndi,
 /// };
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// let ndi = Ndi::new()?;
-/// # let source = Source::new("").unwrap();
-/// let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
+/// let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected())?;
 /// let sync = AvSync::new(receiver)?;
 ///
 /// // The frame stays in the SDK's buffer: nothing is copied.
@@ -1612,13 +1611,12 @@ mod tests {
     fn avsync_accepts_owned_and_borrowed_planar_444_without_a_send_gate() {
         use crate::{
             capture::{CaptureStrategy, Guard, VideoKind},
-            PixelFormat, ReceiverOptions, Source,
+            PixelFormat, ReceiverOptions,
         };
         let Some(ndi) = crate::test_support::advanced_ndi() else {
             return;
         };
-        let receiver =
-            Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap();
         let mut sync = AvSync::new(receiver).unwrap();
         for format in [
             PixelFormat::Na48,
@@ -1968,8 +1966,7 @@ mod tests {
         let Some(ndi) = crate::test_support::advanced_ndi() else {
             return;
         };
-        let receiver =
-            Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+        let receiver = Receiver::new(&ndi, &crate::ReceiverOptions::disconnected()).unwrap();
         let sync = AvSync::new(receiver).unwrap();
         let resource = sync.inner.resource();
         let (handle, table) = (resource.handle, &resource.table);

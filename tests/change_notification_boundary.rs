@@ -579,13 +579,13 @@ fn keyframe(ndi: &Ndi, clear_after_query: bool) {
     use grafton_ndi::{
         advanced::{VideoCodec, VideoPacketFormat},
         capabilities::RuntimeFeature,
-        Receiver, ReceiverOptions, Sender, SenderOptions, Source,
+        Receiver, ReceiverOptions, Sender, SenderOptions,
     };
     if !common::require_feature(ndi.require_feature(RuntimeFeature::KeyframeDemand)) {
         return;
     }
     let sender = Sender::new(ndi, &SenderOptions::new("keyframe fixture")).unwrap();
-    let receiver = Receiver::new(ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+    let receiver = Receiver::new(ndi, &ReceiverOptions::disconnected()).unwrap();
     let h264 = VideoPacketFormat::new(VideoCodec::H264, 64, 32).unwrap();
     let different_size = VideoPacketFormat::new(VideoCodec::H264, 128, 64).unwrap();
     if clear_after_query {

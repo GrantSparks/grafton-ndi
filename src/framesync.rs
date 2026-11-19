@@ -1026,11 +1026,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(
-            &ndi,
-            &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
-        )
-        .unwrap();
+        let receiver = Receiver::new(&ndi, &crate::ReceiverOptions::disconnected()).unwrap();
         let sync = FrameSync::new(receiver).unwrap();
         assert_eq!(
             format!("{sync:?}"),
@@ -1049,11 +1045,7 @@ mod tests {
         let Some(ndi) = crate::test_support::advanced_ndi() else {
             return;
         };
-        let receiver = Receiver::new(
-            &ndi,
-            &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
-        )
-        .unwrap();
+        let receiver = Receiver::new(&ndi, &crate::ReceiverOptions::disconnected()).unwrap();
         let mut sync = FrameSync::new(receiver).unwrap();
         let original = (
             sync.inner.resource().instance,
@@ -1215,11 +1207,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(
-            &ndi,
-            &crate::ReceiverOptions::new(crate::Source::new("").unwrap()),
-        )
-        .unwrap();
+        let receiver = Receiver::new(&ndi, &crate::ReceiverOptions::disconnected()).unwrap();
         let fs = FrameSync::new(receiver).unwrap();
         for (channels, samples) in [
             (2, 8_388_609),

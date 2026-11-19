@@ -280,15 +280,17 @@ there is no source). [`status_monitor`](../examples/status_monitor.rs) shows
 status events; [`receive_ptz`](../examples/receive_ptz.rs) checks PTZ
 support before sending controls.
 
-`connect_to(&source)` remembers a new requested target; `connection_target()`
+Use `ReceiverOptions::disconnected()` if you will select a source after creating
+the receiver. `connection_target()` returns `None` until a local target is set.
+`connect_to(&source)` requests and remembers a target, and `connection_target()`
 returns its owned snapshot. `disconnect()` retains it and `reconnect()` retries
-it. Success means the request was issued; observe connection state and media
-progress separately.
+it when present. Use connection state and media progress to confirm a request
+took effect.
 
 The connection target is the last local request. A Discovery Server client's
 remote source change is observed through `wait_for_source_name_change()` and does
-not update `connection_target()`. Calling `reconnect()` requests the local
-target again, replacing any remote routing.
+not update `connection_target()`. Calling `reconnect()` with a remembered local
+target requests it again, replacing any remote routing.
 
 ## Integrate with async runtimes
 

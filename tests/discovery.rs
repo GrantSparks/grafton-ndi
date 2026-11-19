@@ -386,7 +386,7 @@ fn child(scenario: &str) {
         }
         "advertisement_options_reach_the_sdk" => {
             let receiver = |name: &str| {
-                let options = ReceiverOptions::new(Source::new("").unwrap()).name(name);
+                let options = ReceiverOptions::disconnected().name(name);
                 Receiver::new(&ndi, &options).unwrap()
             };
             let (controlled, monitored) = (receiver("controlled"), receiver("monitored"));
@@ -987,8 +987,7 @@ fn child(scenario: &str) {
         }
         "owners_move_between_threads" => {
             let sender = Sender::new(&ndi, &SenderOptions::new("moved")).unwrap();
-            let receiver =
-                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap();
             let mut router = Router::new(&ndi, &RouterOptions::new("moved router")).unwrap();
             let mut send_advertiser = SendAdvertiser::new(&ndi, &advertisers).unwrap();
             let mut recv_advertiser = RecvAdvertiser::new(&ndi, &advertisers).unwrap();
@@ -1048,8 +1047,7 @@ fn child(scenario: &str) {
             std::env::remove_var("GRAFTON_FAKE_ROUTING_CLEAR");
 
             let sender = Sender::new(&ndi, &SenderOptions::new("refused registration")).unwrap();
-            let receiver =
-                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap();
             let mut send_advertiser = SendAdvertiser::new(&ndi, &advertisers).unwrap();
             let mut recv_advertiser = RecvAdvertiser::new(&ndi, &advertisers).unwrap();
             std::env::set_var("GRAFTON_FAKE_ADVERTISER_ADD", "refuse");

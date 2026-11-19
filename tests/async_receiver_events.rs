@@ -12,7 +12,7 @@ common_helpers!(runtime, name, loopback, unsupported, feature);
 use grafton_ndi::{
     asynchronous::{AsyncReceiver, AsyncRuntime},
     Error, MetadataFrame, Ndi, Receiver, ReceiverEvent, ReceiverOptions, RuntimeFeature, Sender,
-    SenderOptions, Source, SourceNameChange, Timecode,
+    SenderOptions, SourceNameChange, Timecode,
 };
 use std::time::{Duration, Instant};
 
@@ -124,10 +124,10 @@ async fn async_connection_changes_reach_the_receiver<R: AsyncRuntime>(
     )?;
     let source = common::loopback_source(ndi, &sender)?;
     // Created for no source at all, so only `connect_to` can connect it.
-    let nowhere = Source::new("").unwrap();
-    let media =
-        AsyncReceiver::<R>::new(Receiver::new(ndi, &ReceiverOptions::new(nowhere.clone()))?);
+    let media = AsyncReceiver::<R>::new(Receiver::new(ndi, &ReceiverOptions::disconnected())?);
     assert!(!media.receiver().is_connected());
+    media.reconnect().await?;
+    assert!(media.receiver().connection_target().is_none());
 
     media.connect_to(&source).await?;
     wait_until("connect_to", || media.receiver().is_connected());
@@ -150,12 +150,12 @@ async fn async_connection_changes_reach_the_receiver<R: AsyncRuntime>(
 
     media.disconnect().await?;
     wait_until("disconnect", || !media.receiver().is_connected());
-    assert_eq!(media.receiver().connection_target(), source);
+    assert_eq!(media.receiver().connection_target().as_ref(), Some(&source));
     media.reconnect().await?;
     wait_until("reconnect to the latest target", || {
         media.receiver().is_connected()
     });
-    assert_eq!(media.receiver().connection_target(), source);
+    assert_eq!(media.receiver().connection_target().as_ref(), Some(&source));
     Ok(())
 }
 

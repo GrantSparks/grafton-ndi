@@ -10,8 +10,7 @@ fn restricted_views_and_rejected_captures_add_no_allocations_or_native_calls() {
     let Some(ndi) = crate::test_support::ndi() else {
         return;
     };
-    let receiver =
-        Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap())).unwrap();
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap();
     CALLS.with_borrow_mut(|calls| *calls = Calls::default());
     let mut session = KvmSession {
         receiver: &receiver,

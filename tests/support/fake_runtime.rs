@@ -33,7 +33,7 @@
 //! * `fake_tally` — poll/wait share a consumable tally change on each sender;
 //! * `fake_blocking_connect` — hold the `Blocked` receiver connection request
 //!   between `entered` and `release` files in `GRAFTON_FAKE_CONNECT_GATE`;
-
+//! * `fake_receiver_targets` — log both target fields, including null pointers;
 //! * `fake_capability_descriptors` — log send and receiver format gates, and
 //!   validated AV-sync descriptors after checking synchronization availability;
 //! * `fake_capture` — script native media/notification delivery with
@@ -261,6 +261,10 @@ export! {
             }
         };
         log(&format!("receiver-connect:{name}"));
+        #[cfg(fake_receiver_targets)]
+        if let Some(source) = unsafe { p_src.as_ref() } {
+            log_receiver_target("connect", source);
+        }
         #[cfg(fake_blocking_connect)]
         if name == "Blocked" {
             wait_at_gate("GRAFTON_FAKE_CONNECT_GATE");
@@ -270,6 +274,17 @@ export! {
         #[cfg(fake_receiver_controls)]
         log(&format!("connect-instance:{_p_instance:p}"));
     }
+}
+
+#[cfg(fake_receiver_targets)]
+fn log_receiver_target(operation: &str, source: &NDIlib_source_t) {
+    let text = |pointer: *const c_char| {
+        // SAFETY: the caller keeps both source fields readable through the call.
+        (!pointer.is_null()).then(|| unsafe { CStr::from_ptr(pointer) })
+    };
+    let name = text(source.p_ndi_name);
+    let address = text(unsafe { source.__bindgen_anon_1.p_url_address });
+    log(&format!("receiver-{operation}-target:{name:?}:{address:?}"));
 }
 
 #[cfg(any(fake_blocking_connect, fake_capture))]
@@ -576,8 +591,11 @@ mod objects {
                 log(&format!("receiver-settings:{}:{}", settings.color_format, settings.bandwidth));
             }
             let creation_source = Box::new(unsafe { (*_p_create_settings).source_to_connect_to });
+            #[cfg(fake_receiver_targets)]
+            log_receiver_target("create", &creation_source);
             let source = if std::env::var_os("GRAFTON_FAKE_RETAIN_SOURCES").is_some()
-                && (!unsafe { CStr::from_ptr(creation_source.p_ndi_name) }.to_bytes().is_empty()
+                && ((!creation_source.p_ndi_name.is_null()
+                    && !unsafe { CStr::from_ptr(creation_source.p_ndi_name) }.to_bytes().is_empty())
                     || !unsafe { creation_source.__bindgen_anon_1.p_url_address }.is_null())
             {
                 RetainedSource(std::ptr::from_ref(&*creation_source))

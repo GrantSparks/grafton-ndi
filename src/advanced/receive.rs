@@ -451,7 +451,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("").unwrap()))
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected())
             .unwrap()
             .into_packet_for_test();
         let Some(PacketItem::Event(ReceiverEvent::StatusChanged(status))) =
@@ -663,7 +663,7 @@ mod tests {
         use crate::{
             capabilities::{RuntimeFeature, SdkEdition, SdkVersion},
             sys::{table::ExportsWhere, Resolved},
-            ReceiverColorFormat, Source,
+            ReceiverColorFormat,
         };
 
         // An Advanced 6.3.2 runtime that exports every function the crate
@@ -693,7 +693,7 @@ mod tests {
             );
         };
 
-        let best = ReceiverOptions::new(Source::new("").unwrap())
+        let best = ReceiverOptions::disconnected()
             .color_format(ReceiverColorFormat::Best444)
             .allow_video_fields(false);
         // An ordinary receiver would be given Best444.
@@ -710,11 +710,10 @@ mod tests {
                 continue;
             };
             let packets = creation_options(&best, color_format);
-            let target = crate::source_retention::RetainedSource::new(&Source::new("").unwrap());
             let settings = packets
                 .validate_runtime(runtime)
                 .unwrap()
-                .settings(&target, None);
+                .settings(None, None);
             let settings = settings.raw();
             assert_eq!(settings.color_format, color_format, "{preset:?}");
             assert!(settings.allow_video_fields);

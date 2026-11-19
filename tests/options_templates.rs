@@ -13,8 +13,14 @@ fn cloned_templates_can_be_retargeted_without_rebuilding_other_settings() {
         .clone()
         .source(Source::new("Camera B").unwrap())
         .clear_name();
-    assert_eq!(receiver.configured_source().name(), "Camera A");
-    assert_eq!(another.configured_source().name(), "Camera B");
+    assert_eq!(
+        receiver.configured_source().map(Source::name),
+        Some("Camera A")
+    );
+    assert_eq!(
+        another.configured_source().map(Source::name),
+        Some("Camera B")
+    );
     assert_eq!(another.configured_bandwidth(), ReceiverBandwidth::Lowest);
     assert_eq!(
         another.configured_color_format(),

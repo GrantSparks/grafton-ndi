@@ -78,9 +78,8 @@ async fn cancelled_query_releases_before_connecting<R: AsyncRuntime>(runtime: &s
     .unwrap();
     let source = loopback_source(&ndi, &sender);
     let _publishing = Publishing::start(sender);
-    let receiver = AsyncReceiver::<R>::new(
-        Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
-    );
+    let receiver =
+        AsyncReceiver::<R>::new(Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap());
     while receiver
         .wait_for_source_name_change(Duration::ZERO)
         .await

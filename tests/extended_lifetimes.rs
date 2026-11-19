@@ -335,8 +335,7 @@ fn child(case: &str) {
             assert_retained_reads("receiver", &[("creation target", "192.0.2.19:5960")]);
         }
         "retained_connection_targets" => {
-            let receiver =
-                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap();
             receiver.connect_to(&retained_source("target A", "192.0.2.20:5960"));
             receiver.reconnect();
             receiver.connect_to(&retained_source("target B", "http://target.example/ndi"));
@@ -354,8 +353,7 @@ fn child(case: &str) {
             );
         }
         "retained_receiver_metadata" => {
-            let receiver =
-                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap();
             for index in 0..16 {
                 let frame = grafton_ndi::MetadataFrame::new(format!("<entry index='{index}'/>"))
                     .unwrap()
@@ -415,7 +413,7 @@ fn child(case: &str) {
         }
         "retained_receiver_name" | "retained_registered_receiver_name" => {
             let name = "retained receiver creation name";
-            let options = ReceiverOptions::new(Source::new("").unwrap()).name(name);
+            let options = ReceiverOptions::disconnected().name(name);
             let receiver = Receiver::new(&ndi, &options).unwrap();
             drop(options);
             receiver.connect_to(&Source::new("named target").unwrap());
@@ -759,8 +757,7 @@ fn child(case: &str) {
             assert_eq!(events.matches("sender-destroy\n").count(), 1);
         }
         "receiver_registration" => {
-            let receiver =
-                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap();
             let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let registration = advertiser
                 .register(&receiver, &RecvAdvertisement::default())
@@ -780,8 +777,7 @@ fn child(case: &str) {
             drop(advertiser);
         }
         "dropped_receiver_advertiser" => {
-            let receiver =
-                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap();
             let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let _ = advertiser
                 .register(
@@ -829,8 +825,7 @@ fn child(case: &str) {
             assert_eq!(read_fake_log().matches("sender-destroy\n").count(), 1);
             drop(advertiser);
 
-            let receiver =
-                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap();
             let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let mut other = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let registration = advertiser
@@ -865,8 +860,7 @@ fn child(case: &str) {
             assert_eq!(read_fake_log().matches("sender-destroy\n").count(), 1);
             drop(advertiser);
 
-            let receiver =
-                Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap();
             let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let registration = advertiser
                 .register(&receiver, &RecvAdvertisement::default())

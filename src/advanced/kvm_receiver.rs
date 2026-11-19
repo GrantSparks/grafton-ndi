@@ -153,8 +153,8 @@ impl<'a, M: ReceiverMode> KvmReceiver<'a, M> {
         self.receiver.is_connected()
     }
 
-    /// Copy the last requested target; see [`Receiver::connection_target`].
-    pub fn connection_target(&self) -> Source {
+    /// Copy the last requested target, if any; see [`Receiver::connection_target`].
+    pub fn connection_target(&self) -> Option<Source> {
         self.receiver.connection_target()
     }
 

@@ -29,7 +29,7 @@ use grafton_ndi::{
         AdvertisedReceiver, AdvertiserOptions, ListenerOptions, ReceiverCommand, RecvAdvertisement,
         RecvAdvertiser, RecvListener, SendAdvertisement, SendAdvertiser, SendListener,
     },
-    Error, Ndi, Receiver, ReceiverOptions, Sender, SenderOptions, Source,
+    Error, Ndi, Receiver, ReceiverOptions, Sender, SenderOptions,
 };
 use std::{
     io::{BufRead, BufReader, Write},
@@ -102,7 +102,7 @@ fn sender(ndi: &Ndi, label: &str) -> Sender {
 
 /// A receiver named `label`, made unique to this process like a [`sender`].
 fn receiver(ndi: &Ndi, label: &str) -> Receiver {
-    let options = ReceiverOptions::new(Source::new("").unwrap()).name(common::unique_name(label));
+    let options = ReceiverOptions::disconnected().name(common::unique_name(label));
     Receiver::new(ndi, &options).unwrap()
 }
 

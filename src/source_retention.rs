@@ -59,15 +59,6 @@ impl RetainedSource {
     pub(crate) fn reissue<R>(&self, call: impl FnOnce(*const NDIlib_source_t) -> R) -> R {
         call(ptr::from_ref(self.descriptor()))
     }
-
-    /// Install a prepared target only after its native request has returned.
-    pub(crate) fn replace<R>(
-        &mut self,
-        next: Self,
-        call: impl FnOnce(*const NDIlib_source_t) -> R,
-    ) -> R {
-        replace(self, next, |next| next.reissue(call))
-    }
 }
 
 /// An optional native source, also retaining the last refused router request.
@@ -172,11 +163,11 @@ mod tests {
 
     #[test]
     fn replacement_keeps_previous_descriptor_live_and_commits_the_passed_pointer() {
-        let mut source = RetainedSource::new(&Source::new("previous").unwrap());
-        let previous_storage = Arc::downgrade(&source.0);
-        let previous = source.reissue(|pointer| pointer);
-        let next = RetainedSource::new(&Source::new("replacement").unwrap());
-        let passed = source.replace(next, |pointer| {
+        let mut sources = RetainedSources::default();
+        let previous = sources.replace(Some(&Source::new("previous").unwrap()), |ptr| ptr);
+        let previous_storage = Arc::downgrade(&sources.current.as_ref().unwrap().0);
+        let next = Source::new("replacement").unwrap();
+        let passed = sources.replace(Some(&next), |pointer| {
             // SAFETY: replacement retains both allocations throughout the call.
             unsafe {
                 assert_eq!(name(previous), c"previous");
@@ -184,8 +175,8 @@ mod tests {
             }
             pointer
         });
-        assert_eq!(source.reissue(|pointer| pointer), passed);
-        assert_eq!(source.current().name(), "replacement");
+        assert_eq!(reissue(&sources.current, |pointer| pointer), passed);
+        assert_eq!(sources.current(), Some(&next));
         assert!(previous_storage.upgrade().is_none());
     }
 

@@ -220,7 +220,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             // Use a separate receiver: AsyncReceiver keeps the receiver it
             // wraps, and FrameSync::new below takes this one by value.
             let async_receiver =
-                AsyncReceiver::new(self::receiver(&ndi, receiver.connection_target()));
+                AsyncReceiver::new(self::receiver(&ndi, receiver.connection_target().unwrap()));
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let frame = runtime
                 .block_on(async_receiver.capture_video(Duration::from_secs(10)))
@@ -233,7 +233,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         {
             use grafton_ndi::asynchronous::smol::AsyncReceiver;
             let async_receiver =
-                AsyncReceiver::new(self::receiver(&ndi, receiver.connection_target()));
+                AsyncReceiver::new(self::receiver(&ndi, receiver.connection_target().unwrap()));
             let frame = smol::block_on(async_receiver.capture_video(Duration::from_secs(10)))
                 .unwrap()
                 .expect("a frame within the timeout");

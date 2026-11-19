@@ -1342,13 +1342,12 @@ enum Stream {
 /// use std::time::Duration;
 /// use grafton_ndi::{
 ///     advanced::{AllocationBuffer, AllocationRequest, AllocatorLimits, AllocatorService},
-///     Receiver, ReceiverOptions, Source, Ndi,
+///     Receiver, ReceiverOptions, Ndi,
 /// };
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// let ndi = Ndi::new()?;
-/// # let source = Source::new("").unwrap();
-/// let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
+/// let receiver = Receiver::new(&ndi, &ReceiverOptions::disconnected())?;
 /// let service = AllocatorService::new(ndi.process_lifetime(), &AllocatorLimits::default())?;
 /// let mut receiver = service.attach(receiver)?;
 ///

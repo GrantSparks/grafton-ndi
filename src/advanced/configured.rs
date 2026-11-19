@@ -169,7 +169,7 @@ mod tests {
             AdvertiserOptions, ListenerOptions, RecvAdvertiser, RecvListener, SendAdvertiser,
             SendListener,
         },
-        Error, Source,
+        Error,
     };
 
     /// Without the Advanced SDK each constructor given a configuration is
@@ -198,7 +198,7 @@ mod tests {
         refused(Finder::new(&ndi, &finder).err());
         let sender = SenderOptions::new("configured").config(config.clone());
         refused(Sender::new(&ndi, &sender).err());
-        let receiver = ReceiverOptions::new(Source::new("").unwrap()).config(config.clone());
+        let receiver = ReceiverOptions::disconnected().config(config.clone());
         refused(Receiver::new(&ndi, &receiver).err());
         let router = RouterOptions::new("configured").config(config.clone());
         refused(Router::new(&ndi, &router).err());

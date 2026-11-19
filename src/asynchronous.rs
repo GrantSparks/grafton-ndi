@@ -117,8 +117,7 @@ use std::{
 
 use crate::{
     capture::{AllSlots, AudioKind, CaptureKind, MetadataKind, NoSlots, VideoKind},
-    receiver::{ReceiverCore, ReceiverReport},
-    source_retention::RetainedSource,
+    receiver::{prepare_receiver_target, ReceiverCore, ReceiverReport},
     timeout::Deadline,
     Error, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef, Result, Source,
     SourceNameChange, SpawnFailure,
@@ -742,7 +741,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// issued, not that the source is available; watch
     /// [`Self::wait_for_source_name_change`] or [`Receiver::connection_stats`].
     /// The source was validated when constructed. The calling task prepares
-    /// its owned target when the future is first polled.
+    /// its owned target when the future is first polled. An empty name and an
+    /// absent or empty address act like [`Self::disconnect`].
     ///
     /// # Errors
     ///
@@ -757,7 +757,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// and may take effect after this future is dropped.
     #[doc(alias = "NDIlib_recv_connect")]
     pub async fn connect_to(&self, source: &Source) -> Result<()> {
-        let target = RetainedSource::new(source);
+        let target = prepare_receiver_target(source);
         let receiver = Arc::clone(&self.inner);
         R::spawn_blocking(private::Token, move || receiver.connect_target(target)).await
     }
@@ -792,7 +792,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// Reconnect serializes with other local connection changes and runs the
     /// native request on the blocking pool. Captures may continue meanwhile.
     /// Confirm recovery via [`Receiver::connection_stats`]. A Discovery Server
-    /// source change does not update the local target this requests.
+    /// source change does not update the local target this requests. Before a
+    /// local target is selected, the worker completes without an SDK request.
     ///
     /// # Errors
     ///
@@ -1211,7 +1212,7 @@ mod executor_tests {
             return;
         };
         let receiver = AsyncReceiver::<Tokio>::new(
-            Receiver::new(&ndi, &crate::ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
+            Receiver::new(&ndi, &crate::ReceiverOptions::disconnected()).unwrap(),
         );
         assert!(matches!(
             Source::new("NUL\0name"),
@@ -1225,10 +1226,7 @@ mod executor_tests {
                 .poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Err(Error::SpawnFailed(SpawnFailure::NoRuntime)))
         ));
-        assert_eq!(
-            receiver.receiver().connection_target(),
-            Source::new("").unwrap()
-        );
+        assert!(receiver.receiver().connection_target().is_none());
     }
 
     #[cfg(feature = "tokio")]
@@ -1311,12 +1309,9 @@ mod receiver_tests {
     use super::*;
     use crate::{receiver::PendingEvents, Ndi, ReceiverOptions, RuntimeFeature};
 
-    /// An async receiver of `ndi` that stays unconnected: its source has no
-    /// name and no address.
+    /// An async receiver of `ndi` that starts without a target.
     fn unconnected<R: AsyncRuntime>(ndi: &Ndi) -> AsyncReceiver<R> {
-        AsyncReceiver::new(
-            Receiver::new(ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
-        )
+        AsyncReceiver::new(Receiver::new(ndi, &ReceiverOptions::disconnected()).unwrap())
     }
 
     impl ReplayReceiverValue<PendingEvents> for ReceiverReport<ReceiverEvent> {
@@ -1431,10 +1426,7 @@ mod receiver_tests {
     ) {
         // The lent receiver is the one the operations use.
         assert!(std::ptr::eq(receiver.receiver(), &*receiver.inner));
-        assert_eq!(
-            receiver.receiver().connection_target(),
-            Source::new("").unwrap()
-        );
+        assert!(receiver.receiver().connection_target().is_none());
 
         let excessive = crate::MAX_TIMEOUT + Duration::from_nanos(1);
         assert!(matches!(
@@ -1472,16 +1464,16 @@ mod receiver_tests {
             Source::new("NUL\0in name"),
             Err(Error::InvalidCString(_))
         ));
-        assert_eq!(
-            receiver.receiver().connection_target(),
-            Source::new("").unwrap()
-        );
+        assert!(receiver.receiver().connection_target().is_none());
         let target = Source::new("changed target").unwrap();
         receiver.connect_to(&target).await.unwrap();
         receiver.disconnect().await.unwrap();
         receiver.reconnect().await.unwrap();
         // Disconnect and reconnect retain the latest requested target.
-        assert_eq!(receiver.receiver().connection_target(), target);
+        assert_eq!(
+            receiver.receiver().connection_target().as_ref(),
+            Some(&target)
+        );
     }
 
     #[cfg(feature = "smol")]

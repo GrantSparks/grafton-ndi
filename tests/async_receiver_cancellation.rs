@@ -76,7 +76,7 @@ async fn replayed_notifications<R: AsyncRuntime>(ndi: &Ndi) {
             for completed in [false, true] {
                 serial += 1;
                 let receiver = AsyncReceiver::<R>::new(
-                    Receiver::new(ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
+                    Receiver::new(ndi, &ReceiverOptions::disconnected()).unwrap(),
                 );
                 let (script, expected) = match kind {
                     0 => (
@@ -337,9 +337,8 @@ fn abandoned_waits_release_the_receiver_without_spending_their_timeout() {
 }
 
 async fn source_name_worker_retains_runtime<R: AsyncRuntime>(ndi: Ndi) {
-    let receiver = AsyncReceiver::<R>::new(
-        Receiver::new(&ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
-    );
+    let receiver =
+        AsyncReceiver::<R>::new(Receiver::new(&ndi, &ReceiverOptions::disconnected()).unwrap());
     drop(ndi);
     let before = calls(true);
     let mut future = Box::pin(receiver.wait_for_source_name_change(Duration::from_secs(30)));
@@ -440,7 +439,7 @@ async fn capture_queue_delay<R: AsyncRuntime>(ndi: &Ndi, gates: &std::path::Path
             );
             let release = NativeGate(&gate);
             let receiver = AsyncReceiver::<R>::new(
-                Receiver::new(ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
+                Receiver::new(ndi, &ReceiverOptions::disconnected()).unwrap(),
             );
             let before = read_fake_log().len();
             let before_destroyed = destroyed();
@@ -543,9 +542,8 @@ fn async_capture_while_connect_is_gated<R: AsyncRuntime>(
     let gate = gates.join(format!("{runtime}-connect"));
     fs::create_dir(&gate).unwrap();
     std::env::set_var("GRAFTON_FAKE_CONNECT_GATE", &gate);
-    let receiver = AsyncReceiver::<R>::new(
-        Receiver::new(ndi, &ReceiverOptions::new(Source::new("").unwrap())).unwrap(),
-    );
+    let receiver =
+        AsyncReceiver::<R>::new(Receiver::new(ndi, &ReceiverOptions::disconnected()).unwrap());
     std::thread::scope(|scope| {
         let receiver = &receiver;
         let release = runtime_fixture::NativeGate(&gate);
