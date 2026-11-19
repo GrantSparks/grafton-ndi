@@ -1,6 +1,6 @@
 # Examples
 
-Install a runtime using the [setup guide](../docs/setup.md).
+Install a runtime using the [setup guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/setup.md).
 
 Run an example with `cargo run --example <name>`. Arguments vary: read each file's opening comment and parser before running it. Some use extra IP hints; others require a source name, file or timing parameter.
 
@@ -20,13 +20,13 @@ incompatible runtime fails at initialization.
 Start a source producing the required media before running a receiving example.
 For IP hints, source selection and output options, follow that example's usage.
 PTZ/KVM examples also need a source that offers those controls. The
-[usage guide](../docs/usage.md) explains capture ownership and buffer reuse.
+[usage guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md) explains capture ownership and buffer reuse.
 
 These examples use the current 3.0 APIs: borrowed `_ref` captures for immediate
 processing, validated `FrameSyncAudioRequest` values, reusable send buffers and
 explicit completion for async sends and recordings. Software output timers are
 demonstrations; use the output device's clock for playback. See the
-[migration guide](../docs/migration/2.0-to-3.0.md) when adapting older code.
+[migration guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/migration/2.0-to-3.0.md) when adapting older code.
 
 ## Discovery and monitoring
 
@@ -66,7 +66,7 @@ demonstrations; use the output device's clock for playback. See the
 
 ## Advanced SDK
 
-See [Advanced requirements](../docs/advanced.md#requirements) for headers, feature and runtime selection:
+See [Advanced requirements](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/advanced.md#requirements) for headers, feature and runtime selection:
 
 | Example | Command | What it shows |
 | --- | --- | --- |
@@ -74,14 +74,14 @@ See [Advanced requirements](../docs/advanced.md#requirements) for headers, featu
 | [`advanced_passthrough.rs`](advanced_passthrough.rs) | `cargo run --features advanced --example advanced_passthrough` | Relay compressed video and audio without decoding. |
 | [`advanced_queued_send.rs`](advanced_queued_send.rs) | `cargo run --features advanced --example advanced_queued_send` | Queue video frames and reuse each after SDK completion. |
 | [`advanced_allocator.rs`](advanced_allocator.rs) | `cargo run --features advanced --example advanced_allocator` | Receive frames into memory the application supplies. |
-| [Allocator-backed packet capture](../docs/advanced.md#custom-receive-allocation) | Guide snippet | Borrow compressed payloads from application memory with `attach_packets` and `capture_any_ref`. |
+| [Allocator-backed packet capture](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/advanced.md#custom-receive-allocation) | Guide snippet | Borrow compressed payloads from application memory with `attach_packets` and `capture_any_ref`. |
 | [`advanced_avsync.rs`](advanced_avsync.rs) | `cargo run --features advanced --example advanced_avsync` | Fetch the audio that belongs to each video frame. |
 | [`advanced_genlock.rs`](advanced_genlock.rs) | `cargo run --features advanced --example advanced_genlock` | Pace a sender from another source's clock. |
 | [`advanced_kvm.rs`](advanced_kvm.rs) | `cargo run --features advanced --example advanced_kvm` | Remote keyboard and mouse control of a source that offers it. |
 
 ## File API
 
-See [File API requirements](../docs/file-io.md) for the `file-io` feature and runtime capabilities:
+See [File API requirements](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/file-io.md#requirements) for the `file-io` feature and runtime capabilities:
 
 | Example | Command | What it shows |
 | --- | --- | --- |
