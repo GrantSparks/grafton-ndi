@@ -53,6 +53,10 @@ Advanced SDK headers and `libclang`; Apple mobile targets link a static SDK
 archive and some need a later Rust toolchain. See
 [setup and platform support](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/setup.md).
 
+For an upgrade from 2.x, see the
+[3.0 migration guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/migration/2.0-to-3.0.md)
+for runtime loading, features and API changes.
+
 ## Discover, receive and relay
 
 With an NDI source running on your network, this program discovers a source,

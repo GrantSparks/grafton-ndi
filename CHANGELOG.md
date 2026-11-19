@@ -35,6 +35,10 @@ when upgrading from the released 2.1.0 API.
   variants become a validated string type. `Finder::watch` replaces
   `wait_for_sources`. `SourceCache::new(finder)` owns the specified finder and
   host lookups return every matching feed over the discovery window.
+- Finder skips descriptors with malformed UTF-8 in a source name or address.
+  Individual source getters return `Error::InvalidUtf8` for that input.
+  Discovery Server advertisements preserve replacement-decoded display text
+  and refuse to turn malformed input into connection targets.
 - Dimensions and counts use `u32`, strides use `usize`, and checked
   `FrameRate`, `PictureAspectRatio`, `Timecode` and `FourCc` replace raw
   quantities in media APIs. Aspect setters take `PictureAspectRatio`.
@@ -44,8 +48,12 @@ when upgrading from the released 2.1.0 API.
 - `BorrowedVideoFrame` and `BorrowedVideoFrameBuilder` move from `sender` to
   `frames`, with crate-root imports still available. `data()` returns
   optional contiguous active bytes, and `storage()` includes validated row
-  padding. The existing `timestamp()` changes from `i64` to
-  `Option<SdkTimestamp>`; application-built frames have no received timestamp.
+  padding.
+- Video and audio frame and compressed packet timestamps return
+  `Option<ReceivedTimestamp>`. `AvSyncVideo::timestamp()` returns a checked
+  `ReceivedTimestamp`. Use `ticks()` for the source-defined signed 100 ns ticks.
+  Application-built frames have no received timestamp. `Ndi::timestamp()`
+  returns `SdkTimestamp` from the SDK's UTC clock.
 - Capture returns `Result<Option<Frame>>` and a timeout is `Ok(None)`. Owned
   methods name the media kind and the `_ref` methods borrow. FrameSync's short
   audio and video capture names return owned frames. Its separate audio input
@@ -53,9 +61,10 @@ when upgrading from the released 2.1.0 API.
   recovering a FrameSync-attached receiver.
 - `Receiver::next_event` replaces `poll_status_change`, connection queries
   use getters, and PTZ methods are grouped under `receiver.ptz()`.
-  `connection_target()` replaces `Receiver::source()` and reports the latest
-  requested source. Synchronous reconnect reuses that target and returns
-  `()`.
+  `ReceiverOptions::disconnected()` starts a receiver without a source.
+  `connection_target()` replaces `Receiver::source()` and returns the last
+  local target as `Option<Source>`. `disconnect()` keeps that target and
+  synchronous `reconnect()` retries it when present and returns `()`.
 - `send_video` returns `Result<()>`. Asynchronous video uses `submit_video`,
   `submit_video_copy`, `reclaim_video` and `flush_video`. Use returned frames
   to observe completion. Connection counts and tally are immediate getters,
@@ -139,11 +148,22 @@ when upgrading from the released 2.1.0 API.
 - Finder uses bounded snapshots and change-aware waits. It copies only
   selected entries and skips result allocation when nothing matches.
   Cache invalidation reclaims retired storage outside the shared mutex.
+- Native discovery reports `AllocationFailed` for failed text and result
+  reservations. Shared source text and cache owners use the global allocator.
+- A custom receive allocation reuses checked video geometry when the
+  allocator returns the requested stride. A different stride is validated
+  against the actual buffer.
+- Recorder bookkeeping can read bounded event data directly from the SDK
+  buffer. Owned notifications are created only for delivery to a caller.
 
 ### Fixed
 
 - Multiple finder consumers can observe a published source change without
   competing for a single native notification.
+- A host cache lookup returns the feeds already observed when contention
+  prevents its final snapshot. The next lookup retries that discovery window.
+- Invalid names in exact discovery and connection requests report the first
+  NUL byte and retain the input only through that byte.
 - Sender tally polling retains the current value and preserves changes for a
   waiting consumer. Polling can read the cached value while a native wait
   is active.
@@ -153,8 +173,25 @@ when upgrading from the released 2.1.0 API.
   cannot be read. Frame copies keep the reason the text was withheld.
 - Owned media replacements and copies preserve a valid layout and its
   storage when validation fails or copying unwinds.
+- Recorder restarts use one dropped-event sample to close the previous
+  session's accounting and start the next one, so losses after that sample
+  remain visible.
+- The recording thumbnail example computes seek positions in widened file
+  ticks and matches the File player's `FirstFrame` presentation timestamp
+  to the timestamp on the captured video. This avoids selecting a stale
+  frame when editorial timecodes repeat. See the
+  [thumbnail guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/image-encoding.md#thumbnails-from-a-recording)
+  for the validated recording and runtime configuration.
 - Includes the [2.1.0 fixes](#210---2026-11-13) for bounded SDK text, finite
   waits, reconnect-friendly status polling and NV12 stride validation.
+
+### Known issue
+
+- On Windows x64, Standard NDI 6.3.2.0 and 6.4.0.2 can omit registered receiver
+  connection metadata on initial connection or reconnect. Applications can
+  use `Receiver::send_metadata` after fresh media confirms the connection.
+  [Issue #551](https://github.com/GrantSparks/grafton-ndi/issues/551) ·
+  [Troubleshooting](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/troubleshooting.md#receiver-connection-metadata-on-windows)
 
 ## [2.1.0] - 2026-11-13
 
