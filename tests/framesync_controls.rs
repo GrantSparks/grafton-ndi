@@ -13,11 +13,11 @@ use runtime_fixture::read_fake_log;
 
 #[cfg(feature = "advanced")]
 use grafton_ndi::{
-    advanced::MouseButton, MediaTypes, RuntimeFeature, ScanType, SettingChange, StreamTier,
+    advanced::MouseButton, MediaTypes, RuntimeFeature, ScanType, SettingChange, Source, StreamTier,
 };
 use grafton_ndi::{
     Error, FrameDefect, FrameSync, FrameSyncAudioRequest, LayoutDefect, Ndi, Receiver,
-    ReceiverOptions, RuntimeOptions, Source,
+    ReceiverOptions, RuntimeOptions,
 };
 use std::time::Duration;
 
