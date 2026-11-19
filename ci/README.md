@@ -26,7 +26,8 @@ requests, manual CI runs and release-tag runs validate docs without publishing.
 Pages write permissions are confined to the deployment job, which runs no
 repository scripts. A run skips deployment when its commit is no longer the
 tip of `main`. The release caller forwards those permissions for reusable
-workflow validation. Its tag ref keeps the Pages job disabled.
+workflow validation when full CI is needed. Its event keeps the Pages job
+disabled.
 
 A push to `main` can reuse full validation from a successful same-repository
 pull request. CI checks the tested tree against the new `main` tree and verifies
@@ -283,24 +284,41 @@ When reporting a problem, include the crate version, platform, Rust version,
 Cargo features, runtime version/edition, command and error output. Do not
 include SDK archives, credentials or private recordings.
 
-## Release controls
+## Publishing releases
 
-Configure the repository before publishing. The release job verifies the first
-three controls through read-only GitHub API requests. Verify items 4 and 5
-before pushing a release tag. [Release check](release.py)
+Merge the crate version and dated changelog to `main`. Push the matching
+`v<version>` tag to authorize publication. The workflow checks that the tag
+points to a commit on `main` and names the version in that commit's Cargo
+manifest.
 
-1. The `crates-io` environment requires reviewers and has exactly one custom
-   deployment policy for `v*` tags.
-2. An active tag ruleset includes `refs/tags/v*` without exclusions and
-   restricts creating, updating and deleting those tags.
-3. Active rules on `main` require pull requests, Code Owner review and
-   the `required-ci` status check. [CODEOWNERS](../.github/CODEOWNERS)
-4. The crates.io trusted publisher binds this repository, `publish.yml` and the
-   `crates-io` environment. The GitHub API cannot read crates.io settings.
-5. SDK CI has `NDI_SDK_SOURCES_JSON`, a scoped `NDI_SDK_ARCHIVE_TOKEN`, and
-   `NDI_CI_RELEASED=true` when enabled. The release check has no access to
-   secret values.
+The release uses the existing full CI result when the GitHub-signed PR merge
+tree matches the tag and the recorded SDK and platform checks passed. Missing,
+expired or mismatched validation runs the full workflow on the tagged commit.
+The package job builds the crate from that same commit. The publishing job
+requires a byte-for-byte match before it requests the crates.io token.
 
-Anyone who can replace a workflow on a tag or branch can replace its checks.
-Repository rules and review enforce these boundaries. The release job catches
-configuration mistakes before the jobs that build or publish the release.
+For a transient failure, rerun the failed jobs. Reruns use the workflow from
+the original run. To retry an existing tag with the current workflow, dispatch
+`publish.yml` from `main` and enter the tag. Both triggers use the same
+validation and package steps.
+
+```sh
+gh workflow run publish.yml --ref main -f tag=v3.0.0
+```
+
+### Release controls
+
+The crates.io trusted publisher binds this repository, `publish.yml` and the
+`crates-io` environment. Give that environment custom deployment policies
+for `v*` tags and the `main` branch, which is used for manual retries.
+GitHub applies these policies before the publishing job can get its identity.
+
+Write access to the release refs carries publishing authority. Review
+repository access when adding maintainers or automation. Tag rulesets can
+keep published tags immutable, and the repository can use branch rules or
+deployment reviewers when its maintainers require separate approval.
+[CODEOWNERS](../.github/CODEOWNERS) identifies the files that affect CI and
+publishing.
+
+Full SDK CI needs `NDI_SDK_SOURCES_JSON`, a scoped `NDI_SDK_ARCHIVE_TOKEN`
+and `NDI_CI_RELEASED=true`.

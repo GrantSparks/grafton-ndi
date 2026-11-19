@@ -1,11 +1,11 @@
 import contextlib
 import io
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
-from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import release  # noqa: E402
@@ -13,33 +13,6 @@ import release  # noqa: E402
 # Versions here are fixtures. The crate's own version is only ever read from its
 # manifest, so these tests do not change when the crate is released.
 MANIFEST = '[workspace]\nmembers = ["xtask"]\n\n[package]\nname = "x"\nversion = "{version}"\n'
-ENVIRONMENT = 'environments/crates-io'
-DEPLOYMENTS = ENVIRONMENT + '/deployment-branch-policies?per_page=100'
-RULESETS = 'rulesets?targets=tag&per_page=100&page=1'
-TAG_RULES = 'rulesets/42'
-MAIN_RULES = 'rules/branches/main'
-
-
-def protected_repository():
-    return {
-        ENVIRONMENT: {
-            'protection_rules': [{'type': 'required_reviewers', 'reviewers': [{'id': 7}]}],
-            'deployment_branch_policy': {'custom_branch_policies': True, 'protected_branches': False},
-        },
-        DEPLOYMENTS: {'total_count': 1, 'branch_policies': [{'name': 'v*', 'type': 'tag'}]},
-        RULESETS: [{'target': 'tag', 'enforcement': 'active', 'id': 42}],
-        TAG_RULES: {
-            'target': 'tag', 'enforcement': 'active',
-            'conditions': {'ref_name': {'include': ['refs/tags/v*'], 'exclude': []}},
-            'rules': [{'type': rule} for rule in ('creation', 'update', 'deletion')],
-        },
-        MAIN_RULES: [
-            {'type': 'pull_request', 'parameters': {'require_code_owner_review': True}},
-            {'type': 'required_status_checks', 'parameters': {
-                'required_status_checks': [{'context': 'required-ci'}],
-            }},
-        ],
-    }
 
 
 class Release(unittest.TestCase):
@@ -67,60 +40,79 @@ class Release(unittest.TestCase):
         self.assertIn(f'::error::tag {version} does not release crate version {version}; expected v{version}',
                       output.getvalue())
 
-    def test_all_readable_controls_are_required(self):
-        self.assertEqual(list(release.control_refusals(protected_repository().__getitem__)), [])
-        changes = (
-            (ENVIRONMENT, ('protection_rules',), [], 'item 1', 'require reviewers'),
-            (ENVIRONMENT, ('protection_rules', 0, 'reviewers'), [], 'item 1', 'require reviewers'),
-            (ENVIRONMENT, ('protection_rules', 0, 'reviewers'), 'user', 'item 1', 'invalid control data'),
-            (ENVIRONMENT, ('deployment_branch_policy',), None, 'item 1', 'custom deployment'),
-            (DEPLOYMENTS, ('branch_policies', 0, 'type'), 'branch', 'item 1', 'exactly the v* tag'),
-            (DEPLOYMENTS, ('total_count',), 2, 'item 1', 'exactly the v* tag'),
-            (RULESETS, (), [], 'item 2', 'active ruleset'),
-            (TAG_RULES, ('enforcement',), 'evaluate', 'item 2', 'active ruleset'),
-            (TAG_RULES, ('rules',), [{'type': 'creation'}, {'type': 'update'}], 'item 2', 'deletion'),
-            (TAG_RULES, ('conditions', 'ref_name', 'exclude'), ['refs/tags/v3*'], 'item 2', 'active ruleset'),
-            (TAG_RULES, ('conditions', 'ref_name', 'include'), 'refs/tags/v*', 'item 2', 'invalid control data'),
-            (MAIN_RULES, (0, 'parameters', 'require_code_owner_review'), False, 'item 3', 'Code Owner'),
-            (MAIN_RULES, (1, 'parameters', 'required_status_checks'), [], 'item 3', 'required-ci'),
-            (MAIN_RULES, (), {}, 'item 3', 'invalid control data'),
-        )
-        for endpoint, path, value, item, reason in changes:
-            with self.subTest(endpoint=endpoint, path=path, value=value):
-                data = protected_repository()
-                container = data
-                keys = (endpoint, *path)
-                for key in keys[:-1]:
-                    container = container[key]
-                container[keys[-1]] = value
-                refusal, = release.control_refusals(data.__getitem__)
-                self.assertIn(item, refusal)
-                self.assertIn(reason, refusal)
 
-    def test_http_errors_refuse_each_control_and_main_reports_all_failures(self):
-        data = {RULESETS: [], MAIN_RULES: []}
+class TaggedRelease(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.enterContext(contextlib.chdir(temporary.name))
+        self.git('init', '--initial-branch=main')
+        self.git('config', 'user.name', 'Release Test')
+        self.git('config', 'user.email', 'release@example.invalid')
+        self.git('config', 'commit.gpgsign', 'false')
+        self.git('config', 'tag.gpgsign', 'false')
+        self.git('config', 'core.hooksPath', temporary.name)
+        self.commit_version('7.8.9')
+        self.tagged = self.git('rev-parse', 'HEAD')
+        self.git('tag', '-a', 'v7.8.9', '-m', 'Release')
+        self.commit_version('7.9.0')
+        self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
 
-        def get(endpoint):
-            if endpoint == ENVIRONMENT:
-                raise HTTPError('https://api.github.com/', 404, 'Not found', {}, None)
-            return data[endpoint]
+    def git(self, *arguments):
+        return subprocess.check_output(['git', *arguments], text=True, stderr=subprocess.PIPE).strip()
 
-        output = io.StringIO()
-        with patch.object(release, 'repository_get', return_value=get), contextlib.redirect_stdout(output):
-            self.assertEqual(release.main(['--controls', 'owner/repo']), 1)
-        lines = output.getvalue().splitlines()
-        self.assertEqual(len(lines), 3)
-        for number, line in enumerate(lines, 1):
-            self.assertTrue(line.startswith('::error::'))
-            self.assertIn(f'item {number}', line)
-        self.assertIn('HTTP 404', lines[0])
+    def commit_version(self, version):
+        Path('Cargo.toml').write_text(MANIFEST.format(version=version), encoding='utf-8')
+        self.git('add', 'Cargo.toml')
+        self.git('commit', '-m', version)
 
-        def unavailable(endpoint):
-            raise HTTPError('https://api.github.com/', 500, 'Unavailable', {}, None)
+    def test_retry_from_main_uses_the_existing_tag_and_its_manifest(self):
+        self.assertEqual(release.release_commit('v7.8.9', 'workflow_dispatch', 'refs/heads/main'),
+                         (self.tagged, '7.8.9'))
+        with self.assertRaisesRegex(ValueError, 'retry it from main'):
+            release.release_commit('v7.8.9', 'workflow_dispatch', 'refs/heads/staging')
 
-        refusals = list(release.control_refusals(unavailable))
-        self.assertEqual(len(refusals), 3)
-        self.assertTrue(all('HTTP 500' in refusal for refusal in refusals))
+    def test_tag_push_must_match_the_checked_out_commit(self):
+        with self.assertRaisesRegex(ValueError, 'does not match the pushed commit'):
+            release.release_commit('v7.8.9', 'push', 'refs/tags/v7.8.9')
+        self.git('checkout', '--detach', self.tagged)
+        self.assertEqual(release.release_commit('v7.8.9', 'push', 'refs/tags/v7.8.9'),
+                         (self.tagged, '7.8.9'))
+
+    def test_invalid_missing_and_mismatched_tags_are_rejected(self):
+        self.git('tag', 'v7.8.0', self.tagged)
+        for tag, reason in (
+            ('refs/tags/v7.8.9', 'expected a v<version> release tag'),
+            ('v7.8.9\ncommit=other', 'expected a v<version> release tag'),
+            ('v7.8.10', 'does not exist'),
+            ('v7.8.0', 'expected v7.8.9'),
+        ):
+            with self.subTest(tag=tag), self.assertRaisesRegex(ValueError, reason):
+                release.release_commit(tag, 'workflow_dispatch', 'refs/heads/main')
+
+    def test_tag_outside_main_is_rejected(self):
+        self.git('switch', '-c', 'other')
+        self.commit_version('7.10.0')
+        self.git('tag', 'v7.10.0')
+        with self.assertRaisesRegex(ValueError, 'points to a commit of main'):
+            release.release_commit('v7.10.0', 'workflow_dispatch', 'refs/heads/main')
+
+    def test_preparation_records_only_verified_reuse(self):
+        output = Path('output')
+        env = {
+            'RELEASE_TAG': 'v7.8.9', 'GITHUB_EVENT_NAME': 'workflow_dispatch',
+            'GITHUB_REF': 'refs/heads/main', 'GITHUB_OUTPUT': str(output),
+        }
+        for run in (None, 1234):
+            with self.subTest(run=run), patch.object(release, 'find_run', return_value=run) as lookup, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                output.write_text('')
+                release.prepare(env)
+                lookup.assert_called_once_with(env, self.tagged)
+                lines = [f'commit={self.tagged}', 'version=7.8.9']
+                if run:
+                    lines.append(f'run_id={run}')
+                self.assertEqual(output.read_text().splitlines(), lines)
 
 
 if __name__ == '__main__':

@@ -8,6 +8,10 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
   workflow_call:
+    inputs:
+      release_commit:
+        description: The validated release commit to test
+        type: string
     secrets:
       NDI_SDK_SOURCES_JSON:
         required: false
@@ -63,6 +67,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.release_commit || '' }}
           # Documentation archives link to immutable commits, checked locally.
           fetch-depth: 0
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
@@ -161,6 +166,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_commit || '' }}
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: '3.13'
@@ -235,6 +242,8 @@ jobs:
       MIRIFLAGS: ${{ matrix.model == 'tree' && '-Zmiri-tree-borrows' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_commit || '' }}
       - name: Pinned Miri toolchain
         run: |
           rustup toolchain install nightly-2026-11-10 --profile minimal --component miri,rust-src
@@ -266,6 +275,8 @@ jobs:
         aarch64-apple-darwin x86_64-apple-darwin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_commit || '' }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.100.0
@@ -294,6 +305,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_commit || '' }}
       - name: Generate test pictures
         run: |
           # The runner's mirror list prefers a regional archive that can stall FFmpeg downloads.
@@ -527,6 +540,8 @@ jobs:
       GRAFTON_NDI_RECEIVER_DIAGNOSTICS: ${{ contains(fromJSON('["linux-x86 standard-6.4","linux-x64 standard-6.4","linux-arm64 standard-6.4","macos-arm64 standard-6.3.2"]'), matrix.name) && '1' || '0' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_commit || '' }}
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: '3.13'
@@ -764,6 +779,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_commit || '' }}
       - name: Every job this event requires succeeded
         env:
           RESULTS: ${{ toJSON(needs) }}

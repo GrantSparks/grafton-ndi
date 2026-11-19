@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
-"""Check that a release tag names the crate version and verify release controls.
+"""Validate a release tag and select the commit for publishing.
 
-    python ci/release.py "$GITHUB_REF_NAME"
-    python ci/release.py --controls "$GITHUB_REPOSITORY"
-
-The tag must be `v` followed by the `version` in Cargo.toml. The controls
-check reads the GitHub API and uses GITHUB_TOKEN when it is set.
+    python ci/release.py v3.0.0
+    python ci/release.py --prepare
 """
-from itertools import count
-import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tomllib
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+
+from verified_tree import find_run
 
 MANIFEST = Path(__file__).resolve().parents[1] / 'Cargo.toml'
+TAG = re.compile(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?'
+                 r'(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?')
 
 
 def crate_version(manifest=MANIFEST):
@@ -31,129 +29,69 @@ def mismatch(tag, version):
     return f'tag {tag} does not release crate version {version}; expected v{version}'
 
 
-def repository_get(repository, token):
-    headers = {
-        'Accept': 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-    }
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
-
-    def get(endpoint):
-        url = f'https://api.github.com/repos/{repository}/{endpoint}'
-        with urlopen(Request(url, headers=headers), timeout=15) as response:
-            return json.load(response)
-
-    return get
+def git(*arguments):
+    return subprocess.check_output(
+        ['git', *arguments], text=True, stderr=subprocess.PIPE, timeout=15,
+    ).strip()
 
 
-def environment_refusal(get):
-    environment = get('environments/crates-io')
-    reviewer_rules = environment.get('protection_rules', [])
-    if not isinstance(reviewer_rules, list):
-        raise ValueError('expected a list of environment protection rules')
-    reviewers = [rule.get('reviewers') for rule in reviewer_rules
-                 if rule['type'] == 'required_reviewers']
-    if any(not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries)
-           for entries in reviewers):
-        raise ValueError('expected a list of environment reviewers')
-    if not any(reviewers):
-        return 'crates-io must require reviewers'
-    policy = environment.get('deployment_branch_policy')
-    if not policy or policy.get('custom_branch_policies') is not True or policy.get('protected_branches') is not False:
-        return 'crates-io must use custom deployment policies'
-    policies = get('environments/crates-io/deployment-branch-policies?per_page=100')
-    rules = policies['branch_policies']
-    if not isinstance(rules, list) or type(policies['total_count']) is not int:
-        raise ValueError('expected a list of counted deployment policies')
-    if (policies['total_count'] != 1 or len(rules) != 1
-            or rules[0].get('name') != 'v*' or rules[0].get('type') != 'tag'):
-        return 'crates-io deployments must be restricted to exactly the v* tag pattern'
-    return None
+def release_commit(tag, event, ref):
+    """Select the existing tag from a full checkout and read its crate version."""
+    if TAG.fullmatch(tag) is None:
+        raise ValueError('expected a v<version> release tag')
 
+    tag_ref = f'refs/tags/{tag}'
+    try:
+        commit = git('rev-parse', '--verify', f'{tag_ref}^{{commit}}')
+    except subprocess.CalledProcessError:
+        raise ValueError(f'tag {tag} does not exist or does not point to a commit') from None
 
-def tag_ruleset_refusal(get):
-    endpoint = 'rulesets?targets=tag&per_page=100'
-    for page in count(1):
-        summaries = get(f'{endpoint}&page={page}')
-        if not isinstance(summaries, list):
-            raise ValueError('expected a list of rulesets')
-        for summary in summaries:
-            if summary.get('target') != 'tag' or summary.get('enforcement') != 'active':
-                continue
-            ruleset_id = summary['id']
-            if type(ruleset_id) is not int or ruleset_id < 1:
-                raise ValueError('invalid ruleset ID')
-            ruleset = get(f'rulesets/{ruleset_id}')
-            refs = ruleset.get('conditions', {}).get('ref_name', {})
-            includes = refs.get('include', [])
-            if not isinstance(includes, list) or not all(isinstance(pattern, str) for pattern in includes):
-                raise ValueError('expected a list of tag ref patterns')
-            types = {rule['type'] for rule in ruleset.get('rules', [])}
-            if (ruleset.get('target') == 'tag' and ruleset.get('enforcement') == 'active'
-                    and 'refs/tags/v*' in includes and refs.get('exclude') == []
-                    and {'creation', 'update', 'deletion'} <= types):
-                return None
-        if len(summaries) < 100:
-            break
-    return 'an active ruleset for refs/tags/v* must restrict creation, update and deletion'
+    if event == 'push':
+        if ref != tag_ref or commit != git('rev-parse', 'HEAD'):
+            raise ValueError(f'tag {tag} does not match the pushed commit')
+    elif event != 'workflow_dispatch' or ref != 'refs/heads/main':
+        raise ValueError('start a release by pushing the tag or retry it from main')
 
-
-def main_rules_refusal(get):
-    rules = get('rules/branches/main')
-    if not isinstance(rules, list):
-        raise ValueError('expected a list of branch rules')
-    review = any(rule['type'] == 'pull_request'
-                 and rule.get('parameters', {}).get('require_code_owner_review') is True
-                 for rule in rules)
-    status = any(check['context'] == 'required-ci'
-                 for rule in rules if rule['type'] == 'required_status_checks'
-                 for check in rule.get('parameters', {}).get('required_status_checks', []))
-    missing = []
-    if not review:
-        missing.append('pull requests with Code Owner review')
-    if not status:
-        missing.append('the required-ci status check')
-    return 'main must require ' + ' and '.join(missing) if missing else None
-
-
-def control_refusals(get):
-    checks = (
-        ('crates-io environment', environment_refusal),
-        ('release tag ruleset', tag_ruleset_refusal),
-        ('main branch rules', main_rules_refusal),
+    ancestry = subprocess.run(
+        ['git', 'merge-base', '--is-ancestor', commit, 'refs/remotes/origin/main'],
+        capture_output=True, timeout=15,
     )
-    for number, (name, check) in enumerate(checks, 1):
-        try:
-            refusal = check(get)
-        except HTTPError as error:
-            refusal = f'GitHub API returned HTTP {error.code}'
-        except (URLError, TimeoutError):
-            refusal = 'could not read the GitHub API'
-        except (AttributeError, KeyError, TypeError, ValueError):
-            refusal = 'GitHub API returned invalid control data'
-        if refusal:
-            yield f'{name} (ci/README.md Release controls, item {number}): {refusal}'
+    if ancestry.returncode != 0:
+        raise ValueError(f'could not verify that tag {tag} points to a commit of main')
+
+    version = tomllib.loads(git('show', f'{commit}:Cargo.toml'))['package']['version']
+    if problem := mismatch(tag, version):
+        raise ValueError(problem)
+    return commit, version
+
+
+def prepare(env):
+    tag = env['RELEASE_TAG']
+    commit, version = release_commit(tag, env['GITHUB_EVENT_NAME'], env['GITHUB_REF'])
+    print(f'Selected {tag} at {commit}.')
+    run = find_run(env, commit)
+    with open(env['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+        print(f'commit={commit}', f'version={version}', sep='\n', file=output)
+        if run is not None:
+            print(f'run_id={run}', file=output)
 
 
 def main(argv=None):
     arguments = sys.argv[1:] if argv is None else argv
-    if len(arguments) == 2 and arguments[0] == '--controls':
-        repository = arguments[1]
-        if not re.fullmatch(r'[\w.-]+/[\w.-]+', repository, re.ASCII):
-            print('expected an owner/repository argument for --controls', file=sys.stderr)
-            return 2
-        refusals = list(control_refusals(repository_get(repository, os.environ.get('GITHUB_TOKEN'))))
-        for refusal in refusals:
-            print(f'::error::{refusal}')
-        return int(bool(refusals))
+    if arguments == ['--prepare']:
+        try:
+            prepare(os.environ)
+        except (KeyError, OSError, TypeError, ValueError, subprocess.SubprocessError) as error:
+            print(f'::error::{error}')
+            return 1
+        return 0
     if len(arguments) != 1:
         print(__doc__, file=sys.stderr)
         return 2
     problem = mismatch(arguments[0], crate_version())
     if problem:
         print(f'::error::{problem}')
-    return 1 if problem else 0
+    return int(bool(problem))
 
 
 if __name__ == '__main__':
