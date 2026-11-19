@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record an exact tree after full PR CI and look it up on a main push."""
+"""Record a tree after full PR CI and look it up for main and release checks."""
 
 import io
 import json
@@ -148,21 +148,31 @@ def required_check_passed(api, run_id, attempt):
                     for job in checks))
 
 
-def reuse(env):
+def find_run(env, commit=None):
     try:
-        sha = env["GITHUB_SHA"]
+        sha = commit if commit is not None else env["GITHUB_SHA"]
+        if not oid(sha):
+            raise ValueError("expected a commit SHA")
+        tree = git(f"{sha}^{{tree}}") if commit is not None else checked_out_tree(sha)
         api = GitHub(env["GITHUB_REPOSITORY"])
-        run = matching_run(api, sha, checked_out_tree(sha), int(env["GITHUB_REPOSITORY_ID"]))
+        run = matching_run(api, sha, tree, int(env["GITHUB_REPOSITORY_ID"]))
     except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError,
             zipfile.BadZipFile, RuntimeError):
         print("Could not verify a completed full PR run. Running the full CI matrix.")
-        return
+        return None
     if run is None:
         print("No completed full PR run matches this tree. Running the full CI matrix.")
+    else:
+        print(f"Reusing full PR validation from Actions run {run}.")
+    return run
+
+
+def reuse(env):
+    run = find_run(env)
+    if run is None:
         return
     with open(env["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         print(f"run_id={run}", file=output)
-    print(f"Reusing full PR validation from Actions run {run}.")
 
 
 if __name__ == "__main__":

@@ -813,25 +813,15 @@ def obligations(msrv, features, miri_groups):
     )
 
     # publish.yml, release
-    table['publish.yml', 'release', 'Tag names the crate version and its commit is on main'] = Obligation(
-        r'''
-        python3 ci/release.py "$GITHUB_REF_NAME"
-        git fetch --no-tags origin main
-        if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
-          echo "::error::$GITHUB_REF_NAME does not point at a commit of main"
-          exit 1
-        fi
-        ''',
-    )
-    table['publish.yml', 'release', 'Verify GitHub release controls'] = Obligation(
-        'python3 ci/release.py --controls "$GITHUB_REPOSITORY"',
+    table['publish.yml', 'release', 'Validate the tag and look up full CI for its tree'] = Obligation(
+        'python3 ci/release.py --prepare',
     )
 
     # publish.yml, verify
     table['publish.yml', 'verify', 'Package and build the packaged crate'] = Obligation(
         r'''
         cargo package --locked --package grafton-ndi
-        crate="target/package/grafton-ndi-${GITHUB_REF_NAME#v}.crate"
+        crate="target/package/grafton-ndi-${RELEASE_VERSION}.crate"
         {
           echo "sha256=$(sha256sum "$crate" | cut -d' ' -f1)"
           echo "toolchain=$(rustc --version | cut -d' ' -f2)"
@@ -855,7 +845,7 @@ def obligations(msrv, features, miri_groups):
           echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
         } >> "$GITHUB_ENV"
         cargo package --locked --no-verify --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --package grafton-ndi
-        actual=$(sha256sum "$CARGO_TARGET_DIR/package/grafton-ndi-${GITHUB_REF_NAME#v}.crate" | cut -d' ' -f1)
+        actual=$(sha256sum "$CARGO_TARGET_DIR/package/grafton-ndi-${RELEASE_VERSION}.crate" | cut -d' ' -f1)
         if [ "$actual" != "$VERIFIED_SHA256" ]; then
           echo "::error::this package is $actual, the verified package is $VERIFIED_SHA256"
           exit 1

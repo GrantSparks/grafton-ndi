@@ -1,23 +1,29 @@
 name: Publish
 
-# A `v<version>` tag on a commit of main publishes that version to crates.io.
+# Pushing `v<version>` starts publishing that commit of main to crates.io.
+# A dispatch from main can retry an existing tag using the current workflow.
 # CI publishes the authoritative API reference to GitHub Pages from main.
 # docs.rs may also build the published crate as a supplementary reference.
 #
-# Nothing in this file decides who may publish. A tag runs the workflow of the
-# commit it points at, so whoever can push a tag can also change every check
-# below. The controls are repository settings (ci/README.md, "Release controls"):
-# the reviewers the `crates-io` environment requires, the crates.io trusted
-# publisher bound to that environment, and the rule on who may create `v*` tags.
+# GitHub controls deployment access through the crates-io environment.
+# crates.io grants a publishing token to that trusted workflow and environment.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag
+        required: true
+        type: string
+
+run-name: Publish ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: read
 
 concurrency:
-  group: publish-${{ github.ref }}
+  group: publish-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 defaults:
@@ -30,29 +36,35 @@ env:
 jobs:
   release:
     name: release tag
-    if: github.repository == 'GrantSparks/grafton-ndi'
+    if: >-
+      github.repository == 'GrantSparks/grafton-ndi' &&
+      (github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      commit: ${{ steps.release.outputs.commit }}
+      version: ${{ steps.release.outputs.version }}
+      run_id: ${{ steps.release.outputs.run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Tag names the crate version and its commit is on main
-        run: |
-          python3 ci/release.py "$GITHUB_REF_NAME"
-          git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
-            echo "::error::$GITHUB_REF_NAME does not point at a commit of main"
-            exit 1
-          fi
-      - name: Verify GitHub release controls
+      - name: Validate the tag and look up full CI for its tree
+        id: release
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python3 ci/release.py --controls "$GITHUB_REPOSITORY"
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/release.py --prepare
 
   ci:
     name: ci
     needs: release
+    if: needs.release.outputs.run_id == ''
     permissions:
       contents: read
       actions: read
@@ -60,6 +72,8 @@ jobs:
       pages: write
       id-token: write
     uses: ./.github/workflows/rust.yml
+    with:
+      release_commit: ${{ needs.release.outputs.commit }}
     secrets:
       NDI_SDK_SOURCES_JSON: ${{ secrets.NDI_SDK_SOURCES_JSON }}
       NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}
@@ -68,14 +82,22 @@ jobs:
   # job that cannot obtain a registry token.
   verify:
     name: verify package
-    needs: ci
+    needs: [release, ci]
+    if: >-
+      ${{ !cancelled() && needs.release.result == 'success' &&
+      (needs.ci.result == 'success' ||
+      (needs.ci.result == 'skipped' && needs.release.outputs.run_id != '')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      RELEASE_VERSION: ${{ needs.release.outputs.version }}
     outputs:
       sha256: ${{ steps.package.outputs.sha256 }}
       toolchain: ${{ steps.package.outputs.toolchain }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.commit }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.100.0
@@ -83,7 +105,7 @@ jobs:
         id: package
         run: |
           cargo package --locked --package grafton-ndi
-          crate="target/package/grafton-ndi-${GITHUB_REF_NAME#v}.crate"
+          crate="target/package/grafton-ndi-${RELEASE_VERSION}.crate"
           {
             echo "sha256=$(sha256sum "$crate" | cut -d' ' -f1)"
             echo "toolchain=$(rustc --version | cut -d' ' -f2)"
@@ -107,7 +129,8 @@ jobs:
   # have, and the toolchain version that produced it.
   publish:
     name: publish to crates.io
-    needs: verify
+    needs: [release, verify]
+    if: ${{ !cancelled() && needs.release.result == 'success' && needs.verify.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: crates-io
@@ -115,10 +138,13 @@ jobs:
       contents: read
       id-token: write
     env:
+      RELEASE_VERSION: ${{ needs.release.outputs.version }}
       VERIFIED_SHA256: ${{ needs.verify.outputs.sha256 }}
       VERIFIED_TOOLCHAIN: ${{ needs.verify.outputs.toolchain }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.commit }}
       - name: Re-create the verified package
         working-directory: ${{ runner.temp }}
         run: |
@@ -133,7 +159,7 @@ jobs:
             echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
           } >> "$GITHUB_ENV"
           cargo package --locked --no-verify --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --package grafton-ndi
-          actual=$(sha256sum "$CARGO_TARGET_DIR/package/grafton-ndi-${GITHUB_REF_NAME#v}.crate" | cut -d' ' -f1)
+          actual=$(sha256sum "$CARGO_TARGET_DIR/package/grafton-ndi-${RELEASE_VERSION}.crate" | cut -d' ' -f1)
           if [ "$actual" != "$VERIFIED_SHA256" ]; then
             echo "::error::this package is $actual, the verified package is $VERIFIED_SHA256"
             exit 1

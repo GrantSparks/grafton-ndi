@@ -27,6 +27,7 @@ WORKFLOWS = ROOT / '.github' / 'workflows'
 READ_ONLY = {'contents': 'read'}
 # Only deployment jobs and the reusable-workflow caller may request write permissions.
 JOB_PERMISSIONS = {
+    ('publish.yml', 'release'): {'contents': 'read', 'actions': 'read', 'pull-requests': 'read'},
     ('publish.yml', 'ci'): {'contents': 'read', 'actions': 'read', 'pull-requests': 'read', 'pages': 'write', 'id-token': 'write'},
     ('publish.yml', 'publish'): {'contents': 'read', 'id-token': 'write'},
     ('rust.yml', 'verified-tree'): {'contents': 'read', 'actions': 'read', 'pull-requests': 'read'},
@@ -65,13 +66,24 @@ DRAFT_CHECK_NAME = "${{ github.event_name == 'pull_request' && github.event.pull
 PR_EVENTS = ['opened', 'synchronize', 'reopened', 'ready_for_review', 'converted_to_draft']
 PUBLISH_PROOF = ("github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == "
                  "github.repository && needs.sdk.result == 'success'")
+RELEASE_COMMIT = '${{ needs.release.outputs.commit }}'
+RELEASE_VERSION = '${{ needs.release.outputs.version }}'
+RELEASE_TAG = '${{ inputs.tag || github.ref_name }}'
+RELEASE_CI_CHECKOUT = "${{ inputs.release_commit || '' }}"
 JOB_CONDITIONS = {
     'receiver-diagnostics.yml': {'probe': RECEIVER_TRUST},
     'rust.yml': {'verified-tree': REUSE_ALLOWED,
                  **dict.fromkeys(('test', 'cross', 'hx-pictures', 'miri'), FULL_CONDITION),
                  'sdk': (f"!cancelled() && needs.hx-pictures.result == 'success' && {FULL_REQUIRED} && "
                          f"vars.NDI_CI_RELEASED == 'true' && {SECRETS_AVAILABLE}"), 'required-ci': FULL_GATE, 'deploy-docs': "${{ !cancelled() && needs.required-ci.result == 'success' && github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' }}"},
-    'publish.yml': {'release': "github.repository == 'GrantSparks/grafton-ndi'"},
+    'publish.yml': {
+        'release': ("github.repository == 'GrantSparks/grafton-ndi' && (github.event_name == 'push' || "
+                    "(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))"),
+        'ci': "needs.release.outputs.run_id == ''",
+        'verify': ("${{ !cancelled() && needs.release.result == 'success' && (needs.ci.result == 'success' || "
+                   "(needs.ci.result == 'skipped' && needs.release.outputs.run_id != '')) }}"),
+        'publish': "${{ !cancelled() && needs.release.result == 'success' && needs.verify.result == 'success' }}",
+    },
 }
 TRIGGERS = {
     'receiver-diagnostics.yml': {
@@ -82,8 +94,13 @@ TRIGGERS = {
         }}},
     },
     'rust.yml': {'push': {'branches': ['main']}, 'pull_request': {'branches': ['main'], 'types': PR_EVENTS}, 'workflow_dispatch': None,
-                 'workflow_call': {'secrets': {name: {'required': 'false'} for name in PASSED_SECRETS}}},
-    'publish.yml': {'push': {'tags': ['v*']}},
+                 'workflow_call': {
+                     'inputs': {'release_commit': {'description': 'The validated release commit to test', 'type': 'string'}},
+                     'secrets': {name: {'required': 'false'} for name in PASSED_SECRETS},
+                 }},
+    'publish.yml': {'push': {'tags': ['v*']}, 'workflow_dispatch': {'inputs': {'tag': {
+        'description': 'Existing release tag', 'required': 'true', 'type': 'string',
+    }}}},
 }
 # The actions each job uses, in order. The sdk job has SDK files on disk, so it has no
 # cache and only downloads the test pictures; the publish job holds the registry identity.
@@ -107,7 +124,7 @@ ACTIONS = {
         'publish': ['actions/checkout', 'rust-lang/crates-io-auth-action'],
     },
 }
-PUBLISH_NEEDS = {'release': None, 'ci': 'release', 'verify': 'ci', 'publish': 'verify'}
+PUBLISH_NEEDS = {'release': None, 'ci': 'release', 'verify': ['release', 'ci'], 'publish': ['release', 'verify']}
 OUTSIDE_THE_CHECKOUT = '${{ runner.temp }}'
 
 
@@ -546,6 +563,11 @@ def gate_violations(rust):
     found = []
     for job in ('test', 'cross', 'hx-pictures', 'miri'):
         found += differs(f'rust.yml: {job} waits for the verified tree decision', jobs[job].get('needs'), 'verified-tree')
+    for job in ('lint', 'test', 'cross', 'hx-pictures', 'miri', 'sdk', 'required-ci'):
+        checkout = next((step for step in jobs[job]['steps']
+                         if step.get('uses', '').startswith('actions/checkout@')), {})
+        found += differs(f'rust.yml: {job} checks out the selected release commit when provided',
+                         checkout.get('with', {}).get('ref'), RELEASE_CI_CHECKOUT)
     return (found + differs('rust.yml: jobs required-ci waits for', sorted(gate.get('needs') or []),
                     sorted(set(jobs) - {'required-ci', 'deploy-docs'}))
             + differs('rust.yml: the gate step', step.get('env'), {
@@ -568,16 +590,38 @@ def publish_violations(publish):
     """The job that holds the publishing identity runs nothing from the repository."""
     jobs = publish['jobs']
     job = jobs['publish']
+    release_checkout = next((step for step in jobs['release']['steps']
+                             if step.get('uses', '').startswith('actions/checkout@')), {})
+    selector = next((step for step in jobs['release']['steps']
+                     if step.get('name') == 'Validate the tag and look up full CI for its tree'), {})
     scripts = [step for step in job['steps'] if 'run' in step]
     found = (differs('publish.yml: job order', {name: body.get('needs') for name, body in jobs.items()}, PUBLISH_NEEDS)
+             + differs('publish.yml: runs for the same tag share a concurrency group', publish.get('concurrency'),
+                       {'group': 'publish-' + RELEASE_TAG, 'cancel-in-progress': 'false'})
+             + differs('publish.yml: tag selection uses checkout history',
+                       release_checkout.get('with'), {'fetch-depth': '0'})
+             + differs('publish.yml: selected tag and verifier token', selector.get('env'),
+                       {'RELEASE_TAG': RELEASE_TAG, 'GH_TOKEN': '${{ github.token }}'})
+             + differs('publish.yml: release job outputs', jobs['release'].get('outputs'), {
+                 field: f'${{{{ steps.release.outputs.{field} }}}}' for field in ('commit', 'version', 'run_id')})
+             + differs('publish.yml: full CI uses the selected release commit', jobs['ci'].get('with'),
+                       {'release_commit': RELEASE_COMMIT})
              + differs('publish.yml: secrets passed to CI', jobs['ci'].get('secrets'), PASSED_SECRETS)
              + differs('publish.yml: environment of publish', job.get('environment'), 'crates-io')
-             + differs('publish.yml: values publish takes from verify', job.get('env'), {
+             + differs('publish.yml: package version to verify', jobs['verify'].get('env'),
+                       {'RELEASE_VERSION': RELEASE_VERSION})
+             + differs('publish.yml: values publish takes from release and verify', job.get('env'), {
+                 'RELEASE_VERSION': RELEASE_VERSION,
                  'VERIFIED_SHA256': '${{ needs.verify.outputs.sha256 }}',
                  'VERIFIED_TOOLCHAIN': '${{ needs.verify.outputs.toolchain }}'})
              + differs('publish.yml: where the registry token goes',
                        {place: value for place, value in workflows.entries(publish) if 'steps.auth' in value.lower()},
                        {'jobs.publish.steps[Publish].env.CARGO_REGISTRY_TOKEN': '${{ steps.auth.outputs.token }}'}))
+    for name in ('verify', 'publish'):
+        checkout = next((step for step in jobs[name]['steps']
+                         if step.get('uses', '').startswith('actions/checkout@')), {})
+        found += differs(f'publish.yml: {name} checks out the selected release commit',
+                         checkout.get('with', {}).get('ref'), RELEASE_COMMIT)
     # Cargo reads configuration from the working directory upwards, so it must not start in the checkout.
     found += [f'publish.yml: step {step["name"]!r} of publish runs in the checkout'
               for step in scripts if step.get('working-directory') != OUTSIDE_THE_CHECKOUT]
@@ -664,8 +708,14 @@ WRONG_EDITS = (
     ('publishing from a branch push', 'publish.yml', "  push:\n    tags: ['v*']\n",
      "  push:\n    tags: ['v*']\n    branches: [main]\n", 'triggers'),
     ('publish without the environment', 'publish.yml', '    environment: crates-io\n', '', 'environment of publish'),
-    ('publish without waiting for verify', 'publish.yml', '    name: publish to crates.io\n    needs: verify\n',
+    ('publish without waiting for verify', 'publish.yml', '    name: publish to crates.io\n    needs: [release, verify]\n',
      '    name: publish to crates.io\n    needs: release\n', 'job order'),
+    ('publish rechecks out the tag', 'publish.yml',
+     '          ref: ${{ needs.release.outputs.commit }}\n      - name: Re-create the verified package\n',
+     '          ref: ${{ inputs.tag }}\n      - name: Re-create the verified package\n',
+     'checks out the selected release commit'),
+    ('verification allows skipped CI without proof', 'publish.yml', "(needs.ci.result == 'skipped' && needs.release.outputs.run_id != '')) }}",
+     "needs.ci.result == 'skipped') }}", 'job conditions'),
     ('cargo package started in the checkout', 'publish.yml',
      '      - name: Re-create the verified package\n        working-directory: ${{ runner.temp }}\n',
      '      - name: Re-create the verified package\n', 'runs in the checkout'),
