@@ -3152,7 +3152,7 @@ fn configured_machine_names_are_discovered_and_cached_without_dns_restrictions()
         return;
     };
     let _turn = sockets();
-    let machine = format!("Grafton Studio_{}", std::process::id());
+    let machine = format!("Test Sender_{}", std::process::id());
     let group = common::unique_name("machine-query");
     let config =
         AdvancedConfig::parse(format!(r#"{{"ndi":{{"machinename":"{machine}"}}}}"#)).unwrap();
