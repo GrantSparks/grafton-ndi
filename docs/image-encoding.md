@@ -202,22 +202,32 @@ lists the complete option rules.
 The [`file_thumbnails` example](../examples/file_thumbnails.rs) plays a recording
 into a private NDI group, seeks to spaced positions and writes quarter-size
 JPEGs. It requires exactly one video track: with program and proxy tracks, the
-6.4 File player's `FirstFrame` timecode can fail to match the received video.
+6.4 File player's `FirstFrame` event can describe a different frame from the
+video delivered to the full-bandwidth receiver.
 The [`file_record` example](../examples/file_record.rs) uses
 `FileRecorderOptions::proxy(false)` to produce suitable recordings.
 
-The receiver connects before playback starts. Video and events are drained
-together; playback pauses at `FirstFrame` while the receiver catches up and
-encoding completes. The example matches the event's timecode when the SDK
-provides one; otherwise it takes the next available frame. Conversion scratch
-and encoded-output capacity are reused:
+The receiver connects before playback starts. The example matches each
+`FirstFrame` event's file presentation timestamp (PTS) to the raw receive
+timestamp. Editorial timecodes can repeat. Playback pauses at the event, and
+up to eight early video buffers can be kept borrowed between captures while
+waiting for it. If the opening event reports zero, the example uses the
+earliest frame captured on the fresh receiver if that frame has a raw
+timestamp and the SDK reports no video drops. Later requests must advance
+and yield a nonzero PTS beyond the
+last position sent before the seek. This can require wider seek spacing.
+If the seek PTS is ambiguous, timestamps are missing, or the candidate or
+ten-second wait budget is exhausted, the example reports the failure before
+writing that JPEG. Conversion scratch and encoded-output capacity are reused.
 
 ```sh
 cargo run --example file_thumbnails --features file-io,image-encoding -- take_001.mkv 8
 ```
 
-Its accuracy depends on the recording and native seek behavior; validate the
-workflow with your media. See [File API requirements](file-io.md#requirements).
+The seek check assumes that video PTS advances in playback order. Exact
+timestamp matching was verified on Linux x86-64 with a single-track SpeedHQ
+recording and version 6.4.0.2 of the NDI Advanced runtime and File library.
+See [File API requirements](file-io.md#requirements).
 
 ## Validation
 
