@@ -37,14 +37,16 @@ authority before the path, query or fragment. Finder list settings accept
 iterables, such as `groups(["Public", "Studio"])` and
 `extra_ips(["192.0.2.10"])`; their readback accessors return slices.
 
-Snapshots and accumulated results have bounded, fallible allocations.
+Discovery bounds snapshot copy work and the results retained across a window.
 `Error::ResourceLimit` identifies the resource and units through `ResourceKind`.
-Invalid snapshot arrays return `UnexpectedSdkResult`, and storage allocation
-failures return `AllocationFailed` with their `AllocationFailure`;
-individual malformed descriptors can be skipped. See
-[`Finder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.Finder.html)
-for exact limits. Run [`find_sources`](../examples/find_sources.rs) to inspect the
-names your network advertises.
+Invalid snapshot arrays return `UnexpectedSdkResult`. Failed reservations for
+copied text and result containers return `AllocationFailed`. Allocating the
+shared owners for source text or cached results can terminate the process
+through the global allocator. Individual malformed descriptors can be skipped.
+See [`Finder::current_sources`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.Finder.html#method.current_sources)
+and [`Finder::find_sources`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.Finder.html#method.find_sources)
+for exact limits and error behavior. Run [`find_sources`](../examples/find_sources.rs)
+to inspect the names your network advertises.
 
 ### Keep discovery in server state
 

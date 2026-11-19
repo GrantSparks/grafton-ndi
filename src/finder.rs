@@ -552,7 +552,7 @@ impl SourceWatch<'_> {
     ///
     /// Returns the snapshot errors of [`Finder::current_sources`]:
     /// [`Error::UnexpectedSdkResult`] for a malformed top-level descriptor array,
-    /// [`Error::AllocationFailed`] when result or text storage cannot be reserved,
+    /// [`Error::AllocationFailed`] for failed result or text reservations,
     /// or [`Error::ResourceLimit`] when a snapshot exceeds its copy budgets.
     #[doc(alias = "NDIlib_find_get_current_sources")]
     pub fn current_sources(&mut self) -> Result<Vec<Source>> {
@@ -989,9 +989,20 @@ impl Finder {
     ///
     /// Each snapshot permits at most 16,384 descriptors and 16 MiB total
     /// native descriptors, result storage, scanned string bytes (including
-    /// rejected entries) and produced UTF-8. Exceeding either budget returns
-    /// [`Error::ResourceLimit`]; reservations are fallible. An isolated
-    /// malformed descriptor within the budget is skipped.
+    /// rejected entries) and owned source text with its shared storage overhead.
+    /// Exceeding either budget returns [`Error::ResourceLimit`]. Each SDK string
+    /// is also limited to 4 MiB including its terminator. An isolated malformed
+    /// descriptor within the snapshot budgets is skipped.
+    ///
+    /// # Allocation behavior
+    ///
+    /// Failed reservations for the result vector or copied text return
+    /// [`Error::AllocationFailed`]. The same applies to the result and
+    /// deduplication containers in [`Self::find_sources`]. Creating a shared
+    /// owner for copied source text uses the global allocator's allocation
+    /// failure handler, which can terminate the process. This also applies to
+    /// single-source getters that copy an SDK descriptor, such as
+    /// [`crate::Sender::source`].
     ///
     /// # Returns
     ///
@@ -1001,8 +1012,8 @@ impl Finder {
     ///
     /// Returns [`Error::UnexpectedSdkResult`] with
     /// [`crate::SdkResultDefect::MalformedDiscoveryData`] for a malformed top-level
-    /// descriptor array, [`Error::AllocationFailed`] when result or text storage
-    /// cannot be reserved, or [`Error::ResourceLimit`] when a snapshot exceeds
+    /// descriptor array, [`Error::AllocationFailed`] for failed result or text
+    /// reservations, or [`Error::ResourceLimit`] when a snapshot exceeds
     /// its copy budgets. An isolated malformed descriptor is skipped.
     ///
     /// # Examples
@@ -1197,8 +1208,9 @@ impl Finder {
     /// counts shared source strings once, plus the storage of both the result
     /// vector and the deduplication set, including container capacity.
     /// Returns [`Error::UnexpectedSdkResult`] for a malformed top-level snapshot
-    /// array, or [`Error::AllocationFailed`] when result or text storage cannot
-    /// be reserved. An isolated malformed descriptor is skipped.
+    /// array, or [`Error::AllocationFailed`] for failed result, deduplication or
+    /// text reservations. See [`Self::current_sources`] for allocation behavior
+    /// of shared source owners. An isolated malformed descriptor is skipped.
     ///
     /// # Examples
     ///
@@ -2111,8 +2123,9 @@ impl Source {
     /// Returns [`Error::NativeOperationFailed`] naming the call's function when the
     /// descriptor is null, or names neither a source nor an address, and
     /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
-    /// the 4 MiB one SDK string may be. [`Error::AllocationFailed`] when the
-    /// source text storage cannot be reserved.
+    /// the 4 MiB one SDK string may be. [`Error::AllocationFailed`] for failed
+    /// text buffer reservations. See [`Finder::current_sources`] for allocation
+    /// behavior of shared source owners.
     ///
     /// # Safety
     ///
@@ -2316,9 +2329,13 @@ impl SourceCache {
     /// Discovery runs outside the cache lock; its window includes snapshot-lock
     /// contention. Access to cached descriptor copies can briefly serialize on the
     /// cache mutex. Copying and native snapshot execution can finish after the
-    /// discovery wait budget. Discovery uses the same bounded, fallible snapshot
-    /// and accumulated-result allocations as
-    /// [`Finder::find_sources`]. Returned cached descriptors are fallibly copied.
+    /// discovery wait budget. [`Finder::find_sources`] describes the bounded
+    /// discovery work and its allocation errors. Copying a cache hit can return
+    /// [`Error::AllocationFailed`] if the result vector cannot be reserved.
+    /// On a miss, reservations to copy the result, prepare a host key or grow
+    /// the cache map are best-effort. Creating the shared snapshot owner uses
+    /// the global allocator's allocation failure handler, as does creating
+    /// shared source owners during [`Finder::current_sources`].
     /// Entries have the explicit stale-data policy described on [`SourceCache`].
     ///
     /// # Errors
@@ -2326,9 +2343,9 @@ impl SourceCache {
     /// [`Error::InvalidInput`] for a query outside [`Source::matches_host`]'s
     /// grammar or a timeout above [`crate::MAX_TIMEOUT`], even on a cache hit.
     /// The host is checked before the timeout, including in async lookups;
-    /// discovery/resource errors propagate without filling an entry. A completed
-    /// result the cache cannot store is returned uncached. IP hints must already
-    /// be configured on the finder; this method does not change its scope.
+    /// discovery/resource errors propagate without filling an entry. A failed
+    /// publication reservation returns the discovered result uncached. IP hints
+    /// must already be configured on the finder.
     #[doc(alias = "NDIlib_find_get_current_sources")]
     #[doc(alias = "NDIlib_find_wait_for_sources")]
     pub fn find_sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
@@ -4479,6 +4496,35 @@ mod tests {
                 bytes: Some(1_048_577),
             }))
         ));
+    }
+
+    #[cfg(not(miri))] // Requires re-executing this test binary.
+    #[test]
+    fn source_descriptor_shared_owner_uses_the_global_allocation_failure_handler() {
+        const CHILD: &str = "GRAFTON_NDI_TEST_SOURCE_OWNER_ALLOCATION_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let raw = NDIlib_source_t {
+                p_ndi_name: c"x".as_ptr(),
+                ..Default::default()
+            };
+            // The name and its terminator need two bytes. The Arc owner
+            // requires a larger allocation on every supported target.
+            let result = crate::test_alloc::fail_allocations_at_least(3, || {
+                // SAFETY: the raw descriptor and its terminated C literal stay live.
+                unsafe { source_from_raw(&raw, c"test source query") }
+            });
+            panic!("shared-owner allocation unexpectedly returned {result:?}");
+        }
+        let output = crate::test_support::TestChild::new(
+            "finder::tests::source_descriptor_shared_owner_uses_the_global_allocation_failure_handler",
+        )
+        .env(CHILD, "1")
+        .run_expecting(false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("memory allocation of") && stderr.contains("bytes failed"),
+            "{stderr}"
+        );
     }
 
     #[test]

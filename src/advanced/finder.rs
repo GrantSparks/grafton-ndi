@@ -125,8 +125,9 @@ impl Finder {
     /// is included in that same byte budget, including lossy UTF-8 expansion.
     /// [`crate::Error::UnexpectedSdkResult`] with
     /// [`crate::SdkResultDefect::MalformedDiscoveryData`] for a malformed top-level
-    /// descriptor array, or [`crate::Error::AllocationFailed`] when result or text
-    /// storage cannot be reserved. An isolated malformed descriptor is skipped.
+    /// descriptor array, or [`crate::Error::AllocationFailed`] for failed result
+    /// or text reservations. See [`Self::current_sources`] for allocation behavior
+    /// of shared source owners. An isolated malformed descriptor is skipped.
     #[doc(alias = "NDIlib_find_get_current_sources_v2")]
     pub fn current_sources_with_metadata(&self) -> Result<Vec<ExtendedSource>> {
         let table = self.runtime().table::<SourceMetadata>()?;

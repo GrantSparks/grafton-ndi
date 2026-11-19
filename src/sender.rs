@@ -2215,7 +2215,8 @@ impl<M: SenderMode> Sender<M> {
     /// descriptor, or one that names neither a source nor an address, and
     /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
     /// the 4 MiB one SDK string may be.
-    /// [`Error::AllocationFailed`] when source descriptor storage cannot be reserved.
+    /// [`Error::AllocationFailed`] for failed text buffer reservations. See
+    /// [`crate::Finder::current_sources`] for allocation behavior of shared source owners.
     ///
     /// # Examples
     ///
