@@ -201,7 +201,7 @@ lists the complete option rules.
 
 The [`file_thumbnails` example](../examples/file_thumbnails.rs) plays a recording
 into a private NDI group, seeks to spaced positions and writes quarter-size
-JPEGs. It requires exactly one video track: with program and proxy tracks, the
+JPEGs. It requires exactly one video track. With program and proxy tracks, the
 6.4 File player's `FirstFrame` event can describe a different frame from the
 video delivered to the full-bandwidth receiver.
 The [`file_record` example](../examples/file_record.rs) uses
@@ -214,8 +214,9 @@ up to eight early video buffers can be kept borrowed between captures while
 waiting for it. If the opening event reports zero, the example uses the
 earliest frame captured on the fresh receiver if that frame has a raw
 timestamp and the SDK reports no video drops. Later requests must advance
-and yield a nonzero PTS beyond the
-last position sent before the seek. This can require wider seek spacing.
+and yield a nonzero PTS beyond the last position sent before the seek, with
+room for the SDK's millisecond position precision. This can require wider
+seek spacing.
 If the seek PTS is ambiguous, timestamps are missing, or the candidate or
 ten-second wait budget is exhausted, the example reports the failure before
 writing that JPEG. Conversion scratch and encoded-output capacity are reused.

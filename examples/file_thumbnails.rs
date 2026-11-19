@@ -13,7 +13,7 @@
 //!
 //! It stays an example rather than an API, because it advertises an NDI
 //! source while it runs, and exact matching was verified with the 6.4.0.2
-//! Advanced runtime and File library on Linux x86-64 with a SpeedHQ recording:
+//! Advanced runtime and File library on Linux x86-64 with a SpeedHQ recording.
 //!
 //! * A receiver cannot connect to `player.advertised_source()` as it is: it
 //!   has no address. A [`Finder`] in the player's groups lists the source
@@ -117,9 +117,7 @@ pub(crate) fn write_positions(
                     )?;
                     player.seek(position)?;
                     player.set_paused(false);
-                    Playback::Seek {
-                        previous_end: last_sent.max(pts),
-                    }
+                    Playback::after_pause(last_sent, pts)
                 }
             };
             first_frame(&mut player, receiver, playback)
@@ -188,6 +186,16 @@ pub(crate) enum Playback {
 }
 
 impl Playback {
+    pub(crate) fn after_pause(last_sent: FilePosition, first_pts: FilePosition) -> Self {
+        // The verified File runtime can report position in whole milliseconds
+        // while outgoing video timestamps have sub-millisecond precision.
+        // Include the rest of that resolution before permitting another seek.
+        let previous_end = FilePosition::from_ticks(last_sent.ticks().saturating_add(9_999));
+        Self::Seek {
+            previous_end: previous_end.max(first_pts),
+        }
+    }
+
     fn validate_pts(self, position: FilePosition) -> Result<()> {
         if let Self::Seek { previous_end } = self {
             if position.ticks() == 0 {
@@ -198,7 +206,7 @@ impl Playback {
             }
             if position <= previous_end {
                 return Err(format!(
-                    "the seek's FirstFrame PTS {} is at or before the previous playback position {}; queued frames cannot be disambiguated",
+                    "the seek's FirstFrame PTS {} overlaps the previous playback through PTS {}; queued frames cannot be disambiguated",
                     position.ticks(), previous_end.ticks(),
                 ).into());
             }

@@ -155,6 +155,20 @@ fn overlapping_seeks_and_duplicate_pts_are_refused() {
 }
 
 #[test]
+fn seek_leaves_room_for_player_position_rounding() {
+    let playback = Playback::after_pause(
+        FilePosition::from_ticks(2_160_000),
+        FilePosition::from_ticks(2_000_000),
+    );
+    let steps = [step(Some((Some(2_166_666), 0)), Some(2_166_666))];
+    let error = scripted(playback, &steps).0.unwrap_err();
+    assert!(error.contains("overlaps the previous playback"), "{error}");
+
+    let steps = [step(Some((Some(2_170_000), 230)), Some(2_170_000))];
+    assert_eq!(scripted(playback, &steps).0.unwrap(), (230, 2_170_000));
+}
+
+#[test]
 fn candidate_budget_releases_every_guard_on_success_and_exhaustion() {
     let mut steps: Vec<_> = (0..=EARLY_FRAME_LIMIT)
         .map(|index| step(Some((Some(120 + index as i64), index as u8)), None))
@@ -303,17 +317,12 @@ fn thumbnails_capture_dark_then_bright_with_the_same_editorial_timecode() {
         example::connected_player(&ndi, &api, "Thumbnail stale queue").unwrap();
     player.start(&recording).unwrap();
     let (_, opening_pts) = example::first_frame(&mut player, &receiver, Playback::Start).unwrap();
-    let position_before_dark_seek = player.position().unwrap().max(opening_pts);
+    let before_dark_seek = Playback::after_pause(player.position().unwrap(), opening_pts);
     player
         .seek(FilePosition::from_duration(Duration::from_millis(180)).unwrap())
         .unwrap();
     player.set_paused(false);
-    let (_, dark_pts) = example::first_frame(
-        &mut player,
-        &receiver,
-        seek(position_before_dark_seek.ticks()),
-    )
-    .unwrap();
+    let (_, dark_pts) = example::first_frame(&mut player, &receiver, before_dark_seek).unwrap();
     player.set_paused(false);
     let deadline = Instant::now() + Duration::from_secs(3);
     while receiver.connection_stats().unwrap().video_frames_queued() < 2 {
@@ -324,7 +333,11 @@ fn thumbnails_capture_dark_then_bright_with_the_same_editorial_timecode() {
         std::thread::sleep(Duration::from_millis(2));
     }
     player.set_paused(true);
-    let previous_end = player.position().unwrap().max(dark_pts);
+    let last_sent = player.position().unwrap();
+    let before_bright_seek = Playback::after_pause(last_sent, dark_pts);
+    let Playback::Seek { previous_end } = before_bright_seek else {
+        unreachable!();
+    };
     let midpoint = FilePosition::from_ticks(info.duration().value().ticks() / 2);
     player.seek(midpoint).unwrap();
     let stale = receiver
@@ -334,7 +347,7 @@ fn thumbnails_capture_dark_then_bright_with_the_same_editorial_timecode() {
     let stale_ticks = u64::try_from(stale.timestamp().unwrap().ticks()).unwrap();
     assert!(
         (1..=previous_end.ticks()).contains(&stale_ticks),
-        "paused end {previous_end:?}, stale timestamp {stale_ticks}"
+        "paused position {last_sent:?}, end {previous_end:?}, stale timestamp {stale_ticks}"
     );
     assert_eq!(stale.timecode(), Timecode::from_ticks(20));
     let jpeg = ImageOptions::new(ImageFormat::Jpeg(85)).downscale(Downscale::Quarter);
@@ -343,7 +356,7 @@ fn thumbnails_capture_dark_then_bright_with_the_same_editorial_timecode() {
     assert!(receiver.connection_stats().unwrap().video_frames_queued() >= 1);
     player.set_paused(false);
     let (fresh, fresh_pts) =
-        example::first_frame(&mut player, &receiver, seek(previous_end.ticks())).unwrap();
+        example::first_frame(&mut player, &receiver, before_bright_seek).unwrap();
     assert_eq!(fresh.timecode(), Timecode::from_ticks(20));
     assert_eq!(
         u64::try_from(fresh.timestamp().unwrap().ticks()).unwrap(),
