@@ -13,10 +13,11 @@ use runtime_fixture::read_fake_log;
 
 #[cfg(feature = "advanced")]
 use grafton_ndi::{
-    advanced::MouseButton, Error, MediaTypes, RuntimeFeature, ScanType, SettingChange, StreamTier,
+    advanced::MouseButton, MediaTypes, RuntimeFeature, ScanType, SettingChange, StreamTier,
 };
 use grafton_ndi::{
-    FrameSync, FrameSyncAudioRequest, Ndi, Receiver, ReceiverOptions, RuntimeOptions, Source,
+    Error, FrameDefect, FrameSync, FrameSyncAudioRequest, LayoutDefect, Ndi, Receiver,
+    ReceiverOptions, RuntimeOptions, Source,
 };
 use std::time::Duration;
 
@@ -560,6 +561,74 @@ fn framesync_recovery_and_audio_use_the_original_native_owners() {
     .build(&directory.join("libframesync.so"));
     TestChild::new("framesync_recovery_and_audio_use_the_original_native_owners")
         .env("GRAFTON_FRAMESYNC_BOUNDARIES", library)
+        .env("GRAFTON_FAKE_NDI_LOG", directory.join("framesync.log"))
+        .run();
+}
+
+#[test]
+fn framesync_audio_requires_the_requested_shape() {
+    if let Some(library) = std::env::var_os("GRAFTON_FRAMESYNC_AUDIO_CHILD") {
+        let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
+        let sync = FrameSync::new(unconnected(&ndi)).unwrap();
+        #[cfg(feature = "advanced")]
+        let mut sync = sync;
+        let request = FrameSyncAudioRequest::capture_at(48_000, 2, 8).unwrap();
+        let mismatch = FrameDefect::FrameSyncAudioMismatch;
+        for (mode, defect) in [
+            ("rate", mismatch.clone()),
+            ("channels", mismatch.clone()),
+            ("samples", mismatch),
+            (
+                "invalid-rate",
+                FrameDefect::Layout(LayoutDefect::AudioRate((-1).into())),
+            ),
+        ] {
+            std::env::set_var("GRAFTON_FAKE_FRAMESYNC_AUDIO", mode);
+            let check = |capture: &dyn Fn() -> grafton_ndi::Result<()>| {
+                let before = read_fake_log().len();
+                let (result, allocations) = test_alloc::allocation_count(capture);
+                let log = read_fake_log();
+                assert_eq!(count(&log[before..], "fs-audio:"), 1, "{mode}");
+                assert_eq!(count(&log[before..], "fs-audio-free:"), 1, "{mode}");
+                assert!(
+                    matches!(&result, Err(Error::InvalidFrame(actual)) if actual == &defect),
+                    "{mode}: {result:?}"
+                );
+                assert_eq!(allocations, 0, "{mode}");
+            };
+            check(&|| sync.capture_audio_ref(request).map(drop));
+            check(&|| sync.capture_audio(request).map(drop));
+            #[cfg(feature = "advanced")]
+            {
+                let (capture, _) = sync.split();
+                check(&|| capture.capture_audio_ref(request).map(drop));
+                check(&|| capture.capture_audio(request).map(drop));
+            }
+        }
+
+        std::env::set_var("GRAFTON_FAKE_FRAMESYNC_AUDIO", "padded");
+        let before = read_fake_log().len();
+        let (frame, allocations) = test_alloc::allocation_count(|| sync.capture_audio_ref(request));
+        let frame = frame.unwrap();
+        assert_eq!(allocations, 0);
+        assert_eq!(frame.channel_stride_bytes(), 12 * size_of::<f32>());
+        assert!(frame.data().is_none());
+        assert_eq!(frame.channels().count(), 2);
+        assert!(frame.channels().all(|channel| channel == [0.25; 8]));
+        assert_eq!(count(&read_fake_log()[before..], "fs-audio-free:"), 0);
+        drop(frame);
+        assert_eq!(count(&read_fake_log()[before..], "fs-audio-free:"), 1);
+        return;
+    }
+
+    let directory = common::FixtureDir::create("framesync-audio-shape");
+    let library = runtime_fixture::FakeRuntime {
+        cfgs: vec!["fake_objects", "fake_receiver_controls", "fake_capture"],
+        ..Default::default()
+    }
+    .build(&directory.join("libframesync.so"));
+    TestChild::new("framesync_audio_requires_the_requested_shape")
+        .env("GRAFTON_FRAMESYNC_AUDIO_CHILD", library)
         .env("GRAFTON_FAKE_NDI_LOG", directory.join("framesync.log"))
         .run();
 }

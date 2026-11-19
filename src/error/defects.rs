@@ -257,6 +257,9 @@ pub enum FrameDefect {
     /// planar destination rate, channels and samples must match the interleaved source.
     #[error("planar destination rate, channels and samples must match the interleaved source")]
     PlanarAudioMismatch,
+    /// The SDK returned FrameSync audio with dimensions different from the request.
+    #[error("FrameSync audio rate, channels and samples must match the request")]
+    FrameSyncAudioMismatch,
     /// Truncated compressed packet header.
     #[error("Truncated compressed packet header")]
     PacketHeaderTruncated,

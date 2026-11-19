@@ -2076,6 +2076,37 @@ fn players_borrow_their_options() {
 }
 
 #[test]
+fn recorder_creation_and_source_changes_pass_one_native_selector() {
+    let name = "STUDIO (Caméra 2)";
+    let url = "ndi://user@camera.local:5962/path?opaque=1";
+    let named = SourceSpec::new(name).unwrap();
+    let addressed = SourceSpec::from_url(url).unwrap();
+    let native_name = (Some(name.to_owned()), None);
+    let native_url = (None, Some(url.to_owned()));
+
+    for (initial, replacement, expected) in [
+        (
+            &named,
+            &addressed,
+            [native_name.clone(), native_url.clone()],
+        ),
+        (&addressed, &named, [native_url, native_name]),
+    ] {
+        let device = mock::Recorder::new(Closing::AtStop);
+        device.install();
+        let mut recorder = FileRecorder::new(
+            &mock::recorder_api(),
+            &FileRecorderOptions::new(initial.clone()),
+        )
+        .unwrap();
+        assert_eq!(recorder.last_accepted_source(), Some(initial));
+        recorder.set_source(replacement).unwrap();
+        assert_eq!(recorder.last_accepted_source(), Some(replacement));
+        assert_eq!(*device.selected_sources.lock().unwrap(), expected);
+    }
+}
+
+#[test]
 fn selected_endpoints_and_deliberate_names_cross_creation_and_source_change() {
     use crate::{Source, SourceAddress};
     let selected = Source::new("STUDIO (Camera 2)")

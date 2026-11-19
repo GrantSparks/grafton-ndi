@@ -55,6 +55,8 @@ jobs:
     needs: release
     permissions:
       contents: read
+      actions: read
+      pull-requests: read
       pages: write
       id-token: write
     uses: ./.github/workflows/rust.yml

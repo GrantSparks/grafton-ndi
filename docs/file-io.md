@@ -94,6 +94,9 @@ with `RecordingTarget::new("take")`. The target resolves the prefix when it is
 created, so later working-directory changes leave the recording destination
 fixed. `{index}` and `{index:N}` must be in the file name. For a target that
 names an existing directory, use a pattern such as `{prefix}/{index:03}.mkv`.
+The pattern uses the prefix text, including any trailing separator or `.`
+component. For example, `folder/.` with `{prefix}hidden.mkv` gives
+`folder/.hidden.mkv` under the frozen working directory.
 
 `start` and `rollover` require a filename component and check that the output
 directory exists and is writable. Exact naming refuses an existing file.
@@ -169,7 +172,10 @@ The async recorder drains native events continuously. `next_event` supplies
 bounded application notifications; dropped notifications do not alter its
 recording report. For both async handles, the wait starts on first poll and
 can take an event queued by its deadline even if the executor polls again
-later. Each wait leaves events queued after its deadline for later waits.
+later. Each wait reserves the queue through shutdown until it completes or is
+dropped. It leaves events queued after its deadline for later waits. With an
+empty queue, shutdown reports `Closed` or `OwnerFailed` if published by the
+deadline. A shutdown published later leaves the expired wait's result as `None`.
 Configure queue limits with `AsyncFileOptions` and handle `QueueFull`
 when submitting commands.
 Pass `&AsyncFileOptions` to `create_with_options`. Statistics name their units:

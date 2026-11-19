@@ -785,10 +785,10 @@ impl FrameSync {
     ///
     /// # Returns
     ///
-    /// An owned copy of the captured samples, in the request's channels and
-    /// samples per channel. The SDK can supply silence whenever current
-    /// input is unavailable. To read the SDK's known source format, use
-    /// [`Self::audio_input_format`].
+    /// An owned copy of the captured samples at the requested sample rate,
+    /// channel count, and samples per channel. The SDK can supply silence
+    /// whenever current input is unavailable. To read the SDK's known source
+    /// format, use [`Self::audio_input_format`].
     ///
     /// # Errors
     ///
@@ -828,10 +828,11 @@ impl FrameSync {
     /// Capture audio with dynamic resampling, borrowing the SDK's samples
     /// without copying them.
     ///
-    /// Resampling is as for [`Self::capture_audio`]. The frame always holds
-    /// the request's channels and samples per channel; the SDK can supply
-    /// silence whenever current input is unavailable, including after input
-    /// previously arrived. Successful output does not prove fresh reception.
+    /// Resampling is as for [`Self::capture_audio`]. The frame has the
+    /// requested sample rate, channel count, and samples per channel. The SDK
+    /// can supply silence whenever current input is unavailable, including
+    /// after input previously arrived. Successful output does not prove fresh
+    /// reception.
     /// Output without a source timestamp reports `timestamp() == None`; without
     /// a source timecode it carries [`crate::Timecode::SYNTHESIZE`].
     /// See the [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
@@ -845,11 +846,13 @@ impl FrameSync {
     ///
     /// # Errors
     ///
-    /// Returns frame-validation errors only if the SDK returns malformed audio
-    /// dimensions, sample layout, or buffers. Unreadable per-frame metadata is
-    /// withheld; inspect [`AudioSource::metadata_status`](crate::AudioSource::metadata_status). A capture before any
-    /// audio has arrived is not an error. Request dimensions were already
-    /// validated at construction.
+    /// Returns [`Error::InvalidFrame`] when the SDK returns malformed audio
+    /// dimensions, sample layout, or buffers. For a valid frame with dimensions
+    /// that differ from the request, the cause is
+    /// [`crate::FrameDefect::FrameSyncAudioMismatch`].
+    /// Request dimensions are checked at construction.
+    /// Use [`AudioSource::metadata_status`](crate::AudioSource::metadata_status)
+    /// to check whether the frame's metadata could be read.
     ///
     /// # Example
     ///

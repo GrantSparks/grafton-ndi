@@ -119,6 +119,7 @@ fn frame_defect_diagnostics_preserve_their_text() {
         ("V210Width", FrameDefect::V210Width, "V210 conversion requires a positive width divisible by six"),
         ("P216LayoutMismatch", FrameDefect::P216LayoutMismatch, "P216 frame format and dimensions must match the V210 layout"),
         ("PlanarAudioMismatch", FrameDefect::PlanarAudioMismatch, "planar destination rate, channels and samples must match the interleaved source"),
+        ("FrameSyncAudioMismatch", FrameDefect::FrameSyncAudioMismatch, "FrameSync audio rate, channels and samples must match the request"),
         ("PacketHeaderTruncated", FrameDefect::PacketHeaderTruncated, "Truncated compressed packet header"),
         ("PacketHeaderSize", FrameDefect::PacketHeaderSize, "Unsupported compressed packet header size"),
         ("PacketHeaderUnsupported", FrameDefect::PacketHeaderUnsupported, "Cannot send a packet with an unsupported header version or unknown flags"),

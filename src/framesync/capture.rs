@@ -6,7 +6,9 @@ use super::{
 };
 #[cfg(feature = "advanced")]
 use crate::frames::{AudioFrame, VideoFrame};
-use crate::{frames::ScanType, receiver::ReceiverIdentity, FrameSyncAttached, Result};
+use crate::{
+    frames::ScanType, receiver::ReceiverIdentity, Error, FrameDefect, FrameSyncAttached, Result,
+};
 use std::fmt;
 
 /// Clocked capture access lent by [`FrameSync::split`](super::FrameSync::split).
@@ -95,7 +97,14 @@ impl<'a> FrameSyncCapture<'a> {
         request: FrameSyncAudioRequest,
     ) -> Result<FrameSyncAudioRef<'a>> {
         let guard = self.resource.capture_audio(AudioCall::Samples(request));
-        FrameSyncAudioRef::new(guard)
+        let frame = FrameSyncAudioRef::new(guard)?;
+        if frame.sample_rate() != request.sample_rate()
+            || frame.num_channels() != request.num_channels()
+            || frame.num_samples() != request.num_samples()
+        {
+            return Err(Error::InvalidFrame(FrameDefect::FrameSyncAudioMismatch));
+        }
+        Ok(frame)
     }
 
     /// Query the cached input audio format; see [`FrameSync::audio_input_format`](super::FrameSync::audio_input_format).

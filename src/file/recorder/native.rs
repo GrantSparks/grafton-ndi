@@ -8,9 +8,8 @@ use super::{
 };
 use crate::{
     file::{
-        out_param,
-        types::{track_flags, FileText},
-        FileBound, RecorderStats, RecordingTarget, RecordingTimecode, SourceFormat, SourceSpec,
+        out_param, types::track_flags, FileBound, RecorderStats, RecordingTarget,
+        RecordingTimecode, SourceFormat, SourceSpec,
     },
     frames::MetadataPartsExt,
     sys::{self, bindings::*},
@@ -23,15 +22,6 @@ use crate::{
 // the recorder reports that the recorder owns them: what it is given, it
 // copies. `sdk_tests` holds the library to that, by overwriting each string as
 // soon as the call it was passed to returns.
-
-fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
-    let pointer =
-        |text: &Option<FileText>| text.as_ref().map_or(std::ptr::null(), |text| text.as_ptr());
-    NDIlib_file_recorder_source_t {
-        p_ndi_name: pointer(&source.name),
-        p_url_address: pointer(&source.url),
-    }
-}
 
 pub(super) struct NativeRecorder {
     recording: FileBound<sys::FileRecording>,
@@ -127,7 +117,7 @@ impl NativeRecorder {
         options: &CheckedRecorderOptions,
     ) -> Result<Self> {
         let settings = NDIlib_file_recorder_create_t {
-            source_to_connect_to: raw_source(&options.source),
+            source_to_connect_to: options.source.raw_source(),
             track_flags: track_flags(options.tracks),
             record_float_audio_planar_32f: options.planar_audio,
             disable_auto_rollover_on_format_change: !options.format_change_rollover,
@@ -178,7 +168,7 @@ impl NativeRecorder {
     }
 
     pub(super) fn set_source(&mut self, source: &SourceSpec) -> Result<()> {
-        let raw = raw_source(source);
+        let raw = source.raw_source();
         // SAFETY: the recorder is live, and `raw` and the strings it points
         // to, owned by `source`, are valid for the call.
         let accepted = unsafe {

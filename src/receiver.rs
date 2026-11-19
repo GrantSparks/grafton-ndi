@@ -1858,6 +1858,13 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Accepts owned or captured metadata. The receiver keeps its own copy,
     /// so the input need not outlive the registration.
     ///
+    /// On Windows x64, the Standard NDI 6.3.2.0 and 6.4.0.2 builds tested in
+    /// [issue #551](https://github.com/GrantSparks/grafton-ndi/issues/551) can
+    /// omit automatic delivery. Applications that manage reconnects can send
+    /// the payload explicitly with [`Self::send_metadata`] after confirming
+    /// each connection is live. Use a single send path for the payload to
+    /// avoid duplicates.
+    ///
     /// # Errors
     ///
     /// [`Error::UnsupportedCapability`] without
@@ -4097,27 +4104,50 @@ mod tests {
 
     #[test]
     fn reconnect_returns_while_a_capture_attempt_is_in_flight() {
+        struct FinishTrace(bool);
+        impl Drop for FinishTrace {
+            fn drop(&mut self) {
+                if self.0 {
+                    eprintln!("receiver-watchdog: reconnect case finished");
+                }
+            }
+        }
+        let diagnostics = std::env::var("GRAFTON_NDI_RECEIVER_DIAGNOSTICS").as_deref() == Ok("1");
+        let trace = |phase| {
+            if diagnostics {
+                eprintln!("receiver-watchdog: reconnect {phase}");
+            }
+        };
+        let _finish = FinishTrace(diagnostics);
+        trace("case started");
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        trace("receiver created");
         std::thread::scope(|scope| {
             let (done, completed) = std::sync::mpsc::channel();
             let result = {
                 let _attempt = receiver
                     .core
                     .capture_lock(Attempt(Deadline::after(Duration::from_secs(1)).unwrap()));
+                trace("capture attempt acquired");
                 let receiver = &receiver;
                 scope.spawn(move || {
+                    trace("entering Receiver::reconnect");
                     receiver.reconnect();
+                    trace("returned from Receiver::reconnect");
                     done.send(()).unwrap();
                 });
                 // Keep the attempt live across this wait. An accidental Rust
                 // exclusion would hold the reconnect off until this block ends.
                 completed.recv_timeout(Duration::from_secs(2))
             };
+            trace("capture attempt released");
             result.expect("reconnect waited for the capture attempt");
         });
+        trace("destroying receiver");
+        drop(receiver);
     }
 
     #[test]
